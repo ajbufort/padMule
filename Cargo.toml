@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["crates/mule-proto"]
+
+[workspace.package]
+edition = "2021"
+license = "GPL-2.0-or-later"
+rust-version = "1.96"
+
+[workspace.dependencies]
+md4 = "0.10"
+hex = "0.4"
