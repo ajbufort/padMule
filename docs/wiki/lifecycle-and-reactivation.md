@@ -69,6 +69,55 @@ detection. `resume()` must be:
 `pause()`: flush + checkpoint + quiesce queues + mark all sockets disposable;
 set states to PausedForBackground and emit the events.
 
+## Can we avoid the pause in the first place?
+
+Short answer: the pause is the DEFAULT and the only OS-GUARANTEED behavior, but
+it is NOT strictly unavoidable. Sideloading changes the calculus - the classic
+keepalive trick that App Store review (guideline 2.5.4) would reject is
+available to us, because a dev-signed/AltStore build is never reviewed. It buys
+best-effort screen-off running, not a guarantee. Options, weakest-guarantee to
+strongest (verified in the iPadOS research, docs/raw/ipados-constraints-*):
+
+1. **Silent-audio (or continuous-location) keepalive - the real "defeat the
+   pause" lever.** An active audio session keeps the app awake with the screen
+   off, so OUR raw eD2k/Kad sockets keep running. REVIEW-BLOCKED for the App
+   Store but TECHNICALLY-ALLOWED on a sideloaded build; `UIBackgroundModes`
+   (audio/location) are Info.plist keys a free team can set. Caveats that make
+   it best-effort, not a guarantee: Apple DTS is explicit that audio "keeps you
+   awake" is NOT "will not be suspended"; the dominant overnight failure is
+   outright TERMINATION (jetsam) - so background memory MUST stay under ~100MB;
+   heavy battery cost; audio-interruption re-arm needed. Verdict: genuinely
+   defeats the pause for hours of active screen-off use; can still be killed.
+2. **Foreground seedbox mode - the fully-supported always-on path.** Auto-Lock =
+   Never + plugged in keeps the app foreground with the screen on: UNLIMITED,
+   fully supported, sockets alive. The cost is only that the screen is on. Best
+   for "leave it downloading on my desk" and for seeding.
+3. **`BGContinuedProcessingTask` (iPadOS 26) - the legitimate "finish this
+   file."** A user-initiated, bounded job with a mandatory system progress UI
+   that can run a transfer past the ~30s window. Not indefinite seeding, but the
+   clean supported way to let an in-progress download finish while away. (Its
+   availability on the A12Z under iPadOS 26 is an open question to measure.)
+4. **`BGProcessingTask` - opportunistic progress while charging.** Maintenance
+   grade (OS discretion, may not fire): hash-check parts, prune sources, brief
+   resume attempts while on power. Complements, never the primary runtime.
+
+What is genuinely impossible: a fully-supported, always-on, screen-off P2P
+daemon like on desktop. Background `URLSession` (the only thing that truly
+survives suspension) is HTTP/HTTPS-only and cannot carry the eD2k/Kad wire
+protocol. So there is no "free" always-on.
+
+**Decision:** v1 stays foreground-only with the clean pause/resume above (it is
+honest, simple, and always correct). Add background persistence as a LATER,
+OPT-IN, tiered feature (a "Keep active in background" toggle = the audio
+keepalive with a clear battery warning + the <100MB memory discipline; a
+"Seedbox mode" = Auto-Lock=Never; use BGContinuedProcessingTask on iPadOS 26 to
+finish an active download; BGProcessingTask for charging-time upkeep). Crucially,
+**clean pause/resume remains REQUIRED regardless** - every one of these
+mechanisms can be revoked or jetsam-killed by the OS, so the app must always
+degrade gracefully back to pause-and-resume. On-device measurement needed:
+keepalive longevity on the A12Z/iPadOS 26, and whether BGContinuedProcessingTask
+is eligible there (open questions in the iPadOS research).
+
 ## Where it lands
 
 - **Wave 3c+ (engine):** implement the state model + explicit `pause()`/

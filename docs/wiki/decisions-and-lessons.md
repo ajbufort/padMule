@@ -7,6 +7,18 @@ bullet each; newest first.
 
 ## Locked decisions
 
+- 2026-07-13 **Background pause is avoidable best-effort, not always-on.** The
+  ~30s suspend is the only OS-GUARANTEED behavior, but sideloading unlocks the
+  audio/location keepalive (App-Store-review-blocked, but we are not reviewed)
+  for hours of best-effort screen-off running - killable by jetsam, needs
+  <100MB bg memory + battery warning. Fully-supported always-on = foreground
+  "seedbox mode" (Auto-Lock=Never, plugged in). iPadOS 26
+  BGContinuedProcessingTask = legitimate "finish this file." A supported
+  always-on screen-off P2P daemon is impossible (background URLSession is
+  HTTP-only). Plan: v1 foreground-only + clean pause/resume; background
+  persistence is a later OPT-IN tiered feature; clean pause/resume stays
+  REQUIRED as the always-correct fallback. See [[lifecycle-and-reactivation]].
+
 - 2026-07-13 **Replicate first, then improve (standing principle).** Replicate
   standard eD2k/Kad behavior faithfully before proposing improvements; Anthony
   invited improvements past that baseline (perf, correctness, memory, UX). The
