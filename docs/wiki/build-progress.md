@@ -10,8 +10,8 @@ ends at a differential/round-trip gate.
 
 | Wave | Scope | Plan | State |
 |------|-------|------|-------|
-| 1 | `mule-proto`: eD2k/MD4 file hashing | `plans/2026-07-12-wave1-mule-proto-ed2k-hash.md` | DONE (7 tests). |
-| 1b | `mule-proto`: LE byte I/O + eD2k tag codec | `plans/2026-07-12-wave1b-io-and-tags.md` | DONE (17 tests total, clippy clean). |
+| 1 | `mule-proto`: eD2k/MD4 file hashing | `plans/2026-07-12-wave1-mule-proto-ed2k-hash.md` | DONE. |
+| 1b | `mule-proto`: LE byte I/O + eD2k tag codec | `plans/2026-07-12-wave1b-io-and-tags.md` | DONE. Reviewed + corrected (see below). 20 tests total, clippy clean. |
 | 1c | `mule-proto`: AICH SHA-1 hash tree + search-expr encoding | - | not started (remaining Wave-1 codec slices) |
 | 2 | `mule-files` byte-compatible .met/.part | - | not started (unblocked by 1b) |
 | 3 | `mule-engine` eD2k core: login/search/single-source download | - | not started |
@@ -21,6 +21,21 @@ ends at a differential/round-trip gate.
 | 7 | `mule-ec` + `mule-cli` parity (IP filter, UPnP, categories) | - | not started |
 | 8 | `mule-ffi` + `ios/padMule` SwiftUI shell + lifecycle + sideload | - | not started |
 | 9 | (v1.1) seedbox mode | - | not started |
+
+## Review pass (2026-07-12)
+
+Multi-agent adversarial review of Wave 1 + 1b (3 dimensions completed before a
+session limit: Rust quality, hash faithfulness, tag/io faithfulness; docs
+consistency self-audited). The hashing algorithm, endianness, tag byte layout,
+and panic-safety were independently CONFIRMED faithful against the aMule C++
+source. Corrections applied: length-prefixed writers now cap+truncate (no
+stream desync), BOOL/BOOLARRAY tags accepted with round-trip, docs tightened.
+See [[decisions-and-lessons]] for the deliberate divergences (do NOT "fix"
+them). Residual: no fully-independent end-to-end eD2k hash vector exists on this
+box (no rhash/pycryptodome); the algorithm is source-verified + MD4 is
+RFC-anchored, and the live differential test vs amuled (Wave 3+) is the true
+end-to-end oracle. aMule's own `unittests/tests/CTagTest.cpp` /
+`FileDataIOTest.cpp` are a future cross-check for the tag/io codec.
 
 ## Wave 1 notes
 

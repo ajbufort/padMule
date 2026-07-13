@@ -7,6 +7,17 @@ bullet each; newest first.
 
 ## Locked decisions
 
+- 2026-07-12 **Deliberate tag-codec divergences from aMule (do NOT "fix").**
+  Surfaced by the review pass; each is intentional for byte-compat fidelity.
+  (1) `mule-proto` PRESERVES UINT8/UINT16 tag widths; aMule's reader promotes
+  them to UINT32 (Tag.cpp:123-131) and thus re-writes them wider, so preserving
+  is strictly more faithful to the source file and aMule reads them back fine.
+  (2) `write_tag` emits only the non-compact MET form (never the `type|0x80`
+  short form or inline STR1..16), matching aMule's file writers; those are
+  read-only. (3) A `TagName::Str` of length 1 is unrepresentable (the format
+  reserves name-length==1 for numeric ids) and reads back as `TagName::Id` -
+  inherent to eD2k. (4) BOOL/BOOLARRAY are accepted for robustness though no
+  aMule .met writer emits them. See [[protocol-reference]], [[build-progress]].
 - 2026-07-12 **Byte-compatible .met/.part.** padMule reads and writes upstream
   binary formats (known.met, part.met incl. 64-bit variant + gap lists,
   server.met, nodes.dat, prefs, clients.met, ipfilter.dat) so downloads move
