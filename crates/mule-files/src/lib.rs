@@ -2,6 +2,8 @@
 //! (server.met, known.met, part.met, nodes.dat, ...). Built on `mule-proto`.
 //! See docs/wiki/protocol-reference.md.
 
+pub mod known_met;
 pub mod server_met;
 
+pub use known_met::{read_known_met, write_known_met, KnownFileEntry, KnownMet};
 pub use server_met::{read_server_met, write_server_met, Server, ServerMet};
