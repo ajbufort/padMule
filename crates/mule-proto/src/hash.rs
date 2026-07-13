@@ -12,8 +12,13 @@ pub fn md4(data: &[u8]) -> [u8; 16] {
 /// eD2k part size in bytes (aMule PARTSIZE).
 pub const PARTSIZE: u64 = 9_728_000;
 
-/// Number of eD2k parts for a file of `size` bytes: floor(size/PARTSIZE) + 1.
-/// A size that is an exact multiple of PARTSIZE yields a trailing empty part.
+/// eD2k part count for a file of `size` bytes: floor(size/PARTSIZE) + 1.
+///
+/// This is aMule's `m_iED2KPartCount` (used in OP_FILESTATUS and the part-status
+/// bitfield) and also the number of MD4 part hashes `ed2k_hash` combines,
+/// because an exact-multiple file carries a trailing empty (sentinel) part.
+/// It is NOT the data-part count (`m_iPartCount = ceil(size/PARTSIZE)`), which
+/// is one smaller for exact multiples. Do not confuse the two in the engine.
 pub fn part_count(size: u64) -> u64 {
     size / PARTSIZE + 1
 }
