@@ -1,0 +1,284 @@
+# Release — produces a draft GitHub Release with every platform's
+# artifact attached. Two entry points, both ending in the same draft:
+#
+#   1. One-click (workflow_dispatch): a maintainer opens Actions →
+#      Release → Run workflow, picks the branch to release from, and
+#      types a version (e.g. 3.0.1). The prepare-tag job creates and
+#      pushes that tag at the tip of the selected branch if it doesn't
+#      already exist, then the full packaging matrix runs and the draft
+#      is assembled. No local `git tag` / `git push` needed. Re-running
+#      with an existing tag just re-assembles the assets (retry path).
+#
+#   2. Push a release-like tag from a local checkout — same downstream
+#      flow, kept for scripted / habitual taggers.
+#
+# Tag filter: digit-leading tags (aMule's convention — 2.3.3, 2.4.0-rc1,
+# 3.0-beta) plus optional v-prefix (v2.4.0) for compatibility. Excludes
+# branch-backup / topic tags like `backup/*`, `per-peer-cap-fix`, etc.
+#
+# Test on a fork by dispatching (or pushing) a version like
+# `0.0.0-fork-test` — the tag and the draft Release land on the fork,
+# not upstream.
+#
+# Before the draft is created, the release job asserts that all ten
+# expected platform assets are present, so a half-built matrix can never
+# silently produce a draft that's missing a platform.
+#
+# Output is always a draft so a maintainer can review the asset list
+# and edit the auto-generated notes before publishing.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - '[0-9]*'
+      - 'v[0-9]*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: >-
+          Version to release, e.g. 3.0.1 or 3.1.0-rc1. Created and
+          pushed as a tag at the tip of the branch selected above if it
+          doesn't already exist. Re-run with an existing version to
+          retry asset assembly without re-tagging.
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  # One-click entry point: turn the dispatched version into a real tag
+  # so the rest of the pipeline (which keys off git tags for versioning)
+  # behaves identically to the push-a-tag path. On the push trigger this
+  # job is a trivial no-op — the tag already exists — but it still runs
+  # so build/source-bundle can depend on it unconditionally.
+  prepare-tag:
+    name: Create tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Create and push tag if missing
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          TAG: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "Tag ${TAG} already exists — re-assembling assets, not re-tagging."
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # Annotated tag at the dispatched commit (tip of the selected
+          # branch). fetch-depth:0 above means git describe in the build
+          # jobs resolves this to an exact-match tag, so artifacts are
+          # versioned cleanly (aMule-3.0.1-... not aMule-...-gabc123).
+          git tag -a "${TAG}" -m "aMule ${TAG}"
+          git push origin "refs/tags/${TAG}"
+          echo "Created and pushed tag ${TAG} at ${GITHUB_SHA}."
+
+  build:
+    name: Build artifacts
+    needs: prepare-tag
+    uses: ./.github/workflows/packaging.yml
+
+  source-bundle:
+    name: Build source bundle with pre-rendered manpages
+    needs: prepare-tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "tag=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install po4a + gettext
+        run: sudo apt-get install -y po4a gettext
+
+      - name: Render translated manpages into the working tree
+        # CMake's build-time renderer writes translated manpages into the
+        # build dir, not the source tree. For the source bundle we want
+        # them next to the English masters so downstream packagers don't
+        # need po4a. Materialise a docs/man-relative po4a.config from the
+        # CMake-templated po4a.config.in (same substitution as
+        # scripts/update-manpages-po.sh, just without --no-translations).
+        run: |
+          TMP=$(mktemp)
+          sed \
+            -e 's|@CMAKE_CURRENT_SOURCE_DIR@/||g' \
+            -e 's|@CMAKE_CURRENT_BINARY_DIR@/||g' \
+            -e 's|@CMAKE_SOURCE_DIR@|../..|g' \
+            -e 's|@CMAKE_BINARY_DIR@|../..|g' \
+            docs/man/po4a.config.in > "$TMP"
+          # --no-update: render translations but leave po/manpages.pot
+          # and po/manpages-*.po unchanged, so the tarred-up source tree
+          # matches git HEAD byte-for-byte (modulo the new rendered .lang.1.in).
+          (cd docs/man && po4a --no-update --force "$TMP")
+          rm "$TMP"
+          # Sanity-check that po4a actually produced the renders.
+          count=$(find docs/man src/utils \
+                    \( -name '*.[a-z][a-z].1.in' -o -name '*.[a-z][a-z]_[A-Z][A-Z].1.in' \) | wc -l)
+          if [ "$count" -lt 90 ]; then
+            echo "::error::Expected ~100 rendered manpages, got $count"
+            exit 1
+          fi
+
+      - name: Create source tarball
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          # Strip a leading 'v' from the tarball stem so the directory name
+          # matches autotools convention (aMule-2.4.0/ not aMule-v2.4.0/).
+          STEM="aMule-${TAG#v}"
+          mkdir -p dist
+          # `git ls-files` covers every tracked file; append the rendered
+          # manpages on top. The two lists are unioned with sort -u in
+          # case a translation was somehow already tracked.
+          {
+            git ls-files
+            find docs/man src/utils \
+              \( -name '*.[a-z][a-z].1.in' -o -name '*.[a-z][a-z]_[A-Z][A-Z].1.in' \)
+          } | sort -u > /tmp/sources.txt
+          tar -czf "dist/${STEM}-src.tar.gz" \
+            --transform "s|^|${STEM}/|" \
+            --files-from=/tmp/sources.txt
+
+      - name: Upload source bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: source-bundle
+          path: dist/aMule-*-src.tar.gz
+
+  release:
+    name: Assemble draft Release
+    needs: [build, source-bundle]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # Pull only the final per-platform artifacts. The intermediate
+      # macos-app-arm64 / macos-app-x86_64 .app trees are inputs to the
+      # lipo merge job and don't belong on the Release page.
+      - name: Download AppImages
+        uses: actions/download-artifact@v8
+        with:
+          pattern: appimage-*
+          path: dist/
+          merge-multiple: true
+      - name: Download Flatpaks
+        uses: actions/download-artifact@v8
+        with:
+          pattern: flatpak-*
+          path: dist/
+          merge-multiple: true
+      - name: Download macOS Universal2 .dmg
+        uses: actions/download-artifact@v8
+        with:
+          name: macos-universal2
+          path: dist/
+      - name: Download Windows portable zips
+        uses: actions/download-artifact@v8
+        with:
+          pattern: windows-*
+          path: dist/
+          merge-multiple: true
+      - name: Download source bundle
+        uses: actions/download-artifact@v8
+        with:
+          name: source-bundle
+          path: dist/
+
+      - name: List artifacts
+        run: ls -la dist/
+
+      - name: Verify all platform artifacts are present
+        # Belt-and-suspenders manifest check. The build matrix uses
+        # fail-fast:false and this job `needs: [build, source-bundle]`,
+        # so a failed platform already blocks the draft via `needs` —
+        # but that surfaces as a generic "dependency failed". This step
+        # instead names exactly which asset is missing, and guards
+        # against the subtler case where a platform's upload succeeded
+        # with an unexpected filename (so the glob below finds nothing).
+        run: |
+          set -euo pipefail
+          fail=0
+          check() {
+            local label="$1" expected="$2" glob="$3" n
+            # shellcheck disable=SC2086 -- intentional glob expansion
+            n=$(ls -1 dist/$glob 2>/dev/null | wc -l | tr -d ' ')
+            if [ "$n" -ne "$expected" ]; then
+              echo "::error::${label}: expected ${expected}, found ${n} (dist/${glob})"
+              fail=1
+            else
+              echo "ok: ${label} (${n}/${expected})"
+            fi
+          }
+          check "Linux AppImage (x86_64 + aarch64)" 2 'aMule-*-Linux-*.AppImage'
+          check "Linux Flatpak (x86_64 + aarch64)"  2 'aMule-*-Linux-*.flatpak'
+          check "macOS Universal2 .dmg"             1 'aMule-*-macOS-universal2.dmg'
+          check "Windows portable .zip (x64 + arm64)" 2 'aMule-*-Windows-*.zip'
+          check "Windows installer .exe (x64 + arm64)" 2 'aMule-*-Windows-Setup-*.exe'
+          check "Source bundle"                     1 'aMule-*-src.tar.gz'
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::Artifact manifest incomplete — refusing to assemble the draft Release."
+            exit 1
+          fi
+          echo "All 10 expected release artifacts present."
+
+      - name: Create draft Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TAG="${{ inputs.version }}"
+          else
+            TAG="${{ github.ref_name }}"
+          fi
+          # Semver-style pre-release detection: any tag with a hyphenated
+          # suffix after the version core counts as a pre-release.
+          # Matches 2.4.0-rc1, 2.4.0-rc.1, 2.4.0-beta, 2.4.0-alpha.2,
+          # 0.0.0-fork-test, v1.0.0-rc1, etc. Plain 2.3.3 / v1.0 / v3
+          # stays as a full release.
+          IS_PRERELEASE=false
+          if [[ "${TAG}" =~ ^v?[0-9]+(\.[0-9]+)*- ]]; then
+            IS_PRERELEASE=true
+          fi
+          echo "Tag: ${TAG} (prerelease: ${IS_PRERELEASE})"
+          # `gh release create` rejects re-runs if the release already
+          # exists. Retry-friendly: if a release with this tag is
+          # already present, upload assets to it instead of creating,
+          # and refresh the prerelease flag in case it was wrong.
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists — uploading assets to it."
+            gh release upload "${TAG}" dist/* --clobber
+            gh release edit "${TAG}" --prerelease="${IS_PRERELEASE}"
+          else
+            PRERELEASE_FLAG=""
+            if [[ "${IS_PRERELEASE}" == "true" ]]; then
+              PRERELEASE_FLAG="--prerelease"
+            fi
+            # --generate-notes auto-fills the body from PR titles since
+            # the previous tag. The release stays a draft, so the
+            # maintainer can edit / trim / replace the auto notes
+            # before publishing.
+            gh release create "${TAG}" \
+              --title "aMule ${TAG}" \
+              --generate-notes \
+              --draft \
+              ${PRERELEASE_FLAG} \
+              dist/*
+          fi

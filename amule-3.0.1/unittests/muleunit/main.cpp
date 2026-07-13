@@ -1,0 +1,85 @@
+//
+// MuleUnit: A minimalistic C++ Unit testing framework based on EasyUnit.
+//
+// Copyright (c) 2003-2026 aMule Team ( https://amule-org.github.io )
+// Copyright (c) 2004-2011 Barthelemy Dagenais ( barthelemy@prologique.com )
+//
+// This library is free software; you can redistribute it and/or
+// modify it under the terms of the GNU Lesser General Public
+// License as published by the Free Software Foundation; either
+// version 2.1 of the License, or (at your option) any later version.
+//
+// This library is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+// Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public
+// License along with this library; if not, write to the Free Software
+// Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301, USA
+//
+
+#include <wx/wx.h>
+#include "testregistry.h"
+#include "test.h"
+#include <common/MuleDebug.h>
+
+using namespace muleunit;
+
+wxString GetFullMuleVersion()
+{
+	return "UnitTest";
+}
+
+
+unsigned s_disableAssertions = 0;
+
+
+static void MuleUnitAssertHandler(const wxString& file, int line,
+                                  const wxString& /*func*/, const wxString& cond,
+                                  const wxString& msg)
+{
+	if (s_disableAssertions) {
+		return;
+	}
+
+	wxString desc;
+	if (!cond.IsEmpty() && !msg.IsEmpty()) {
+		desc << cond << " -- " << msg;
+	} else if (!cond.IsEmpty()) {
+		desc << "Assertion: " << cond;
+	} else {
+		desc << msg;
+	}
+
+	throw CAssertFailureException(desc, file, line);
+}
+
+
+class UnitTestApp : public wxAppConsole
+{
+public:
+	bool OnInit() override {
+		// In Release builds (NDEBUG), wxIMPLEMENT_APP_CONSOLE auto-calls
+		// wxDISABLE_DEBUG_SUPPORT(), which nulls wxTheAssertHandler. Without
+		// re-enabling, wxASSERT short-circuits before reaching OnAssertFailure
+		// and ASSERT_RAISES tests fail on platforms where wxDEBUG_LEVEL >= 1
+		// at compile time (Linux, mingw-w64). Install our handler explicitly.
+		wxSetAssertHandler(MuleUnitAssertHandler);
+		return wxAppConsole::OnInit();
+	}
+
+	int OnRun() override {
+		return (TestRegistry::runAndPrint() ? 0 : 1);
+	}
+
+#ifndef __WXMSW__
+	void OnUnhandledException() override {
+		::OnUnhandledException();
+	}
+#endif
+
+};
+
+
+IMPLEMENT_APP_CONSOLE(UnitTestApp);

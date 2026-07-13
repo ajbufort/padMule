@@ -1,0 +1,871 @@
+set (LIBS_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/libs")
+set (INCLUDE_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/include")
+set (SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+set (EC_INCLUDE_DIR "${CMAKE_CURRENT_BINARY_DIR}/libs/ec/cpp")
+
+# Embed every PNG under src/icons/ as a static byte-array table in a
+# generated C TU (see src/icons/embed_icons.py for the format).
+# CamuleArtProvider then exposes the entries to wxArtProvider at
+# runtime — there's no longer any compile-time #include of icon
+# source data, which is why this PR also deletes the entire
+# src/pixmaps/ XPM tree and src/pixmaps/flags_xpm/CountryFlags.h.
+#
+# Python3 is the canonical generator path. If Python3 is missing on
+# the build host (rare — base distros all ship it; Windows MSYS2 too)
+# we fall back to a checked-in copy at src/icons/icon_data.c that the
+# project keeps in sync via CI.  AMULE_ICON_DATA_C is then the right
+# path for downstream targets to consume regardless of which path
+# was taken.
+find_package (Python3 COMPONENTS Interpreter)
+if (Python3_FOUND)
+	file (GLOB_RECURSE AMULE_ICON_PNGS CONFIGURE_DEPENDS
+		${CMAKE_CURRENT_SOURCE_DIR}/icons/*.png)
+	add_custom_command (
+		OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/icons/icon_data.c
+		COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/icons
+		COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/icons/embed_icons.py
+			${CMAKE_CURRENT_SOURCE_DIR}/icons
+			${CMAKE_CURRENT_BINARY_DIR}/icons/icon_data.c
+		DEPENDS
+			${CMAKE_CURRENT_SOURCE_DIR}/icons/embed_icons.py
+			${AMULE_ICON_PNGS}
+		WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/icons
+		COMMENT "Embedding ${CMAKE_CURRENT_SOURCE_DIR}/icons -> icon_data.c"
+	)
+	set (AMULE_ICON_DATA_C ${CMAKE_CURRENT_BINARY_DIR}/icons/icon_data.c)
+	message (STATUS "Icon data: regenerating at build time via ${Python3_EXECUTABLE}")
+else()
+	set (AMULE_ICON_DATA_C ${CMAKE_CURRENT_SOURCE_DIR}/icons/icon_data.c)
+	message (STATUS "Icon data: Python3 not found — using checked-in fallback ${AMULE_ICON_DATA_C}")
+endif()
+
+add_custom_command (
+	OUTPUT ${EC_INCLUDE_DIR}/ECCodes.h
+	COMMAND ${CMAKE_COMMAND} -DHEADER_FILE="${CMAKE_CURRENT_BINARY_DIR}/libs/ec/cpp/ECCodes.h" -P ${CMAKE_CURRENT_SOURCE_DIR}/libs/ec/abstracts/CMakeLists.txt
+	WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/libs/ec/abstracts"
+)
+
+add_custom_command (
+	OUTPUT ${EC_INCLUDE_DIR}/ECTagTypes.h
+	COMMAND ${CMAKE_COMMAND} -DHEADER_FILE="${CMAKE_CURRENT_BINARY_DIR}/libs/ec/cpp/ECTagTypes.h" -P ${CMAKE_CURRENT_SOURCE_DIR}/libs/ec/abstracts/CMakeLists.txt
+	WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/libs/ec/abstracts"
+)
+
+if (Python3_FOUND)
+	add_custom_target (generate_icon_data DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/icons/icon_data.c)
+	set_source_files_properties (${CMAKE_CURRENT_BINARY_DIR}/icons/icon_data.c PROPERTIES GENERATED TRUE)
+endif()
+add_custom_target (generate_ECCodes.h DEPENDS ${EC_INCLUDE_DIR}/ECCodes.h)
+add_custom_target (generate_ECTagTypes.h DEPENDS ${EC_INCLUDE_DIR}/ECTagTypes.h)
+set_source_files_properties (${EC_INCLUDE_DIR}/ECCodes.h PROPERTIES GENERATED TRUE)
+set_source_files_properties (${EC_INCLUDE_DIR}/ECTagTypes.h PROPERTIES GENERATED TRUE)
+include (${CMAKE_SOURCE_DIR}/cmake/source-vars.cmake)
+
+if (BUILD_UTIL)
+	add_subdirectory (utils)
+endif()
+
+if (BUILD_WEBSERVER)
+	add_subdirectory (webserver)
+endif()
+
+if (INSTALL_SKINS)
+	add_subdirectory (skins)
+endif()
+
+
+# MaxMindDBDatabase.cpp lives under src/geoip/ but #includes
+# project headers as `"Logger.h"` etc., so it needs the src dir
+# (and matching binary dir, for generated config.h) on its include
+# search path. The flag-XPM include path that used to live here
+# (-I.../pixmaps/flags_xpm) is gone — flag icons are loaded via
+# CamuleArtProvider's embedded PNG table now.
+if (ENABLE_IP2COUNTRY)
+	set_source_files_properties (${IP2COUNTRY}
+		PROPERTIES COMPILE_FLAGS "-I${CMAKE_CURRENT_BINARY_DIR} -I${CMAKE_CURRENT_SOURCE_DIR}"
+	)
+endif()
+
+if (NEED_LIB)
+	add_subdirectory (libs)
+endif()
+
+if (BUILD_AMULECMD)
+	add_executable (amulecmd
+		DataToText.cpp
+		ExternalConnector.cpp
+		LoggerConsole.cpp
+		NetworkFunctions.cpp
+		OtherFunctions.cpp
+		TextClient.cpp
+	)
+
+	if (WIN32)
+		target_sources (amulecmd
+			PRIVATE ${CMAKE_BINARY_DIR}/version.rc
+		)
+	endif()
+
+	target_compile_definitions (amulecmd
+		PRIVATE wxUSE_GUI=0
+	)
+
+	target_include_directories (amulecmd
+		PRIVATE ${SRC_DIR}
+	)
+
+	target_link_libraries (amulecmd
+		PRIVATE mulecommon
+		PRIVATE mulesocket
+		PRIVATE ec
+	)
+
+	if (HAVE_BFD)
+		target_link_libraries (amulecmd 
+			PRIVATE ${BFD_LIBRARY}
+		)
+	endif (HAVE_BFD)
+
+	if (HAVE_LIBREADLINE)
+		target_link_libraries (amulecmd
+			PRIVATE ${READLINE_LIBRARIES}
+		)
+	endif()
+
+	install (TARGETS amulecmd
+		RUNTIME DESTINATION bin
+	)
+endif (BUILD_AMULECMD)
+
+if (BUILD_DAEMON)
+	add_executable (amuled
+		${CORE_SOURCES}
+		${COMMON_SOURCES}
+		amuled.cpp
+	)
+
+	if (WIN32)
+		target_sources (amuled
+			PRIVATE ${CMAKE_BINARY_DIR}/version.rc
+		)
+	endif()
+
+	target_compile_definitions (amuled
+		PRIVATE AMULE_DAEMON
+		PRIVATE wxUSE_GUI=0
+	)
+
+	target_include_directories (amuled
+		PRIVATE ${SRC_DIR}
+	)
+
+	target_link_libraries (amuled
+		PRIVATE ec
+		PRIVATE muleappcommon
+		PRIVATE muleappcore
+		PRIVATE mulecommon
+		PRIVATE mulesocket
+		PRIVATE wxWidgets::NET
+	)
+
+	if (GLIB_FOUND)
+		# amule.cpp's CamuleApp::OnInit calls g_set_prgname; daemon
+		# build pulls amule.cpp via CORE_SOURCES so it needs the
+		# glib include path too.
+		target_include_directories (amuled PRIVATE ${GLIB_INCLUDE_DIRS})
+		target_link_libraries (amuled PRIVATE ${GLIB_LIBRARIES})
+	endif()
+
+	if (HAVE_BFD)
+		target_link_libraries (amuled
+			PRIVATE ${BFD_LIBRARY}
+		)
+	endif()
+
+	if (WIN32)
+		target_link_libraries (amuled
+			PRIVATE shlwapi.lib
+		)
+	endif()
+
+	install (TARGETS amuled
+		RUNTIME DESTINATION bin
+	)
+endif()
+
+if (BUILD_ED2K)
+	add_executable (ed2k
+		ED2KLinkParser.cpp
+		MagnetURI.cpp
+		MuleCollection.cpp
+	)
+
+	if (WIN32)
+		target_sources (ed2k
+			PRIVATE ${CMAKE_BINARY_DIR}/version.rc
+		)
+	endif()
+
+	target_compile_definitions (ed2k
+		PRIVATE "USE_STD_STRING"
+	)
+
+	if (WIN32)
+		target_link_libraries (ed2k
+			PRIVATE shlwapi.lib
+		)
+	endif()
+
+	if (APPLE)
+		target_link_libraries (ed2k
+			PRIVATE "-framework CoreServices"
+		)
+	endif()
+
+	install (TARGETS ed2k
+		RUNTIME DESTINATION bin
+	)
+endif()
+
+if (BUILD_MONOLITHIC)
+	add_executable (amule
+		${COMMON_SOURCES}
+		${CORE_SOURCES}
+		${GUI_SOURCES}
+		CaptchaDialog.cpp
+		CaptchaGenerator.cpp
+		PartFileConvert.cpp
+		PartFileConvertDlg.cpp
+	)
+
+	if (WIN32)
+		target_sources (amule
+			PRIVATE ${CMAKE_BINARY_DIR}/version.rc ${CMAKE_SOURCE_DIR}/amule.rc
+		)
+	endif()
+
+	target_link_libraries (amule
+		PRIVATE ec
+		PRIVATE muleappcommon
+		PRIVATE muleappcore
+		PRIVATE muleappgui
+		PRIVATE mulecommon
+		PRIVATE mulesocket
+		PRIVATE $<$<VERSION_LESS:${wxWidgets_VERSION_STRING},3.1.2>:wxWidgets::ADV>
+		PRIVATE wxWidgets::NET
+	)
+
+	if (HAVE_BFD)
+		target_link_libraries (amule
+			PRIVATE ${BFD_LIBRARY}
+		)
+	endif()
+
+	if (GLIB_FOUND)
+		# CamuleApp::OnInit calls g_set_prgname (Wayland app_id binding),
+		# so amule.cpp needs the glib include path even when the
+		# AppIndicator backend isn't compiled in.
+		target_include_directories (amule PRIVATE ${GLIB_INCLUDE_DIRS})
+		target_link_libraries (amule PRIVATE ${GLIB_LIBRARIES})
+	endif()
+
+	if (WITH_LIBAYATANA_APPINDICATOR)
+		target_include_directories (amule PRIVATE ${AYATANA_APPINDICATOR_INCLUDE_DIRS})
+		target_link_libraries (amule PRIVATE ${AYATANA_APPINDICATOR_LIBRARIES})
+		target_compile_options (amule PRIVATE ${AYATANA_APPINDICATOR_CFLAGS_OTHER})
+	endif()
+
+	if (WIN32)
+		target_link_libraries (amule
+			PRIVATE shlwapi.lib
+		)
+
+		set_target_properties (amule PROPERTIES
+			WIN32_EXECUTABLE TRUE
+		)
+	endif()
+
+	if (APPLE)
+		set_target_properties (amule PROPERTIES
+			MACOSX_BUNDLE TRUE
+			MACOSX_BUNDLE_BUNDLE_NAME "aMule"
+			MACOSX_BUNDLE_GUI_IDENTIFIER "org.amule.aMule"
+			MACOSX_BUNDLE_ICON_FILE "amule.icns"
+			MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}"
+			MACOSX_BUNDLE_BUNDLE_VERSION "${PROJECT_VERSION}"
+			MACOSX_BUNDLE_COPYRIGHT "Copyright 2003-2026 aMule Project"
+			OUTPUT_NAME "aMule"
+		)
+
+		set (AMULE_ICNS "${CMAKE_SOURCE_DIR}/platforms/MacOSX/amule.icns")
+		target_sources (amule PRIVATE ${AMULE_ICNS})
+		set_source_files_properties (${AMULE_ICNS} PROPERTIES
+			MACOSX_PACKAGE_LOCATION "Resources"
+		)
+
+		target_link_libraries (amule
+			PRIVATE "-framework CoreServices"
+			PRIVATE "-framework ApplicationServices"
+			# AppKit: MacAppHelper.mm calls [NSApp setActivationPolicy:]
+			# (used by amuleDlg's tray-icon hide path to drop the Dock
+			# icon). Was implicitly satisfied by wx-3.2's wx-config
+			# --libs; wx-3.3 dropped that transitive link, so we now
+			# have to name AppKit ourselves.
+			PRIVATE "-framework AppKit"
+		)
+
+		# aMule performs HTTP downloads to user-configurable URLs
+		# (server.met, IP filter, Kad nodes) and the upstream defaults for
+		# some of these are plaintext http://. wxWebRequest is backed by
+		# NSURLSession on macOS, which enforces App Transport Security and
+		# blocks plaintext HTTP unless the bundle opts out. Inject the
+		# opt-out into the CMake-generated Info.plist. This matches the
+		# legacy wxHTTP/wxSocket path's behaviour, which bypassed ATS by
+		# going through raw BSD sockets.
+		add_custom_command (TARGET amule POST_BUILD
+			COMMAND /usr/bin/plutil -replace NSAppTransportSecurity
+				-json "{\"NSAllowsArbitraryLoads\": true}"
+				"$<TARGET_BUNDLE_CONTENT_DIR:amule>/Info.plist"
+			COMMENT "Opting aMule.app out of App Transport Security"
+			VERBATIM
+		)
+
+		# Copy translation catalogs into the .app bundle so the in-tree
+		# build picks them up.  wxLocale's lookup prefix on macOS is
+		# wxStandardPaths::GetDataDir() + "/locale", which resolves to
+		# Contents/Resources/locale inside the bundle.  Done here (not
+		# in po/) because the `amule` target is defined in this file
+		# while `po` is added earlier in the top-level CMakeLists.
+		if (ENABLE_NLS AND AMULE_TRANSLATIONS)
+			add_dependencies (amule pofiles)
+			foreach (_lang IN LISTS AMULE_TRANSLATIONS)
+				set (_mo_dir
+					"$<TARGET_BUNDLE_CONTENT_DIR:amule>/Resources/locale/${_lang}/LC_MESSAGES")
+				add_custom_command (TARGET amule POST_BUILD
+					COMMAND ${CMAKE_COMMAND} -E make_directory "${_mo_dir}"
+					COMMAND ${CMAKE_COMMAND} -E copy_if_different
+						"${CMAKE_BINARY_DIR}/po/${_lang}.gmo"
+						"${_mo_dir}/amule.mo"
+					COMMENT "Bundling ${_lang} catalog into aMule.app"
+					VERBATIM
+				)
+			endforeach()
+		endif()
+
+		# Bundle the default webserver template into the .app at
+		# Contents/Resources/webserver/default/. amuleweb's macOS
+		# template lookup in WebInterface.cpp::GetTemplateDir uses
+		# LSCopyApplicationURLsForBundleIdentifier("org.amule.aMule")
+		# to find the bundle, then expects login.php and friends under
+		# Contents/Resources/webserver/<templateName>/. The unix-style
+		# INSTALL rule in src/webserver/default/CMakeLists.txt writes
+		# to ${PKGDATADIR}/webserver/default which is outside the .app
+		# bundle scope, so without this bundling step every macOS user
+		# enabling the web server gets a fatal "Cannot find template:
+		# default" at amuleweb startup. The file list is the one set
+		# in src/webserver/default/CMakeLists.txt so the bundle stays
+		# in sync with the unix INSTALL rule automatically.
+		if (BUILD_WEBSERVER AND WEBSERVER_DEFAULT_TEMPLATE_FILES)
+			set (_tmpl_src "${CMAKE_SOURCE_DIR}/src/webserver/default")
+			set (_tmpl_dst
+				"$<TARGET_BUNDLE_CONTENT_DIR:amule>/Resources/webserver/default")
+			add_custom_command (TARGET amule POST_BUILD
+				COMMAND ${CMAKE_COMMAND} -E make_directory "${_tmpl_dst}"
+				COMMENT "Bundling default webserver template into aMule.app"
+				VERBATIM
+			)
+			foreach (_tmpl IN LISTS WEBSERVER_DEFAULT_TEMPLATE_FILES)
+				add_custom_command (TARGET amule POST_BUILD
+					COMMAND ${CMAKE_COMMAND} -E copy_if_different
+						"${_tmpl_src}/${_tmpl}" "${_tmpl_dst}/"
+					VERBATIM
+				)
+			endforeach()
+		endif()
+	endif()
+
+	install (TARGETS amule
+		RUNTIME DESTINATION bin
+		BUNDLE DESTINATION .
+	)
+
+	# Legacy /usr/share/pixmaps/ fallback for desktops that don't
+	# implement the hicolor icon theme. The matching hicolor install
+	# happens in the top-level CMakeLists.txt; both paths reference
+	# the same source PNG. Filename matches the .desktop's Icon= field.
+	install (FILES ${CMAKE_SOURCE_DIR}/org.amule.aMule.png
+		DESTINATION "${CMAKE_INSTALL_DATADIR}/pixmaps"
+	)
+endif (BUILD_MONOLITHIC)
+
+if (BUILD_REMOTEGUI)
+	add_executable (amulegui
+		${COMMON_SOURCES}
+		${GUI_SOURCES}
+		kademlia/utils/UInt128.cpp
+		amule-remote-gui.cpp
+	)
+
+	if (WIN32)
+		target_sources (amulegui
+			PRIVATE ${CMAKE_BINARY_DIR}/version.rc ${CMAKE_SOURCE_DIR}/amule.rc
+		)
+	endif()
+
+	target_compile_definitions (amulegui
+		PRIVATE "CLIENT_GUI"
+	)
+
+	target_include_directories (amulegui
+		PRIVATE ${SRC_DIR}
+	)
+
+	target_link_libraries (amulegui
+		PRIVATE ec
+		PRIVATE muleappcommon
+		PRIVATE muleappgui
+		PRIVATE mulecommon
+		PRIVATE mulesocket
+		PRIVATE $<$<VERSION_LESS:${wxWidgets_VERSION_STRING},3.1.2>:wxWidgets::ADV>
+		PRIVATE wxWidgets::NET
+	)
+
+	if (HAVE_BFD)
+		target_link_libraries (amulegui
+			PRIVATE ${BFD_LIBRARY}
+		)
+	endif()
+
+	if (GLIB_FOUND)
+		# amulegui pulls MuleTrayIcon.cpp via GUI_SOURCES; the SNI
+		# backend includes app-indicator headers which transitively
+		# need glib's include path.
+		target_include_directories (amulegui PRIVATE ${GLIB_INCLUDE_DIRS})
+		target_link_libraries (amulegui PRIVATE ${GLIB_LIBRARIES})
+	endif()
+
+	if (WITH_LIBAYATANA_APPINDICATOR)
+		target_include_directories (amulegui PRIVATE ${AYATANA_APPINDICATOR_INCLUDE_DIRS})
+		target_link_libraries (amulegui PRIVATE ${AYATANA_APPINDICATOR_LIBRARIES})
+		target_compile_options (amulegui PRIVATE ${AYATANA_APPINDICATOR_CFLAGS_OTHER})
+	endif()
+
+	if (WIN32)
+		set_target_properties (amulegui PROPERTIES
+			WIN32_EXECUTABLE TRUE
+		)
+	endif()
+
+	if (APPLE)
+		# amulegui is a GUI wxApp (remote-control UI) — bundle it as a
+		# .app so macOS gives it an icon in the Dock, a menu bar and
+		# normal application lifecycle events, matching the monolithic
+		# aMule.app. Shares the same .icns because it's the same visual
+		# identity.
+		set_target_properties (amulegui PROPERTIES
+			MACOSX_BUNDLE TRUE
+			MACOSX_BUNDLE_BUNDLE_NAME "aMuleGUI"
+			MACOSX_BUNDLE_GUI_IDENTIFIER "org.amule.aMuleGUI"
+			MACOSX_BUNDLE_ICON_FILE "amule.icns"
+			MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}"
+			MACOSX_BUNDLE_BUNDLE_VERSION "${PROJECT_VERSION}"
+			MACOSX_BUNDLE_COPYRIGHT "Copyright 2003-2026 aMule Project"
+			OUTPUT_NAME "aMuleGUI"
+		)
+
+		set (AMULEGUI_ICNS "${CMAKE_SOURCE_DIR}/platforms/MacOSX/amule.icns")
+		target_sources (amulegui PRIVATE ${AMULEGUI_ICNS})
+		set_source_files_properties (${AMULEGUI_ICNS} PROPERTIES
+			MACOSX_PACKAGE_LOCATION "Resources"
+		)
+
+		target_link_libraries (amulegui
+			PRIVATE "-framework CoreServices"
+			PRIVATE "-framework ApplicationServices"
+			# AppKit: see comment on the amule target above.
+			PRIVATE "-framework AppKit"
+		)
+
+		# Same ATS opt-out as the monolithic amule.app: wxWebRequest on
+		# macOS is backed by NSURLSession which blocks plaintext HTTP
+		# by default; amulegui uses the same HTTP download path for its
+		# own version checks via CHTTPDownloadThread.
+		add_custom_command (TARGET amulegui POST_BUILD
+			COMMAND /usr/bin/plutil -replace NSAppTransportSecurity
+				-json "{\"NSAllowsArbitraryLoads\": true}"
+				"$<TARGET_BUNDLE_CONTENT_DIR:amulegui>/Info.plist"
+			COMMENT "Opting aMuleGUI.app out of App Transport Security"
+			VERBATIM
+		)
+
+		# Same translation-catalog bundling as the monolithic amule.app
+		# — wxLocale's lookup prefix on macOS is GetDataDir() + "/locale"
+		# which resolves to Contents/Resources/locale inside whichever
+		# bundle is running, so each .app needs its own copy.  Without
+		# this aMuleGUI.app launches in English regardless of system
+		# locale (issue #541).
+		if (ENABLE_NLS AND AMULE_TRANSLATIONS)
+			add_dependencies (amulegui pofiles)
+			foreach (_lang IN LISTS AMULE_TRANSLATIONS)
+				set (_mo_dir
+					"$<TARGET_BUNDLE_CONTENT_DIR:amulegui>/Resources/locale/${_lang}/LC_MESSAGES")
+				add_custom_command (TARGET amulegui POST_BUILD
+					COMMAND ${CMAKE_COMMAND} -E make_directory "${_mo_dir}"
+					COMMAND ${CMAKE_COMMAND} -E copy_if_different
+						"${CMAKE_BINARY_DIR}/po/${_lang}.gmo"
+						"${_mo_dir}/amule.mo"
+					COMMENT "Bundling ${_lang} catalog into aMuleGUI.app"
+					VERBATIM
+				)
+			endforeach()
+		endif()
+	endif()
+
+	install (TARGETS amulegui
+		RUNTIME DESTINATION bin
+		BUNDLE DESTINATION .
+	)
+endif()
+
+# Expose libcurl headers + link AND set AMULE_HAVE_LIBCURL=1 on every app
+# that pulls HTTPDownload.cpp via COMMON_SOURCES, when libcurl-dev was
+# found at configure time (see cmake/wx.cmake). HTTPDownload.cpp's
+# CURLOPT-tuning block is double-gated on AMULE_HAVE_LIBCURL (set here)
+# AND wxUSE_WEBREQUEST_CURL (wx-internal, true when wx itself was built
+# with the libcurl backend). Either missing → block is a no-op and the
+# header isn't included, so the build stays clean on hosts without
+# libcurl-dev or with a non-curl wxWebRequest backend.
+if (amule_HAVE_LIBCURL)
+	foreach (_tgt IN ITEMS amuled amule amulegui)
+		if (TARGET ${_tgt})
+			target_include_directories (${_tgt} PRIVATE ${CURL_INCLUDE_DIRS})
+			target_link_libraries (${_tgt} PRIVATE ${CURL_LIBRARIES})
+			target_compile_definitions (${_tgt} PRIVATE AMULE_HAVE_LIBCURL=1)
+		endif()
+	endforeach()
+endif()
+
+if (NEED_LIB_MULEAPPCOMMON)
+	add_library (muleappcommon STATIC
+		${UPNP_SOURCES}
+		CFile.cpp
+		ClientCredits.cpp
+		DataToText.cpp
+		ED2KLink.cpp
+		Friend.cpp
+		GapList.cpp
+		MagnetURI.cpp
+		MemFile.cpp
+		NetworkFunctions.cpp
+		OtherFunctions.cpp
+		Packet.cpp
+		RLE.cpp
+		SafeFile.cpp
+		SHA.cpp
+		Tag.cpp
+		TerminationProcess.cpp
+		Timer.cpp
+	)
+
+	add_dependencies (muleappcommon
+		generate_ECCodes.h
+		generate_ECTagTypes.h
+	)
+
+	target_compile_definitions (muleappcommon
+		PRIVATE wxUSE_GUI=0
+		PRIVATE WXUSINGDLL
+	)
+
+	target_include_directories (muleappcommon
+		PUBLIC ${amule_BINARY_DIR}
+		PUBLIC ${EC_INCLUDE_DIR}
+		PRIVATE ${INCLUDE_INCLUDE_DIR}
+		PRIVATE ${LIBS_INCLUDE_DIR}
+		PRIVATE ${ZLIB_INCLUDE_DIR}
+	)
+
+	target_link_libraries(muleappcommon
+		PUBLIC wxWidgets::BASE
+	)
+
+	if (ENABLE_UPNP)
+		target_link_libraries (muleappcommon
+			PUBLIC UPNP::Shared
+		)
+	endif()
+endif()
+
+if (NEED_LIB_MULEAPPCORE)
+	if (BISON_FOUND)
+		bison_target (Parser.cpp
+			${CMAKE_CURRENT_SOURCE_DIR}/Parser.y
+			${CMAKE_CURRENT_BINARY_DIR}/Parser.cpp
+			COMPILE_FLAGS "-t -d -v"
+		)
+
+		set (PARSER ${CMAKE_CURRENT_BINARY_DIR}/Parser.cpp)
+	else()
+		set (PARSER ${CMAKE_CURRENT_SOURCE_DIR}/Parser.cpp)
+	endif (BISON_FOUND)
+
+	if (FLEX_FOUND)
+		if (FLEX_MATCH)
+			set (FLEX_FLAGS "--header-file=${CMAKE_CURRENT_BINARY_DIR}/Scanner.h")
+
+			set_source_files_properties (Parser.cpp
+				COMPILE_FLAGS "-I${CMAKE_CURRENT_BINARY_DIR}"
+			)
+		endif()
+
+		flex_target (Scanner.cpp
+			${CMAKE_CURRENT_SOURCE_DIR}/Scanner.l
+			${CMAKE_CURRENT_BINARY_DIR}/Scanner.cpp
+			COMPILE_FLAGS "${FLEX_FLAGS}"
+		)
+
+		flex_target (IPFilterScanner.cpp
+			${CMAKE_CURRENT_SOURCE_DIR}/IPFilterScanner.l
+			${CMAKE_CURRENT_BINARY_DIR}/IPFilterScanner.cpp
+			COMPILE_FLAGS "-Pyyip"
+		)
+
+		set (SCANNER ${CMAKE_CURRENT_BINARY_DIR}/Scanner.cpp)
+		set (IPFILTERSCANNER ${CMAKE_CURRENT_BINARY_DIR}/IPFilterScanner.cpp)
+	else()
+		set (SCANNER ${CMAKE_CURRENT_SOURCE_DIR}/Scanner.cpp)
+		set (IPFILTERSCANNER ${CMAKE_CURRENT_SOURCE_DIR}/IPFilterScanner.cpp)
+	endif()
+
+	add_library (muleappcore STATIC
+		${IPFILTERSCANNER}
+		${PARSER}
+		${SCANNER}
+		kademlia/kademlia/Entry.cpp
+		kademlia/kademlia/Indexed.cpp
+		kademlia/kademlia/SearchManager.cpp
+		kademlia/routing/RoutingBin.cpp
+		kademlia/utils/UInt128.cpp
+		AsyncDNS.cpp
+		CanceledFileList.cpp
+		DeadSourceList.cpp
+		FileArea.cpp
+		FileAutoClose.cpp
+		PlatformSpecific.cpp
+		RandomFunctions.cpp
+		RC4Encrypt.cpp
+		StateMachine.cpp
+		TerminationProcessAmuleweb.cpp
+		ThreadScheduler.cpp
+		UPnPBase.cpp
+	)
+
+	target_compile_definitions (muleappcore
+		PRIVATE wxUSE_GUI=0
+		PRIVATE WXUSINGDLL
+	)
+
+	target_include_directories (muleappcore
+		PRIVATE ${CMAKE_BINARY_DIR}
+		PRIVATE ${CMAKE_CURRENT_BINARY_DIR}
+		PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
+		PRIVATE ${INCLUDE_INCLUDE_DIR}
+		PRIVATE ${LIBS_INCLUDE_DIR}
+	)
+
+	if (ENABLE_UPNP)
+		target_include_directories (muleappcore
+			PRIVATE $<TARGET_PROPERTY:UPNP::Shared,INTERFACE_INCLUDE_DIRECTORIES>
+		)
+	endif()
+
+	target_link_libraries (muleappcore
+		PUBLIC wxWidgets::BASE
+		PRIVATE CRYPTOPP::CRYPTOPP
+	)
+
+	# DownloadBandwidthThrottler's std::atomic<int64_t> byte budget
+	# needs libatomic on 32-bit targets without a hardware 8-byte
+	# CAS (PPC32, ARMv5/v6, MIPS32). LIBATOMIC is set at the top
+	# of the root CMakeLists.txt — empty on 64-bit, "atomic" on
+	# 32-bit. Linked PUBLIC so amule / amuled / amulegui pick it
+	# up transitively.
+	if (LIBATOMIC)
+		target_link_libraries (muleappcore PUBLIC ${LIBATOMIC})
+	endif()
+
+	# Parser.cpp's bison-generated yyparse() expands YY_(Msgid) to dgettext,
+	# so libintl needs to be on the link line whenever NLS is enabled.
+	# Empty/no-op on glibc; the .dylib / .dll.a on macOS / MinGW.  PUBLIC so
+	# every consumer of muleappcore (amule, amuled, amulecmd, amulegui)
+	# inherits the dependency.
+	if (ENABLE_NLS AND Intl_FOUND)
+		target_include_directories (muleappcore PUBLIC ${Intl_INCLUDE_DIRS})
+		target_link_libraries (muleappcore PUBLIC ${Intl_LIBRARIES})
+	endif()
+
+	if (APPLE)
+		target_link_libraries (muleappcore
+			PRIVATE "-framework IOKit"
+			PRIVATE "-framework CoreFoundation"
+		)
+	endif()
+endif()
+
+if (NEED_LIB_MULEAPPGUI)
+	add_library (muleappgui STATIC
+		${IP2COUNTRY}
+		extern/wxWidgets/listctrl.cpp
+		BarShader.cpp
+		ColorFrameCtrl.cpp
+		EditServerListDlg.cpp
+		FileDetailListCtrl.cpp
+		MuleCollection.cpp
+		MuleColour.cpp
+		MuleGifCtrl.cpp
+		MuleListCtrl.cpp
+		MuleNotebook.cpp
+		MuleTextCtrl.cpp
+		muuli_wdr.cpp
+	)
+
+	if (ENABLE_IP2COUNTRY)
+		target_link_libraries (muleappgui
+			PUBLIC MaxMindDB::Shared
+		)
+	endif()
+
+	target_compile_definitions (muleappgui
+		PRIVATE WXUSINGDLL
+	)
+
+	target_include_directories (muleappgui
+		PUBLIC ${amule_BINARY_DIR}
+		PUBLIC ${INCLUDE_INCLUDE_DIR}
+		PUBLIC ${LIBS_INCLUDE_DIR}
+		# The build-generated icon_data.c #includes "icon_data.h",
+		# which lives in src/icons/ — needs to be on the include
+		# path for the C compile. PUBLIC so it propagates to the
+		# amule monolithic + amulegui executables, which compile
+		# the same GUI_SOURCES list directly into themselves
+		# (see add_executable for those targets).
+		PUBLIC ${SRC_DIR}/icons
+	)
+
+	target_link_libraries (muleappgui
+		PRIVATE wxWidgets::CORE
+	)
+
+	# generate_icon_data produces ${BINARY_DIR}/src/icons/icon_data.c,
+	# which is part of GUI_SOURCES (see cmake/source-vars.cmake).
+	# Only present when Python3 was found at configure time; without
+	# it muleappgui consumes the checked-in fallback at
+	# ${SOURCE_DIR}/icons/icon_data.c directly, no extra dependency
+	# needed.
+	if (Python3_FOUND)
+		add_dependencies (muleappgui generate_icon_data)
+	endif()
+endif()
+
+IF (NEED_LIB_MULESOCKET)
+	add_library (mulesocket STATIC
+		LibSocket.cpp
+	)
+
+	target_compile_definitions (mulesocket
+		PRIVATE wxUSE_GUI=0
+	)
+	
+	target_include_directories (mulesocket
+		PUBLIC ${amule_BINARY_DIR}
+		PUBLIC ${INCLUDE_INCLUDE_DIR}
+		PUBLIC ${LIBS_INCLUDE_DIR}
+	)
+
+	target_link_libraries (mulesocket
+		PRIVATE ${Boost_LIBRARIES}
+		PUBLIC wxWidgets::BASE
+	)
+endif()
+
+# On MinGW-built Windows targets, bundle the MSYS2 MinGW64 runtime DLLs
+# next to the installed executables so the install tree is self-contained.
+# Must live here (not in root CMakeLists.txt) because CMake appends
+# subdirectory install scripts at the END of the root cmake_install.cmake,
+# so a root-level install(CODE) would run before the exes are installed.
+if (WIN32 AND MINGW AND CMAKE_VERSION VERSION_GREATER_EQUAL 3.16)
+	get_filename_component (MINGW_BIN_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
+
+	install (CODE "
+		message (STATUS \"Resolving Windows runtime dependencies...\")
+		file (GLOB _exes \"\${CMAKE_INSTALL_PREFIX}/bin/*.exe\")
+		file (GET_RUNTIME_DEPENDENCIES
+			EXECUTABLES \${_exes}
+			RESOLVED_DEPENDENCIES_VAR _resolved
+			UNRESOLVED_DEPENDENCIES_VAR _unresolved
+			DIRECTORIES \"${MINGW_BIN_DIR}\"
+			PRE_EXCLUDE_REGEXES
+				\"api-ms-.*\"
+				\"ext-ms-.*\"
+			POST_EXCLUDE_REGEXES
+				\".*[Ss]ystem32.*\"
+				\".*SysWOW64.*\"
+		)
+		foreach (_dll \${_resolved})
+			file (INSTALL \${_dll} DESTINATION \"\${CMAKE_INSTALL_PREFIX}/bin\" FOLLOW_SYMLINK_CHAIN)
+		endforeach()
+		list (LENGTH _resolved _count)
+		message (STATUS \"Bundled \${_count} runtime DLL(s) into \${CMAKE_INSTALL_PREFIX}/bin\")
+		if (_unresolved)
+			message (WARNING \"Unresolved runtime dependencies:\\n  \${_unresolved}\")
+		endif()
+	")
+
+	# MSYS2's libcurl is built with an absolute --with-ca-bundle path
+	# (e.g. /clangarm64/etc/ssl/certs/ca-bundle.crt) that does not exist
+	# on end-user machines, so wxWebRequest HTTPS fails with error 77
+	# anywhere outside the dev box. Ship the MSYS2 CA bundle next to the
+	# .exe so a portable install can find it; CamuleApp::OnInit points
+	# CURL_CA_BUNDLE at it on startup when the user has not set their own.
+	find_file (MINGW_CA_BUNDLE
+		NAMES cert.pem ca-bundle.crt
+		PATHS "${MINGW_BIN_DIR}/../etc/ssl/certs"
+		      "${MINGW_BIN_DIR}/../etc/ssl"
+		      "${MINGW_BIN_DIR}/../ssl/certs"
+		      "${MINGW_BIN_DIR}/../ssl"
+		NO_DEFAULT_PATH)
+	if (MINGW_CA_BUNDLE)
+		install (FILES "${MINGW_CA_BUNDLE}"
+			DESTINATION bin
+			RENAME ca-bundle.crt)
+		message (STATUS "Will bundle CA certificates from ${MINGW_CA_BUNDLE}")
+	else()
+		message (WARNING
+			"No MSYS2 CA bundle found under ${MINGW_BIN_DIR}/../etc/ssl; "
+			"libcurl HTTPS will fail at runtime unless CURL_CA_BUNDLE is "
+			"set externally. Install mingw-w64-*-ca-certificates and "
+			"re-run cmake to populate this.")
+	endif()
+endif()
+
+# `gettext_process_po_files` puts the per-language `.gmo` builds in the
+# `all` target but adds no dependency to any specific binary target.
+# Building one binary in isolation (e.g. `cmake --build build --target
+# amuled`) therefore skips the `.gmo` step, and the subsequent `cmake
+# --install build` errors with "file INSTALL cannot find
+# /.../build/po/<lang>.gmo: No such file or directory" because the
+# `install (FILES ${gmo})` rules issued from `po/CMakeLists.txt` expect
+# them to exist.
+#
+# Make every NLS-aware executable take a hard dependency on the
+# CMake-internal `pofiles` aggregator that `gettext_process_po_files`
+# maintains. A partial-target build now transitively builds the catalogs
+# it would later install. Skipped under ENABLE_NLS=OFF because
+# `pofiles` is only created when `add_subdirectory(po)` runs.
+if (ENABLE_NLS AND TARGET pofiles)
+	foreach (_bin amule amuled amulecmd amulegui amuleweb ed2k alc alcc cas wxcas fileview)
+		if (TARGET ${_bin})
+			add_dependencies (${_bin} pofiles)
+		endif()
+	endforeach()
+endif()
