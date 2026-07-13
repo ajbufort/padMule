@@ -17,6 +17,7 @@ the Ingest / Query / Lint workflows.
 
 ## Process
 - [[decisions-and-lessons]] - locked decisions, rejected approaches, gotchas.
+- [[build-progress]] - wave-by-wave build status; Wave 1 eD2k hashing done.
 
 ## Strategy
 (Engine = Rust rewrite, decided 2026-07-12, see [[decisions-and-lessons]].
