@@ -18,7 +18,7 @@ ends at a differential/round-trip gate.
 | 2c | `part.met` (+64-bit + gap list) | `plans/2026-07-12-wave2c-part-met.md` | DONE (17 mule-files tests). `nodes.dat` moved to Wave 6 (Kad). |
 | 3a | `mule-proto` packet framing + zlib | `plans/2026-07-13-wave3a-packet-framing.md` | DONE (31 mule-proto tests). |
 | 3b | `mule-engine` crate + login-handshake codecs (offline) | `plans/2026-07-13-wave3b-login-codecs.md` | DONE (8 tests): build_login_request, parse_id_change/server_message/server_status. |
-| 3b-2 | search codecs: OP_SEARCHREQUEST + search-expression encoding, OP_SEARCHRESULT/OP_SERVERIDENT/OP_SERVERLIST | - | not started |
+| 3b-2 | search codec + server list/ident | `plans/2026-07-13-wave3b2-search-codec.md` | DONE (15 mule-engine tests): build_search_request (ANDed-terms), parse_search_result, parse_server_list, parse_server_ident. Full boolean tree (OR/NOT) + global UDP search + OP_FOUNDSOURCES deferred. |
 | 3c | `mule-engine`: tokio ServerConnection, live handshake | - | not started |
 | 3d | get-sources + single-source download to .part; differential vs amuled | - | not started |
 | 4 | multi-source + upload + queue + credits + SX + corruption | - | not started |
