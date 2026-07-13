@@ -19,6 +19,13 @@ pub const PARTSIZE: u64 = 9_728_000;
 /// because an exact-multiple file carries a trailing empty (sentinel) part.
 /// It is NOT the data-part count (`m_iPartCount = ceil(size/PARTSIZE)`), which
 /// is one smaller for exact multiples. Do not confuse the two in the engine.
+///
+/// Degenerate case: this returns 1 for `size == 0`, which is what `ed2k_hash`
+/// needs (an empty file hashes to `md4(b"")`). aMule instead special-cases a
+/// 0-byte file to `m_iED2KPartCount == 0` (KnownFile.cpp SetFileSize), but it
+/// never shares or hashes 0-byte files, so no OP_FILESTATUS is ever emitted for
+/// one. If the engine reuses this for the OP_FILESTATUS/part-status count, it
+/// must special-case `size == 0` to 0 there.
 pub fn part_count(size: u64) -> u64 {
     size / PARTSIZE + 1
 }

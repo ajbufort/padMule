@@ -137,9 +137,15 @@ impl Writer {
     }
 
     /// Write a u16-length-prefixed byte string.
+    ///
+    /// If `b` exceeds u16::MAX, the length is capped and the payload truncated
+    /// to match, so the prefix and byte count never disagree. This mirrors
+    /// aMule's WriteStringCore (SafeFile.cpp), which caps at 0xFFFF rather than
+    /// letting a wrapped length desync the stream.
     pub fn write_string_u16(&mut self, b: &[u8]) {
-        self.write_u16(b.len() as u16);
-        self.write_bytes(b);
+        let n = b.len().min(u16::MAX as usize);
+        self.write_u16(n as u16);
+        self.write_bytes(&b[..n]);
     }
 }
 
@@ -184,5 +190,20 @@ mod tests {
     fn underrun_errors() {
         let mut r = Reader::new(&[0x01, 0x02]);
         assert_eq!(r.read_u32(), Err(IoError::UnexpectedEof));
+    }
+
+    #[test]
+    fn write_string_u16_caps_oversized_length_and_payload() {
+        // Over-length string: prefix caps at 0xFFFF and only 0xFFFF bytes follow,
+        // so a reader stays in sync (matches aMule WriteStringCore).
+        let big = vec![b'x'; 0x10000]; // 65536 bytes, one over the u16 max
+        let mut w = Writer::new();
+        w.write_string_u16(&big);
+        let bytes = w.into_inner();
+        assert_eq!(&bytes[..2], &[0xFF, 0xFF]); // length prefix 0xFFFF
+        assert_eq!(bytes.len(), 2 + 0xFFFF); // exactly that many payload bytes
+        let mut r = Reader::new(&bytes);
+        assert_eq!(r.read_string_u16().unwrap().len(), 0xFFFF);
+        assert_eq!(r.remaining(), 0);
     }
 }
