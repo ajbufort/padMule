@@ -12,6 +12,12 @@ pub enum IoError {
     UnexpectedEof,
     /// A tag (or other structure) was malformed. Carries the offending value.
     BadTag(u8),
+    /// A packet header had an unknown protocol byte.
+    BadHeader(u8),
+    /// A packet exceeded the maximum allowed size.
+    TooBig,
+    /// zlib decompression of a packed packet failed.
+    Decompress,
 }
 
 impl fmt::Display for IoError {
@@ -19,6 +25,9 @@ impl fmt::Display for IoError {
         match self {
             IoError::UnexpectedEof => write!(f, "unexpected end of input"),
             IoError::BadTag(t) => write!(f, "malformed tag (type/marker 0x{t:02x})"),
+            IoError::BadHeader(p) => write!(f, "unknown protocol byte 0x{p:02x}"),
+            IoError::TooBig => write!(f, "packet exceeds maximum size"),
+            IoError::Decompress => write!(f, "packet decompression failed"),
         }
     }
 }
