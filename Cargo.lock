@@ -57,6 +57,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "mule-files"
+version = "0.0.0"
+dependencies = [
+ "hex",
+ "mule-proto",
+]
+
+[[package]]
 name = "mule-proto"
 version = "0.0.0"
 dependencies = [
