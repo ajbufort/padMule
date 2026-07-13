@@ -34,8 +34,11 @@ subsystem.
 
 ## Ports + identity
 
-- Defaults: TCP 4662, client/Kad UDP 4672, EC 4712; server UDP = TCP+3 (4665).
-  Sanity: ECport != TCP, UDP != TCP+3; TCP capped <= 65532.
+- Defaults: TCP 4662, client/Kad UDP 4672, EC 4712. Our LOCAL server-query UDP
+  socket binds to (our TCP)+3 = 4665. But when SENDING a UDP query to a remote
+  server, target that server's advertised TCP port + 4 (obfuscated stat ping
+  +12), NOT +3. Sanity: ECport != TCP, UDP != TCP+3; TCP capped <= 65532. See
+  [[protocol-understanding]] for the bind-vs-send distinction.
 - User hash: 16 random bytes, then byte[5]=14, byte[14]=111 (aMule/eMule
   marker).
 
