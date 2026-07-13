@@ -10,8 +10,10 @@ ends at a differential/round-trip gate.
 
 | Wave | Scope | Plan | State |
 |------|-------|------|-------|
-| 1 | `mule-proto` foundation: eD2k/MD4 file hashing | `plans/2026-07-12-wave1-mule-proto-ed2k-hash.md` | eD2k hash DONE (7 tests, clippy clean). Framing, tags, AICH, search-expr: follow-on Wave-1 plans, not yet written. |
-| 2 | `mule-files` byte-compatible .met/.part | - | not started |
+| 1 | `mule-proto`: eD2k/MD4 file hashing | `plans/2026-07-12-wave1-mule-proto-ed2k-hash.md` | DONE (7 tests). |
+| 1b | `mule-proto`: LE byte I/O + eD2k tag codec | `plans/2026-07-12-wave1b-io-and-tags.md` | DONE (17 tests total, clippy clean). |
+| 1c | `mule-proto`: AICH SHA-1 hash tree + search-expr encoding | - | not started (remaining Wave-1 codec slices) |
+| 2 | `mule-files` byte-compatible .met/.part | - | not started (unblocked by 1b) |
 | 3 | `mule-engine` eD2k core: login/search/single-source download | - | not started |
 | 4 | multi-source + upload + queue + credits + SX + corruption | - | not started |
 | 5 | obfuscation + secure ident | - | not started |
@@ -32,11 +34,18 @@ ends at a differential/round-trip gate.
 
 ## Remaining Wave-1 slices (next plans)
 
-1. LE byte reader/writer primitives + packet framing (protocol byte, u32 size,
-   opcode, split packets, packed/zlib). See [[protocol-reference]].
-2. Tag system (types, special short-name compressed tags, read/write).
-3. AICH SHA-1 hash tree (180 KiB blocks, master hash, recovery packet).
-4. Search-expression encoding (boolean AND/OR/NOT + parameter terms).
+1. DONE (1b): LE byte reader/writer primitives (`io`) + eD2k tag codec (`tag`).
+2. Packet framing (protocol byte, u32 size, opcode, split packets, packed/zlib)
+   - deferred to the engine wave; `.met` files need tags, not framing.
+3. AICH SHA-1 hash tree (180 KiB blocks, non-trivial split formula, master
+   hash, recovery packet). See [[protocol-reference]] section 2. Needed by
+   part.met (Wave 2) and hashset exchange (engine).
+4. Search-expression encoding (boolean AND/OR/NOT + parameter terms) - engine
+   search wave.
+
+Tag codec divergences (matching aMule MET writers): `write_tag` emits the
+non-compact form only; the `(type|0x80)` short form and inline STR1..16 are
+read-only. Values preserve on-disk width/bytes for bit-identical round-trip.
 
 ## Test fixtures / live data (from [[ref-ecosystem]])
 
