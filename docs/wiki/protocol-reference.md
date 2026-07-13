@@ -70,16 +70,24 @@ subsystem.
   sharedfiles, Kad. Every 5 s: listensocket. Every 60 s: stats save. Every
   30 min: known.met. Every 13 min: clients.met.
 
-## CRITICAL CAVEAT: this tree is a locally-modified aMule
+## RESOLVED (2026-07-13): the tree is faithful aMule, not a local fork
 
-The recon flagged (transfers-credits especially) that `amule-3.0.1/` here is a
-locally MODIFIED tree, not pristine upstream: e.g. GetMaxSlots floor 20,
-adaptive sub-packet size (datarate/8), zlib level 1, a global download token
-bucket, >3-block request batching, async write/hash threads, ALPHA_QUERY=5 (vs
-classic Kad 3). WIRE FORMATS are identical; POLICY/behavior may differ. Open
-decision: does padMule match pristine aMule/eMule behavior or this tree's? See
-the raw doc's per-subsystem "Open questions". Resolve per subsystem before
-implementing, and diff against the pristine zip when it matters.
+The recon called `amule-3.0.1/` a "locally modified tree" (citing GetMaxSlots
+floor 20, ALPHA_QUERY=5, a global download token bucket, zlib level, etc.).
+That was WRONG. Cross-checked against pristine aMule mainline
+(`refs/amule-master`) and canonical eMule 0.50a (`refs/emule-0.50a`), those
+items are aMule design, present byte-identically in aMule master (e.g.
+GetMaxSlots N_FLOOR=20 and its exact comment; ALPHA_QUERY=5 with the "cascade"
+comment). They are **aMule-vs-eMule POLICY differences** (wire-neutral), not
+one-off hacks. See [[ref-source-trees]].
+
+Practical rule: our tree is a legitimate aMule reference. For WIRE + FILE
+FORMATS, eMule is the de-facto authority (most of the live network runs
+eMule/derivatives) - and the load-bearing wire landmines (userhash markers
+[5]=14/[14]=111, Kad crypt overhead 16B, MAGICVALUE_UDP_SYNC 0x395F2EC1,
+CUInt128::SetValueBE) are CONFIRMED identical in eMule 0.50a. For wire-neutral
+POLICY (queue scoring, slot count, alpha, block batching), aMule's choices are
+fine; match aMule. Only re-check eMule when a byte layout is ambiguous.
 
 ## Open questions (must resolve against source before implementing that piece)
 

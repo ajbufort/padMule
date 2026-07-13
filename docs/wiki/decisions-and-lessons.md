@@ -7,6 +7,17 @@ bullet each; newest first.
 
 ## Locked decisions
 
+- 2026-07-13 **"Modified tree" caveat RETIRED; our tree is faithful aMule.**
+  Cross-checked `amule-3.0.1/` against pristine aMule mainline
+  (`refs/amule-master`) and canonical eMule 0.50a/0.70b (`refs/emule-0.50a`,
+  `refs/emule-0.70b`). The items the recon called "local modifications"
+  (GetMaxSlots N_FLOOR=20, ALPHA_QUERY=5, the cascade heuristic) are aMule
+  design, byte-identical in aMule master - aMule-vs-eMule POLICY differences,
+  wire-neutral. New rule: eMule 0.50a is the de-facto WIRE/FORMAT authority
+  (most of the network runs eMule); match aMule for wire-neutral policy. Wire
+  landmines (userhash markers, Kad crypt 16B, MAGICVALUE_UDP_SYNC, SetValueBE)
+  CONFIRMED identical in eMule 0.50a. See [[ref-source-trees]].
+
 - 2026-07-12 **Deliberate tag-codec divergences from aMule (do NOT "fix").**
   Surfaced by the review pass; each is intentional for byte-compat fidelity.
   (1) `mule-proto` PRESERVES UINT8/UINT16 tag widths; aMule's reader promotes

@@ -15,6 +15,7 @@ the Ingest / Query / Lint workflows.
 
 ## Reference
 - [[ref-ecosystem]] - eMule AI fork, eMule-Board dev forums, official aMule docs site.
+- [[ref-source-trees]] - the reference source oracles under refs/ (eMule 0.50a/0.70b, aMule master); protocol authority + findings.
 
 ## Process
 - [[decisions-and-lessons]] - locked decisions, rejected approaches, gotchas.
