@@ -7,6 +7,17 @@ bullet each; newest first.
 
 ## Locked decisions
 
+- 2026-07-12 **Byte-compatible .met/.part.** padMule reads and writes upstream
+  binary formats (known.met, part.met incl. 64-bit variant + gap lists,
+  server.met, nodes.dat, prefs, clients.met, ipfilter.dat) so downloads move
+  between padMule and desktop aMule/eMule. Doubles as a differential test
+  (load upstream file, re-emit, diff bytes). See [[protocol-reference]].
+- 2026-07-12 **Seeding: foreground-only v1, seedbox toggle in v1.1.** Given the
+  ~30s background suspension ([[ipados-constraints]]), v1 is honestly
+  foreground-only (transfers pause on background, resume + Kad re-bootstrap on
+  foreground). A supported "seedbox mode" (Auto-Lock=Never, plugged in, screen
+  on) lands as a v1.1 toggle. Rejected the fragile silent-audio/location
+  keepalive (unreliable, battery-heavy, memory-capped) for v1.
 - 2026-07-12 **v1 scope: full amuled parity.** Anthony chose full parity over
   a download-focused v1 or a minimal-first-transfer MVP: eD2k servers + Kad,
   search, multi-source transfers with AICH recovery, uploads + credits,
