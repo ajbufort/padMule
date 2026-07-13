@@ -7,6 +7,15 @@ bullet each; newest first.
 
 ## Locked decisions
 
+- 2026-07-13 **Replicate first, then improve (standing principle).** Replicate
+  standard eD2k/Kad behavior faithfully before proposing improvements; Anthony
+  invited improvements past that baseline (perf, correctness, memory, UX). The
+  boundary: WIRE + FILE FORMATS stay byte-faithful to eMule/aMule (improving
+  them = breaking interop); WIRE-NEUTRAL POLICY and IMPLEMENTATION INTERNALS are
+  fair game. Flag any post-baseline deviation explicitly with rationale (like
+  the tag-codec divergences below) and prefer it be measurable. iPad constraints
+  ([[ipados-constraints]]) are a legitimate driver.
+
 - 2026-07-13 **"Modified tree" caveat RETIRED; our tree is faithful aMule.**
   Cross-checked `amule-3.0.1/` against pristine aMule mainline
   (`refs/amule-master`) and canonical eMule 0.50a/0.70b (`refs/emule-0.50a`,
