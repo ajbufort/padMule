@@ -38,8 +38,17 @@ ends at a differential/round-trip gate.
 3. AICH SHA-1 hash tree (180 KiB blocks, master hash, recovery packet).
 4. Search-expression encoding (boolean AND/OR/NOT + parameter terms).
 
+## Test fixtures / live data (from [[ref-ecosystem]])
+
+emule-security.org provides real `nodes.dat` (Wave-2 round-trip + Wave-6 Kad
+bootstrap) and `ipfilter.dat` (Wave-7 IP filter). Fetch at the relevant wave;
+do not vendor. For known.met/part.met/clients.met round-trips, generate golden
+files by building/running amuled from `amule-3.0.1/`, or hand-construct from the
+verified byte layouts in [[protocol-reference]] / docs/raw.
+
 ## Related
 
 - [[protocol-reference]]
+- [[ref-ecosystem]]
 - [[arch-upstream-amule]]
 - [[decisions-and-lessons]]

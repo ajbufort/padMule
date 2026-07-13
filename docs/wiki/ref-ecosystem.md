@@ -30,6 +30,16 @@ Active as of 2026-07; recent items: open-source ed2k server with server-side
 NAT traversal coordination; "cherrypick a code within aMule pull requests"
 (2026-05); eMule 0.72 public beta test (2026-07).
 
+## eMule-Security.org (test fixtures + Kad bootstrap)
+
+<https://www.emule-security.org> - maintenance resources, not a download hub.
+Offers a real versioned `ipfilter.dat`, an Ip-To-Country DB, a real Kad
+`nodes.dat`, and an indexed safe server list (no direct server.met). Value to
+padMule: golden fixtures for the byte-compat readers and real data to exercise
+the live network - `ipfilter.dat` for the Wave-7 IP filter, `nodes.dat` for the
+Wave-2 format round-trip AND as actual Wave-6 Kad bootstrap contacts. Fetch
+these when those waves start; do not vendor them into the repo (they change).
+
 ## Official aMule docs site
 
 <https://amule-org.github.io/docs> - Quick Start, User Manual, Developer
