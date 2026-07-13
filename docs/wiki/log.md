@@ -13,3 +13,4 @@ Append-only, timestamped record of Ingest / Query / Lint passes.
 - 2026-07-12 Ingest: Wave 1 landed - mule-proto crate + verified ed2k_hash (single/multi-part + exact-multiple edge case), 7 tests green. Wrote [[build-progress]]. Design spec + Wave-1 plan committed.
 - 2026-07-12 Ingest: Wave 1b landed - mule-proto io (LE reader/writer) + tag (MET-format eD2k tag codec, byte-preserving), 17 tests green. Also noted emule-security.org as fixture/bootstrap source in [[ref-ecosystem]]. Updated [[build-progress]].
 - 2026-07-12 Review+Lint: adversarial review of Wave 1/1b (3 dims + docs self-audit). Hashing/endianness/tag-layout/panic-safety CONFIRMED faithful vs aMule C++. Applied corrections (length capping, BOOL/BOOLARRAY, docs) -> 20 tests green. Recorded deliberate divergences in [[decisions-and-lessons]]. No index orphans; docs ASCII-clean.
+- 2026-07-12 Trivial: rustfmt-only reflow of the BoolArray variant (no behavior change); no KB impact.
