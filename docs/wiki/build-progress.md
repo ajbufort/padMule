@@ -16,7 +16,10 @@ ends at a differential/round-trip gate.
 | 2a | `mule-files` crate + `server.met` | `plans/2026-07-12-wave2a-mule-files-server-met.md` | DONE (5 tests). |
 | 2b | `known.met` | `plans/2026-07-12-wave2b-known-met.md` | DONE (10 mule-files tests total). |
 | 2c | `part.met` (+64-bit + gap list) | `plans/2026-07-12-wave2c-part-met.md` | DONE (17 mule-files tests). `nodes.dat` moved to Wave 6 (Kad). |
-| 3 | `mule-engine` eD2k core: login/search/single-source download | - | not started |
+| 3a | `mule-proto` packet framing + zlib | `plans/2026-07-13-wave3a-packet-framing.md` | DONE (31 mule-proto tests). |
+| 3b | `mule-engine`: server login/search MESSAGE codecs (offline-testable) | - | not started |
+| 3c | `mule-engine`: tokio ServerConnection, live handshake | - | not started |
+| 3d | get-sources + single-source download to .part; differential vs amuled | - | not started |
 | 4 | multi-source + upload + queue + credits + SX + corruption | - | not started |
 | 5 | obfuscation + secure ident | - | not started |
 | 6 | `mule-kad` (+ `nodes.dat` format, moved here) | - | not started |
@@ -80,6 +83,24 @@ end-to-end oracle. aMule's own `unittests/tests/CTagTest.cpp` /
 Tag codec divergences (matching aMule MET writers): `write_tag` emits the
 non-compact form only; the `(type|0x80)` short form and inline STR1..16 are
 read-only. Values preserve on-disk width/bytes for bit-identical round-trip.
+
+## Wave 3 plan (eD2k engine core)
+
+Decomposed so most protocol logic stays offline-testable before any socket:
+- 3a DONE: packet framing + zlib in `mule-proto` (streaming `read_packet`,
+  `write_packet`, `compress`/`decompress`). New deps: flate2 (miniz_oxide
+  backend, pure Rust, iOS-safe).
+- 3b: server login/search MESSAGE codecs as pure functions in `mule-engine`
+  (build OP_LOGINREQUEST, parse OP_IDCHANGE/SERVERMESSAGE/SERVERSTATUS; build
+  OP_SEARCHREQUEST + search-expression encoding; parse OP_SEARCHRESULT/
+  OP_FOUNDSOURCES). Golden-byte tested, no networking.
+- 3c: tokio `ServerConnection` driving the handshake over a real socket; live
+  smoke test against a public eD2k server (from a fetched server.met) or a local
+  amuled. Apply the protocol-understanding recommendations (plain-LE client IDs,
+  never advertise VBT, capability gating, userhash markers, one canonical IP).
+- 3d: OP_GETSOURCES -> OP_FOUNDSOURCES, connect a source, download one file to a
+  `.part` via the 3-block window, verify the ed2k hash. First differential test
+  vs `amuled`. See [[protocol-understanding]] for all flows.
 
 ## Test fixtures / live data (from [[ref-ecosystem]])
 
