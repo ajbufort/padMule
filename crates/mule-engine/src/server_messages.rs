@@ -2,13 +2,17 @@
 //! ServerConnect.cpp:210-259 (login), ServerSocket.cpp:228-320 (IDCHANGE), and
 //! docs/wiki/protocol-understanding.md Part 1.
 
-use mule_proto::{write_tag, IoError, Packet, Reader, Tag, TagValue, Writer, PROT_EDONKEY};
+use mule_proto::{
+    read_tag, write_tag, IoError, Packet, Reader, Tag, TagValue, Writer, PROT_EDONKEY,
+};
 
 // Opcodes (protocol 0xE3).
 pub const OP_LOGINREQUEST: u8 = 0x01;
+pub const OP_SERVERLIST: u8 = 0x32;
 pub const OP_SERVERSTATUS: u8 = 0x34;
 pub const OP_SERVERMESSAGE: u8 = 0x38;
 pub const OP_IDCHANGE: u8 = 0x40;
+pub const OP_SERVERIDENT: u8 = 0x41;
 
 // Login tag ids (ClientTags.h).
 const CT_NAME: u8 = 0x01;
@@ -153,6 +157,50 @@ pub fn parse_server_status(payload: &[u8]) -> Result<(u32, u32), IoError> {
     Ok((users, files))
 }
 
+/// Parse an OP_SERVERLIST payload: `u8 count` then `count * (u32 IP, u16 port)`.
+/// Peer-server gossip used to grow the local server list.
+pub fn parse_server_list(payload: &[u8]) -> Result<Vec<(u32, u16)>, IoError> {
+    let mut r = Reader::new(payload);
+    let count = r.read_u8()?;
+    let mut out = Vec::with_capacity(count as usize); // count is a u8, bounded
+    for _ in 0..count {
+        let ip = r.read_u32()?;
+        let port = r.read_u16()?;
+        out.push((ip, port));
+    }
+    Ok(out)
+}
+
+/// A server's self-identification (OP_SERVERIDENT).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServerIdent {
+    pub hash: [u8; 16],
+    pub ip: u32,
+    pub port: u16,
+    pub tags: Vec<Tag>,
+}
+
+/// Parse an OP_SERVERIDENT payload: `hash(16)`, `IP(u32)`, `port(u16)`, tags.
+pub fn parse_server_ident(payload: &[u8]) -> Result<ServerIdent, IoError> {
+    let mut r = Reader::new(payload);
+    let mut hash = [0u8; 16];
+    hash.copy_from_slice(&r.read_bytes(16)?);
+    let ip = r.read_u32()?;
+    let port = r.read_u16()?;
+    let tagcount = r.read_u32()?;
+    // Untrusted count: grow as we read rather than pre-allocating.
+    let mut tags = Vec::new();
+    for _ in 0..tagcount {
+        tags.push(read_tag(&mut r)?);
+    }
+    Ok(ServerIdent {
+        hash,
+        ip,
+        port,
+        tags,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,5 +317,36 @@ mod tests {
         // users = 100, files = 5000
         let status = [0x64, 0x00, 0x00, 0x00, 0x88, 0x13, 0x00, 0x00];
         assert_eq!(parse_server_status(&status).unwrap(), (100, 5000));
+    }
+
+    #[test]
+    fn server_list_two_entries() {
+        let payload = [
+            0x02, // count = 2
+            0x01, 0x00, 0x00, 0x0A, 0x36, 0x12, // 0x0A000001 : 4662
+            0xEF, 0xBE, 0xAD, 0xDE, 0x35, 0x12, // 0xDEADBEEF : 4661
+        ];
+        assert_eq!(
+            parse_server_list(&payload).unwrap(),
+            vec![(0x0A00_0001, 4662), (0xDEAD_BEEF, 4661)]
+        );
+    }
+
+    #[test]
+    fn server_ident_with_name_tag() {
+        let mut payload = vec![0xAAu8; 16]; // hash
+        payload.extend_from_slice(&[0x01, 0x00, 0x00, 0x0A]); // ip
+        payload.extend_from_slice(&[0x36, 0x12]); // port 4662
+        payload.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]); // tagcount = 1
+                                                              // ST_SERVERNAME(0x01) STRING "s"
+        payload.extend_from_slice(&[0x02, 0x01, 0x00, 0x01, 0x01, 0x00, b's']);
+        let ident = parse_server_ident(&payload).unwrap();
+        assert_eq!(ident.hash, [0xAA; 16]);
+        assert_eq!(ident.ip, 0x0A00_0001);
+        assert_eq!(ident.port, 4662);
+        assert_eq!(
+            ident.tags,
+            vec![Tag::id(0x01, TagValue::Str(b"s".to_vec()))]
+        );
     }
 }
