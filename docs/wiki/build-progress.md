@@ -24,7 +24,7 @@ ends at a differential/round-trip gate.
 | 5 | obfuscation + secure ident | - | not started |
 | 6 | `mule-kad` (+ `nodes.dat` format, moved here) | - | not started |
 | 7 | `mule-ec` + `mule-cli` parity (IP filter, UPnP, categories) | - | not started |
-| 8 | `mule-ffi` + `ios/padMule` SwiftUI shell + lifecycle + sideload | - | not started |
+| 8 | `mule-ffi` + `ios/padMule` SwiftUI shell + lifecycle + sideload | - | not started. Must render the honest status notice + per-transfer Paused badges + Reconnecting banner, and wire ScenePhase -> engine pause()/resume() ([[lifecycle-and-reactivation]]). |
 | 9 | (v1.1) seedbox mode | - | not started |
 
 ## Review pass (2026-07-12)
@@ -98,6 +98,10 @@ Decomposed so most protocol logic stays offline-testable before any socket:
   smoke test against a public eD2k server (from a fetched server.met) or a local
   amuled. Apply the protocol-understanding recommendations (plain-LE client IDs,
   never advertise VBT, capability gating, userhash markers, one canonical IP).
+  ALSO design in the lifecycle state model + explicit `pause()`/`resume()` +
+  connection-state EVENT STREAM now (not later) - see
+  [[lifecycle-and-reactivation]]; the CLI harness exercises a simulated
+  pause/resume so it is tested before the iPad UI exists.
 - 3d: OP_GETSOURCES -> OP_FOUNDSOURCES, connect a source, download one file to a
   `.part` via the 3-block window, verify the ed2k hash. First differential test
   vs `amuled`. See [[protocol-understanding]] for all flows.
