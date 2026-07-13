@@ -15,11 +15,11 @@ ends at a differential/round-trip gate.
 | 1c | `mule-proto`: AICH SHA-1 hash tree + search-expr encoding | - | not started (remaining Wave-1 codec slices) |
 | 2a | `mule-files` crate + `server.met` | `plans/2026-07-12-wave2a-mule-files-server-met.md` | DONE (5 tests). |
 | 2b | `known.met` | `plans/2026-07-12-wave2b-known-met.md` | DONE (10 mule-files tests total). |
-| 2c | `part.met` (+64-bit + gap list) + `nodes.dat` | - | not started |
+| 2c | `part.met` (+64-bit + gap list) | `plans/2026-07-12-wave2c-part-met.md` | DONE (17 mule-files tests). `nodes.dat` moved to Wave 6 (Kad). |
 | 3 | `mule-engine` eD2k core: login/search/single-source download | - | not started |
 | 4 | multi-source + upload + queue + credits + SX + corruption | - | not started |
 | 5 | obfuscation + secure ident | - | not started |
-| 6 | `mule-kad` | - | not started |
+| 6 | `mule-kad` (+ `nodes.dat` format, moved here) | - | not started |
 | 7 | `mule-ec` + `mule-cli` parity (IP filter, UPnP, categories) | - | not started |
 | 8 | `mule-ffi` + `ios/padMule` SwiftUI shell + lifecycle + sideload | - | not started |
 | 9 | (v1.1) seedbox mode | - | not started |
@@ -45,10 +45,13 @@ end-to-end oracle. aMule's own `unittests/tests/CTagTest.cpp` /
   preserve every field as read, so read-then-write is bit-identical. The header
   byte is preserved (server.met 0xE0/0x0E, known.met 0x0E/0x0F) rather than
   forced, which is more faithful than aMule's own re-save.
-- Still to do in 2c: `part.met` (gap-list tags named `\x09`/`\x0A` + decimal
-  index, GAPSTART inclusive / GAPEND exclusive; 0xE0/0xE2 large variant) and
-  `nodes.dat` (Kad). part.met gap semantics are the tricky part (reference
-  section 4). `nodes.dat` real fixture available from emule-security.org.
+- 2c DONE: `part.met` round-trips (version 0xE0/0xE2, accepts 0xE1); the gap
+  list is carried as string-named tags (`\x09`/`\x0A` + decimal index) that the
+  generic codec handles, with `gaps()`/`gap_tags()` translating to `(start,
+  end)` ranges - start inclusive, end EXCLUSIVE (the on-disk GAPEND value =
+  file size for a fresh download). Pairing is by decimal index (order/dup
+  tolerant). `nodes.dat` moved to Wave 6 (its 128-bit id needs interpretation
+  there); real fixture available from emule-security.org.
 - Not yet golden-tested against a REAL aMule-written file (only hand-built
   golden vectors). Generating real .met files needs a built amuled or samples;
   tracked as a cross-check for when the engine wave can produce them.
