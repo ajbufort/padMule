@@ -65,7 +65,10 @@ pub enum TagValue {
     Bool(u8),
     /// A bit array (TAGTYPE_BOOLARRAY): `bit_len` bits stored in `data`, whose
     /// length is aMule's `(bit_len / 8) + 1` bytes (the quirk is preserved).
-    BoolArray { bit_len: u16, data: Vec<u8> },
+    BoolArray {
+        bit_len: u16,
+        data: Vec<u8>,
+    },
 }
 
 /// One eD2k tag.
