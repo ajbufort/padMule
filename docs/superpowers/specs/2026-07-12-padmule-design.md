@@ -58,6 +58,26 @@ path for "peer dropped us" and "we were suspended" is the SAME reconnect path.
 A dropped socket is a rebuild event, never a fatal error. Kad membership is not
 maintained across suspension; it is re-bootstrapped on each foreground return.
 
+**Clean status + clean reactivation are a hard requirement** (full spec:
+`docs/wiki/lifecycle-and-reactivation.md`). Two obligations follow from the
+suspend model:
+
+- **Honest status to the user.** The engine exposes a rich connection-state
+  model (ServerState/KadState, plus a per-transfer state that distinguishes
+  lifecycle-Paused from Stalled from Error) as an EVENT STREAM, so the UI never
+  shows a stale "Connected" that is actually dead. On foreground return the UI
+  shows "Reconnecting..." immediately; a background pause is presented calmly as
+  by-design ("padMule pauses when not in the foreground"), never as an error.
+- **Clean reactivation.** The UI's scene-phase observer calls explicit engine
+  `pause()`/`resume()` over FFI (not implicit socket-death detection).
+  `resume()` is idempotent, leak-free, fast/non-blocking, correct on a changed
+  network/IP (re-login from scratch since a changed public IP flips
+  HighID<->LowID), and progress-safe (resume from the gap list, no re-hash).
+
+This shapes the engine's public API from Wave 3c (the state model + pause/resume
++ event stream are designed in, and the CLI harness exercises a simulated
+pause/resume), not just Wave 8's SwiftUI wiring.
+
 ## 4. Architecture
 
 A Cargo workspace developed and tested on WSL2, compiling to two surfaces: a
