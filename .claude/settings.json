@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/ajbufort/claude-projects/padMule/.claude/hooks/kb-reflect-check.sh",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,970 @@
+//
+// This file is part of the aMule Project.
+//
+// Copyright (c) 2003-2026 aMule Team ( https://amule-org.github.io )
+//
+// Any parts of this program derived from the xMule, lMule or eMule project,
+// or contributed by third-party developers are copyrighted by their
+// respective authors.
+//
+// This program is free software; you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation; either version 2 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program; if not, write to the Free Software
+// Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301, USA
+//
+
+#include "GuiEvents.h"
+#include "amule.h"
+#include <common/MenuIDs.h>		// MP_PAUSE/STOP/RESUME/CANCEL + MP_PRIO* for the
+#ifndef AMULE_DAEMON
+#include "CommentDialog.h"		// CCommentDialog::DropReferencesTo
+#include "CommentDialogLst.h"		// CCommentDialogLst::DropReferencesTo
+#include "FileDetailDialog.h"		// CFileDetailDialog::DropReferencesTo
+#include "GenericClientListCtrl.h"	// CGenericClientListCtrl::RemoveKnownFile
+#include "TransferWnd.h"		// access to m_transferwnd->clientlistctrl
+#include "SharedFilesWnd.h"		// access to m_sharedfileswnd->peerslistctrl
+#endif
+#ifndef CLIENT_GUI
+#include "SHAHashSet.h"			// CAICHHashSet::DropReferencesTo
+#include "PartFileWriteThread.h"	// CPartFileWriteThread::DropReferencesTo
+#endif
+					// CLIENT_GUI implementations of Download_Set_Cat_*
+#include "PartFile.h"
+#include "DownloadQueue.h"
+#include "ServerList.h"
+#include "Preferences.h"
+#include "ExternalConn.h"
+#include "SearchFile.h"
+#include "SearchList.h"
+#include "IPFilter.h"
+#include "Friend.h"
+#include "Logger.h"
+
+#ifdef __WXMAC__
+#include "MacAppHelper.h"	// mac_set_accessory_mode
+#endif
+
+#ifndef AMULE_DAEMON
+#	include "ChatWnd.h"
+#	include "amuleDlg.h"
+#	include "ServerWnd.h"
+#	include "SearchDlg.h"
+#	include "TransferWnd.h"
+#	include "SharedFilesWnd.h"
+#	include "ServerListCtrl.h"
+#	include "SourceListCtrl.h"
+#	include "SharedFilesCtrl.h"
+#	include "DownloadListCtrl.h"
+#	include "muuli_wdr.h"
+#	include "SharedFilePeersListCtrl.h"
+#	ifndef CLIENT_GUI
+#		include "PartFileConvertDlg.h"
+#		include "PartFileConvert.h"
+#	endif
+#endif
+
+#ifndef CLIENT_GUI
+#	include "UploadQueue.h"
+#	include "EMSocket.h"
+#	include "ListenSocket.h"
+#	include "MuleUDPSocket.h"
+#endif
+
+#include <common/MacrosProgramSpecific.h>
+
+wxDEFINE_EVENT(MULE_EVT_NOTIFY, wxEvent);
+
+namespace MuleNotify
+{
+
+	void HandleNotification(const CMuleNotiferBase& ntf)
+	{
+		if (wxThread::IsMain()) {
+#ifdef AMULE_DAEMON
+			ntf.Notify();
+#else
+			if (theApp->amuledlg) {
+				ntf.Notify();
+			}
+#endif
+		} else {
+			CMuleGUIEvent evt(ntf.Clone());
+			wxQueueEvent(wxTheApp, (evt).Clone());
+		}
+	}
+
+
+	void HandleNotificationAlways(const CMuleNotiferBase& ntf)
+	{
+		CMuleGUIEvent evt(ntf.Clone());
+		wxQueueEvent(wxTheApp, (evt).Clone());
+	}
+
+
+	void Search_Add_Download(CSearchFile* file, uint8 category)
+	{
+		theApp->downloadqueue->AddSearchToDownload(file, category);
+	}
+
+
+	void ShowUserCount(wxString NOT_ON_DAEMON(str))
+	{
+#ifndef AMULE_DAEMON
+		theApp->amuledlg->ShowUserCount(str);
+#endif
+	}
+
+
+	void Search_Update_Progress(uint32 NOT_ON_DAEMON(val))
+	{
+#ifndef AMULE_DAEMON
+		if (theApp->amuledlg->m_searchwnd) {
+			if (val == 0xffff) {
+				// Global search ended
+				theApp->amuledlg->m_searchwnd->ResetControls();
+			} else if (val == 0xfffe) {
+				// Kad search ended
+				theApp->amuledlg->m_searchwnd->KadSearchEnd(0);
+			} else {
+				theApp->amuledlg->m_searchwnd->UpdateProgress(val);
+			}
+		}
+#endif
+	}
+
+
+	void DownloadCtrlUpdateItem(const void* item)
+	{
+#ifndef CLIENT_GUI
+		// Notify can fire from PartFile load during early OnInit (#268
+		// crash from a wx2.8.12 / pre-ASIO build) and from background
+		// threads during shutdown after `delete ECServerHandler`.
+		// Master's OnInit currently builds ECServerHandler before
+		// LoadMetFiles, so the early-init crash is fixed by ordering;
+		// guard the dereference anyway so future reorders or
+		// shutdown races can't reintroduce the segfault.
+		if (theApp->ECServerHandler && theApp->ECServerHandler->m_ec_notifier) {
+			theApp->ECServerHandler->m_ec_notifier->DownloadFile_SetDirty(static_cast<const CPartFile*>(item));
+		}
+#endif
+#ifndef AMULE_DAEMON
+		if (theApp->amuledlg->m_transferwnd && theApp->amuledlg->m_transferwnd->downloadlistctrl) {
+			theApp->amuledlg->m_transferwnd->downloadlistctrl->UpdateItem(item);
+		}
+#endif
+	}
+
+
+	void DownloadCtrlDoItemSelectionChanged()
+	{
+#ifndef AMULE_DAEMON
+		if (theApp->amuledlg->m_transferwnd && theApp->amuledlg->m_transferwnd->downloadlistctrl) {
+			theApp->amuledlg->m_transferwnd->downloadlistctrl->DoItemSelectionChanged();
+		}
+#endif
+	}
+
+
+	void NodesURLChanged(wxString NOT_ON_DAEMON(url))
+	{
+#ifndef AMULE_DAEMON
+		CastByID(IDC_NODESLISTURL, NULL, wxTextCtrl)->SetValue(url);
+#endif
+	}
+
+	void ServersURLChanged(wxString NOT_ON_DAEMON(url))
+	{
+#ifndef AMULE_DAEMON
+		CastByID(IDC_SERVERLISTURL, NULL, wxTextCtrl)->SetValue(url);
+#endif
+	}
+
+	void ShowGUI()
+	{
+#ifndef AMULE_DAEMON
+		// Triggered from a duplicate-launch RAISE_DIALOG signal (the
+		// running instance picks it up via ED2KLinks polling) and
+		// from MacReopenApp when the user clicks the Dock icon. Cover
+		// every hidden state the main window can be in:
+		//   * Show(false) via the close-button HideOnClose path
+		//   * Iconize(true) via the minimize-to-tray path
+		//   * just behind another app's window
+#ifdef __WXMAC__
+		// If we're still in accessory mode (window was hidden via the
+		// tray), restore the regular Dock icon before the window
+		// comes back, otherwise activate-ignoring-other-apps lands on
+		// a Dock-less app and the focus shift is invisible.
+		mac_set_accessory_mode(false);
+#endif
+		theApp->amuledlg->Show(true);
+		theApp->amuledlg->Iconize(false);
+		theApp->amuledlg->Raise();
+#endif
+	}
+
+	void SourceCtrlUpdateSource(uint32 NOT_ON_DAEMON(source), SourceItemType NOT_ON_DAEMON(type))
+	{
+#ifndef AMULE_DAEMON
+		if (theApp->amuledlg->m_transferwnd && theApp->amuledlg->m_transferwnd->clientlistctrl) {
+			theApp->amuledlg->m_transferwnd->clientlistctrl->UpdateItem(source, type);
+		}
+#endif
+	}
+
+	void SourceCtrlAddSource(CPartFile* NOT_ON_DAEMON(owner), CClientRef NOT_ON_DAEMON(source), SourceItemType NOT_ON_DAEMON(type))
+	{
+#ifndef AMULE_DAEMON
+		if (theApp->amuledlg->m_transferwnd && theApp->amuledlg->m_transferwnd->clientlistctrl) {
+			theApp->amuledlg->m_transferwnd->clientlistctrl->AddSource(owner, source, type);
+		}
+#endif
+	}
+
+	void SourceCtrlRemoveSource(uint32 NOT_ON_DAEMON(source), const CPartFile* NOT_ON_DAEMON(owner))
+	{
+#ifndef AMULE_DAEMON
+		if (theApp->amuledlg->m_transferwnd && theApp->amuledlg->m_transferwnd->clientlistctrl) {
+			theApp->amuledlg->m_transferwnd->clientlistctrl->RemoveSource(source, owner);
+		}
+#endif
+	}
+
+	void SharedCtrlAddClient(CKnownFile* NOT_ON_DAEMON(owner), CClientRef NOT_ON_DAEMON(source), SourceItemType NOT_ON_DAEMON(type))
+	{
+#ifndef AMULE_DAEMON
+		if (theApp->amuledlg->m_sharedfileswnd && theApp->amuledlg->m_sharedfileswnd->peerslistctrl) {
+			theApp->amuledlg->m_sharedfileswnd->peerslistctrl->AddSource(owner, source, type);
+		}
+#endif
+	}
+
+	void SharedCtrlRefreshClient(uint32 NOT_ON_DAEMON(client), SourceItemType NOT_ON_DAEMON(type))
+	{
+#ifndef AMULE_DAEMON
+		if (theApp->amuledlg->m_sharedfileswnd && theApp->amuledlg->m_sharedfileswnd->peerslistctrl) {
+			theApp->amuledlg->m_sharedfileswnd->peerslistctrl->UpdateItem(client, type);
+		}
+#endif
+	}
+
+	void SharedCtrlRemoveClient(uint32 NOT_ON_DAEMON(source), const CKnownFile* NOT_ON_DAEMON(owner))
+	{
+#ifndef AMULE_DAEMON
+		if (theApp->amuledlg->m_sharedfileswnd && theApp->amuledlg->m_sharedfileswnd->peerslistctrl) {
+			theApp->amuledlg->m_sharedfileswnd->peerslistctrl->RemoveSource(source, owner);
+		}
+#endif
+	}
+
+	void ServerRefresh(CServer* NOT_ON_DAEMON(server))
+	{
+#ifndef AMULE_DAEMON
+		if (theApp->amuledlg->m_serverwnd && theApp->amuledlg->m_serverwnd->serverlistctrl) {
+			theApp->amuledlg->m_serverwnd->serverlistctrl->RefreshServer(server);
+		}
+#endif
+	}
+
+	void ChatUpdateFriend(CFriend * NOT_ON_DAEMON(toupdate))
+	{
+#ifndef AMULE_DAEMON
+		if (theApp->amuledlg->m_chatwnd) {
+			theApp->amuledlg->m_chatwnd->UpdateFriend(toupdate);
+		}
+#endif
+	}
+
+	void ChatRemoveFriend(CFriend * toremove)
+	{
+#ifndef AMULE_DAEMON
+		if (theApp->amuledlg->m_chatwnd) {
+			theApp->amuledlg->m_chatwnd->RemoveFriend(toremove);
+		}
+#endif
+		delete toremove;
+	}
+
+#ifdef CLIENT_GUI
+
+	void PartFile_Swap_A4AF(CPartFile* file)
+	{
+		theApp->downloadqueue->SendFileCommand(file, EC_OP_PARTFILE_SWAP_A4AF_THIS);
+	}
+
+	void PartFile_Swap_A4AF_Auto(CPartFile* file)
+	{
+		theApp->downloadqueue->SendFileCommand(file, EC_OP_PARTFILE_SWAP_A4AF_THIS_AUTO);
+	}
+
+	void PartFile_Swap_A4AF_Others(CPartFile* file)
+	{
+		theApp->downloadqueue->SendFileCommand(file, EC_OP_PARTFILE_SWAP_A4AF_OTHERS);
+	}
+
+	void PartFile_Pause(CPartFile* file)
+	{
+		theApp->downloadqueue->SendFileCommand(file, EC_OP_PARTFILE_PAUSE);
+	}
+
+	void PartFile_Resume(CPartFile* file)
+	{
+		theApp->downloadqueue->SendFileCommand(file, EC_OP_PARTFILE_RESUME);
+	}
+
+	void PartFile_Stop(CPartFile* file)
+	{
+		theApp->downloadqueue->SendFileCommand(file, EC_OP_PARTFILE_STOP);
+	}
+
+	void PartFile_PrioAuto(CPartFile* file, bool val)
+	{
+		theApp->downloadqueue->AutoPrio(file, val);
+	}
+
+	void PartFile_PrioSet(CPartFile* file, uint8 newDownPriority, bool)
+	{
+		theApp->downloadqueue->Prio(file, newDownPriority);
+	}
+
+	void PartFile_Delete(CPartFile* file)
+	{
+		theApp->downloadqueue->SendFileCommand(file, EC_OP_PARTFILE_DELETE);
+	}
+
+	void PartFile_SetCat(CPartFile* file, uint32 val)
+	{
+		theApp->downloadqueue->Category(file, val);
+	}
+
+	void KnownFile_Up_Prio_Set(CKnownFile* file, uint8 val)
+	{
+		theApp->sharedfiles->SetFilePrio(file, val);
+	}
+
+	void KnownFile_Up_Prio_Auto(CKnownFile* file)
+	{
+		theApp->sharedfiles->SetFilePrio(file, PR_AUTO);
+	}
+
+	void KnownFile_Comment_Set(CKnownFile* file, wxString comment, int8 rating)
+	{
+		theApp->sharedfiles->SetFileCommentRating(file, comment, rating);
+	}
+
+	void Download_Set_Cat_Prio(uint8 cat, uint8 newprio)
+	{
+		// EC has no per-category bulk priority opcode. Mirror the daemon's
+		// CDownloadQueue::SetCatPrio predicate (all files if cat == 0, else
+		// exact category match) and send one EC_OP_PARTFILE_PRIO_SET per
+		// file using the existing per-file helpers. Without this stub being
+		// filled in, amulegui's category-tab right-click priority items
+		// silently no-op'd (#697 sibling of the status case below).
+		std::vector<CPartFile*> targets;
+		for (CDownQueueRem::iterator it = theApp->downloadqueue->begin();
+				it != theApp->downloadqueue->end(); ++it) {
+			CPartFile *file = it->second;
+			if (!cat || file->GetCategory() == cat) {
+				targets.push_back(file);
+			}
+		}
+		for (std::vector<CPartFile*>::iterator it = targets.begin();
+				it != targets.end(); ++it) {
+			if (newprio == PR_AUTO) {
+				theApp->downloadqueue->AutoPrio(*it, true);
+			} else {
+				theApp->downloadqueue->Prio(*it, newprio);
+			}
+		}
+	}
+
+	void Download_Set_Cat_Status(uint8 cat, int newstatus)
+	{
+		// EC has no per-category bulk status opcode. Mirror the daemon's
+		// CDownloadQueue::SetCatStatus: snapshot files that
+		// CheckShowItemInGivenCat() admits for this (cat, AllcatFilter)
+		// pair, then send one per-file EC command. Snapshot first so a
+		// late-arriving EC response can't mutate the queue mid-iteration.
+		// #697: previously empty -- tab-right-click Stop/Pause/Resume/
+		// Cancel silently no-op'd in amulegui (only the remote GUI, not
+		// the monolithic amule, hit this stub).
+		ec_tagname_t cmd = 0;
+		switch (newstatus) {
+			case MP_CANCEL:	cmd = EC_OP_PARTFILE_DELETE;	break;
+			case MP_PAUSE:	cmd = EC_OP_PARTFILE_PAUSE;	break;
+			case MP_STOP:	cmd = EC_OP_PARTFILE_STOP;	break;
+			case MP_RESUME:	cmd = EC_OP_PARTFILE_RESUME;	break;
+			default:	return;
+		}
+		std::vector<CPartFile*> targets;
+		for (CDownQueueRem::iterator it = theApp->downloadqueue->begin();
+				it != theApp->downloadqueue->end(); ++it) {
+			if (it->second->CheckShowItemInGivenCat(cat)) {
+				targets.push_back(it->second);
+			}
+		}
+		for (std::vector<CPartFile*>::iterator it = targets.begin();
+				it != targets.end(); ++it) {
+			theApp->downloadqueue->SendFileCommand(*it, cmd);
+		}
+	}
+
+	void Upload_Resort_Queue()
+	{
+	}
+
+#else
+
+	void SharedFilesShowFile(CKnownFile* NOT_ON_DAEMON(file))
+	{
+#ifndef AMULE_DAEMON
+		if (theApp->amuledlg->m_sharedfileswnd && theApp->amuledlg->m_sharedfileswnd->sharedfilesctrl) {
+			theApp->amuledlg->m_sharedfileswnd->sharedfilesctrl->ShowFile(file);
+		}
+#endif
+	}
+
+	void SharedFilesRemoveFile(CKnownFile* NOT_ON_DAEMON(file))
+	{
+#ifndef AMULE_DAEMON
+		if (theApp->amuledlg->m_sharedfileswnd && theApp->amuledlg->m_sharedfileswnd->sharedfilesctrl) {
+			theApp->amuledlg->m_sharedfileswnd->sharedfilesctrl->RemoveFile(file);
+		}
+#endif
+	}
+
+	void SharedFilesRemoveAllFiles()
+	{
+#ifndef AMULE_DAEMON
+		if (theApp->amuledlg->m_sharedfileswnd) {
+			theApp->amuledlg->m_sharedfileswnd->RemoveAllSharedFiles();
+		}
+#endif
+	}
+
+
+	void SharedFilesShowFileList()
+	{
+#ifndef AMULE_DAEMON
+		if (theApp->amuledlg->m_sharedfileswnd && theApp->amuledlg->m_sharedfileswnd->sharedfilesctrl) {
+			theApp->amuledlg->m_sharedfileswnd->sharedfilesctrl->ShowFileList();
+		}
+#endif
+	}
+
+
+	void SharedFilesUpdateItem(CKnownFile* NOT_ON_DAEMON(file))
+	{
+#ifndef AMULE_DAEMON
+		if (theApp->amuledlg->m_sharedfileswnd && theApp->amuledlg->m_sharedfileswnd->sharedfilesctrl) {
+			theApp->amuledlg->m_sharedfileswnd->sharedfilesctrl->UpdateItem(file);
+		}
+#endif
+	}
+
+
+	void SharedFilesBeginBulkUpdate()
+	{
+#ifndef AMULE_DAEMON
+		if (theApp->amuledlg && theApp->amuledlg->m_sharedfileswnd && theApp->amuledlg->m_sharedfileswnd->sharedfilesctrl) {
+			theApp->amuledlg->m_sharedfileswnd->sharedfilesctrl->BeginBulkUpdate();
+		}
+#endif
+	}
+
+
+	void SharedFilesEndBulkUpdate()
+	{
+#ifndef AMULE_DAEMON
+		if (theApp->amuledlg && theApp->amuledlg->m_sharedfileswnd && theApp->amuledlg->m_sharedfileswnd->sharedfilesctrl) {
+			theApp->amuledlg->m_sharedfileswnd->sharedfilesctrl->EndBulkUpdate();
+		}
+#endif
+	}
+
+
+	void DownloadCtrlAddFile(CPartFile* file)
+	{
+		// See DownloadCtrlUpdateItem above for the rationale; the
+		// notifier can be NULL during init or shutdown.
+		if (theApp->ECServerHandler && theApp->ECServerHandler->m_ec_notifier) {
+			theApp->ECServerHandler->m_ec_notifier->DownloadFile_AddFile(file);
+		}
+#ifndef AMULE_DAEMON
+		if (theApp->amuledlg->m_transferwnd && theApp->amuledlg->m_transferwnd->downloadlistctrl ) {
+			theApp->amuledlg->m_transferwnd->downloadlistctrl->AddFile(file);
+		}
+#endif
+	}
+
+	void DownloadCtrlRemoveFile(CPartFile* file)
+	{
+		if (theApp->ECServerHandler && theApp->ECServerHandler->m_ec_notifier) {
+			theApp->ECServerHandler->m_ec_notifier->DownloadFile_RemoveFile(file);
+		}
+#ifndef AMULE_DAEMON
+		if (theApp->amuledlg->m_transferwnd && theApp->amuledlg->m_transferwnd->downloadlistctrl) {
+			theApp->amuledlg->m_transferwnd->downloadlistctrl->RemoveFile(file);
+		}
+#endif
+	}
+
+	void DownloadCtrlSort()
+	{
+#ifndef AMULE_DAEMON
+		if (theApp->amuledlg->m_transferwnd && theApp->amuledlg->m_transferwnd->downloadlistctrl) {
+			theApp->amuledlg->m_transferwnd->downloadlistctrl->SortList();
+		}
+#endif
+	}
+
+	void ServerAdd(CServer* NOT_ON_DAEMON(server))
+	{
+#ifndef AMULE_DAEMON
+		if (theApp->amuledlg->m_serverwnd && theApp->amuledlg->m_serverwnd->serverlistctrl) {
+			theApp->amuledlg->m_serverwnd->serverlistctrl->AddServer(server);
+		}
+#endif
+	}
+
+	void ServerRemove(CServer* NOT_ON_DAEMON(server))
+	{
+#ifndef AMULE_DAEMON
+		if (theApp->amuledlg->m_serverwnd && theApp->amuledlg->m_serverwnd->serverlistctrl) {
+			theApp->amuledlg->m_serverwnd->serverlistctrl->RemoveServer(server);
+		}
+#endif
+	}
+
+	void ServerRemoveDead()
+	{
+		if (theApp->serverlist) {
+			theApp->serverlist->RemoveDeadServers();
+		}
+	}
+
+	void ServerRemoveAll()
+	{
+#ifndef AMULE_DAEMON
+		if (theApp->amuledlg->m_serverwnd && theApp->amuledlg->m_serverwnd->serverlistctrl) {
+			theApp->amuledlg->m_serverwnd->serverlistctrl->DeleteAllItems();
+		}
+#endif
+	}
+
+	void ServerHighlight(CServer* NOT_ON_DAEMON(server), bool NOT_ON_DAEMON(highlight))
+	{
+#ifndef AMULE_DAEMON
+		if (theApp->amuledlg->m_serverwnd && theApp->amuledlg->m_serverwnd->serverlistctrl) {
+			theApp->amuledlg->m_serverwnd->serverlistctrl->HighlightServer(server, highlight);
+		}
+#endif
+	}
+
+	void ServerFreeze()
+	{
+#ifndef AMULE_DAEMON
+		if (theApp->amuledlg->m_serverwnd && theApp->amuledlg->m_serverwnd->serverlistctrl) {
+			theApp->amuledlg->m_serverwnd->serverlistctrl->Freeze();
+		}
+#endif
+	}
+
+	void ServerThaw()
+	{
+#ifndef AMULE_DAEMON
+		if (theApp->amuledlg->m_serverwnd && theApp->amuledlg->m_serverwnd->serverlistctrl) {
+			theApp->amuledlg->m_serverwnd->serverlistctrl->Thaw();
+		}
+#endif
+	}
+
+	void ServerUpdateED2KInfo()
+	{
+#ifndef AMULE_DAEMON
+		if (theApp->amuledlg->m_serverwnd) {
+			theApp->amuledlg->m_serverwnd->UpdateED2KInfo();
+		}
+#endif
+	}
+
+	void ServerUpdateKadKInfo()
+	{
+#ifndef AMULE_DAEMON
+		if (theApp->amuledlg->m_serverwnd) {
+			theApp->amuledlg->m_serverwnd->UpdateKadInfo();
+		}
+#endif
+	}
+
+
+	void SearchCancel()
+	{
+#ifndef AMULE_DAEMON
+		if (theApp->amuledlg->m_searchwnd) {
+			theApp->amuledlg->m_searchwnd->ResetControls();
+		}
+#endif
+	}
+
+	void SearchLocalEnd()
+	{
+#ifndef AMULE_DAEMON
+		if (theApp->amuledlg->m_searchwnd) {
+			theApp->amuledlg->m_searchwnd->LocalSearchEnd();
+		}
+#endif
+	}
+
+	void KadSearchEnd(uint32 NOT_ON_DAEMON(id))
+	{
+#ifndef AMULE_DAEMON
+		if (theApp->amuledlg->m_searchwnd) {
+			theApp->amuledlg->m_searchwnd->KadSearchEnd(id);
+		}
+#endif
+		theApp->searchlist->SetKadSearchFinished();
+	}
+
+	void Search_Update_Sources(CSearchFile* result)
+	{
+		result->SetDownloadStatus();
+#ifndef AMULE_DAEMON
+		if (theApp->amuledlg && theApp->amuledlg->m_searchwnd) {
+			theApp->amuledlg->m_searchwnd->UpdateResult(result);
+		}
+#endif
+	}
+
+	void Search_Add_Result(CSearchFile* NOT_ON_DAEMON(result))
+	{
+#ifndef AMULE_DAEMON
+		if (theApp->amuledlg && theApp->amuledlg->m_searchwnd) {
+			theApp->amuledlg->m_searchwnd->AddResult(result);
+		}
+#endif
+	}
+
+
+	void ChatConnResult(bool NOT_ON_DAEMON(success), uint64 NOT_ON_DAEMON(id), wxString NOT_ON_DAEMON(message))
+	{
+#ifndef AMULE_DAEMON
+		if (theApp->amuledlg->m_chatwnd) {
+			theApp->amuledlg->m_chatwnd->ConnectionResult(success, message, id);
+		}
+#endif
+	}
+
+	void ChatProcessMsg(uint64 NOT_ON_DAEMON(sender), wxString NOT_ON_DAEMON(message))
+	{
+#ifndef AMULE_DAEMON
+		if (theApp->amuledlg->m_chatwnd) {
+			theApp->amuledlg->m_chatwnd->ProcessMessage(sender, message);
+		}
+#endif
+	}
+
+
+	void ChatSendCaptcha(wxString NOT_ON_DAEMON(captcha), uint64 NOT_ON_DAEMON(to_id))
+	{
+#ifndef AMULE_DAEMON
+		if (theApp->amuledlg->m_chatwnd) {
+			theApp->amuledlg->m_chatwnd->SendMessage(captcha, "", to_id);
+		}
+#endif
+	}
+
+
+	void ShowConnState(long NOT_ON_DAEMON(forceUpdate))
+	{
+#ifndef AMULE_DAEMON
+		theApp->amuledlg->ShowConnectionState(forceUpdate != 0);
+#endif
+	}
+
+	void ShowUpdateCatTabTitles()
+	{
+#ifndef AMULE_DAEMON
+		if (theApp->amuledlg->m_transferwnd) {
+			theApp->amuledlg->m_transferwnd->UpdateCatTabTitles();
+		}
+#endif
+	}
+
+	void CategoryAdded()
+	{
+#ifndef AMULE_DAEMON
+		if (theApp->amuledlg->m_transferwnd) {
+			theApp->amuledlg->m_transferwnd->
+				AddCategory(theApp->glob_prefs->GetCategory(
+					theApp->glob_prefs->GetCatCount()-1));
+		}
+#endif
+	}
+
+	void CategoryUpdate(uint32 NOT_ON_DAEMON(cat))
+	{
+#ifndef AMULE_DAEMON
+		if (theApp->amuledlg->m_transferwnd) {
+			theApp->amuledlg->m_transferwnd->UpdateCategory(cat);
+			theApp->amuledlg->m_transferwnd->downloadlistctrl->Refresh();
+			theApp->amuledlg->m_searchwnd->UpdateCatChoice();
+		}
+#endif
+	}
+
+	void CategoryDelete(uint32 cat)
+	{
+#ifdef AMULE_DAEMON
+		if (cat > 0) {
+			theApp->downloadqueue->ResetCatParts(cat);
+			theApp->glob_prefs->RemoveCat(cat);
+			if ( theApp->glob_prefs->GetCatCount() == 1 ) {
+				thePrefs::SetAllcatFilter( acfAll );
+			}
+			theApp->glob_prefs->SaveCats();
+		}
+#else
+		if (theApp->amuledlg->m_transferwnd) {
+			theApp->amuledlg->m_transferwnd->RemoveCategory(cat);
+		}
+#endif
+	}
+
+
+	void PartFile_Swap_A4AF(CPartFile* file)
+	{
+		if ((file->GetStatus(false) == PS_READY || file->GetStatus(false) == PS_EMPTY)) {
+			CPartFile::SourceSet::const_iterator it = file->GetA4AFList().begin();
+			for ( ; it != file->GetA4AFList().end(); ) {
+				it++->SwapToAnotherFile(true, false, false, file);
+			}
+		}
+	}
+
+	void PartFile_Swap_A4AF_Auto(CPartFile* file)
+	{
+		file->SetA4AFAuto(!file->IsA4AFAuto());
+	}
+
+	void PartFile_Swap_A4AF_Others(CPartFile* file)
+	{
+		if ((file->GetStatus(false) == PS_READY) || (file->GetStatus(false) == PS_EMPTY)) {
+			CPartFile::SourceSet::const_iterator it = file->GetSourceList().begin();
+			for( ; it != file->GetSourceList().end(); ) {
+				it++->SwapToAnotherFile(false, false, false, NULL);
+			}
+		}
+	}
+
+	void PartFile_Pause(CPartFile* file)
+	{
+		file->PauseFile();
+		file->SavePartFile();
+	}
+
+	void PartFile_Resume(CPartFile* file)
+	{
+		file->ResumeFile();
+		file->SavePartFile();
+	}
+
+	void PartFile_Stop(CPartFile* file)
+	{
+		file->StopFile();
+		file->SavePartFile();
+	}
+
+	void PartFile_PrioAuto(CPartFile* file, bool val)
+	{
+		file->SetAutoDownPriority(val);
+	}
+
+	void PartFile_PrioSet(CPartFile* file, uint8 newDownPriority, bool bSave)
+	{
+		file->SetDownPriority(newDownPriority, bSave);
+	}
+
+	void PartFile_Delete(CPartFile* file)
+	{
+		file->Delete();
+	}
+
+	void PartFile_SetCat(CPartFile* file, uint32 val)
+	{
+		file->SetCategory(val);
+	}
+
+
+	void KnownFile_Up_Prio_Set(CKnownFile* file, uint8 val)
+	{
+		file->SetAutoUpPriority(false);
+		file->SetUpPriority(val);
+	}
+
+	void KnownFile_Up_Prio_Auto(CKnownFile* file)
+	{
+		file->SetAutoUpPriority(true);
+		file->UpdateAutoUpPriority();
+	}
+
+	void KnownFile_Comment_Set(CKnownFile* file, wxString comment, int8 rating)
+	{
+		file->SetFileCommentRating(comment, rating);
+		SharedFilesUpdateItem(file);
+	}
+
+
+	void Download_Set_Cat_Prio(uint8 cat, uint8 newprio)
+	{
+		theApp->downloadqueue->SetCatPrio(cat, newprio);
+	}
+
+	void Download_Set_Cat_Status(uint8 cat, int newstatus)
+	{
+		theApp->downloadqueue->SetCatStatus(cat, newstatus);
+	}
+
+	void Upload_Resort_Queue()
+	{
+		theApp->uploadqueue->ResortQueue();
+	}
+
+	void IPFilter_Reload()
+	{
+		theApp->ipfilter->Reload();
+	}
+
+	void IPFilter_Update(wxString url)
+	{
+		theApp->ipfilter->Update(url);
+	}
+
+	void Client_Delete(CClientRef client)
+	{
+		client.Safe_Delete();
+	}
+
+#ifndef AMULE_DAEMON
+	void ConvertUpdateProgress(float percent, wxString text, wxString header)
+	{
+		CPartFileConvertDlg::UpdateProgress(percent, text, header);
+	}
+
+	void ConvertUpdateJobInfo(ConvertInfo info)
+	{
+		CPartFileConvertDlg::UpdateJobInfo(info);
+	}
+
+	void ConvertRemoveJobInfo(unsigned id)
+	{
+		CPartFileConvertDlg::RemoveJobInfo(id);
+	}
+
+	void ConvertClearInfos()
+	{
+		CPartFileConvertDlg::ClearInfo();
+	}
+
+	void ConvertRemoveJob(unsigned id)
+	{
+		CPartFileConvert::RemoveJob(id);
+	}
+
+	void ConvertRetryJob(unsigned id)
+	{
+		CPartFileConvert::RetryJob(id);
+	}
+
+	void ConvertReaddAllJobs()
+	{
+		CPartFileConvert::ReaddAllJobs();
+	}
+#endif	// #ifndef AMULE_DAEMON
+
+#endif	// #ifndef CLIENT_GUI
+
+
+// Broadcast called from every CKnownFile destruction site BEFORE
+// the `delete file`. Subscribers MUST only compare the file pointer
+// by value (==) to entries they already hold — never dereference it.
+// By the time a subscriber on the main thread processes this event
+// the bytes pointed at by `file` may already have been recycled.
+//
+// Defined outside the CLIENT_GUI / non-CLIENT_GUI split so the same
+// function compiles into both `amule` and `amulegui`. The branches
+// inside select the right subscriber set per target.
+//
+// Sites that fire this:
+//   - CPartFile::Delete()                  (user cancel)
+//   - CKnownFileList::PruneDuplicates       (TTL eviction)
+//   - CKnownFileList::~CKnownFileList       (shutdown / via Clear())
+//   - CSharedFileList::Reload()             (rebuild)
+//   - CKnownFilesRem::DeleteItem            (amulegui EC_TAG_FILE_REMOVED)
+void KnownFileBeingDestroyed(CKnownFile* file)
+{
+#ifndef AMULE_DAEMON
+	// GUI subscribers (linked into `amule` and `amulegui`).
+	if (theApp->amuledlg) {
+		// #1: CGenericClientListCtrl in the transfer window's
+		// downloads pane caches selected files in m_knownfiles;
+		// stale entries crash on the next selection change
+		// (issue #755).
+		if (theApp->amuledlg->m_transferwnd
+			&& theApp->amuledlg->m_transferwnd->clientlistctrl) {
+			theApp->amuledlg->m_transferwnd->clientlistctrl
+				->RemoveKnownFile(file);
+		}
+		// #2: CGenericClientListCtrl in the shared-files pane
+		// caches selected files the same way.
+		if (theApp->amuledlg->m_sharedfileswnd
+			&& theApp->amuledlg->m_sharedfileswnd->peerslistctrl) {
+			theApp->amuledlg->m_sharedfileswnd->peerslistctrl
+				->RemoveKnownFile(file);
+		}
+		// #3, #4, #5: open modal dialogs that captured the file
+		// pointer at construction time (CommentDialog,
+		// CommentDialogLst, FileDetailDialog). Each class keeps
+		// its own static registry of live instances so the
+		// broadcast can iterate without needing a friend.
+		CCommentDialog::DropReferencesTo(file);
+		CCommentDialogLst::DropReferencesTo(file);
+		CFileDetailDialog::DropReferencesTo(file);
+	}
+#endif
+#ifdef CLIENT_GUI
+	// Remote-GUI subscriber: null CUpDownClient::m_uploadingfile /
+	// m_reqfile on every client that points at this file (the #748
+	// crash flow). Pointer-value comparison only.
+	if (theApp->clientlist) {
+		theApp->clientlist->DropReferencesTo(file);
+	}
+#endif
+#ifndef CLIENT_GUI
+	// Daemon-side subscribers — drop pending requests/writes naming
+	// this file. Both lists are kept by background-thread machinery
+	// and would otherwise leave dangling pointers after the file is
+	// freed (see audit table in the PR description).
+	//
+	// #5: AICH static recovery-request list. Strip-by-pointer; the
+	// existing RequestAICHRecovery() guard at SHAHashSet.cpp:990 can
+	// be spoofed by allocator reuse, which this prevents.
+	CAICHHashSet::DropReferencesTo(file);
+	// #8: pending writes the CPartFileWriteThread hasn't drained yet.
+	// Without this, ~CPartFile would race the write loop.
+	if (theApp->partFileWriteThread) {
+		theApp->partFileWriteThread->DropReferencesTo(file);
+	}
+#endif
+}
+
+}
+// File_checked_for_headers

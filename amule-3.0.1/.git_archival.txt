@@ -1,0 +1,4 @@
+node: 02db0d7faecfc377694ff6242bc23346185990ed
+node-date: 2026-06-24T09:54:18-03:00
+describe-name: 3.0.1
+ref-names: tag: 3.0.1

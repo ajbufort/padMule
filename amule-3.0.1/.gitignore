@@ -1,0 +1,48 @@
+# Files created by the Visual Studio build process
+platforms/Windows/**/Debug30ALC
+platforms/Windows/**/Debug
+platforms/Windows/**/Debug30
+platforms/Windows/**/Release
+platforms/Windows/**/Release30
+platforms/Windows/**/UpgradeLog.htm
+platforms/Windows/*/libs/libGeoIP/GeoIP.c
+platforms/Windows/*/libs/libGeoIP/GeoIP.h
+platforms/Windows/*/libs/libGeoIP/GeoIP_X.c
+*.suo
+
+# Other files created by various editors
+.*~
+*~
+*.sw?
+*.orig
+**/#*#
+.#*
+
+# msgfmt artifact
+*.mo
+
+# User files (should go into .git/info/exclude)
+Makefile.user
+*.vcxproj.user
+.vscode
+
+# CMake
+build
+
+# Windows installer build artifacts
+packaging/windows/installer_strings_generated.nsh
+
+# AI coding assistants
+*.local.md
+.claude/
+.cursor/
+.windsurf/
+.copilot/
+.continue/
+.codeium/
+.tabnine/
+.gemini/
+.devin/
+.aider*
+
+.cache/
