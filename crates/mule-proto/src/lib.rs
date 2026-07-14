@@ -3,6 +3,7 @@
 
 pub mod hash;
 pub mod io;
+pub mod kad_id;
 pub mod obf;
 pub mod packet;
 pub mod rc4;
@@ -10,6 +11,7 @@ pub mod tag;
 
 pub use hash::{ed2k_hash, md4, part_count, OLD_MAX_FILE_SIZE, PARTSIZE};
 pub use io::{IoError, Reader, Writer};
+pub use kad_id::Kad128;
 pub use obf::{
     build_initiator_handshake, is_plaintext_marker, semi_random_marker, tcp_cipher, StreamCiphers,
     MAGICVALUE_REQUESTER, MAGICVALUE_SERVER, MAGICVALUE_SYNC, TCP_RC4_DISCARD,
