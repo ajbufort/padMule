@@ -95,8 +95,30 @@ to emit client-level events. **Lesson: advertise no capability you do not
 honour on the wire - a symmetric client never punishes the mismatch, a real one
 disconnects.**
 
-Remaining differential coverage (future): multi-part file + hashset over the
-wire, padMule as the UPLOADER to amuled, and obfuscated sessions (Wave 5).
+### Extended coverage (2026-07-14)
+
+- **Multi-part + hashset download: PROVEN.** padMule downloads a 15 MB /
+  2-eD2k-part file from real amuled byte-for-byte, exercising
+  OP_HASHSETREQUEST/ANSWER and per-part MD4 verification against amuled's REAL
+  hashset, over mixed compressed+raw blocks. Now in `differential-test.sh`.
+- **Upload direction (amuled pulls FROM padMule): PARTIAL.** `mule-cli
+  serve-file <port> <path>` makes padMule the uploader. A real amuled CONNECTS
+  to padMule's listener (inbound reachability + our accept path proven), but the
+  full pull is blocked by amuled-side orchestration, not padMule:
+  * amuled unconditionally rejects loopback 127/8 and (with FilterLanIPs=1, the
+    default) LAN sources - `IsGoodIP` (NetworkFunctions.cpp:133). Serve on the
+    mirrored **10.0.0.33** with **FilterLanIPs=0** so 10/8 passes (10/8 is only
+    in the conditional LAN table, not the unconditional reserved table).
+  * amuled attempts an **OBFUSCATED** client handshake by default
+    (`IsCryptLayerRequested=1`) - a Wave 5 feature padMule lacks; its one
+    successful dial failed the handshake for this reason. Disable with the three
+    `[Obfuscation]` keys = 0.
+  * amuled rewrites amule.conf on startup, so a manual pref edit needs the file
+    chmod'd read-only to stick. And a leftover `.part` makes amuled say "already
+    trying to download" and skip the link's source - clear Temp between runs.
+  * even with all that, amuled's offline link-source dialing is irregular.
+  padMule's `serve()` is independently proven by the padMule-to-padMule
+  multi_source tests. Revisit the amuled-pull after Wave 5 adds obfuscation.
 
 ## Wave 4d adversarial review + fixes (2026-07-14)
 
