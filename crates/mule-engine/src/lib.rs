@@ -7,6 +7,7 @@ pub mod credits;
 pub mod framed;
 pub mod link;
 pub mod multi_source;
+pub mod obf_handshake;
 pub mod part_file;
 pub mod part_store;
 pub mod peer;
@@ -23,6 +24,7 @@ pub use credits::score_ratio;
 pub use framed::{FrameError, FramedStream};
 pub use link::ServerLink;
 pub use multi_source::{download_from_peer, Download};
+pub use obf_handshake::{obf_accept, obf_initiate, ObfDetect};
 pub use part_file::{data_part_count, part_size, PartFile};
 pub use part_store::PartStore;
 pub use peer::{
