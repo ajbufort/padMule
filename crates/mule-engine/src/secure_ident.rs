@@ -340,6 +340,35 @@ impl SecureIdentSession {
     }
 }
 
+/// Drive the mutual secure-identification exchange to completion over a live
+/// stream, right after the hello handshake and BEFORE any file request. Returns
+/// whether the PEER proved it owns its userhash.
+///
+/// This assumes the peer sends only secure-ident packets during this phase,
+/// which is true of a real eMule/aMule client: it emits its OP_SECIDENTSTATE the
+/// moment both hello info-packets are in, and sends nothing else until we ask for
+/// a file. Any non-secure-ident packet that does arrive is ignored (it would be a
+/// protocol violation to send transfer data unprompted here).
+pub async fn run_secure_ident<S>(
+    fs: &mut crate::framed::FramedStream<S>,
+    id: &Identity,
+) -> Result<bool, crate::framed::FrameError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let mut session = SecureIdentSession::new(id);
+    fs.write_packet(&session.start()).await?;
+    while !session.is_complete() {
+        let pkt = fs.read_packet_unpacked().await?;
+        if matches!(pkt.opcode, OP_SECIDENTSTATE | OP_PUBLICKEY | OP_SIGNATURE) {
+            for reply in session.on_packet(id, pkt.opcode, &pkt.payload)? {
+                fs.write_packet(&reply).await?;
+            }
+        }
+    }
+    Ok(session.peer_verified())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
