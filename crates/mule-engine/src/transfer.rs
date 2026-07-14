@@ -259,6 +259,29 @@ pub fn build_accept_upload() -> Packet {
     Packet::new(PROT_EDONKEY, OP_ACCEPTUPLOADREQ, Vec::new())
 }
 
+/// OP_FILESTATUS advertising a PARTIAL source: which eD2k parts we hold.
+///
+/// Note the asymmetry with `build_file_status_complete`: a complete source sends
+/// a part count of 0 rather than an all-ones bitfield.
+pub fn build_file_status(hash: &[u8; 16], parts: &[bool]) -> Packet {
+    let mut w = Writer::new();
+    w.write_bytes(hash);
+    w.write_bytes(&write_part_status(parts));
+    Packet::new(PROT_EDONKEY, OP_FILESTATUS, w.into_inner())
+}
+
+/// OP_HASHSETANSWER: the per-part MD4 list, which the downloader needs before it
+/// can verify anything on a multi-part file.
+pub fn build_hashset_answer(hash: &[u8; 16], part_hashes: &[[u8; 16]]) -> Packet {
+    let mut w = Writer::new();
+    w.write_bytes(hash);
+    w.write_u16(part_hashes.len() as u16);
+    for h in part_hashes {
+        w.write_bytes(h);
+    }
+    Packet::new(PROT_EDONKEY, OP_HASHSETANSWER, w.into_inner())
+}
+
 /// OP_SENDINGPART / _I64: serve a block `data` covering `[start, end)`. Uses the
 /// 64-bit variant when an offset exceeds 32 bits.
 pub fn build_sending_part(hash: &[u8; 16], start: u64, end: u64, data: &[u8]) -> Packet {

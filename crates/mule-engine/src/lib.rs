@@ -6,7 +6,9 @@ pub mod connection;
 pub mod credits;
 pub mod framed;
 pub mod link;
+pub mod multi_source;
 pub mod part_file;
+pub mod part_store;
 pub mod peer;
 pub mod peer_conn;
 pub mod search;
@@ -20,7 +22,9 @@ pub use connection::{connect_server, login_handshake, ServerEvent, ServerState};
 pub use credits::score_ratio;
 pub use framed::{FrameError, FramedStream};
 pub use link::ServerLink;
+pub use multi_source::{download_from_peer, Download};
 pub use part_file::{data_part_count, part_size, PartFile};
+pub use part_store::PartStore;
 pub use peer::{
     build_hello, build_hello_answer, parse_hello, Capabilities, HelloInfo, ParsedHello,
 };
