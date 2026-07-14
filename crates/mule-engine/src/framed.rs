@@ -41,22 +41,56 @@ impl From<std::io::Error> for FrameError {
     }
 }
 
-/// Reads and writes eD2k packets over an async byte stream.
+/// Reads and writes eD2k packets over an async byte stream, optionally through
+/// the eMule obfuscation layer (RC4 on the raw bytes). Obfuscation is transparent
+/// to the packet codec: the ciphers are applied to exactly the bytes read from /
+/// written to the socket, in order, which is all a stream cipher needs.
 pub struct FramedStream<S> {
     stream: S,
     buf: Vec<u8>,
+    /// RC4 ciphers when the stream is obfuscated (`send` encrypts our writes,
+    /// `recv` decrypts reads). `None` for a plaintext stream.
+    ciphers: Option<mule_proto::StreamCiphers>,
 }
 
 impl<S> FramedStream<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    /// Wrap `stream`.
+    /// Wrap `stream` as a plaintext connection.
     pub fn new(stream: S) -> Self {
         FramedStream {
             stream,
             buf: Vec::new(),
+            ciphers: None,
         }
+    }
+
+    /// Wrap `stream` as an OBFUSCATED connection whose handshake has already run,
+    /// yielding `ciphers`. `prefix` is any already-read plaintext bytes to
+    /// re-inject (normally empty for the obfuscated case).
+    pub fn obfuscated(stream: S, ciphers: mule_proto::StreamCiphers) -> Self {
+        FramedStream {
+            stream,
+            buf: Vec::new(),
+            ciphers: Some(ciphers),
+        }
+    }
+
+    /// Wrap `stream` as plaintext, but with `prefix` bytes already consumed from
+    /// it (e.g. the marker byte the obfuscation auto-detector peeked and found to
+    /// be a plaintext eD2k header). Those bytes are the head of the first packet.
+    pub fn plaintext_with_prefix(stream: S, prefix: &[u8]) -> Self {
+        FramedStream {
+            stream,
+            buf: prefix.to_vec(),
+            ciphers: None,
+        }
+    }
+
+    /// True if this connection is obfuscated.
+    pub fn is_obfuscated(&self) -> bool {
+        self.ciphers.is_some()
     }
 
     /// Read the next full packet, awaiting more bytes as needed. Errors with
@@ -71,6 +105,10 @@ where
             let n = self.stream.read(&mut chunk).await?;
             if n == 0 {
                 return Err(FrameError::Closed);
+            }
+            // Decrypt exactly the bytes just read, in order, before framing.
+            if let Some(c) = self.ciphers.as_mut() {
+                c.recv.apply(&mut chunk[..n]);
             }
             self.buf.extend_from_slice(&chunk[..n]);
         }
@@ -89,7 +127,11 @@ where
 
     /// Write one packet and flush it.
     pub async fn write_packet(&mut self, p: &Packet) -> Result<(), FrameError> {
-        let bytes = write_packet(p);
+        let mut bytes = write_packet(p);
+        // Encrypt exactly the bytes we are about to send, in order.
+        if let Some(c) = self.ciphers.as_mut() {
+            c.send.apply(&mut bytes);
+        }
         self.stream.write_all(&bytes).await?;
         self.stream.flush().await?;
         Ok(())
