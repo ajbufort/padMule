@@ -94,7 +94,29 @@ bullet each; newest first.
   not the working tree. Rejected: C++ port of amuled (wxWidgets pervades the
   engine; zero upstream iOS support), hybrid C++-then-Rust (pays both costs).
 
+## Lessons
+
+- 2026-07-14 **Agent-derived constants are a HYPOTHESIS until a test pins them
+  against real bytes.** The Wave-4d research pass reported the source-exchange
+  record sizes as 14/30/31. They are 12/28/29 - upstream's own size checks are
+  literally `nCount*(4+2+4+2)[+16][+1]`. The agent's FIELD LIST was right and its
+  SIZE COLUMN was wrong, and the two contradicted each other in the same table.
+  Because SX1 resolves the record version BY PACKET SIZE, shipping the wrong
+  numbers would have made padMule silently reject every real source-exchange
+  answer on the network - a bug that would have looked like "source exchange just
+  does not work" and been miserable to trace. A byte-exact test caught it in
+  minutes, because the test asserted the LAYOUT (offsets and total length), not
+  just that a round-trip succeeded. Rule: for any wire/file format, assert the
+  actual byte offsets and sizes - a round-trip test alone would have passed here,
+  since our writer and reader were consistently wrong together.
+- 2026-07-14 **Upstream is a reference, not an authority.** Wave 4d found four
+  genuine aMule 3.0.1 bugs in the subsystems it touched (see [[build-progress]]).
+  Replicate-then-improve means replicating the WIRE, not the mistakes: where aMule
+  and eMule disagree and eMule is right, follow eMule. Every such divergence is
+  documented at its call site so it is never "fixed" back into a bug.
+
 ## Related
 
 - [[arch-upstream-amule]]
 - [[ref-ecosystem]]
+- [[build-progress]]

@@ -25,12 +25,42 @@ ends at a differential/round-trip gate.
 | 4a | client-to-client peer connection + inbound listener | (implemented directly) | DONE (30 tests): peer_handshake_outbound/inbound, connect_peer/accept_peer; two engines handshake on loopback. mule-cli `listen` command for HighID validation. |
 | 4b | download-side transfer message codecs | (implemented directly) | DONE (37 tests): request_filename/setreqfileid/startupload/hashset, file-status bitfield, request_parts (3-block u32/u64), sending_part, queue-ranking. |
 | 4c | first end-to-end transfer (two engines) | (implemented directly) | DONE (40 tests): download_file + serve_file; two engines transfer a 3-block file on loopback, ed2k hash matches byte-for-byte. Next: write to a real .part, multi-part+hashset, differential vs local amuled. |
-| 4d | upload side + queue/slots + credits + source exchange + corruption; get-sources codec | - | not started |
+| 4d | upload side + queue/slots + credits + source exchange + corruption; get-sources codec | (implemented directly) | MOSTLY DONE (158 workspace tests). 4d-1/2 credits + clients.met + upload queue/slots/ranking; 4d-3 source exchange (SX1/SX2 v1-v4) + get-sources + LowID callback; 4d-4/5 PartFile block allocation + corruption handling. Fixed 4 aMule bugs rather than replicating them (see below). REMAINING: disk-backed .part I/O, multi-source driver, differential test vs a local amuled. |
 | 5 | obfuscation + secure ident | - | not started |
 | 6 | `mule-kad` (+ `nodes.dat` format, moved here) | - | not started |
 | 7 | `mule-ec` + `mule-cli` parity (IP filter, UPnP, categories) | - | not started |
 | 8 | `mule-ffi` + `ios/padMule` SwiftUI shell + lifecycle + sideload | - | not started. Must render the honest status notice + per-transfer Paused badges + Reconnecting banner, and wire ScenePhase -> engine pause()/resume() ([[lifecycle-and-reactivation]]). |
 | 9 | (v1.1) seedbox mode | - | not started |
+
+## Wave 4d notes - aMule bugs we deliberately do NOT replicate (2026-07-14)
+
+Source-grounded research for Wave 4d (docs/raw/wave4d-upstream-research-2026-07-14.md)
+turned up genuine defects in aMule 3.0.1 in exactly the subsystems the wave
+builds. Per [[decisions-and-lessons]] replicate-then-improve, faithful
+replication here would be WRONG. Each divergence is documented at its call site.
+
+1. **Exactly-PARTSIZE file is permanently corrupt.** aMule verifies a single-part file
+   against the FILE hash, but a 9,728,000-byte file has a two-entry hashset (real
+   part + empty-MD4 sentinel), so the file hash is `MD4(h0 || h_empty) != h0`.
+   The part never verifies, on every retry. We use eMule's guard
+   (`part_count > 1 || size == PARTSIZE`). A test builds exactly that file.
+2. **aMule cannot receive a standalone `OP_REQUESTSOURCES2`** - it checks
+   `size != 16` (SX2 is 19 bytes) and reads the hash at offset 0 instead of 3, so
+   it throws and disconnects. Still broken in amule-master.
+3. **SX id byte order gated on the wrong version** in `CPartFile` - sends
+   byte-reversed source IPs when a peer's SX1 and SX2 versions disagree. aMule's
+   own `CKnownFile` and eMule both get it right; we gate on the version written.
+4. **OBFU found-sources userhash flag is 0x80**, not `0x08` as the header comment
+   says. The code is right; the comment lies.
+
+Also: aMule's ICH (intelligent corruption handling) is unreachable dead code in
+3.0.1 - do not "faithfully" port a dead path.
+
+**Lesson (recorded in [[decisions-and-lessons]]):** our own research pass got the
+SX record sizes wrong (14/30/31; they are 12/28/29). Since SX1 resolves the
+record version BY PACKET SIZE, that would have made padMule reject every real
+source-exchange answer. A byte-exact test caught it within minutes. Agent-derived
+constants are a hypothesis until a test pins them against the actual bytes.
 
 ## Review pass (2026-07-12)
 
