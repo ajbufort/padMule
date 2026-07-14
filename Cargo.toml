@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/mule-proto", "crates/mule-files", "crates/mule-engine"]
+members = [
+    "crates/mule-proto",
+    "crates/mule-files",
+    "crates/mule-engine",
+    "crates/mule-cli",
+]
 
 [workspace.package]
 edition = "2021"

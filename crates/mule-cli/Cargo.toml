@@ -1,0 +1,16 @@
+[package]
+name = "mule-cli"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "mule-cli"
+path = "src/main.rs"
+
+[dependencies]
+mule-proto = { path = "../mule-proto" }
+mule-files = { path = "../mule-files" }
+mule-engine = { path = "../mule-engine" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
