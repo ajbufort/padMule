@@ -13,6 +13,7 @@ pub mod part_store;
 pub mod peer;
 pub mod peer_conn;
 pub mod search;
+pub mod secure_ident;
 pub mod server_messages;
 pub mod sources;
 pub mod transfer;
@@ -34,6 +35,7 @@ pub use peer_conn::{
     accept_peer, connect_peer, connect_peer_obf, peer_handshake_inbound, peer_handshake_outbound,
 };
 pub use search::{build_search_request, parse_search_result, SearchParams, SearchResultFile};
+pub use secure_ident::{verify_v1, Identity};
 pub use server_messages::{
     build_login_request, is_low_id, parse_id_change, parse_server_ident, parse_server_list,
     parse_server_message, parse_server_status, IdChange, LoginRequest, ServerIdent,
