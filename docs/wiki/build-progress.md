@@ -76,6 +76,44 @@ the upstream ctest suite (an independent cross-check of our tag/io/hash codecs
 via aMule's own CTagTest/FileDataIOTest). Deps missing as of 2026-07-14; cmake
 absent too.
 
+## Wave 4d adversarial review + fixes (2026-07-14)
+
+8-dimension multi-agent review of all Wave 4d code against the C++ oracles, each
+finding attacked by 3 independent skeptics (majority-refute kills it). 6 real
+defects survived; ALL fixed and cross-checked against eMule 0.50a as the wire
+authority. None were catchable by padMule-to-padMule tests - they only appear
+against a real/hostile peer, which is exactly what the review substitutes for
+until the amuled differential test runs.
+
+- HIGH remote PANIC: a peer sending data longer than its declared range hit
+  `copy_from_slice` with mismatched lengths (transfer_session).
+- HIGH remote HANG: a zero-length block (start==end) advanced the completion
+  counter by 0 forever (both download loops).
+- HIGH interop break: padMule advertises `data_comp=1`, so a stock uploader
+  sends `OP_COMPRESSEDPART` (0x40/0xA1); the loop only matched OP_SENDINGPART and
+  silently dropped them -> every real-network download of a compressible file
+  hung. Fix required per-block STREAMING zlib inflate (each fragment carries the
+  block START; write position = running total_out), matching eMule's
+  ProcessBlockPacket (DownloadClient.cpp:1201) exactly.
+- The three collapse into ONE hardened `BlockReceiver` that both download loops
+  route through, killing the duplicated receive logic that let the same bug live
+  in two copies. Guards reject zip-bomb over-expansion and short streams.
+- MEDIUM unverified accept: `needs_hashset` gated on `data_part_count > 1`, so an
+  exactly-PARTSIZE file never fetched its hashset and was moved into place
+  UNVERIFIED - silently defeating the PARTSIZE-bug fix. Now matches verify_part.
+- MEDIUM x2 wrong large-file boundary: used `u32::MAX` where it is
+  `OLD_MAX_FILE_SIZE = 4_290_048_000` (eMule OLD_MAX_EMULE_FILE_SIZE, same value,
+  = `(u32::MAX / PARTSIZE) * PARTSIZE`). Files in the ~4.9M-byte band between them
+  were mis-encoded on the wire (OP_GETSOURCES) and in .part.met.
+
+180 workspace tests (was 166); 14 new regression tests pin each finding.
+
+**Lesson (in [[decisions-and-lessons]]):** for wire behaviour, eMule 0.50a is the
+source of truth - not aMule. The fixes were derived from aMule and then CONFIRMED
+identical in eMule (bounds guard DownloadClient.cpp:1123, compressed opcodes +
+inflate formula, the 4_290_048_000 constant). Cross-checking turned "probably
+fine" into "verified"; do it on every wire fix, not just when a bug is suspected.
+
 ## Review pass (2026-07-12)
 
 Multi-agent adversarial review of Wave 1 + 1b (3 dimensions completed before a

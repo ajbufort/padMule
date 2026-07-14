@@ -114,6 +114,23 @@ bullet each; newest first.
   Replicate-then-improve means replicating the WIRE, not the mistakes: where aMule
   and eMule disagree and eMule is right, follow eMule. Every such divergence is
   documented at its call site so it is never "fixed" back into a bug.
+- 2026-07-14 **eMule 0.50a is the wire source of truth; CONFIRM every wire fix
+  against it, not just aMule.** (Anthony reinforced this mid-Wave-4d.) padMule is
+  an aMule PORT, so LOCAL POLICY (queue-score curves, credit thresholds, slot
+  counts) follows aMule deliberately. But the WIRE - opcodes, byte layouts,
+  guards, constants that other clients observe - is defined by eMule; aMule is
+  just one implementation of it, and a buggy one in places. Workflow: derive a
+  fix from whichever tree is clearest, then grep the OTHER tree to confirm the
+  bytes match before banking it. Doing this on the 6 Wave-4d review fixes upgraded
+  them from "cited aMule, probably fine" to "verified identical in eMule"
+  (bounds guard, compressed opcodes + inflate, the 4_290_048_000 boundary). Note
+  eMule's .cpp files have high-bit bytes - use `grep -a` or you get silent
+  zero-hit false negatives.
+- 2026-07-14 **A duplicated code path is a duplicated bug.** The Wave-4d review
+  found the SAME panic and hang in BOTH download loops (transfer_session and
+  multi_source) because the receive logic was copy-pasted. The fix extracted one
+  hardened `BlockReceiver` both route through. When two places implement the same
+  wire behaviour, factor it - or the next reviewer files the same finding twice.
 
 ## Related
 
