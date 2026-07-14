@@ -21,8 +21,8 @@ use std::time::Duration;
 use mule_engine::peer::HelloInfo;
 use mule_engine::server_messages::{LoginRequest, DEFAULT_SERVER_FLAGS};
 use mule_engine::{
-    connect_peer, connect_peer_obf, download_from_peer, peer_handshake_inbound, serve, Download,
-    FramedStream, PartStore, ServedFile, ServerEvent, ServerLink, ServerState,
+    connect_peer, connect_peer_obf, download_from_peer, obf_accept, peer_handshake_inbound, serve,
+    Download, FramedStream, ObfDetect, PartStore, ServedFile, ServerEvent, ServerLink, ServerState,
 };
 use mule_files::read_server_met;
 use mule_proto::ed2k_hash;
@@ -453,7 +453,22 @@ async fn cmd_serve_file(port: u16, path: &str) {
         let data = data.clone();
         let name = name.clone();
         tokio::spawn(async move {
-            let mut fs = FramedStream::new(stream);
+            let mut stream = stream;
+            // Auto-detect obfuscation (real aMule requests it by default) keyed
+            // off our own userhash, then run the hello handshake.
+            let mut fs = match obf_accept(&mut stream, &me.user_hash).await {
+                Ok(ObfDetect::Obfuscated(c)) => {
+                    println!("  [obfuscated]");
+                    FramedStream::obfuscated(stream, *c)
+                }
+                Ok(ObfDetect::Plaintext { first }) => {
+                    FramedStream::plaintext_with_prefix(stream, &[first])
+                }
+                Err(e) => {
+                    eprintln!("  obf detect failed: {e}");
+                    return;
+                }
+            };
             if let Err(e) = peer_handshake_inbound(&mut fs, &me).await {
                 eprintln!("  handshake failed: {e}");
                 return;
