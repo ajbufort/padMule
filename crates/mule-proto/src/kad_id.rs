@@ -12,9 +12,9 @@
 //! ```
 //!
 //! i.e. each 4-byte group is byte-reversed, but the group order is preserved.
-//! Reading the raw hash bytes as a Kad ID (or vice versa) targets the WRONG node
-//! - the single most common Kad interop bug. This type keeps the canonical hash
-//! and the wire form strictly separate: [`Kad128::from_hash`] / [`Kad128::to_hash`]
+//! Reading the raw hash bytes as a Kad ID (or vice versa) targets the WRONG node,
+//! the single most common Kad interop bug. This type keeps the canonical hash and
+//! the wire form strictly separate: [`Kad128::from_hash`] / [`Kad128::to_hash`]
 //! take the canonical MD4/SHA form, while [`Kad128::from_wire`] / [`Kad128::to_wire`]
 //! take the serialised form.
 
