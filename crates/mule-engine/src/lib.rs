@@ -30,7 +30,9 @@ pub use part_store::PartStore;
 pub use peer::{
     build_hello, build_hello_answer, parse_hello, Capabilities, HelloInfo, ParsedHello,
 };
-pub use peer_conn::{accept_peer, connect_peer, peer_handshake_inbound, peer_handshake_outbound};
+pub use peer_conn::{
+    accept_peer, connect_peer, connect_peer_obf, peer_handshake_inbound, peer_handshake_outbound,
+};
 pub use search::{build_search_request, parse_search_result, SearchParams, SearchResultFile};
 pub use server_messages::{
     build_login_request, is_low_id, parse_id_change, parse_server_ident, parse_server_list,

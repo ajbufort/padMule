@@ -21,8 +21,8 @@ use std::time::Duration;
 use mule_engine::peer::HelloInfo;
 use mule_engine::server_messages::{LoginRequest, DEFAULT_SERVER_FLAGS};
 use mule_engine::{
-    connect_peer, download_from_peer, peer_handshake_inbound, serve, Download, FramedStream,
-    PartStore, ServedFile, ServerEvent, ServerLink, ServerState,
+    connect_peer, connect_peer_obf, download_from_peer, peer_handshake_inbound, serve, Download,
+    FramedStream, PartStore, ServedFile, ServerEvent, ServerLink, ServerState,
 };
 use mule_files::read_server_met;
 use mule_proto::ed2k_hash;
@@ -385,16 +385,33 @@ async fn cmd_serve_file(port: u16, path: &str) {
 /// the real multi-source path (disk-backed PartStore, hashset exchange, block
 /// receive incl. compressed parts, and verification against the peer's hashset).
 /// This is the padMule side of the amuled differential test.
-async fn cmd_peer_download(addr: SocketAddr, hash: [u8; 16], size: u64, out: &str) {
+async fn cmd_peer_download(
+    addr: SocketAddr,
+    hash: [u8; 16],
+    size: u64,
+    out: &str,
+    obf_target: Option<[u8; 16]>,
+) {
     println!(
-        "connecting to peer {addr} for {} ({size} bytes) ...",
-        hex16(&hash)
+        "connecting to peer {addr} for {} ({size} bytes){} ...",
+        hex16(&hash),
+        if obf_target.is_some() {
+            " [obfuscated]"
+        } else {
+            ""
+        }
     );
     // Advertise client id 0 (LowID/unregistered): we have no server-assigned
     // HighID, and a non-LowID id that does not match our real source IP trips
     // aMule's ParanoidFilter (ClientTCPSocket.cpp:300).
     let me = HelloInfo::baseline(demo_user_hash(), 0, 4662, 4672, "padMule");
-    let (peer, mut fs) = match connect_peer(addr, &me).await {
+    let connect = async {
+        match obf_target {
+            Some(th) => connect_peer_obf(addr, &me, &th).await,
+            None => connect_peer(addr, &me).await,
+        }
+    };
+    let (peer, mut fs) = match connect.await {
         Ok(v) => v,
         Err(e) => {
             eprintln!("peer connect/handshake failed: {e}");
@@ -402,9 +419,14 @@ async fn cmd_peer_download(addr: SocketAddr, hash: [u8; 16], size: u64, out: &st
         }
     };
     println!(
-        "handshake OK with {} (port {})",
+        "handshake OK with {} (port {}){}",
         hex16(&peer.user_hash),
-        peer.tcp_port
+        peer.tcp_port,
+        if fs.is_obfuscated() {
+            " [obfuscated session]"
+        } else {
+            ""
+        }
     );
 
     let dir = Path::new(out).parent().unwrap_or(Path::new("."));
@@ -517,18 +539,22 @@ async fn main() {
                 (_, None) => eprintln!("bad hash: {}", args[4]),
             }
         }
-        Some("peer-download") if args.len() == 7 => {
+        // peer-download <host> <port> <hash> <size> <out> [obfuscate-peer-hash]
+        Some("peer-download") if args.len() == 7 || args.len() == 8 => {
             let hostport = format!("{}:{}", args[2], args[3]);
             let addr = hostport.to_socket_addrs().ok().and_then(|mut it| it.next());
             let hash = parse_hex16(&args[4]);
             let size: Option<u64> = args[5].parse().ok();
-            match (addr, hash, size) {
-                (Some(addr), Some(hash), Some(size)) => {
-                    cmd_peer_download(addr, hash, size, &args[6]).await
+            // Optional 8th arg: the peer's userhash -> obfuscate the connection.
+            let obf = args.get(7).map(|s| parse_hex16(s));
+            match (addr, hash, size, obf) {
+                (_, _, _, Some(None)) => eprintln!("bad obfuscation peer-hash: {}", args[7]),
+                (Some(addr), Some(hash), Some(size), obf) => {
+                    cmd_peer_download(addr, hash, size, &args[6], obf.flatten()).await
                 }
-                (None, _, _) => eprintln!("cannot resolve {hostport}"),
-                (_, None, _) => eprintln!("bad hash (need 32 hex chars): {}", args[4]),
-                (_, _, None) => eprintln!("bad size: {}", args[5]),
+                (None, ..) => eprintln!("cannot resolve {hostport}"),
+                (_, None, ..) => eprintln!("bad hash (need 32 hex chars): {}", args[4]),
+                (_, _, None, _) => eprintln!("bad size: {}", args[5]),
             }
         }
         _ => {
@@ -537,7 +563,8 @@ async fn main() {
             eprintln!("  mule-cli login-any <server.met>");
             eprintln!("  mule-cli listen [port]");
             eprintln!("  mule-cli hash-file <path>");
-            eprintln!("  mule-cli peer-download <host> <port> <hash-hex> <size> <out>");
+            eprintln!("  mule-cli serve-file <port> <path>");
+            eprintln!("  mule-cli peer-download <host> <port> <hash> <size> <out> [obf-peer-hash]");
         }
     }
 }
