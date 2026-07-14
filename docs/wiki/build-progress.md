@@ -21,8 +21,8 @@ ends at a differential/round-trip gate.
 | 3b-2 | search codec + server list/ident | `plans/2026-07-13-wave3b2-search-codec.md` | DONE (15 mule-engine tests): build_search_request (ANDed-terms), parse_search_result, parse_server_list, parse_server_ident. Full boolean tree (OR/NOT) + global UDP search + OP_FOUNDSOURCES deferred. |
 | 3c-1 | async framing + login handshake (tokio) | (implemented directly, no separate plan doc) | DONE (21 mule-engine tests): FramedStream, ServerState/ServerEvent, login_handshake, connect_server. Mock-server tested. |
 | 3c-2 | pause/resume ServerLink + mule-cli live harness | `plans/2026-07-13-wave3c2-link-and-cli.md` | DONE (23 mule-engine tests): ServerLink connect/pause/resume over a real loopback socket; mule-cli login / login-any. Live run: see note below. |
-| 3d | get-sources + single-source download to .part; differential vs amuled | - | not started |
-| 4 | multi-source + upload + queue + credits + SX + corruption | - | not started |
+| 3d | client-to-client peer HELLO codec | (implemented directly) | DONE (28 mule-engine tests): build_hello/answer, baseline MISCOPTIONS1/2 (0x34103212/0x438) byte-verified, parse_hello + Capabilities. Pivoted from get-sources (server-dependent, untestable here) to the peer protocol (locally testable). |
+| 4 | file transfer: request -> queue -> slot -> blocks -> .part; upload; credits; SX; corruption; get-sources codec; differential vs local amuled | - | not started |
 | 5 | obfuscation + secure ident | - | not started |
 | 6 | `mule-kad` (+ `nodes.dat` format, moved here) | - | not started |
 | 7 | `mule-ec` + `mule-cli` parity (IP filter, UPnP, categories) | - | not started |
