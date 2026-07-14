@@ -10,6 +10,7 @@ pub mod peer_conn;
 pub mod search;
 pub mod server_messages;
 pub mod transfer;
+pub mod transfer_session;
 
 pub use connection::{connect_server, login_handshake, ServerEvent, ServerState};
 pub use framed::{FrameError, FramedStream};

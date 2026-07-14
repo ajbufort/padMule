@@ -30,6 +30,10 @@ pub const EMBLOCKSIZE: u64 = 184_320;
 /// Blocks requested per OP_REQUESTPARTS on the wire (always 3).
 pub const STANDARD_BLOCKS_REQUEST: usize = 3;
 
+/// A parsed OP_REQUESTPARTS: the file hash plus its `(start, end_exclusive)`
+/// blocks (zero-padding removed).
+pub type RequestedBlocks = ([u8; 16], Vec<(u64, u64)>);
+
 fn read_hash16(r: &mut Reader) -> Result<[u8; 16], IoError> {
     let mut h = [0u8; 16];
     h.copy_from_slice(&r.read_bytes(16)?);
@@ -193,6 +197,76 @@ pub fn parse_sending_part(payload: &[u8], i64: bool) -> Result<SendingPart, IoEr
     })
 }
 
+/// OP_REQFILENAMEANSWER: reply to a filename request (hash + filename).
+pub fn build_req_filename_answer(hash: &[u8; 16], name: &[u8]) -> Packet {
+    let mut w = Writer::new();
+    w.write_bytes(hash);
+    w.write_string_u16(name);
+    Packet::new(PROT_EDONKEY, OP_REQFILENAMEANSWER, w.into_inner())
+}
+
+/// OP_FILESTATUS advertising a COMPLETE source (part count 0).
+pub fn build_file_status_complete(hash: &[u8; 16]) -> Packet {
+    let mut w = Writer::new();
+    w.write_bytes(hash);
+    w.write_u16(0);
+    Packet::new(PROT_EDONKEY, OP_FILESTATUS, w.into_inner())
+}
+
+/// OP_ACCEPTUPLOADREQ (empty): grant the requester an upload slot.
+pub fn build_accept_upload() -> Packet {
+    Packet::new(PROT_EDONKEY, OP_ACCEPTUPLOADREQ, Vec::new())
+}
+
+/// OP_SENDINGPART / _I64: serve a block `data` covering `[start, end)`. Uses the
+/// 64-bit variant when an offset exceeds 32 bits.
+pub fn build_sending_part(hash: &[u8; 16], start: u64, end: u64, data: &[u8]) -> Packet {
+    let i64 = start > u32::MAX as u64 || end > u32::MAX as u64;
+    let mut w = Writer::new();
+    w.write_bytes(hash);
+    if i64 {
+        w.write_u64(start);
+        w.write_u64(end);
+        w.write_bytes(data);
+        Packet::new(PROT_EMULE, OP_SENDINGPART_I64, w.into_inner())
+    } else {
+        w.write_u32(start as u32);
+        w.write_u32(end as u32);
+        w.write_bytes(data);
+        Packet::new(PROT_EDONKEY, OP_SENDINGPART, w.into_inner())
+    }
+}
+
+/// Parse OP_REQUESTPARTS (`i64 = false`) or _I64 (`i64 = true`): the file hash
+/// and the non-empty `(start, end_exclusive)` blocks (zero-padding is dropped).
+pub fn parse_request_parts(payload: &[u8], i64: bool) -> Result<RequestedBlocks, IoError> {
+    let mut r = Reader::new(payload);
+    let hash = read_hash16(&mut r)?;
+    let mut starts = [0u64; STANDARD_BLOCKS_REQUEST];
+    let mut ends = [0u64; STANDARD_BLOCKS_REQUEST];
+    for s in starts.iter_mut() {
+        *s = if i64 {
+            r.read_u64()?
+        } else {
+            r.read_u32()? as u64
+        };
+    }
+    for e in ends.iter_mut() {
+        *e = if i64 {
+            r.read_u64()?
+        } else {
+            r.read_u32()? as u64
+        };
+    }
+    let blocks = starts
+        .iter()
+        .zip(ends.iter())
+        .filter(|(s, e)| e > s)
+        .map(|(&s, &e)| (s, e))
+        .collect();
+    Ok((hash, blocks))
+}
+
 /// Parse OP_HASHSETANSWER: (file hash, part hashes).
 pub fn parse_hashset_answer(payload: &[u8]) -> Result<([u8; 16], Vec<[u8; 16]>), IoError> {
     let mut r = Reader::new(payload);
@@ -289,6 +363,25 @@ mod tests {
         assert_eq!((sp.start, sp.end), (100, 104));
         assert_eq!(sp.data, vec![0xDE, 0xAD, 0xBE, 0xEF]);
         assert_eq!(sp.data.len() as u64, sp.end - sp.start);
+    }
+
+    #[test]
+    fn request_parts_parse_round_trip() {
+        let blocks = vec![(0u64, 184_320u64), (184_320, 300_000)];
+        let pkt = build_request_parts(&H, &blocks);
+        let (hash, got) = parse_request_parts(&pkt.payload, false).unwrap();
+        assert_eq!(hash, H);
+        assert_eq!(got, blocks); // zero third slot dropped
+    }
+
+    #[test]
+    fn sending_part_build_parse_round_trip() {
+        let data = vec![0x55u8; 300];
+        let pkt = build_sending_part(&H, 1000, 1300, &data);
+        assert_eq!(pkt.opcode, OP_SENDINGPART);
+        let sp = parse_sending_part(&pkt.payload, false).unwrap();
+        assert_eq!((sp.start, sp.end), (1000, 1300));
+        assert_eq!(sp.data, data);
     }
 
     #[test]

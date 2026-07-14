@@ -76,6 +76,17 @@ where
         }
     }
 
+    /// Read the next packet, transparently decompressing it if it arrived
+    /// zlib-packed (protocol 0xD4/0xF5/0xE5).
+    pub async fn read_packet_unpacked(&mut self) -> Result<Packet, FrameError> {
+        let pkt = self.read_packet().await?;
+        if pkt.protocol == mule_proto::PROT_PACKED {
+            Ok(mule_proto::decompress(&pkt, mule_proto::MAX_PACKET_SIZE)?)
+        } else {
+            Ok(pkt)
+        }
+    }
+
     /// Write one packet and flush it.
     pub async fn write_packet(&mut self, p: &Packet) -> Result<(), FrameError> {
         let bytes = write_packet(p);
