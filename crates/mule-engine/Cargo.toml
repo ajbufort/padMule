@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+mule-files = { path = "../mule-files" }
 mule-proto = { path = "../mule-proto" }
 tokio = { workspace = true, features = ["net", "io-util", "sync", "rt", "time"] }
 
