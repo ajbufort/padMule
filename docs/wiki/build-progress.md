@@ -24,7 +24,7 @@ ends at a differential/round-trip gate.
 | 3d | client-to-client peer HELLO codec | (implemented directly) | DONE (28 mule-engine tests): build_hello/answer, baseline MISCOPTIONS1/2 (0x34103212/0x438) byte-verified, parse_hello + Capabilities. Pivoted from get-sources (server-dependent, untestable here) to the peer protocol (locally testable). |
 | 4a | client-to-client peer connection + inbound listener | (implemented directly) | DONE (30 tests): peer_handshake_outbound/inbound, connect_peer/accept_peer; two engines handshake on loopback. mule-cli `listen` command for HighID validation. |
 | 4b | download-side transfer message codecs | (implemented directly) | DONE (37 tests): request_filename/setreqfileid/startupload/hashset, file-status bitfield, request_parts (3-block u32/u64), sending_part, queue-ranking. |
-| 4c | transfer state machine: drive request->queue->slot->3-block loop -> write .part -> verify hash; two engines + differential vs local amuled | - | not started |
+| 4c | first end-to-end transfer (two engines) | (implemented directly) | DONE (40 tests): download_file + serve_file; two engines transfer a 3-block file on loopback, ed2k hash matches byte-for-byte. Next: write to a real .part, multi-part+hashset, differential vs local amuled. |
 | 4d | upload side + queue/slots + credits + source exchange + corruption; get-sources codec | - | not started |
 | 5 | obfuscation + secure ident | - | not started |
 | 6 | `mule-kad` (+ `nodes.dat` format, moved here) | - | not started |
