@@ -7,7 +7,7 @@
 use crate::framed::{FrameError, FramedStream};
 use crate::transfer::{
     build_accept_upload, build_file_status, build_file_status_complete, build_hashset_answer,
-    build_req_filename_answer, build_request_filename, build_request_parts, build_sending_part,
+    build_req_filename_answer, build_request_filename_ext, build_request_parts, build_sending_part,
     build_set_req_file_id, build_start_upload_req, parse_file_status, parse_request_parts,
     BlockReceiver, EMBLOCKSIZE, OP_ACCEPTUPLOADREQ, OP_FILEREQANSNOFIL, OP_FILESTATUS,
     OP_HASHSETREQUEST, OP_REQUESTFILENAME, OP_REQUESTPARTS, OP_REQUESTPARTS_I64, OP_SETREQFILEID,
@@ -58,7 +58,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     // Ask for the file and its status.
-    fs.write_packet(&build_request_filename(hash)).await?;
+    fs.write_packet(&build_request_filename_ext(hash)).await?;
     fs.write_packet(&build_set_req_file_id(hash)).await?;
     loop {
         let pkt = fs.read_packet_unpacked().await?;

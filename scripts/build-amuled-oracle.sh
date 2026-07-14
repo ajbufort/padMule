@@ -15,10 +15,17 @@ SRC="$REPO/amule-3.0.1"
 BUILD="$REPO/build-oracle"
 
 echo "== configuring amuled (daemon only, no GUI) =="
+# Disable optional features that need extra libraries but are irrelevant to a
+# protocol differential-test oracle: GeoIP (libmaxminddb), libbfd backtraces,
+# UPnP, and national-language support (gettext).
 cmake -S "$SRC" -B "$BUILD" \
   -DBUILD_DAEMON=ON \
   -DBUILD_MONOLITHIC=OFF \
   -DBUILD_TESTING=ON \
+  -DENABLE_IP2COUNTRY=NO \
+  -DENABLE_UPNP=NO \
+  -DENABLE_BFD=NO \
+  -DENABLE_NLS=NO \
   -DCMAKE_BUILD_TYPE=Release
 
 echo "== building =="
