@@ -25,7 +25,7 @@ ends at a differential/round-trip gate.
 | 4a | client-to-client peer connection + inbound listener | (implemented directly) | DONE (30 tests): peer_handshake_outbound/inbound, connect_peer/accept_peer; two engines handshake on loopback. mule-cli `listen` command for HighID validation. |
 | 4b | download-side transfer message codecs | (implemented directly) | DONE (37 tests): request_filename/setreqfileid/startupload/hashset, file-status bitfield, request_parts (3-block u32/u64), sending_part, queue-ranking. |
 | 4c | first end-to-end transfer (two engines) | (implemented directly) | DONE (40 tests): download_file + serve_file; two engines transfer a 3-block file on loopback, ed2k hash matches byte-for-byte. Next: write to a real .part, multi-part+hashset, differential vs local amuled. |
-| 4d | upload side + queue/slots + credits + source exchange + corruption; get-sources codec | (implemented directly) | MOSTLY DONE (158 workspace tests). 4d-1/2 credits + clients.met + upload queue/slots/ranking; 4d-3 source exchange (SX1/SX2 v1-v4) + get-sources + LowID callback; 4d-4/5 PartFile block allocation + corruption handling. Fixed 4 aMule bugs rather than replicating them (see below). REMAINING: disk-backed .part I/O, multi-source driver, differential test vs a local amuled. |
+| 4d | upload side + queue/slots + credits + source exchange + corruption; get-sources codec | (implemented directly) | MOSTLY DONE (166 workspace tests). 4d-1/2 credits + clients.met + upload queue/slots/ranking; 4d-3 source exchange (SX1/SX2 v1-v4) + get-sources + LowID callback; 4d-4/5 PartFile block allocation + corruption handling; 4d-6 disk-backed PartStore (.part + byte-compat .part.met, resume, atomic save); 4d-7 multi-source Download driver (shared block reservations, release-on-disconnect, hashset exchange, 3-peer + disjoint-parts + dead-peer tests). Fixed 4 aMule bugs rather than replicating them (see below). Under adversarial multi-agent review (2026-07-14). REMAINING for the wave GATE: differential test vs a local amuled (needs the C++ build deps - see below). |
 | 5 | obfuscation + secure ident | - | not started |
 | 6 | `mule-kad` (+ `nodes.dat` format, moved here) | - | not started |
 | 7 | `mule-ec` + `mule-cli` parity (IP filter, UPnP, categories) | - | not started |
@@ -61,6 +61,20 @@ SX record sizes wrong (14/30/31; they are 12/28/29). Since SX1 resolves the
 record version BY PACKET SIZE, that would have made padMule reject every real
 source-exchange answer. A byte-exact test caught it within minutes. Agent-derived
 constants are a hypothesis until a test pins them against the actual bytes.
+
+## Differential test vs amuled - the true Wave 4 gate (BLOCKED on build deps)
+
+Every transfer proven so far has padMule on BOTH ends, which cannot catch a
+mistake made consistently in both directions (exactly how the SX record-size
+error slipped past our own round-trip tests). The real oracle is a headless
+`amuled` built from `amule-3.0.1/`, with padMule transferring a file to/from it.
+
+Blocked on C++ build deps that need Anthony's password once:
+`sudo apt install -y cmake libwxgtk3.2-dev libcrypto++-dev zlib1g-dev`.
+Then `scripts/build-amuled-oracle.sh` configures daemon-only, builds, and runs
+the upstream ctest suite (an independent cross-check of our tag/io/hash codecs
+via aMule's own CTagTest/FileDataIOTest). Deps missing as of 2026-07-14; cmake
+absent too.
 
 ## Review pass (2026-07-12)
 
