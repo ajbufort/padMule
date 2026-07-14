@@ -251,4 +251,50 @@ mod tests {
         drop(fs); // closes the connection so the uploader returns
         uploader.await.unwrap();
     }
+
+    #[tokio::test]
+    async fn secure_ident_then_transfer_on_one_connection() {
+        // Both engines run the mutual secure-ident exchange right after the hello,
+        // THEN transfer the file - proving identity and transfer coexist on one
+        // connection with no dropped packets (each side sends its signature before
+        // any transfer packet, so run_secure_ident returns before the transfer).
+        use crate::secure_ident::{run_secure_ident, Identity};
+
+        let file: Vec<u8> = (0..250_000u32)
+            .map(|i| (i.wrapping_mul(17)) as u8)
+            .collect();
+        let hash = ed2k_hash(&file);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let up_file = file.clone();
+        let uploader = tokio::spawn(async move {
+            let bob_id = Identity::generate();
+            let bob = HelloInfo::baseline([0xBB; 16], 0, 4662, 4672, "bob");
+            let (_peer, mut fs) = accept_peer(&listener, &bob).await.unwrap();
+            let verified = run_secure_ident(&mut fs, &bob_id).await.unwrap();
+            serve_file(&mut fs, &hash, b"secure.bin", &up_file)
+                .await
+                .unwrap();
+            verified
+        });
+
+        let alice_id = Identity::generate();
+        let alice = HelloInfo::baseline([0xAA; 16], 0x0A00_0001, 4663, 4673, "alice");
+        let (_peer, mut fs) = connect_peer(addr, &alice).await.unwrap();
+        let peer_verified = run_secure_ident(&mut fs, &alice_id).await.unwrap();
+        let got = download_file(&mut fs, &hash, file.len() as u64)
+            .await
+            .unwrap();
+
+        // Each side verified the other's identity...
+        assert!(peer_verified, "downloader must verify the uploader");
+        // ...and the file transferred correctly THROUGH the same connection.
+        assert_eq!(got, file);
+
+        drop(fs);
+        let uploader_verified = uploader.await.unwrap();
+        assert!(uploader_verified, "uploader must verify the downloader");
+    }
 }
