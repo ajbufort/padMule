@@ -7,6 +7,15 @@ bullet each; newest first.
 
 ## Locked decisions
 
+- 2026-07-13 **LIVE-VALIDATED: padMule logged into a real eD2k server.**
+  Against 45.87.41.16:6262 (emule-security.org list) - LowID assigned (NATed
+  box), full connect/pause/resume/reconnect lifecycle worked. Proves Wave 3a-3c
+  end-to-end against real server software; the exact login tags/flags/version
+  interoperated first try. LESSON: the WSL2 env does NOT block P2P ports
+  (arbitrary outbound + UDP work); earlier all-fail runs were STALE server
+  lists. Always use a current trusted list: `http://upd.emule-security.org/
+  server.met`. See [[build-progress]], [[ref-ecosystem]].
+
 - 2026-07-13 **Background pause is avoidable best-effort, not always-on.** The
   ~30s suspend is the only OS-GUARANTEED behavior, but sideloading unlocks the
   audio/location keepalive (App-Store-review-blocked, but we are not reviewed)

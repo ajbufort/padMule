@@ -108,29 +108,42 @@ Decomposed so most protocol logic stays offline-testable before any socket:
   `.part` via the 3-block window, verify the ed2k hash. First differential test
   vs `amuled`. See [[protocol-understanding]] for all flows.
 
-## Live networking: environment blocks eD2k server ports (2026-07-13)
+## LIVE VALIDATED against a real eD2k server (2026-07-13)
 
-The Wave 3c-2 live run VALIDATED the code as far as this box allows but could
-NOT complete a real server handshake:
-- `mule-files::read_server_met` parsed TWO real server.met files (25 and 27
-  servers) correctly - the "golden-vectors-only" caveat is partly retired.
-- IP decoding (LE-octet) produced real eD2k addresses; the ServerLink state
-  machine drove Connecting -> timeout/Disconnected with correct timeouts and
-  error surfacing.
-- BUT every eD2k-port connection (both mule-cli and raw bash /dev/tcp to 4
-  hand-picked known servers) timed out or was unroutable, while HTTP/HTTPS
-  works. Conclusion: outbound to P2P ports is filtered from this WSL2 env (or
-  the public eD2k server network is largely dead in 2026). Environment limit,
-  NOT a code defect.
+padMule successfully LOGGED IN to a live eD2k server: `45.87.41.16:6262` (from
+the emule-security.org trusted list), assigned a LowID (expected - this NATed
+box cannot accept the server's HighID connect-back test). Full lifecycle also
+validated live: connect -> pause -> resume -> reconnect (fresh LowID each time)
+-> disconnect. So Wave 3a-3c (login handshake, framing, IDCHANGE parse,
+ServerLink pause/resume) are proven end-to-end against real server software, not
+just mocks. The byte-level fidelity (exact login tags/flags/version) interoperated
+with the real eD2k network on the first try.
 
-Implications for the true end-to-end proof:
-- The SERVER login handshake needs a reachable eD2k SERVER (scarce/blocked
-  here). amuled is a CLIENT/daemon, not a server, so it does not help here.
-- Better local proof paths: (a) CLIENT-TO-CLIENT differential test vs a local
-  amuled in Wave 4 (no server or internet needed - two peers on loopback); (b)
-  Kad bootstrap against the real Kad network over UDP in Wave 6 (if UDP outbound
-  is allowed here - untested); (c) the real iPad on home Wi-Fi later; (d) a
-  locally-run open-source ed2k server if we obtain one.
+CORRECTION to an earlier wrong finding: this WSL2 env does NOT block P2P ports.
+Arbitrary outbound ports work (SSH 22, DNS 53, DoT 853, IRC 6667 all open; UDP
+egress works). The earlier all-fail runs were STALE server lists (the 38.107.x
+block and some server-met.de entries are dead). Lesson: use a CURRENT, trusted
+list. Working source: `http://upd.emule-security.org/server.met` (0xE0 header,
+~9 servers). Good news for later: Kad UDP (Wave 6) should work from here too.
+
+Remaining live gaps: HighID needs an inbound-reachable client (NAT/port-forward,
+or the real iPad on home Wi-Fi). Client-to-client transfer will be validated in
+Wave 4 (two peers on loopback + differential vs a local amuled - no server
+needed).
+
+### eMule vs aMule format/server notes (Anthony flagged 2026-07-13)
+
+- server.met format is the SAME for eMule and aMule (0xE0/0x0E header + tag
+  records); confirmed - our parser read emule-security.org's file fine.
+- The eD2k SERVER software (eserver/lugdunum) is shared; both eMule and aMule
+  connect identically. Our aMule-based login interoperated with a real server,
+  confirming aMule's login is eMule-network-compatible (aMule mirrors eMule).
+- String tags: eMule writes some BOM-prefixed strings; aMule 3.0.1 does not. Our
+  reader accepts BOM (preserves raw bytes); strip the BOM only for DISPLAY
+  (server names). Non-load-bearing for connecting. See [[decisions-and-lessons]]
+  tag-codec divergences.
+- We advertise SO_AMULE (software id 3) in CT_EMULE_VERSION, so peers/servers see
+  us as an aMule client - correct and intended.
 
 ## Test fixtures / live data (from [[ref-ecosystem]])
 
