@@ -12,6 +12,15 @@ pub fn md4(data: &[u8]) -> [u8; 16] {
 /// eD2k part size in bytes (aMule PARTSIZE).
 pub const PARTSIZE: u64 = 9_728_000;
 
+/// The largest file the OLD 32-bit eD2k protocol could address. A file STRICTLY
+/// larger than this is a "large file" (`IsLargeFile()` upstream, Constants.h:77
+/// OLD_MAX_FILE_SIZE) and must use the 64-bit-size wire and .met encodings.
+///
+/// Note this is 4,290,048,000 - a good 4.9 million bytes BELOW `u32::MAX`
+/// (4,294,967,295). Using `u32::MAX` as the boundary would mis-encode files in
+/// that band, so the two must not be confused.
+pub const OLD_MAX_FILE_SIZE: u64 = 4_290_048_000;
+
 /// eD2k part count for a file of `size` bytes: floor(size/PARTSIZE) + 1.
 ///
 /// This is aMule's `m_iED2KPartCount` (used in OP_FILESTATUS and the part-status

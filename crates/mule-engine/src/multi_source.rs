@@ -25,11 +25,12 @@ use crate::part_file::data_part_count;
 use crate::part_store::PartStore;
 use crate::transfer::{
     build_hashset_request, build_request_filename, build_request_parts, build_set_req_file_id,
-    build_start_upload_req, parse_file_status, parse_hashset_answer, parse_sending_part,
-    FileStatus, OP_ACCEPTUPLOADREQ, OP_FILEREQANSNOFIL, OP_FILESTATUS, OP_HASHSETANSWER,
-    OP_SENDINGPART, OP_SENDINGPART_I64, STANDARD_BLOCKS_REQUEST,
+    build_start_upload_req, parse_file_status, parse_hashset_answer, BlockReceiver, FileStatus,
+    OP_ACCEPTUPLOADREQ, OP_FILEREQANSNOFIL, OP_FILESTATUS, OP_HASHSETANSWER,
+    STANDARD_BLOCKS_REQUEST,
 };
 use crate::transfer_session::TransferError;
+use mule_proto::PARTSIZE;
 
 /// One file being pulled from many peers.
 pub struct Download {
@@ -68,11 +69,18 @@ impl Download {
         self.inner.lock().await.store.pf.missing()
     }
 
-    /// True if this is a multi-part file and we still lack the part hashes, so
-    /// nothing can be verified yet.
+    /// True if we still need the part-hash list before anything can be verified.
+    ///
+    /// This MUST match `PartFile::verify_part`'s "use the part hash" condition
+    /// (`data_part_count > 1 || size == PARTSIZE`). An exactly-PARTSIZE file has a
+    /// single data part but a two-entry hashset, so it verifies against the PART
+    /// hash - if we gated only on `> 1` we would never fetch the hashset, and the
+    /// file would be moved into place UNVERIFIED, defeating the very divergence
+    /// that exists to catch a corrupt PARTSIZE file.
     pub async fn needs_hashset(&self) -> bool {
         let g = self.inner.lock().await;
-        data_part_count(g.store.pf.size) > 1 && g.store.pf.part_hashes.is_empty()
+        let size = g.store.pf.size;
+        (data_part_count(size) > 1 || size == PARTSIZE) && g.store.pf.part_hashes.is_empty()
     }
 
     pub async fn set_hashset(&self, hashes: Vec<[u8; 16]>) {
@@ -195,6 +203,7 @@ where
     }
 
     // Fetch blocks until this peer has nothing we still need.
+    let size = dl.size().await;
     loop {
         let blocks = dl.take_blocks(&status, STANDARD_BLOCKS_REQUEST).await;
         if blocks.is_empty() {
@@ -202,21 +211,16 @@ where
         }
         held.extend_from_slice(&blocks);
 
-        let want: u64 = blocks.iter().map(|(s, e)| e - s).sum();
         fs.write_packet(&build_request_parts(&hash, &blocks))
             .await?;
 
-        let mut got = 0u64;
-        while got < want {
+        // One hardened receiver validates every reply (raw or compressed) against
+        // exactly these blocks - a hostile peer cannot panic or wedge it.
+        let mut rx = BlockReceiver::new(hash, size, &blocks);
+        while !rx.is_done() {
             let pkt = fs.read_packet_unpacked().await?;
-            let i64 = pkt.opcode == OP_SENDINGPART_I64;
-            if pkt.opcode == OP_SENDINGPART || i64 {
-                let sp = parse_sending_part(&pkt.payload, i64)?;
-                if sp.end > dl.size().await || sp.start > sp.end {
-                    return Err(TransferError::BadBlock);
-                }
-                got += sp.data.len() as u64;
-                dl.commit(sp.start, &sp.data)
+            for w in rx.accept(pkt.opcode, &pkt.payload)? {
+                dl.commit(w.offset, &w.data)
                     .await
                     .map_err(TransferError::Io)?;
             }
@@ -243,6 +247,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[tokio::test]
+    async fn an_exactly_partsize_file_still_fetches_its_hashset() {
+        // Review finding 4: needs_hashset gated on `> 1` skipped the hashset for a
+        // single-DATA-part PARTSIZE file, so verify_part returned None forever and
+        // the file was accepted UNVERIFIED. It must report needing the hashset.
+        let dir = tmpdir("needs-hashset");
+        let store = PartStore::create(&dir, 1, [0xAB; 16], PARTSIZE, b"exact.bin").unwrap();
+        let dl = Download::new(store);
+        assert_eq!(data_part_count(PARTSIZE), 1, "one DATA part");
+        assert!(dl.needs_hashset().await, "must still fetch the hashset");
+
+        // Once the hashset is set, it no longer needs one.
+        dl.set_hashset(vec![[1; 16], [2; 16]]).await;
+        assert!(!dl.needs_hashset().await);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Spawn a serving peer that holds `available` parts of `data`.

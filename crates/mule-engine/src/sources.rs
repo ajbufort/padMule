@@ -33,7 +33,9 @@
 //! - The OBFU "userhash follows" flag is `0x80`. The upstream header comment says
 //!   `0x08`; the code says `0x80`. The code is right.
 
-use mule_proto::{compress, IoError, Packet, Reader, Writer, PROT_EDONKEY, PROT_EMULE};
+use mule_proto::{
+    compress, IoError, Packet, Reader, Writer, OLD_MAX_FILE_SIZE, PROT_EDONKEY, PROT_EMULE,
+};
 
 // Server (0xE3).
 pub const OP_GETSOURCES: u8 = 0x19;
@@ -142,16 +144,24 @@ fn sx_id_from_wire(id: u32, version: u8) -> u32 {
 
 // ---------------------------------------------------------------- server side
 
+/// True if `size` needs the 64-bit ("large file") eD2k encodings. Boundary is
+/// `OLD_MAX_FILE_SIZE`, NOT `u32::MAX` - the two differ by ~4.9 M bytes and a
+/// file in that band must still be treated as large.
+pub fn is_large_file(size: u64) -> bool {
+    size > OLD_MAX_FILE_SIZE
+}
+
 /// OP_GETSOURCES: ask our server who has this file.
 ///
 /// aMule never sends the bare 16-byte legacy form - the size always goes out.
-/// A file over 4 GiB uses the sentinel form (`0u32` then a u64 size) and requires
-/// a server advertising large-file support; upstream DROPS the request rather
-/// than downgrading it, so the caller must gate on that flag.
+/// A LARGE file (`is_large_file`) uses the sentinel form (`0u32` then a u64 size).
+/// Upstream requires the server to advertise large-file support and DROPS the
+/// request otherwise rather than downgrading it, so the caller MUST gate a large
+/// file on that server flag - hence [`is_large_file`] is public.
 pub fn build_get_sources(hash: &[u8; 16], size: u64, obfuscated: bool) -> Packet {
     let mut w = Writer::new();
     w.write_bytes(hash);
-    if size > u32::MAX as u64 {
+    if is_large_file(size) {
         w.write_u32(0); // sentinel: a 64-bit size follows
         w.write_u64(size);
     } else {
@@ -446,6 +456,26 @@ mod tests {
         assert_eq!(p.payload.len(), 16 + 4 + 8);
         assert_eq!(&p.payload[16..20], &0u32.to_le_bytes());
         assert_eq!(&p.payload[20..28], &size.to_le_bytes());
+    }
+
+    #[test]
+    fn the_large_file_boundary_is_old_max_not_u32_max() {
+        // Review finding 5: the boundary is OLD_MAX_FILE_SIZE (4_290_048_000),
+        // confirmed identical in eMule 0.50a (OLD_MAX_EMULE_FILE_SIZE). A file in
+        // the (OLD_MAX_FILE_SIZE, u32::MAX] band must use the 64-bit sentinel form,
+        // NOT a plain u32 - otherwise a server that knows the file under its true
+        // 64-bit size never matches the query.
+        assert!(!is_large_file(OLD_MAX_FILE_SIZE));
+        assert!(is_large_file(OLD_MAX_FILE_SIZE + 1));
+        assert!(is_large_file(u32::MAX as u64)); // the band that u32::MAX would miss
+
+        // Exactly at the boundary: plain u32 form.
+        let at = build_get_sources(&H, OLD_MAX_FILE_SIZE, false);
+        assert_eq!(at.payload.len(), 16 + 4);
+        // One byte over: 64-bit sentinel form.
+        let over = build_get_sources(&H, OLD_MAX_FILE_SIZE + 1, false);
+        assert_eq!(over.payload.len(), 16 + 4 + 8);
+        assert_eq!(&over.payload[16..20], &0u32.to_le_bytes());
     }
 
     #[test]

@@ -9,9 +9,9 @@ use crate::transfer::{
     build_accept_upload, build_file_status, build_file_status_complete, build_hashset_answer,
     build_req_filename_answer, build_request_filename, build_request_parts, build_sending_part,
     build_set_req_file_id, build_start_upload_req, parse_file_status, parse_request_parts,
-    parse_sending_part, EMBLOCKSIZE, OP_ACCEPTUPLOADREQ, OP_FILEREQANSNOFIL, OP_FILESTATUS,
-    OP_HASHSETREQUEST, OP_REQUESTFILENAME, OP_REQUESTPARTS, OP_REQUESTPARTS_I64, OP_SENDINGPART,
-    OP_SENDINGPART_I64, OP_SETREQFILEID, OP_STARTUPLOADREQ, STANDARD_BLOCKS_REQUEST,
+    BlockReceiver, EMBLOCKSIZE, OP_ACCEPTUPLOADREQ, OP_FILEREQANSNOFIL, OP_FILESTATUS,
+    OP_HASHSETREQUEST, OP_REQUESTFILENAME, OP_REQUESTPARTS, OP_REQUESTPARTS_I64, OP_SETREQFILEID,
+    OP_STARTUPLOADREQ, STANDARD_BLOCKS_REQUEST,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -21,7 +21,7 @@ pub enum TransferError {
     Frame(FrameError),
     /// The peer does not have the file (OP_FILEREQANSNOFIL).
     NoFile,
-    /// A received block fell outside the file bounds.
+    /// The peer sent a data packet outside what we asked for (see `BlockError`).
     BadBlock,
     /// Writing to the `.part` file failed.
     Io(std::io::Error),
@@ -36,6 +36,13 @@ impl From<FrameError> for TransferError {
 impl From<mule_proto::IoError> for TransferError {
     fn from(e: mule_proto::IoError) -> Self {
         TransferError::Frame(FrameError::Protocol(e))
+    }
+}
+
+impl From<crate::transfer::BlockError> for TransferError {
+    fn from(_: crate::transfer::BlockError) -> Self {
+        // Every BlockError means the peer sent something outside the request.
+        TransferError::BadBlock
     }
 }
 
@@ -76,7 +83,10 @@ where
     }
 
     // Block-request loop: up to 3 blocks of EMBLOCKSIZE per batch, refilled
-    // until the file is complete.
+    // until the file is complete. The same hardened BlockReceiver the
+    // multi-source driver uses validates every reply, so this shares its
+    // panic/hang/compression handling rather than re-implementing (and
+    // re-mis-implementing) the receive logic.
     let mut buf = vec![0u8; size as usize];
     let mut next = 0u64;
     while next < size {
@@ -90,22 +100,14 @@ where
             blocks.push((off, end));
             off = end;
         }
-        let batch_total: u64 = blocks.iter().map(|(s, e)| e - s).sum();
         fs.write_packet(&build_request_parts(hash, &blocks)).await?;
 
-        let mut batch_got = 0u64;
-        while batch_got < batch_total {
+        let mut rx = BlockReceiver::new(*hash, size, &blocks);
+        while !rx.is_done() {
             let pkt = fs.read_packet_unpacked().await?;
-            let is_i64 = pkt.opcode == OP_SENDINGPART_I64;
-            if pkt.opcode == OP_SENDINGPART || is_i64 {
-                let sp = parse_sending_part(&pkt.payload, is_i64)?;
-                let s = sp.start as usize;
-                let e = sp.end as usize;
-                if e > buf.len() || s > e {
-                    return Err(TransferError::BadBlock);
-                }
-                buf[s..e].copy_from_slice(&sp.data);
-                batch_got += sp.data.len() as u64;
+            for w in rx.accept(pkt.opcode, &pkt.payload)? {
+                let s = w.offset as usize;
+                buf[s..s + w.data.len()].copy_from_slice(&w.data);
             }
         }
         next = off;
