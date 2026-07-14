@@ -13,6 +13,7 @@ the Ingest / Query / Lint workflows.
 ## Platform
 - [[ipados-constraints]] - iPadOS/Rust-on-iOS constraints; foreground-only engine, sockets OK, free-team sideload limits, storage plan (verified 2026).
 - [[lifecycle-and-reactivation]] - HARD requirement: honest status notice + clean pause/resume across focus loss; shapes the engine state model from Wave 3c.
+- [[net-highid-and-port-forwarding]] - the 5-link inbound chain (router forward, DHCP reservation, Windows + Hyper-V firewalls, WSL mirrored mode); HighID VALIDATED live 2026-07-14. iPad needs UPnP (Wave 7).
 
 ## Reference
 - [[ref-ecosystem]] - eMule AI fork, eMule-Board dev forums, official aMule docs site.

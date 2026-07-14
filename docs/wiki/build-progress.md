@@ -1,6 +1,6 @@
 # Build Progress
 
-Updated: 2026-07-12
+Updated: 2026-07-14
 
 Wave-by-wave status of the padMule Rust engine (waves defined in
 `docs/superpowers/specs/2026-07-12-padmule-design.md` section 10). Each wave
@@ -129,10 +129,28 @@ block and some server-met.de entries are dead). Lesson: use a CURRENT, trusted
 list. Working source: `http://upd.emule-security.org/server.met` (0xE0 header,
 ~9 servers). Good news for later: Kad UDP (Wave 6) should work from here too.
 
-Remaining live gaps: HighID needs an inbound-reachable client (NAT/port-forward,
-or the real iPad on home Wi-Fi). Client-to-client transfer will be validated in
-Wave 4 (two peers on loopback + differential vs a local amuled - no server
-needed).
+## HIGHID ACHIEVED - inbound chain validated live (2026-07-14)
+
+padMule now gets a **HighID** from the live server `45.87.41.16:6262`:
+`Connected { id: <client-id>, low_id: false }`. `<client-id>` = `<client-id-hex>` ->
+decodes (LE, first octet low) to **<public-ip>** = our public IP, which is what a
+HighID IS - and it independently confirms our client-ID decode against real
+server software. The `mule-cli listen 4662` listener logged the server's
+connect-back arriving from the internet (`45.87.41.16:49144`). Pause/resume kept
+HighID.
+
+This closes the 2026-07-13 gap (same server gave LowID then). All five inbound
+links now work: router forward -> DHCP reservation -> Windows Firewall ->
+Hyper-V firewall (the mirrored-mode trap) -> WSL mirrored networking -> our
+listener. Full detail + how to re-validate: [[net-highid-and-port-forwarding]].
+
+Observed: the server's HighID test is a bare TCP connect+close, no eD2k HELLO -
+a successful accept is enough. Our listener treats that as the healthy path.
+
+Remaining live gaps: the dev-box forward does NOT carry to the iPad; on-device
+HighID needs UPnP/NAT-PMP (raises Wave 7's priority), and cellular/CGNAT will
+force LowID regardless. Client-to-client transfer is validated on loopback
+(Wave 4c); differential vs a local amuled still pending.
 
 ### eMule vs aMule format/server notes (Anthony flagged 2026-07-13)
 
