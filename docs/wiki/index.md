@@ -22,6 +22,9 @@ the Ingest / Query / Lint workflows.
 - [[decisions-and-lessons]] - locked decisions, rejected approaches, gotchas.
 - [[build-progress]] - wave-by-wave build status; Wave 1 eD2k hashing done.
 
+## Backlog / feature ideas
+- [[feature-server-hunter]] - discover + verify live eD2k servers (auto-update, health-check, server-graph crawl); NOT literal whole-net scanning. Future work.
+
 ## Strategy
 (Engine = Rust rewrite, decided 2026-07-12, see [[decisions-and-lessons]].
 Remaining forks - deploy/signing path, v1 scope, background strategy - being
