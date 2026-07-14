@@ -9,6 +9,10 @@ rust-version.workspace = true
 flate2 = { workspace = true }
 mule-files = { path = "../mule-files" }
 mule-proto = { path = "../mule-proto" }
+rsa = { workspace = true }
+sha1 = { workspace = true }
+base64 = { workspace = true }
+rand = { workspace = true }
 tokio = { workspace = true, features = ["net", "io-util", "sync", "rt", "time"] }
 
 [dev-dependencies]
