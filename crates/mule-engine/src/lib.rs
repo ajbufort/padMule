@@ -10,6 +10,7 @@ pub mod peer;
 pub mod peer_conn;
 pub mod search;
 pub mod server_messages;
+pub mod sources;
 pub mod transfer;
 pub mod transfer_session;
 pub mod upload_queue;
@@ -27,6 +28,12 @@ pub use server_messages::{
     build_login_request, is_low_id, parse_id_change, parse_server_ident, parse_server_list,
     parse_server_message, parse_server_status, IdChange, LoginRequest, ServerIdent,
     DEFAULT_SERVER_FLAGS, EMULE_VERSION_TAG,
+};
+pub use sources::{
+    build_answer_sources, build_callback_request, build_get_sources, build_request_sources,
+    build_request_sources2, parse_answer_sources, parse_callback_requested, parse_found_sources,
+    parse_request_sources, parse_request_sources2, CallbackRequested, FoundSource, Source,
+    SOURCE_EXCHANGE_VERSION,
 };
 pub use upload_queue::{
     max_slots, peer_score, should_kick, FilePriority, QueuedPeer, UploadQueue, FRIEND_SLOT_SCORE,

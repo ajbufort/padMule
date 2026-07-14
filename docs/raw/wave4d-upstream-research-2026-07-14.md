@@ -266,10 +266,17 @@ Record layouts:
 
 | ver | fields | size |
 |-----|--------|------|
-| 1 | id u32 (ed2k), port u16, server_ip u32, server_port u16 | **14** |
-| 2 | v1 + userhash 16 | **30** |
-| 3 | same fields as v2, but id is **hybrid** (byte-swapped) | **30** |
-| 4 | v3 + crypt u8 | **31** |
+| 1 | id u32 (ed2k), port u16, server_ip u32, server_port u16 | **12** |
+| 2 | v1 + userhash 16 | **28** |
+| 3 | same fields as v2, but id is **hybrid** (byte-swapped) | **28** |
+| 4 | v3 + crypt u8 | **29** |
+
+CORRECTED 2026-07-14: the research pass first reported these as 14/30/31. That
+was WRONG - it double-counted 2 bytes. Upstream's own size checks are literally
+`nCount*(4+2+4+2)`, `nCount*(4+2+4+2+16)`, `nCount*(4+2+4+2+16+1)`
+(`A/PartFile.cpp:2934-2946`), i.e. **12 / 28 / 29**. This matters because SX1
+disambiguates the record version BY PACKET SIZE - the wrong table would have made
+padMule reject every real source-exchange answer. Caught by a byte-exact test.
 
 crypt byte = `(requires << 2) | (requests << 1) | supports`. Bits 3-7 reserved
 (eMule's "DirectCallback" bit 3 is commented out in 0.50a - not on the wire).
@@ -277,9 +284,9 @@ crypt byte = `(requires << 2) | (requests << 1) | supports`. Bits 3-7 reserved
 **v2 and v3 are the same length**, so an SX1 receiver disambiguates by the
 sender's *announced* SX1 version:
 ```
-count*14 == size -> v1  (require announced == 1, else DROP)
-count*30 == size -> v2 if announced == 2; v3 if announced > 2; else DROP
-count*31 == size -> v4  (require announced == 4, else DROP)
+count*12 == size -> v1  (require announced == 1, else DROP)
+count*28 == size -> v2 if announced == 2; v3 if announced > 2; else DROP
+count*29 == size -> v4  (require announced == 4, else DROP)
 else                DROP
 ```
 For SX2 the version byte in the packet governs; valid range 1..=4.
