@@ -20,7 +20,7 @@ ends at a differential/round-trip gate.
 | 3b | `mule-engine` crate + login-handshake codecs (offline) | `plans/2026-07-13-wave3b-login-codecs.md` | DONE (8 tests): build_login_request, parse_id_change/server_message/server_status. |
 | 3b-2 | search codec + server list/ident | `plans/2026-07-13-wave3b2-search-codec.md` | DONE (15 mule-engine tests): build_search_request (ANDed-terms), parse_search_result, parse_server_list, parse_server_ident. Full boolean tree (OR/NOT) + global UDP search + OP_FOUNDSOURCES deferred. |
 | 3c-1 | async framing + login handshake (tokio) | (implemented directly, no separate plan doc) | DONE (21 mule-engine tests): FramedStream, ServerState/ServerEvent, login_handshake, connect_server. Mock-server tested. |
-| 3c-2 | live server smoke test + pause/resume ServerLink | - | not started |
+| 3c-2 | pause/resume ServerLink + mule-cli live harness | `plans/2026-07-13-wave3c2-link-and-cli.md` | DONE (23 mule-engine tests): ServerLink connect/pause/resume over a real loopback socket; mule-cli login / login-any. Live run: see note below. |
 | 3d | get-sources + single-source download to .part; differential vs amuled | - | not started |
 | 4 | multi-source + upload + queue + credits + SX + corruption | - | not started |
 | 5 | obfuscation + secure ident | - | not started |
@@ -107,6 +107,30 @@ Decomposed so most protocol logic stays offline-testable before any socket:
 - 3d: OP_GETSOURCES -> OP_FOUNDSOURCES, connect a source, download one file to a
   `.part` via the 3-block window, verify the ed2k hash. First differential test
   vs `amuled`. See [[protocol-understanding]] for all flows.
+
+## Live networking: environment blocks eD2k server ports (2026-07-13)
+
+The Wave 3c-2 live run VALIDATED the code as far as this box allows but could
+NOT complete a real server handshake:
+- `mule-files::read_server_met` parsed TWO real server.met files (25 and 27
+  servers) correctly - the "golden-vectors-only" caveat is partly retired.
+- IP decoding (LE-octet) produced real eD2k addresses; the ServerLink state
+  machine drove Connecting -> timeout/Disconnected with correct timeouts and
+  error surfacing.
+- BUT every eD2k-port connection (both mule-cli and raw bash /dev/tcp to 4
+  hand-picked known servers) timed out or was unroutable, while HTTP/HTTPS
+  works. Conclusion: outbound to P2P ports is filtered from this WSL2 env (or
+  the public eD2k server network is largely dead in 2026). Environment limit,
+  NOT a code defect.
+
+Implications for the true end-to-end proof:
+- The SERVER login handshake needs a reachable eD2k SERVER (scarce/blocked
+  here). amuled is a CLIENT/daemon, not a server, so it does not help here.
+- Better local proof paths: (a) CLIENT-TO-CLIENT differential test vs a local
+  amuled in Wave 4 (no server or internet needed - two peers on loopback); (b)
+  Kad bootstrap against the real Kad network over UDP in Wave 6 (if UDP outbound
+  is allowed here - untested); (c) the real iPad on home Wi-Fi later; (d) a
+  locally-run open-source ed2k server if we obtain one.
 
 ## Test fixtures / live data (from [[ref-ecosystem]])
 
