@@ -18,6 +18,7 @@ pub const OP_HASHSETREQUEST: u8 = 0x51; // E3
 pub const OP_HASHSETANSWER: u8 = 0x52; // E3
 pub const OP_STARTUPLOADREQ: u8 = 0x54; // E3
 pub const OP_ACCEPTUPLOADREQ: u8 = 0x55; // E3
+pub const OP_OUTOFPARTREQS: u8 = 0x57; // E3
 pub const OP_REQUESTFILENAME: u8 = 0x58; // E3
 pub const OP_REQFILENAMEANSWER: u8 = 0x59; // E3
 pub const OP_QUEUERANKING: u8 = 0x60; // C5 (eMule ext)
@@ -72,9 +73,49 @@ pub fn parse_req_filename_answer(payload: &[u8]) -> Result<([u8; 16], Vec<u8>), 
     Ok((hash, name))
 }
 
+/// OP_QUEUERANKING payload is exactly this long: a u16 rank + 10 zero bytes.
+/// Upstream rejects any other size outright, so we do too.
+pub const QUEUE_RANKING_LEN: usize = 12;
+
 /// Parse OP_QUEUERANKING (u16 rank + 10 zero pad).
 pub fn parse_queue_ranking(payload: &[u8]) -> Result<u16, IoError> {
+    if payload.len() != QUEUE_RANKING_LEN {
+        return Err(IoError::UnexpectedEof);
+    }
     Reader::new(payload).read_u16()
+}
+
+/// OP_QUEUERANKING: tell a waiting downloader its 1-BASED place in our queue.
+///
+/// Rank 0 means "not queued" and is never sent - callers must not pass it.
+/// The 10 trailing zero bytes are not optional; upstream size-checks the packet.
+/// This is sent only on queue insertion and on each re-ask, NOT on a timer.
+pub fn build_queue_ranking(rank: u16) -> Packet {
+    debug_assert!(
+        rank > 0,
+        "rank is 1-based; 0 means not queued and is not sent"
+    );
+    let mut w = Writer::new();
+    w.write_u16(rank);
+    w.write_bytes(&[0u8; QUEUE_RANKING_LEN - 2]);
+    Packet::new(PROT_EMULE, OP_QUEUERANKING, w.into_inner())
+}
+
+/// OP_OUTOFPARTREQS (empty): revoke a slot, bouncing the peer back to the queue.
+/// Upstream immediately re-queues the client, so a fresh OP_QUEUERANKING follows.
+pub fn build_out_of_part_reqs() -> Packet {
+    Packet::new(PROT_EDONKEY, OP_OUTOFPARTREQS, Vec::new())
+}
+
+/// OP_FILEREQANSNOFIL: "I do not have that file."
+///
+/// Note the upstream asymmetry this mirrors: only OP_SETREQFILEID (and the
+/// multipackets) get this answer. An OP_REQUESTFILENAME or OP_STARTUPLOADREQ for
+/// an unknown file is answered with SILENCE, not with this packet.
+pub fn build_file_req_ans_no_fil(hash: &[u8; 16]) -> Packet {
+    let mut w = Writer::new();
+    w.write_bytes(hash);
+    Packet::new(PROT_EDONKEY, OP_FILEREQANSNOFIL, w.into_inner())
 }
 
 /// Which parts of a file a peer holds (OP_FILESTATUS).

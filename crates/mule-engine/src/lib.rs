@@ -3,6 +3,7 @@
 //! See docs/wiki/protocol-understanding.md.
 
 pub mod connection;
+pub mod credits;
 pub mod framed;
 pub mod link;
 pub mod peer;
@@ -11,8 +12,10 @@ pub mod search;
 pub mod server_messages;
 pub mod transfer;
 pub mod transfer_session;
+pub mod upload_queue;
 
 pub use connection::{connect_server, login_handshake, ServerEvent, ServerState};
+pub use credits::score_ratio;
 pub use framed::{FrameError, FramedStream};
 pub use link::ServerLink;
 pub use peer::{
@@ -24,4 +27,7 @@ pub use server_messages::{
     build_login_request, is_low_id, parse_id_change, parse_server_ident, parse_server_list,
     parse_server_message, parse_server_status, IdChange, LoginRequest, ServerIdent,
     DEFAULT_SERVER_FLAGS, EMULE_VERSION_TAG,
+};
+pub use upload_queue::{
+    max_slots, peer_score, should_kick, FilePriority, QueuedPeer, UploadQueue, FRIEND_SLOT_SCORE,
 };
