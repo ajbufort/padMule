@@ -135,6 +135,7 @@ name = "mule-engine"
 version = "0.0.0"
 dependencies = [
  "hex",
+ "mule-files",
  "mule-proto",
  "tokio",
 ]
