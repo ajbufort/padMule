@@ -21,8 +21,8 @@ use std::time::Duration;
 use mule_engine::peer::HelloInfo;
 use mule_engine::server_messages::{LoginRequest, DEFAULT_SERVER_FLAGS};
 use mule_engine::{
-    connect_peer, download_from_peer, peer_handshake_inbound, Download, FramedStream, PartStore,
-    ServerEvent, ServerLink, ServerState,
+    connect_peer, download_from_peer, peer_handshake_inbound, serve, Download, FramedStream,
+    PartStore, ServedFile, ServerEvent, ServerLink, ServerState,
 };
 use mule_files::read_server_met;
 use mule_proto::ed2k_hash;
@@ -289,6 +289,98 @@ fn cmd_hash_file(path: &str) {
     }
 }
 
+/// The eD2k per-part hashset (MD4 of each PARTSIZE chunk), including the trailing
+/// empty-MD4 sentinel for an exact multiple of PARTSIZE - the same rule
+/// `ed2k_hash` folds, so `md4(concat(parts)) == file hash`.
+fn part_hashes(data: &[u8]) -> Vec<[u8; 16]> {
+    use mule_proto::{md4, PARTSIZE};
+    let ps = PARTSIZE as usize;
+    let mut hs: Vec<[u8; 16]> = data.chunks(ps).map(md4).collect();
+    if data.is_empty() || data.len().is_multiple_of(ps) {
+        hs.push(md4(b""));
+    }
+    hs
+}
+
+/// Serve `path` to inbound peers on `port` (padMule as the UPLOADER). Used for
+/// the reverse differential test: a real amuled downloads this file from us.
+/// Serves every connection until killed.
+async fn cmd_serve_file(port: u16, path: &str) {
+    let data = match std::fs::read(path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("cannot read {path}: {e}");
+            return;
+        }
+    };
+    let hash = ed2k_hash(&data);
+    // A single-part file needs no hashset; a multi-part one does.
+    let phs = if data.len() as u64 > mule_proto::PARTSIZE {
+        part_hashes(&data)
+    } else {
+        Vec::new()
+    };
+    let name = Path::new(path)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file.bin".into());
+
+    let listener = match TcpListener::bind(("0.0.0.0", port)).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("cannot bind 0.0.0.0:{port}: {e}");
+            return;
+        }
+    };
+    println!(
+        "serving {} ({} bytes, {} part-hashes) as {} on 0.0.0.0:{port}",
+        hex16(&hash),
+        data.len(),
+        phs.len(),
+        name
+    );
+    println!(
+        "ed2k link for a downloader:\ned2k://|file|{}|{}|{}|/|sources,127.0.0.1:{port}|/",
+        name,
+        data.len(),
+        hex16(&hash)
+    );
+
+    let me = HelloInfo::baseline(demo_user_hash(), 0, port, 4672, "padMule");
+    loop {
+        let (stream, peer) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("accept error: {e}");
+                return;
+            }
+        };
+        println!("inbound peer {peer}");
+        let me = me.clone();
+        let phs = phs.clone();
+        let data = data.clone();
+        let name = name.clone();
+        tokio::spawn(async move {
+            let mut fs = FramedStream::new(stream);
+            if let Err(e) = peer_handshake_inbound(&mut fs, &me).await {
+                eprintln!("  handshake failed: {e}");
+                return;
+            }
+            let f = ServedFile {
+                hash,
+                name: name.as_bytes(),
+                data: &data,
+                part_hashes: &phs,
+                available: None,
+            };
+            match serve(&mut fs, &f).await {
+                Ok(()) => println!("  peer {peer} done"),
+                Err(e) => eprintln!("  serve ended: {e}"),
+            }
+        });
+    }
+}
+
 /// Download `hash` (`size` bytes) from a single peer at `addr` into `out`, driving
 /// the real multi-source path (disk-backed PartStore, hashset exchange, block
 /// receive incl. compressed parts, and verification against the peer's hashset).
@@ -410,6 +502,10 @@ async fn main() {
             cmd_listen(port).await;
         }
         Some("hash-file") if args.len() == 3 => cmd_hash_file(&args[2]),
+        Some("serve-file") if args.len() == 4 => match args[2].parse::<u16>() {
+            Ok(port) => cmd_serve_file(port, &args[3]).await,
+            Err(_) => eprintln!("bad port: {}", args[2]),
+        },
         Some("peer-probe") if args.len() == 5 => {
             let hostport = format!("{}:{}", args[2], args[3]);
             match (

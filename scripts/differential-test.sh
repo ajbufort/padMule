@@ -33,17 +33,24 @@ command -v "$AMULED" >/dev/null || { echo "amuled not built: $AMULED"; exit 1; }
 
 mkdir -p "$CFG/Incoming" "$CFG/Temp" "$WORK/out"
 
-# Two shared files: one compressible (-> OP_COMPRESSEDPART), one random (-> raw).
+# Three shared files exercising the distinct download paths:
+#  - compressible (single part)  -> OP_COMPRESSEDPART
+#  - random       (single part)  -> raw OP_SENDINGPART
+#  - multipart 15 MB (2 eD2k parts, mixed content) -> OP_HASHSETREQUEST/ANSWER +
+#    per-part MD4 verification against amuled's real hashset.
 python3 - "$CFG/Incoming" <<'PY'
 import os, sys, random
 d = sys.argv[1]
-# ~600 KB of repetitive text: compresses hard, so amuled sends compressed blocks.
+r = random.Random(1234)
 with open(os.path.join(d, "compressible.bin"), "wb") as f:
     f.write((b"padMule differential test, the quick brown fox jumps. " * 12000)[:600_000])
-# ~400 KB of random bytes: incompressible, so amuled sends raw blocks.
-random.seed(1234)
 with open(os.path.join(d, "random.bin"), "wb") as f:
-    f.write(bytes(random.randrange(256) for _ in range(400_000)))
+    f.write(r.randbytes(400_000))  # randbytes: fast, avoids per-byte generators
+# 15 MB, alternating compressible + random 1 MB chunks (both block paths, needs a hashset).
+chunks = [(b"block %d compressible filler ... " % i * 40000)[:1_000_000] if i % 2 == 0
+          else r.randbytes(1_000_000) for i in range(15)]
+with open(os.path.join(d, "multipart.bin"), "wb") as f:
+    f.write(b"".join(chunks))
 print("shared files written")
 PY
 
@@ -73,12 +80,13 @@ done
 if [ "$LISTENING" != 1 ]; then
   echo "amuled never listened on $PORT; log tail:"; tail -25 "$WORK/amuled.log"; exit 1
 fi
-# Give the async hasher time to finish both shared files.
-for _ in $(seq 1 30); do
+# Give the async hasher time to finish all shared files (the 15 MB one is the
+# slowest). known.met grows past its 5-byte empty header once files are hashed.
+for _ in $(seq 1 40); do
   [ "$(stat -c%s "$CFG/known.met" 2>/dev/null || echo 0)" -gt 100 ] && break
   sleep 0.5
 done
-sleep 1
+sleep 4
 
 run_one() {
   local name="$1"
@@ -98,6 +106,7 @@ run_one() {
 echo "== downloading from amuled with padMule =="
 run_one compressible.bin
 run_one random.bin
+run_one multipart.bin  # multi-part: exercises the hashset exchange + verification
 
 echo
 if [ "$FAIL" = 0 ]; then

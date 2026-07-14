@@ -41,6 +41,7 @@ pub use sources::{
     parse_request_sources, parse_request_sources2, CallbackRequested, FoundSource, Source,
     SOURCE_EXCHANGE_VERSION,
 };
+pub use transfer_session::{serve, serve_file, ServedFile};
 pub use upload_queue::{
     max_slots, peer_score, should_kick, FilePriority, QueuedPeer, UploadQueue, FRIEND_SLOT_SCORE,
 };
