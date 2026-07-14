@@ -6,12 +6,12 @@
 
 use crate::framed::{FrameError, FramedStream};
 use crate::transfer::{
-    build_accept_upload, build_file_status_complete, build_req_filename_answer,
-    build_request_filename, build_request_parts, build_sending_part, build_set_req_file_id,
-    build_start_upload_req, parse_file_status, parse_request_parts, parse_sending_part,
-    EMBLOCKSIZE, OP_ACCEPTUPLOADREQ, OP_FILEREQANSNOFIL, OP_FILESTATUS, OP_REQUESTFILENAME,
-    OP_REQUESTPARTS, OP_REQUESTPARTS_I64, OP_SENDINGPART, OP_SENDINGPART_I64, OP_SETREQFILEID,
-    OP_STARTUPLOADREQ, STANDARD_BLOCKS_REQUEST,
+    build_accept_upload, build_file_status, build_file_status_complete, build_hashset_answer,
+    build_req_filename_answer, build_request_filename, build_request_parts, build_sending_part,
+    build_set_req_file_id, build_start_upload_req, parse_file_status, parse_request_parts,
+    parse_sending_part, EMBLOCKSIZE, OP_ACCEPTUPLOADREQ, OP_FILEREQANSNOFIL, OP_FILESTATUS,
+    OP_HASHSETREQUEST, OP_REQUESTFILENAME, OP_REQUESTPARTS, OP_REQUESTPARTS_I64, OP_SENDINGPART,
+    OP_SENDINGPART_I64, OP_SETREQFILEID, OP_STARTUPLOADREQ, STANDARD_BLOCKS_REQUEST,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -23,6 +23,8 @@ pub enum TransferError {
     NoFile,
     /// A received block fell outside the file bounds.
     BadBlock,
+    /// Writing to the `.part` file failed.
+    Io(std::io::Error),
 }
 
 impl From<FrameError> for TransferError {
@@ -111,15 +113,22 @@ where
     Ok(buf)
 }
 
-/// A minimal serving peer for an already-handshaked connection: it advertises a
-/// complete source for `hash`/`name` and serves requested blocks from `data`.
-/// Returns when the peer disconnects.
-pub async fn serve_file<S>(
-    fs: &mut FramedStream<S>,
-    hash: &[u8; 16],
-    name: &[u8],
-    data: &[u8],
-) -> Result<(), FrameError>
+/// What a serving peer offers.
+pub struct ServedFile<'a> {
+    pub hash: [u8; 16],
+    pub name: &'a [u8],
+    pub data: &'a [u8],
+    /// Per-part MD4s, served on OP_HASHSETREQUEST. May be empty for a
+    /// single-part file, which needs no hashset.
+    pub part_hashes: &'a [[u8; 16]],
+    /// Which parts we hold. `None` means a COMPLETE source, which upstream
+    /// signals with a part count of 0 rather than an all-ones bitfield.
+    pub available: Option<&'a [bool]>,
+}
+
+/// A serving peer for an already-handshaked connection. Returns when the peer
+/// disconnects.
+pub async fn serve<S>(fs: &mut FramedStream<S>, f: &ServedFile<'_>) -> Result<(), FrameError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -131,11 +140,19 @@ where
         };
         match pkt.opcode {
             OP_REQUESTFILENAME => {
-                fs.write_packet(&build_req_filename_answer(hash, name))
+                fs.write_packet(&build_req_filename_answer(&f.hash, f.name))
                     .await?;
             }
             OP_SETREQFILEID => {
-                fs.write_packet(&build_file_status_complete(hash)).await?;
+                let p = match f.available {
+                    Some(parts) => build_file_status(&f.hash, parts),
+                    None => build_file_status_complete(&f.hash),
+                };
+                fs.write_packet(&p).await?;
+            }
+            OP_HASHSETREQUEST => {
+                fs.write_packet(&build_hashset_answer(&f.hash, f.part_hashes))
+                    .await?;
             }
             OP_STARTUPLOADREQ => {
                 fs.write_packet(&build_accept_upload()).await?;
@@ -148,15 +165,43 @@ where
                 };
                 for (s, e) in blocks {
                     let (s, e) = (s as usize, e as usize);
-                    if e <= data.len() {
-                        fs.write_packet(&build_sending_part(hash, s as u64, e as u64, &data[s..e]))
-                            .await?;
+                    if e <= f.data.len() {
+                        fs.write_packet(&build_sending_part(
+                            &f.hash,
+                            s as u64,
+                            e as u64,
+                            &f.data[s..e],
+                        ))
+                        .await?;
                     }
                 }
             }
-            _ => {} // hashset request etc. - not needed for a single-part file
+            _ => {}
         }
     }
+}
+
+/// A serving peer that holds the COMPLETE file. Thin wrapper over [`serve`].
+pub async fn serve_file<S>(
+    fs: &mut FramedStream<S>,
+    hash: &[u8; 16],
+    name: &[u8],
+    data: &[u8],
+) -> Result<(), FrameError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    serve(
+        fs,
+        &ServedFile {
+            hash: *hash,
+            name,
+            data,
+            part_hashes: &[],
+            available: None,
+        },
+    )
+    .await
 }
 
 #[cfg(test)]
