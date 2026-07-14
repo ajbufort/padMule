@@ -216,6 +216,98 @@ fn parse_hex16(s: &str) -> Option<[u8; 16]> {
     Some(out)
 }
 
+/// Differential test of SECURE IDENTIFICATION against a real peer (amuled).
+/// Connects (optionally obfuscated), advertises secure-ident support in the
+/// hello, runs the mutual RSA challenge/response, and reports whether we verified
+/// the peer's identity (and completed our half so the peer can verify us).
+async fn cmd_sec_ident(addr: SocketAddr, obf: Option<[u8; 16]>) {
+    use mule_engine::peer::baseline_misc_options1;
+    use mule_engine::secure_ident::{OP_PUBLICKEY, OP_SECIDENTSTATE, OP_SIGNATURE};
+    use mule_engine::{Identity, SecureIdentSession};
+
+    let id = Identity::generate();
+    let mut me = HelloInfo::baseline(demo_user_hash(), 0, 4662, 4672, "padMule");
+    me.misc_options1 = baseline_misc_options1(1); // advertise SecureIdent v1
+
+    let (peer, mut fs) = match match obf {
+        Some(th) => connect_peer_obf(addr, &me, &th).await,
+        None => connect_peer(addr, &me).await,
+    } {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("connect/handshake failed: {e}");
+            return;
+        }
+    };
+    let peer_secident = peer.capabilities().map(|c| c.sec_ident).unwrap_or(0);
+    println!(
+        "handshake OK with {} (peer advertises secure-ident v{}){}",
+        hex16(&peer.user_hash),
+        peer_secident,
+        if fs.is_obfuscated() {
+            " [obfuscated]"
+        } else {
+            ""
+        }
+    );
+    if peer_secident == 0 {
+        eprintln!("peer does not support secure identification");
+        return;
+    }
+
+    let mut session = SecureIdentSession::new(&id);
+    if let Err(e) = fs.write_packet(&session.start()).await {
+        eprintln!("failed to send our challenge: {e}");
+        return;
+    }
+    loop {
+        match timeout(Duration::from_secs(15), fs.read_packet_unpacked()).await {
+            Ok(Ok(p)) => {
+                if matches!(p.opcode, OP_SECIDENTSTATE | OP_PUBLICKEY | OP_SIGNATURE) {
+                    println!(
+                        "  <- secure-ident opcode=0x{:02x} len={} bytes={}",
+                        p.opcode,
+                        p.payload.len(),
+                        p.payload
+                            .iter()
+                            .map(|b| format!("{b:02x}"))
+                            .collect::<String>()
+                    );
+                    match session.on_packet(&id, p.opcode, &p.payload) {
+                        Ok(replies) => {
+                            for r in replies {
+                                let _ = fs.write_packet(&r).await;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("  bad secure-ident packet: {e:?}");
+                            return;
+                        }
+                    }
+                    if session.is_complete() {
+                        break;
+                    }
+                }
+                // ignore any non-secure-ident traffic
+            }
+            Ok(Err(e)) => {
+                eprintln!("connection ended: {e}");
+                break;
+            }
+            Err(_) => {
+                eprintln!("timed out waiting for secure-ident packets");
+                break;
+            }
+        }
+    }
+
+    if session.peer_verified() {
+        println!("OK: the peer PASSED secure identification (it proved it owns its userhash)");
+    } else {
+        println!("FAILED: the peer did not pass secure identification");
+    }
+}
+
 /// Diagnostic: send a raw OP_HELLO, then dump EVERY packet the peer sends back
 /// (protocol/opcode/len, unfiltered, in order) so we can see exactly what a real
 /// aMule does - including the order of OP_HELLOANSWER vs OP_EMULEINFO and any
@@ -522,6 +614,17 @@ async fn main() {
         Some("listen") => {
             let port: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(4662);
             cmd_listen(port).await;
+        }
+        // sec-ident <host> <port> [obf-peer-hash]
+        Some("sec-ident") if args.len() == 4 || args.len() == 5 => {
+            let hostport = format!("{}:{}", args[2], args[3]);
+            let addr = hostport.to_socket_addrs().ok().and_then(|mut it| it.next());
+            let obf = args.get(4).map(|s| parse_hex16(s));
+            match (addr, obf) {
+                (_, Some(None)) => eprintln!("bad obfuscation peer-hash: {}", args[4]),
+                (Some(addr), obf) => cmd_sec_ident(addr, obf.flatten()).await,
+                (None, _) => eprintln!("cannot resolve {hostport}"),
+            }
         }
         Some("hash-file") if args.len() == 3 => cmd_hash_file(&args[2]),
         Some("serve-file") if args.len() == 4 => match args[2].parse::<u16>() {
