@@ -131,6 +131,19 @@ bullet each; newest first.
   multi_source) because the receive logic was copy-pasted. The fix extracted one
   hardened `BlockReceiver` both route through. When two places implement the same
   wire behaviour, factor it - or the next reviewer files the same finding twice.
+- 2026-07-14 **Advertise no capability you do not honour on the wire.** The
+  amuled differential test caught, in its first successful run, a bug all 166
+  padMule-to-padMule tests missed: we advertised `ExtendedRequestsVersion=2` in
+  the hello but sent a bare `OP_REQUESTFILENAME`. aMule disconnects a client that
+  claims extended requests then omits the payload (ProcessExtendedInfo,
+  UploadClient.cpp:193). A SYMMETRIC peer (our own serve()) ignored the mismatch,
+  so only the real implementation punished it. Two lessons: (1) capabilities and
+  behaviour must be coherent - the receiver enforces what you advertise; (2) the
+  differential test against the real client is not optional polish, it is the
+  only oracle that catches mistakes we make identically on both ends (same class
+  as the SX record-size error). Diagnosis tip: when the real client's own debug
+  logging won't cooperate, trace the wire from our side (`mule-cli peer-probe`) -
+  the packet sequence + close point localises the fault faster than the source.
 
 ## Related
 

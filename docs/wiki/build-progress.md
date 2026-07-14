@@ -25,7 +25,7 @@ ends at a differential/round-trip gate.
 | 4a | client-to-client peer connection + inbound listener | (implemented directly) | DONE (30 tests): peer_handshake_outbound/inbound, connect_peer/accept_peer; two engines handshake on loopback. mule-cli `listen` command for HighID validation. |
 | 4b | download-side transfer message codecs | (implemented directly) | DONE (37 tests): request_filename/setreqfileid/startupload/hashset, file-status bitfield, request_parts (3-block u32/u64), sending_part, queue-ranking. |
 | 4c | first end-to-end transfer (two engines) | (implemented directly) | DONE (40 tests): download_file + serve_file; two engines transfer a 3-block file on loopback, ed2k hash matches byte-for-byte. Next: write to a real .part, multi-part+hashset, differential vs local amuled. |
-| 4d | upload side + queue/slots + credits + source exchange + corruption; get-sources codec | (implemented directly) | MOSTLY DONE (166 workspace tests). 4d-1/2 credits + clients.met + upload queue/slots/ranking; 4d-3 source exchange (SX1/SX2 v1-v4) + get-sources + LowID callback; 4d-4/5 PartFile block allocation + corruption handling; 4d-6 disk-backed PartStore (.part + byte-compat .part.met, resume, atomic save); 4d-7 multi-source Download driver (shared block reservations, release-on-disconnect, hashset exchange, 3-peer + disjoint-parts + dead-peer tests). Fixed 4 aMule bugs rather than replicating them (see below). Under adversarial multi-agent review (2026-07-14). REMAINING for the wave GATE: differential test vs a local amuled (needs the C++ build deps - see below). |
+| 4d | upload side + queue/slots + credits + source exchange + corruption; get-sources codec | (implemented directly) | **DONE - Wave 4 GATE MET (180 tests + differential test vs real amuled passes).** 4d-1/2 credits + clients.met + upload queue/slots/ranking; 4d-3 source exchange (SX1/SX2 v1-v4) + get-sources + LowID callback; 4d-4/5 PartFile block allocation + corruption handling; 4d-6 disk-backed PartStore (.part + byte-compat .part.met, resume, atomic save); 4d-7 multi-source Download driver; 4d-8 adversarial review + 6 fixes; 4d-9 DIFFERENTIAL TEST: padMule downloads from a real amuled 3.0.1 byte-for-byte (raw + compressed paths). Fixed 4 aMule bugs + 6 review findings + 1 interop bug the differential test caught. See notes below. |
 | 5 | obfuscation + secure ident | - | not started |
 | 6 | `mule-kad` (+ `nodes.dat` format, moved here) | - | not started |
 | 7 | `mule-ec` + `mule-cli` parity (IP filter, UPnP, categories) | - | not started |
@@ -62,19 +62,41 @@ record version BY PACKET SIZE, that would have made padMule reject every real
 source-exchange answer. A byte-exact test caught it within minutes. Agent-derived
 constants are a hypothesis until a test pins them against the actual bytes.
 
-## Differential test vs amuled - the true Wave 4 gate (BLOCKED on build deps)
+## Differential test vs amuled - PASSED (2026-07-14, the true Wave 4 gate)
 
-Every transfer proven so far has padMule on BOTH ends, which cannot catch a
-mistake made consistently in both directions (exactly how the SX record-size
-error slipped past our own round-trip tests). The real oracle is a headless
-`amuled` built from `amule-3.0.1/`, with padMule transferring a file to/from it.
+padMule downloads files from a REAL headless amuled 3.0.1, byte-for-byte, over
+both the raw (`OP_SENDINGPART`) and compressed (`OP_COMPRESSEDPART`) block paths.
+This is the oracle that padMule-to-padMule testing cannot be: it catches mistakes
+made symmetrically on both our ends.
 
-Blocked on C++ build deps that need Anthony's password once:
-`sudo apt install -y cmake libwxgtk3.2-dev libcrypto++-dev zlib1g-dev`.
-Then `scripts/build-amuled-oracle.sh` configures daemon-only, builds, and runs
-the upstream ctest suite (an independent cross-check of our tag/io/hash codecs
-via aMule's own CTagTest/FileDataIOTest). Deps missing as of 2026-07-14; cmake
-absent too.
+Build: `scripts/build-amuled-oracle.sh` builds daemon-only amuled (deps: cmake,
+libwxgtk3.2-dev, libcrypto++-dev, zlib1g-dev, libboost-dev, pkg-config,
+libglib2.0-dev; optional GeoIP/UPnP/BFD/NLS disabled with -DENABLE_*=NO). The
+upstream ctest suite (11 tests) PASSES - an independent cross-check of our
+tag/io/hash codecs. Run: `scripts/differential-test.sh` (shares a compressible +
+a random file from amuled, downloads both with `mule-cli peer-download`, asserts
+byte-for-byte match).
+
+**What the differential run validated against real aMule:**
+- our ed2k file hash == amuled's known.met hash, byte-for-byte (600 KB file);
+- our block reassembly incl. the Wave-4d compressed-part fix, against amuled's
+  actual per-block zlib;
+- verification against amuled's real per-part hashset.
+
+**The interop bug it caught (that all 166 padMule-to-padMule tests missed):**
+We advertise `ExtendedRequestsVersion=2` in the hello (MISCOPTIONS1) but sent a
+BARE 16-byte `OP_REQUESTFILENAME`. aMule's `ProcessExtendedInfo`
+(UploadClient.cpp:193) THROWS and disconnects a client that advertised extended
+requests but omitted the payload - we advertised a capability and violated it.
+Fix: `build_request_filename_ext` appends requester-part-count (0) +
+complete-sources-count (0), matching aMule's own `SendFileRequest`. Diagnosed
+with `mule-cli peer-probe` (wire trace) after aMule's own debug logging refused
+to emit client-level events. **Lesson: advertise no capability you do not
+honour on the wire - a symmetric client never punishes the mismatch, a real one
+disconnects.**
+
+Remaining differential coverage (future): multi-part file + hashset over the
+wire, padMule as the UPLOADER to amuled, and obfuscated sessions (Wave 5).
 
 ## Wave 4d adversarial review + fixes (2026-07-14)
 
