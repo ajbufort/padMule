@@ -46,9 +46,28 @@ fn hash_only(opcode: u8, hash: &[u8; 16]) -> Packet {
     Packet::new(PROT_EDONKEY, opcode, hash.to_vec())
 }
 
-/// OP_REQUESTFILENAME: ask a peer for the name of the file with this hash.
+/// OP_REQUESTFILENAME: ask a peer for the name of the file with this hash (bare
+/// form, no extended info). Only valid to send if we advertise
+/// ExtendedRequestsVersion == 0; otherwise use [`build_request_filename_ext`].
 pub fn build_request_filename(hash: &[u8; 16]) -> Packet {
     hash_only(OP_REQUESTFILENAME, hash)
+}
+
+/// OP_REQUESTFILENAME with the extended requester info that eMule appends when it
+/// advertises ExtendedRequestsVersion > 0 (which padMule does, via MISCOPTIONS1).
+///
+/// This is NOT optional: aMule's ProcessExtendedInfo (UploadClient.cpp:193)
+/// THROWS and disconnects a client that advertised extended requests but sent a
+/// bare 16-byte request. The payload is `<hash 16><u16 our-part-count><u16
+/// complete-sources>`. We send part-count 0 ("we have no parts of this file yet",
+/// true for a fresh download - upstream's `nED2KUpPartCount == 0` branch skips
+/// the bitfield) followed by a 0 complete-source count for the version>1 field.
+pub fn build_request_filename_ext(hash: &[u8; 16]) -> Packet {
+    let mut w = Writer::new();
+    w.write_bytes(hash);
+    w.write_u16(0); // nED2KUpPartCount: we hold no parts yet
+    w.write_u16(0); // complete-sources count (read when ExtendedRequestsVersion > 1)
+    Packet::new(PROT_EDONKEY, OP_REQUESTFILENAME, w.into_inner())
 }
 
 /// OP_SETREQFILEID: tell the peer which file we want (before OP_FILESTATUS).

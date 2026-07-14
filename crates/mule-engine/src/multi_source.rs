@@ -24,7 +24,7 @@ use crate::framed::FramedStream;
 use crate::part_file::data_part_count;
 use crate::part_store::PartStore;
 use crate::transfer::{
-    build_hashset_request, build_request_filename, build_request_parts, build_set_req_file_id,
+    build_hashset_request, build_request_filename_ext, build_request_parts, build_set_req_file_id,
     build_start_upload_req, parse_file_status, parse_hashset_answer, BlockReceiver, FileStatus,
     OP_ACCEPTUPLOADREQ, OP_FILEREQANSNOFIL, OP_FILESTATUS, OP_HASHSETANSWER,
     STANDARD_BLOCKS_REQUEST,
@@ -169,7 +169,7 @@ where
     let hash = dl.hash().await;
 
     // Ask what this peer has.
-    fs.write_packet(&build_request_filename(&hash)).await?;
+    fs.write_packet(&build_request_filename_ext(&hash)).await?;
     fs.write_packet(&build_set_req_file_id(&hash)).await?;
     let status = loop {
         let pkt = fs.read_packet_unpacked().await?;
