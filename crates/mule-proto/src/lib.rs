@@ -6,7 +6,7 @@ pub mod io;
 pub mod packet;
 pub mod tag;
 
-pub use hash::{ed2k_hash, md4, part_count, PARTSIZE};
+pub use hash::{ed2k_hash, md4, part_count, OLD_MAX_FILE_SIZE, PARTSIZE};
 pub use io::{IoError, Reader, Writer};
 pub use packet::{
     compress, decompress, read_packet, write_packet, Packet, MAX_PACKET_SIZE, PROT_EDONKEY,

@@ -22,6 +22,7 @@ pub const OP_OUTOFPARTREQS: u8 = 0x57; // E3
 pub const OP_REQUESTFILENAME: u8 = 0x58; // E3
 pub const OP_REQFILENAMEANSWER: u8 = 0x59; // E3
 pub const OP_QUEUERANKING: u8 = 0x60; // C5 (eMule ext)
+pub const OP_COMPRESSEDPART: u8 = 0x40; // C5
 pub const OP_COMPRESSEDPART_I64: u8 = 0xA1; // C5
 pub const OP_SENDINGPART_I64: u8 = 0xA2; // C5
 pub const OP_REQUESTPARTS_I64: u8 = 0xA3; // C5
@@ -343,6 +344,204 @@ pub fn parse_hashset_answer(payload: &[u8]) -> Result<([u8; 16], Vec<[u8; 16]>),
     Ok((hash, parts))
 }
 
+/// One range of the file to persist, produced by [`BlockReceiver`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockWrite {
+    pub offset: u64,
+    pub data: Vec<u8>,
+}
+
+/// Why a received data packet was rejected. Every one of these means the peer
+/// sent something it should not have; the caller drops the peer.
+#[derive(Debug)]
+pub enum BlockError {
+    /// The packet's file hash was not the file we are downloading.
+    WrongFile,
+    /// The declared range is empty/inverted, outside the file, outside anything
+    /// we requested, or disagrees with the payload length.
+    BadRange,
+    /// A compressed block failed to inflate (or tried to overrun its block).
+    Decompress,
+    /// The packet was truncated.
+    Truncated,
+}
+
+impl From<IoError> for BlockError {
+    fn from(_: IoError) -> Self {
+        BlockError::Truncated
+    }
+}
+
+struct PackedBlock {
+    decomp: flate2::Decompress,
+    out: Vec<u8>,
+    written: u64,
+    total: u64,
+}
+
+/// Reassembles the reply to ONE `OP_REQUESTPARTS` batch: it accepts the peer's
+/// `OP_SENDINGPART` / `OP_COMPRESSEDPART` packets (32- and 64-bit variants),
+/// validates each against the exact ranges we asked for, transparently inflates
+/// per-block-compressed data, and yields the bytes to persist.
+///
+/// Every rejection path returns an error rather than panicking or looping: a
+/// peer we connected to is untrusted, and the review found that the old inline
+/// loops could be made to panic (a payload longer than its declared range) or
+/// hang forever (a zero-length block that never advanced the counter). This type
+/// is the single hardened place both download drivers go through.
+///
+/// Compression note: a compressed block is ONE zlib stream split across several
+/// `OP_COMPRESSEDPART` packets that all carry the block's START offset (never the
+/// running write position) plus a size field aMule ignores. We keep a streaming
+/// inflater per block and emit each newly produced run at
+/// `block_start + bytes_already_written`, exactly as `ProcessBlockPacket` does.
+pub struct BlockReceiver {
+    hash: [u8; 16],
+    file_size: u64,
+    /// requested `(start, end_exclusive)` blocks
+    blocks: Vec<(u64, u64)>,
+    /// real (decompressed) bytes still expected across the batch
+    remaining: u64,
+    /// streaming inflate state for blocks that arrive compressed, keyed by start
+    packed: std::collections::HashMap<u64, PackedBlock>,
+}
+
+impl BlockReceiver {
+    pub fn new(hash: [u8; 16], file_size: u64, blocks: &[(u64, u64)]) -> Self {
+        let remaining = blocks.iter().map(|(s, e)| e - s).sum();
+        BlockReceiver {
+            hash,
+            file_size,
+            blocks: blocks.to_vec(),
+            remaining,
+            packed: std::collections::HashMap::new(),
+        }
+    }
+
+    /// True once every requested byte has been received.
+    pub fn is_done(&self) -> bool {
+        self.remaining == 0
+    }
+
+    /// Feed one received packet. Non-data opcodes (queue ranking, etc.) yield no
+    /// writes. Data packets yield the bytes to persist, or an error if the peer
+    /// sent something outside what we asked for.
+    pub fn accept(&mut self, opcode: u8, payload: &[u8]) -> Result<Vec<BlockWrite>, BlockError> {
+        match opcode {
+            OP_SENDINGPART => self.accept_raw(payload, false),
+            OP_SENDINGPART_I64 => self.accept_raw(payload, true),
+            OP_COMPRESSEDPART => self.accept_packed(payload, false),
+            OP_COMPRESSEDPART_I64 => self.accept_packed(payload, true),
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    fn check_hash(&self, r: &mut Reader) -> Result<(), BlockError> {
+        if read_hash16(r)? != self.hash {
+            return Err(BlockError::WrongFile);
+        }
+        Ok(())
+    }
+
+    /// The requested block that fully contains `[start, end)`, if any.
+    fn containing_block(&self, start: u64, end: u64) -> Option<(u64, u64)> {
+        self.blocks
+            .iter()
+            .copied()
+            .find(|&(s, e)| s <= start && end <= e)
+    }
+
+    fn accept_raw(&mut self, payload: &[u8], i64: bool) -> Result<Vec<BlockWrite>, BlockError> {
+        let mut r = Reader::new(payload);
+        self.check_hash(&mut r)?;
+        let (start, end) = if i64 {
+            (r.read_u64()?, r.read_u64()?)
+        } else {
+            (r.read_u32()? as u64, r.read_u32()? as u64)
+        };
+        let data = r.read_bytes(r.remaining())?;
+        // The guard aMule uses (DownloadClient.cpp:905): reject an empty/inverted
+        // range, a range past EOF, one we never asked for, or one whose declared
+        // length disagrees with the payload (the old code's copy_from_slice
+        // panicked on exactly this).
+        if end <= start
+            || end > self.file_size
+            || data.len() as u64 != end - start
+            || self.containing_block(start, end).is_none()
+        {
+            return Err(BlockError::BadRange);
+        }
+        self.remaining = self.remaining.saturating_sub(data.len() as u64);
+        Ok(vec![BlockWrite {
+            offset: start,
+            data,
+        }])
+    }
+
+    fn accept_packed(&mut self, payload: &[u8], i64: bool) -> Result<Vec<BlockWrite>, BlockError> {
+        let mut r = Reader::new(payload);
+        self.check_hash(&mut r)?;
+        let start = if i64 {
+            r.read_u64()?
+        } else {
+            r.read_u32()? as u64
+        };
+        let _declared = r.read_u32()?; // total compressed size; aMule ignores it here
+        let frag = r.read_bytes(r.remaining())?;
+        // An empty fragment can never make progress; refusing it closes the only
+        // way a compressed stream could spin the receive loop forever.
+        if frag.is_empty() {
+            return Err(BlockError::BadRange);
+        }
+        // A compressed packet always names the block's START; it must be a block
+        // we actually requested.
+        let total = match self.blocks.iter().find(|&&(s, _)| s == start) {
+            Some(&(s, e)) => e - s,
+            None => return Err(BlockError::BadRange),
+        };
+
+        let pb = self.packed.entry(start).or_insert_with(|| PackedBlock {
+            decomp: flate2::Decompress::new(true),
+            // Reserve exactly the block size: the stream decompresses to that and
+            // no more, so decompress_vec can never grow (or overrun) the buffer.
+            out: Vec::with_capacity(total as usize),
+            written: 0,
+            total,
+        });
+
+        let before = pb.out.len();
+        let in_before = pb.decomp.total_in();
+        let status = pb
+            .decomp
+            .decompress_vec(&frag, &mut pb.out, flate2::FlushDecompress::Sync)
+            .map_err(|_| BlockError::Decompress)?;
+        let produced = (pb.out.len() - before) as u64;
+        let consumed = pb.decomp.total_in() - in_before;
+
+        // Over-expansion (zip bomb / wrong-size block): output has hit the block
+        // cap but the peer still has compressed input we could not consume. A
+        // legitimate block decompresses to exactly its size and consumes all its
+        // input; the trailing adler checksum consumes input but produces nothing,
+        // so this check does not misfire on it.
+        if pb.out.len() as u64 == pb.total && consumed < frag.len() as u64 {
+            return Err(BlockError::Decompress);
+        }
+        // If the zlib stream ended, the block must be exactly its requested size -
+        // a stream that ends short would otherwise never complete and hang.
+        if matches!(status, flate2::Status::StreamEnd) && pb.written + produced != pb.total {
+            return Err(BlockError::Decompress);
+        }
+        if produced == 0 {
+            return Ok(Vec::new()); // needs more input; not done, not an error
+        }
+        let offset = start + pb.written;
+        let data = pb.out[before..].to_vec();
+        pb.written += produced;
+        self.remaining = self.remaining.saturating_sub(produced);
+        Ok(vec![BlockWrite { offset, data }])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,6 +550,188 @@ mod tests {
         0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
         0x0F,
     ];
+
+    // ---- BlockReceiver: the hardened receive path (review findings 1, 2, 3) ----
+
+    /// Build a raw OP_SENDINGPART payload with an arbitrary declared range and
+    /// arbitrary data - so a test can lie about the range the way a peer could.
+    fn raw_payload(hash: &[u8; 16], start: u32, end: u32, data: &[u8]) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.write_bytes(hash);
+        w.write_u32(start);
+        w.write_u32(end);
+        w.write_bytes(data);
+        w.into_inner()
+    }
+
+    /// Compress `data` as one zlib stream and frame it as an OP_COMPRESSEDPART
+    /// carrying `block_start` (the way an uploader packs a whole block).
+    fn packed_payload(hash: &[u8; 16], block_start: u32, data: &[u8]) -> Vec<u8> {
+        use flate2::{write::ZlibEncoder, Compression};
+        use std::io::Write as _;
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::new(1));
+        enc.write_all(data).unwrap();
+        let z = enc.finish().unwrap();
+        let mut w = Writer::new();
+        w.write_bytes(hash);
+        w.write_u32(block_start);
+        w.write_u32(z.len() as u32); // the size field aMule ignores on receive
+        w.write_bytes(&z);
+        w.into_inner()
+    }
+
+    #[test]
+    fn accepts_a_normal_raw_block() {
+        let data = vec![0xABu8; 1000];
+        let mut rx = BlockReceiver::new(H, 10_000, &[(0, 1000)]);
+        let writes = rx
+            .accept(OP_SENDINGPART, &raw_payload(&H, 0, 1000, &data))
+            .unwrap();
+        assert_eq!(writes, vec![BlockWrite { offset: 0, data }]);
+        assert!(rx.is_done());
+    }
+
+    #[test]
+    fn a_raw_block_longer_than_its_declared_range_is_rejected_not_a_panic() {
+        // Review finding 1: the old code did buf[0..1].copy_from_slice(&[..100])
+        // and panicked. The guard must reject it instead.
+        let mut rx = BlockReceiver::new(H, 10_000, &[(0, 1000)]);
+        let payload = raw_payload(&H, 0, 1, &[0u8; 100]); // says 1 byte, sends 100
+        assert!(matches!(
+            rx.accept(OP_SENDINGPART, &payload),
+            Err(BlockError::BadRange)
+        ));
+    }
+
+    #[test]
+    fn a_zero_length_raw_block_is_rejected_so_the_loop_cannot_hang() {
+        // Review finding 2: start==end added 0 to the counter forever.
+        let mut rx = BlockReceiver::new(H, 10_000, &[(0, 1000)]);
+        let payload = raw_payload(&H, 500, 500, &[]);
+        assert!(matches!(
+            rx.accept(OP_SENDINGPART, &payload),
+            Err(BlockError::BadRange)
+        ));
+        assert!(!rx.is_done());
+    }
+
+    #[test]
+    fn a_block_past_eof_or_outside_the_request_is_rejected() {
+        let mut rx = BlockReceiver::new(H, 1000, &[(0, 500)]);
+        // Past EOF.
+        assert!(matches!(
+            rx.accept(OP_SENDINGPART, &raw_payload(&H, 900, 1100, &[0u8; 200])),
+            Err(BlockError::BadRange)
+        ));
+        // Inside the file but outside anything we asked for.
+        assert!(matches!(
+            rx.accept(OP_SENDINGPART, &raw_payload(&H, 600, 700, &[0u8; 100])),
+            Err(BlockError::BadRange)
+        ));
+    }
+
+    #[test]
+    fn a_block_for_the_wrong_file_is_rejected() {
+        // Review: "do we even CHECK the hash in SENDINGPART?" Now we do.
+        let mut rx = BlockReceiver::new(H, 10_000, &[(0, 1000)]);
+        let other = [0xFFu8; 16];
+        let payload = raw_payload(&other, 0, 1000, &[0u8; 1000]);
+        assert!(matches!(
+            rx.accept(OP_SENDINGPART, &payload),
+            Err(BlockError::WrongFile)
+        ));
+    }
+
+    #[test]
+    fn accepts_a_compressed_block_and_inflates_it() {
+        // Review finding 3: compressed blocks used to be dropped -> hang forever.
+        let data: Vec<u8> = (0..1000u32).map(|i| i as u8).collect();
+        let mut rx = BlockReceiver::new(H, 10_000, &[(0, 1000)]);
+        let writes = rx
+            .accept(OP_COMPRESSEDPART, &packed_payload(&H, 0, &data))
+            .unwrap();
+        let got: Vec<u8> = writes.into_iter().flat_map(|w| w.data).collect();
+        assert_eq!(got, data);
+        assert!(rx.is_done());
+    }
+
+    #[test]
+    fn a_compressed_block_split_across_several_packets_reassembles() {
+        // The realistic case: one block's zlib stream arrives in fragments that
+        // all name the block START, and output must be written sequentially.
+        let data: Vec<u8> = (0..5000u32).map(|i| (i * 3) as u8).collect();
+        use flate2::{write::ZlibEncoder, Compression};
+        use std::io::Write as _;
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::new(1));
+        enc.write_all(&data).unwrap();
+        let z = enc.finish().unwrap();
+
+        let mut rx = BlockReceiver::new(H, 10_000, &[(0, 5000)]);
+        let mut assembled = vec![0u8; 5000];
+        // Feed the compressed stream in 64-byte fragments, each a COMPRESSEDPART
+        // naming block start 0.
+        for chunk in z.chunks(64) {
+            let mut w = Writer::new();
+            w.write_bytes(&H);
+            w.write_u32(0); // block start, constant across fragments
+            w.write_u32(z.len() as u32);
+            w.write_bytes(chunk);
+            for bw in rx.accept(OP_COMPRESSEDPART, &w.into_inner()).unwrap() {
+                let s = bw.offset as usize;
+                assembled[s..s + bw.data.len()].copy_from_slice(&bw.data);
+            }
+        }
+        assert!(rx.is_done());
+        assert_eq!(assembled, data);
+    }
+
+    #[test]
+    fn an_empty_compressed_fragment_is_rejected_so_it_cannot_spin() {
+        let mut rx = BlockReceiver::new(H, 10_000, &[(0, 1000)]);
+        let mut w = Writer::new();
+        w.write_bytes(&H);
+        w.write_u32(0);
+        w.write_u32(0);
+        // no fragment bytes
+        assert!(matches!(
+            rx.accept(OP_COMPRESSEDPART, &w.into_inner()),
+            Err(BlockError::BadRange)
+        ));
+    }
+
+    #[test]
+    fn garbage_compressed_data_errors_rather_than_corrupting() {
+        let mut rx = BlockReceiver::new(H, 10_000, &[(0, 1000)]);
+        let mut w = Writer::new();
+        w.write_bytes(&H);
+        w.write_u32(0);
+        w.write_u32(4);
+        w.write_bytes(&[0xDE, 0xAD, 0xBE, 0xEF]); // not a zlib stream
+        assert!(matches!(
+            rx.accept(OP_COMPRESSEDPART, &w.into_inner()),
+            Err(BlockError::Decompress)
+        ));
+    }
+
+    #[test]
+    fn a_compressed_block_that_inflates_past_its_size_is_rejected() {
+        // A zip-bomb-style block: claims block size 100 but the stream expands to
+        // 100_000. The reserved capacity caps output at 100, and we reject when
+        // the decompressor still wants to produce more.
+        let big = vec![7u8; 100_000];
+        let mut rx = BlockReceiver::new(H, 10_000, &[(0, 100)]);
+        let r = rx.accept(OP_COMPRESSEDPART, &packed_payload(&H, 0, &big));
+        // Either the overrun guard or the decompressor's own bounds fire; both are
+        // errors, and crucially it does not allocate 100_000 bytes or panic.
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn unrelated_opcodes_yield_no_writes() {
+        let mut rx = BlockReceiver::new(H, 10_000, &[(0, 1000)]);
+        assert!(rx.accept(OP_QUEUERANKING, &[0u8; 12]).unwrap().is_empty());
+        assert!(!rx.is_done());
+    }
 
     #[test]
     fn hash_only_requests() {

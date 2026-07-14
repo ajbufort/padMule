@@ -134,6 +134,7 @@ dependencies = [
 name = "mule-engine"
 version = "0.0.0"
 dependencies = [
+ "flate2",
  "hex",
  "mule-files",
  "mule-proto",

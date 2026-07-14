@@ -29,7 +29,7 @@ use mule_files::part_met::{
     gap_tags, gaps as met_gaps, read_part_met, write_part_met, PartMet, PARTFILE_VERSION,
     PARTFILE_VERSION_LARGEFILE,
 };
-use mule_proto::{Tag, TagValue, PARTSIZE};
+use mule_proto::{Tag, TagValue, OLD_MAX_FILE_SIZE, PARTSIZE};
 
 use crate::part_file::{part_size, PartFile};
 
@@ -188,7 +188,11 @@ impl PartStore {
     /// Written to a temp file and renamed, so an interrupted save cannot leave a
     /// half-written met behind.
     pub fn save_met(&mut self) -> io::Result<()> {
-        let large = self.pf.size > u32::MAX as u64;
+        // Boundary is OLD_MAX_FILE_SIZE, not u32::MAX: aMule gates the 0xE2
+        // version + 64-bit filesize/gap tags on IsLargeFile(), so a file in the
+        // (OLD_MAX_FILE_SIZE, u32::MAX] band must use the large encoding too or
+        // the .met is not byte-identical to aMule's.
+        let large = self.pf.size > OLD_MAX_FILE_SIZE;
         let mut tags = vec![
             Tag::id(FT_FILENAME, TagValue::Str(self.name.clone())),
             Tag::id(
@@ -272,6 +276,33 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn the_large_file_met_boundary_is_old_max_not_u32_max() {
+        // Review finding 6: a file in (OLD_MAX_FILE_SIZE, u32::MAX] must be written
+        // with the 0xE2 large version + 64-bit tags, matching aMule/eMule's
+        // IsLargeFile gate. The sparse data file is never populated, so this costs
+        // no real disk. Skip gracefully if the filesystem refuses the sparse size.
+        let dir = tmpdir("large-met");
+        let size = OLD_MAX_FILE_SIZE + 1; // one byte into the "large" band
+        let s = match PartStore::create(&dir, 1, [0xCD; 16], size, b"huge.bin") {
+            Ok(s) => s,
+            Err(_) => {
+                std::fs::remove_dir_all(&dir).ok();
+                return; // filesystem won't hold a >4GiB sparse file; not our bug
+            }
+        };
+        drop(s);
+        let met = fs::read(dir.join("001.part.met")).unwrap();
+        assert_eq!(
+            met[0], PARTFILE_VERSION_LARGEFILE,
+            "a file just over OLD_MAX_FILE_SIZE must use the 0xE2 large-file met"
+        );
+        // And it must round-trip that size back.
+        let reopened = PartStore::open(&dir, 1).unwrap();
+        assert_eq!(reopened.pf.size, size);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
