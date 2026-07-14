@@ -6,13 +6,18 @@
 //!                                         demonstrate pause/resume
 //!   mule-cli login-any <server.met>       try each server in a server.met until
 //!                                         one logs in
+//!   mule-cli listen [port]                bind an inbound peer listener (default
+//!                                         4662) and report connections - used to
+//!                                         validate HighID port forwarding
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 
+use mule_engine::peer::HelloInfo;
 use mule_engine::server_messages::{LoginRequest, DEFAULT_SERVER_FLAGS};
-use mule_engine::{ServerEvent, ServerLink, ServerState};
+use mule_engine::{peer_handshake_inbound, FramedStream, ServerEvent, ServerLink, ServerState};
 use mule_files::read_server_met;
+use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
@@ -132,6 +137,64 @@ async fn cmd_login_any(met_path: &str) {
     println!("no server accepted a login.");
 }
 
+/// Bind an inbound peer listener and report every connection. Any TCP connect
+/// that reaches us (e.g. an external port-checker, a server HighID callback, or
+/// a real peer) proves the port forward works; a full peer then completes the
+/// hello handshake.
+async fn cmd_listen(port: u16) {
+    let bind = format!("0.0.0.0:{port}");
+    let listener = match TcpListener::bind(&bind).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("cannot bind {bind}: {e}");
+            return;
+        }
+    };
+    println!("listening for inbound peers on {bind}");
+    println!("(with WSL mirrored mode this is reachable on the Windows host IP)");
+    println!("validate the forward: point an external port checker at <public-ip>:{port}");
+    let me = HelloInfo::baseline(demo_user_hash(), 0, port, 4672, "padMule");
+    loop {
+        match listener.accept().await {
+            Ok((stream, peer)) => {
+                println!("inbound connection from {peer}");
+                let me = me.clone();
+                tokio::spawn(async move {
+                    let mut fs = FramedStream::new(stream);
+                    match timeout(
+                        Duration::from_secs(10),
+                        peer_handshake_inbound(&mut fs, &me),
+                    )
+                    .await
+                    {
+                        Ok(Ok(ph)) => println!(
+                            "  handshake OK: peer hash={} port={}",
+                            hex16(&ph.user_hash),
+                            ph.tcp_port
+                        ),
+                        Ok(Err(e)) => {
+                            println!(
+                                "  connection reached us (forward works); handshake ended: {e}"
+                            )
+                        }
+                        Err(_) => {
+                            println!("  connection reached us (forward works); handshake timed out")
+                        }
+                    }
+                });
+            }
+            Err(e) => {
+                eprintln!("accept error: {e}");
+                break;
+            }
+        }
+    }
+}
+
+fn hex16(b: &[u8; 16]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -144,10 +207,15 @@ async fn main() {
             }
         }
         Some("login-any") if args.len() == 3 => cmd_login_any(&args[2]).await,
+        Some("listen") => {
+            let port: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(4662);
+            cmd_listen(port).await;
+        }
         _ => {
             eprintln!("usage:");
             eprintln!("  mule-cli login <host> <port>");
             eprintln!("  mule-cli login-any <server.met>");
+            eprintln!("  mule-cli listen [port]");
         }
     }
 }
