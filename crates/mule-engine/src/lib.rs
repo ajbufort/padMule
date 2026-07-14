@@ -4,6 +4,7 @@
 
 pub mod connection;
 pub mod credits;
+pub mod crypt_policy;
 pub mod framed;
 pub mod link;
 pub mod multi_source;
@@ -21,7 +22,8 @@ pub mod transfer_session;
 pub mod upload_queue;
 
 pub use connection::{connect_server, login_handshake, ServerEvent, ServerState};
-pub use credits::score_ratio;
+pub use credits::{resolve_ident_state, score_ratio, score_ratio_ident, IdentState};
+pub use crypt_policy::{should_obfuscate_outbound, should_reject, CryptPrefs};
 pub use framed::{FrameError, FramedStream};
 pub use link::ServerLink;
 pub use multi_source::{download_from_peer, Download};
