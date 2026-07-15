@@ -140,6 +140,31 @@ impl Download {
     }
 }
 
+/// Resume every in-progress download in `dir` by opening each `NNN.part` from
+/// its `.part.met`, ordered by index. Unreadable/corrupt part files are skipped.
+/// This is the engine's on-start resume: the `.part` persists progress across
+/// launches, so a download picks up exactly where it left off.
+pub fn resume_downloads(dir: &std::path::Path) -> Vec<Arc<Download>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    let mut indices: Vec<u32> = entries
+        .flatten()
+        .filter_map(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .strip_suffix(".part.met")
+                .and_then(|stem| stem.parse::<u32>().ok())
+        })
+        .collect();
+    indices.sort_unstable();
+    indices
+        .into_iter()
+        .filter_map(|i| PartStore::open(dir, i).ok().map(Download::new))
+        .collect()
+}
+
 /// Pull whatever we can from one peer, until it has nothing left to give.
 ///
 /// Returns when the file is complete, when this peer holds no block we still
