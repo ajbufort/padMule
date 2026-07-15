@@ -235,6 +235,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "mule-kad"
+version = "0.0.0"
+dependencies = [
+ "mule-files",
+ "mule-proto",
+]
+
+[[package]]
 name = "mule-proto"
 version = "0.0.0"
 dependencies = [

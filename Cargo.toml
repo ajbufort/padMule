@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/mule-proto",
     "crates/mule-files",
+    "crates/mule-kad",
     "crates/mule-engine",
     "crates/mule-cli",
 ]
