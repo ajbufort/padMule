@@ -238,6 +238,7 @@ dependencies = [
 name = "mule-kad"
 version = "0.0.0"
 dependencies = [
+ "md-5",
  "mule-files",
  "mule-proto",
 ]
