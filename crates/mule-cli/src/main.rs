@@ -21,9 +21,9 @@ use std::time::Duration;
 use mule_engine::peer::HelloInfo;
 use mule_engine::server_messages::{LoginRequest, DEFAULT_SERVER_FLAGS};
 use mule_engine::{
-    connect_peer, connect_peer_obf, download_from_peer, obf_accept, peer_handshake_inbound, serve,
-    Download, FramedStream, KadNode, ObfDetect, PartStore, ServedFile, ServerEvent, ServerLink,
-    ServerState,
+    connect_peer, connect_peer_obf, download_from_peer, fetch_from_sources, obf_accept,
+    peer_handshake_inbound, serve, Download, FramedStream, KadNode, ObfDetect, PartStore,
+    ServedFile, ServerEvent, ServerLink, ServerState, SourceRegistry,
 };
 use mule_files::{read_nodes_dat, read_server_met};
 use mule_proto::{ed2k_hash, Kad128};
@@ -791,6 +791,107 @@ async fn cmd_kad_search(nodes_path: &str, hash: [u8; 16], size: u64) {
     }
 }
 
+/// Wave-7 end-to-end: bootstrap Kad, resolve an ed2k hash to sources, and
+/// download the file from a connectable (HighID) source - "give a hash, get the
+/// file" in one driver. Firewalled Kad sources (the common case for an arbitrary
+/// hash) are not directly connectable and are reported as such.
+async fn cmd_kad_fetch(nodes_path: &str, hash: [u8; 16], size: u64, out: &str) {
+    let bytes = match std::fs::read(nodes_path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("cannot read {nodes_path}: {e}");
+            return;
+        }
+    };
+    let parsed = match read_nodes_dat(&bytes) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("bad nodes.dat: {e:?}");
+            return;
+        }
+    };
+    let contacts: Vec<_> = parsed
+        .contacts
+        .into_iter()
+        .filter(|c| c.version >= 2)
+        .collect();
+
+    let bind: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 4672);
+    let mut node = match KadNode::bind(bind, 4662).await {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("bind failed: {e}");
+            return;
+        }
+    };
+    println!("bootstrapping into Kad...");
+    if let Err(e) = node
+        .bootstrap_any(&contacts, Duration::from_millis(1200), 40)
+        .await
+    {
+        eprintln!("bootstrap failed: {e}");
+        return;
+    }
+
+    let target = Kad128::from_hash(&hash);
+    println!("resolving sources for {} (size {size})...", hex16(&hash));
+    let outcome = match node
+        .resolve_sources(&target, size, 20, Duration::from_millis(1400))
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("resolve failed: {e}");
+            return;
+        }
+    };
+
+    let mut reg = SourceRegistry::new();
+    let connectable = reg.add_kad(&outcome.sources);
+    println!(
+        "found {} source(s), {connectable} directly connectable (HighID)",
+        outcome.sources.len()
+    );
+    if reg.is_empty() {
+        println!(
+            "no connectable source for this hash (all firewalled / none published). \
+             Discovery + orchestration are wired; there is just no HighID seeder to pull from."
+        );
+        return;
+    }
+
+    let dir = std::path::Path::new(out)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let name = std::path::Path::new(out)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "out.bin".into());
+    let store = match PartStore::create(&dir, 1, hash, size, name.as_bytes()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("cannot create part store in {}: {e}", dir.display());
+            return;
+        }
+    };
+    let dl = Download::new(store);
+    let me = HelloInfo::baseline(demo_user_hash(), 0, 4662, 4672, "padMule");
+
+    println!("downloading from {} connectable source(s)...", reg.len());
+    let fetched = fetch_from_sources(&dl, reg.sources(), &me, Duration::from_secs(60)).await;
+    println!(
+        "connected to {}/{} sources; {} / {size} bytes present; complete={}",
+        fetched.peers_connected, fetched.sources_tried, fetched.bytes_present, fetched.completed
+    );
+    if fetched.completed {
+        println!("OK: fetched {} -> {out}", hex16(&hash));
+    } else {
+        println!("incomplete (sources did not serve the full file)");
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -860,6 +961,13 @@ async fn main() {
                 (_, Err(_)) => eprintln!("bad size: {}", args[4]),
             }
         }
+        Some("kad-fetch") if args.len() == 6 => {
+            match (parse_hex16(&args[3]), args[4].parse::<u64>()) {
+                (Some(hash), Ok(size)) => cmd_kad_fetch(&args[2], hash, size, &args[5]).await,
+                (None, _) => eprintln!("bad hash (need 32 hex chars): {}", args[3]),
+                (_, Err(_)) => eprintln!("bad size: {}", args[4]),
+            }
+        }
         _ => {
             eprintln!("usage:");
             eprintln!("  mule-cli login <host> <port>");
@@ -870,6 +978,7 @@ async fn main() {
             eprintln!("  mule-cli peer-download <host> <port> <hash> <size> <out> [obf-peer-hash]");
             eprintln!("  mule-cli kad-bootstrap <nodes.dat>");
             eprintln!("  mule-cli kad-search <nodes.dat> <ed2k-hash-hex> <size>");
+            eprintln!("  mule-cli kad-fetch <nodes.dat> <ed2k-hash-hex> <size> <out>");
         }
     }
 }
