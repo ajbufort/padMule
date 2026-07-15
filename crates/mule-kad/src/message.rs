@@ -22,6 +22,10 @@ pub const OP_HELLO_RES_ACK: u8 = 0x22;
 pub const OP_KAD2_REQ: u8 = 0x21;
 /// FIND_NODE response (Wave 6c).
 pub const OP_KAD2_RES: u8 = 0x29;
+/// Source search request (Wave 6d).
+pub const OP_SEARCH_SOURCE_REQ: u8 = 0x34;
+/// Keyword/source search response (Wave 6d).
+pub const OP_SEARCH_RES: u8 = 0x3B;
 /// Liveness ping.
 pub const OP_PING: u8 = 0x60;
 /// Liveness pong.
@@ -56,6 +60,13 @@ pub const TAG_SOURCEUPORT: u8 = 0xFC;
 /// Firewall/ack option bits: `0x01` UDP-fw, `0x02` TCP-fw, `0x04` requests
 /// HELLO_RES_ACK (u8).
 pub const TAG_KADMISCOPTIONS: u8 = 0xF2;
+/// Source-result tags (KADEMLIA2_SEARCH_RES). `TAG_SOURCETYPE`: 1=HighID,
+/// 3=firewalled+buddy, 4=HighID >4GB, 5=firewalled >4GB, 6=firewalled callback.
+pub const TAG_SOURCETYPE: u8 = 0xFF;
+/// Source IP (u32, host order).
+pub const TAG_SOURCEIP: u8 = 0xFE;
+/// Source TCP port (u16).
+pub const TAG_SOURCEPORT: u8 = 0xFD;
 
 // --- Kad tag wire types (TagTypes.h). ---
 const TT_HASH16: u8 = 0x01;
@@ -139,15 +150,17 @@ fn write_kad_tag(w: &mut Writer, tag: &KadTag) {
     }
 }
 
-/// Read one tag. Kad names are exactly one byte; any other name length is a
-/// malformed Kad2 tag.
+/// Read one tag: `<type u8><nameLen u16 LE><name bytes><value>`. eMule
+/// `CFileDataIO::ReadTag` reads the name as a length-prefixed string, so a Kad
+/// single-byte name is `01 00 <byte>`; we take the first byte as the name ID
+/// (like eMule, which then string-compares it) and tolerate any name length so
+/// one odd tag never fails a whole result. An unknown TYPE is still an error -
+/// we cannot know its value length to skip it.
 fn read_kad_tag(r: &mut Reader) -> Result<KadTag, IoError> {
     let ty = r.read_u8()?;
-    let name_len = r.read_u16()?;
-    if name_len != 1 {
-        return Err(IoError::BadTag(ty));
-    }
-    let name = r.read_u8()?;
+    let name_len = r.read_u16()? as usize;
+    let name_bytes = r.read_bytes(name_len)?;
+    let name = name_bytes.first().copied().unwrap_or(0);
     let value = match ty {
         TT_UINT8 => KadTagValue::Int(r.read_u8()? as u64),
         TT_UINT16 => KadTagValue::Int(r.read_u16()? as u64),
@@ -473,6 +486,145 @@ pub fn parse_kad2_res(payload: &[u8]) -> Result<Kad2Res, IoError> {
     Ok(Kad2Res { target, contacts })
 }
 
+// --- SOURCE SEARCH: KADEMLIA2_SEARCH_SOURCE_REQ / KADEMLIA2_SEARCH_RES (6d) ---
+
+/// Build a KADEMLIA2_SEARCH_SOURCE_REQ (26 bytes): `target 16 | startPos 2 |
+/// fileSize 8`. `target` is the ed2k file hash as a Kad ID; `start_pos` is masked
+/// to 15 bits by the receiver. eMule `Process2SearchSourceRequest`.
+pub fn build_search_source_req(target: &Kad128, start_pos: u16, file_size: u64) -> (u8, Vec<u8>) {
+    let mut w = Writer::new();
+    w.write_bytes(&target.to_wire());
+    w.write_u16(start_pos & 0x7FFF);
+    w.write_u64(file_size);
+    (OP_SEARCH_SOURCE_REQ, w.into_inner())
+}
+
+/// One result in a KADEMLIA2_SEARCH_RES: the answer hash (a source's client
+/// hash, for a source search) plus its tag list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchResult {
+    /// The source's client hash (`sourceID`), as a raw 16-byte value.
+    pub answer: Kad128,
+    pub tags: Vec<KadTag>,
+}
+
+/// A parsed KADEMLIA2_SEARCH_RES.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchRes {
+    /// The responding node's Kad ID.
+    pub responder: Kad128,
+    /// The search key echoed back (the file/keyword hash).
+    pub target: Kad128,
+    pub results: Vec<SearchResult>,
+}
+
+/// Parse a KADEMLIA2_SEARCH_RES: `responderID 16 | target 16 | count 2 | count x
+/// { answer 16 | taglist }`. eMule `Process2SearchResponse` /
+/// `ProcessSearchResponse`.
+pub fn parse_search_res(payload: &[u8]) -> Result<SearchRes, IoError> {
+    let mut r = Reader::new(payload);
+    let responder = read_id(&mut r)?;
+    let target = read_id(&mut r)?;
+    let count = r.read_u16()?;
+    let mut results = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let answer = read_id(&mut r)?;
+        let tags = read_kad_taglist(&mut r)?;
+        results.push(SearchResult { answer, tags });
+    }
+    Ok(SearchRes {
+        responder,
+        target,
+        results,
+    })
+}
+
+/// A file source distilled from a source-search result's tags.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Source {
+    /// The source's client hash (the result's answer ID, wire form).
+    pub client_hash: Kad128,
+    /// TAG_SOURCETYPE: 1=HighID, 3=firewalled+buddy, 4=HighID>4GB,
+    /// 5=firewalled>4GB, 6=firewalled callback.
+    pub source_type: u8,
+    /// TAG_SOURCEIP (host order), if present. HighID sources carry a real IP;
+    /// firewalled ones (types 3/6) are reached via buddy/callback instead.
+    pub ip: Option<u32>,
+    /// TAG_SOURCEPORT (TCP), if present.
+    pub tcp_port: Option<u16>,
+    /// TAG_SOURCEUPORT (UDP), if present.
+    pub udp_port: Option<u16>,
+}
+
+impl SearchResult {
+    /// Distil this result's tags into a [`Source`]. eMule `ProcessResultFile`
+    /// accepts source types {1,3,4,5,6}; `None` for any other (e.g. a keyword
+    /// result, which has no SOURCETYPE tag).
+    pub fn as_source(&self) -> Option<Source> {
+        let mut source_type = None;
+        let mut ip = None;
+        let mut tcp_port = None;
+        let mut udp_port = None;
+        for t in &self.tags {
+            if let KadTagValue::Int(v) = t.value {
+                match t.name {
+                    TAG_SOURCETYPE => source_type = Some(v as u8),
+                    TAG_SOURCEIP => ip = Some(v as u32),
+                    TAG_SOURCEPORT => tcp_port = Some(v as u16),
+                    TAG_SOURCEUPORT => udp_port = Some(v as u16),
+                    _ => {}
+                }
+            }
+        }
+        let source_type = source_type?;
+        if !matches!(source_type, 1 | 3 | 4 | 5 | 6) {
+            return None;
+        }
+        Some(Source {
+            client_hash: self.answer,
+            source_type,
+            ip,
+            tcp_port,
+            udp_port,
+        })
+    }
+}
+
+/// Read a Kad tag list: `<u8 count>` then `count` tags.
+fn read_kad_taglist(r: &mut Reader) -> Result<Vec<KadTag>, IoError> {
+    let count = r.read_u8()? as usize;
+    let mut tags = Vec::with_capacity(count);
+    for _ in 0..count {
+        tags.push(read_kad_tag(r)?);
+    }
+    Ok(tags)
+}
+
+fn write_kad_taglist(w: &mut Writer, tags: &[KadTag]) {
+    w.write_u8(tags.len() as u8);
+    for t in tags {
+        write_kad_tag(w, t);
+    }
+}
+
+/// Build a KADEMLIA2_SEARCH_RES (a responder role / tests): `responderID 16 |
+/// target 16 | count 2 | count x { answer 16 | taglist }`.
+pub fn build_search_res(
+    responder: &Kad128,
+    target: &Kad128,
+    results: &[SearchResult],
+) -> (u8, Vec<u8>) {
+    let mut w = Writer::new();
+    w.write_bytes(&responder.to_wire());
+    w.write_bytes(&target.to_wire());
+    w.write_u16(results.len() as u16);
+    for res in results {
+        w.write_bytes(&res.answer.to_wire());
+        write_kad_taglist(&mut w, &res.tags);
+    }
+    (OP_SEARCH_RES, w.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -568,11 +720,22 @@ mod tests {
         let mut bad = vec![0u8; 16];
         bad.extend_from_slice(&[0x36, 0x12, 0x00, 0x00]); // tcp, ver=0, tagcount=0
         assert!(parse_hello(&bad).is_err());
-        // A tag with a multi-byte name is malformed for Kad2.
+        // A tag with an UNKNOWN type is malformed - we cannot know its value
+        // length to skip it (a multi-byte NAME, by contrast, is tolerated).
         let mut bad2 = vec![0u8; 16];
         bad2.extend_from_slice(&[0x36, 0x12, 0x08, 0x01]); // tcp, ver=8, tagcount=1
-        bad2.extend_from_slice(&[0x09, 0x02, 0x00, 0xFC, 0xFD, 0x01]); // nameLen=2
+        bad2.extend_from_slice(&[0x99, 0x01, 0x00, 0xFC, 0x01]); // type 0x99 unknown
         assert!(parse_hello(&bad2).is_err());
+    }
+
+    #[test]
+    fn tag_with_multibyte_name_is_tolerated() {
+        // eMule reads the name as a string; a 2-byte name must not fail the parse.
+        let mut p = vec![0u8; 16];
+        p.extend_from_slice(&[0x36, 0x12, 0x08, 0x01]); // tcp 4662, ver 8, 1 tag
+        p.extend_from_slice(&[0x09, 0x02, 0x00, 0xAB, 0xCD, 0x07]); // UINT8, nameLen 2
+        let h = parse_hello(&p).unwrap();
+        assert_eq!(h.version, 8);
     }
 
     #[test]
@@ -646,5 +809,84 @@ mod tests {
         let res = parse_kad2_res(&payload).unwrap();
         assert_eq!(res.contacts.len(), 1);
         assert_eq!(res.contacts[0].version, 8);
+    }
+
+    #[test]
+    fn search_source_req_is_26_bytes_and_masks_start_pos() {
+        let target = Kad128::from_hash(&[0x77; 16]);
+        let (op, payload) = build_search_source_req(&target, 0xFFFF, 9_728_000);
+        assert_eq!(op, OP_SEARCH_SOURCE_REQ);
+        assert_eq!(payload.len(), 26);
+        // start_pos is masked to 15 bits: 0xFFFF & 0x7FFF = 0x7FFF.
+        assert_eq!(&payload[16..18], &[0xFF, 0x7F]);
+        // fileSize u64 LE.
+        assert_eq!(
+            u64::from_le_bytes(payload[18..26].try_into().unwrap()),
+            9_728_000
+        );
+    }
+
+    #[test]
+    fn search_res_round_trips_and_distils_sources() {
+        let responder = Kad128::from_hash(&[0x01; 16]);
+        let target = Kad128::from_hash(&[0x02; 16]);
+        // A HighID source (type 1) with IP + TCP + UDP ports.
+        let hi = SearchResult {
+            answer: Kad128::from_hash(&[0xAA; 16]),
+            tags: vec![
+                KadTag {
+                    name: TAG_SOURCETYPE,
+                    value: KadTagValue::Int(1),
+                },
+                KadTag {
+                    name: TAG_SOURCEIP,
+                    value: KadTagValue::Int(0x5FEC_24FA),
+                },
+                KadTag {
+                    name: TAG_SOURCEPORT,
+                    value: KadTagValue::Int(4662),
+                },
+                KadTag {
+                    name: TAG_SOURCEUPORT,
+                    value: KadTagValue::Int(4672),
+                },
+            ],
+        };
+        // A keyword-style result (no SOURCETYPE) -> not a source.
+        let kw = SearchResult {
+            answer: Kad128::from_hash(&[0xBB; 16]),
+            tags: vec![KadTag {
+                name: 0x01, // TAG_FILENAME
+                value: KadTagValue::Str(b"movie.avi".to_vec()),
+            }],
+        };
+        let (op, payload) = build_search_res(&responder, &target, &[hi.clone(), kw.clone()]);
+        assert_eq!(op, OP_SEARCH_RES);
+
+        let parsed = parse_search_res(&payload).unwrap();
+        assert_eq!(parsed.responder, responder);
+        assert_eq!(parsed.target, target);
+        assert_eq!(parsed.results, vec![hi.clone(), kw.clone()]);
+
+        let src = parsed.results[0].as_source().unwrap();
+        assert_eq!(src.source_type, 1);
+        assert_eq!(src.ip, Some(0x5FEC_24FA));
+        assert_eq!(src.tcp_port, Some(4662));
+        assert_eq!(src.udp_port, Some(4672));
+        assert_eq!(src.client_hash, hi.answer);
+        // The keyword result is not a source.
+        assert!(parsed.results[1].as_source().is_none());
+    }
+
+    #[test]
+    fn search_res_rejects_unaccepted_source_types() {
+        let r = SearchResult {
+            answer: Kad128::from_hash(&[0xCC; 16]),
+            tags: vec![KadTag {
+                name: TAG_SOURCETYPE,
+                value: KadTagValue::Int(2), // not in {1,3,4,5,6}
+            }],
+        };
+        assert!(r.as_source().is_none());
     }
 }
