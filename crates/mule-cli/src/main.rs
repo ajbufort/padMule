@@ -23,9 +23,10 @@ use mule_engine::search::{build_search_request, parse_search_result, SearchParam
 use mule_engine::server_messages::{LoginRequest, DEFAULT_SERVER_FLAGS};
 use mule_engine::sources::{build_get_sources, parse_found_sources};
 use mule_engine::{
-    connect_peer, connect_peer_obf, connect_server, download_from_peer, fetch_from_sources,
-    login_handshake, obf_accept, peer_handshake_inbound, serve, Download, FramedStream, KadNode,
-    ObfDetect, PartStore, ServedFile, ServerEvent, ServerLink, ServerState, SourceRegistry,
+    connect_peer, connect_peer_obf, connect_server, download_file, download_from_peer,
+    fetch_from_sources, login_handshake, obf_accept, peer_handshake_inbound, serve, Download,
+    FramedStream, KadNode, ManagerConfig, ObfDetect, PartStore, ServedFile, ServerEvent,
+    ServerLink, ServerState, SourceRegistry,
 };
 use mule_files::{read_nodes_dat, read_server_met};
 use mule_proto::{ed2k_hash, Kad128};
@@ -1126,31 +1127,34 @@ async fn cmd_search_download(met_path: &str, keyword: &str, out: &str) {
     let me = HelloInfo::baseline(demo_user_hash(), 0, 4662, 4672, "padMule");
     let mut reg = reg;
 
-    // A single source usually queues us after an initial burst, so retry a few
-    // rounds: re-fetch sources (accumulating, de-duped) and resume - the .part
-    // persists progress between rounds.
-    for round in 0..6 {
+    // The download manager pulls in parallel and rides out upload-queue
+    // rationing across reconnects; between passes we refresh the source set from
+    // the server (peers ration slots, so more sources + retries accumulate the
+    // file - the .part persists progress).
+    for pass in 0..3 {
         if dl.is_complete().await {
             break;
         }
         println!(
-            "round {}: downloading from {} source(s) ({} / {size} bytes so far)...",
-            round + 1,
+            "pass {}: {} source(s), {} / {size} bytes so far...",
+            pass + 1,
             reg.len(),
             size - dl.missing().await
         );
-        let fetched = fetch_from_sources(&dl, reg.sources(), &me, Duration::from_secs(45)).await;
+        let cfg = ManagerConfig {
+            parallel: 4,
+            per_peer: Duration::from_secs(45),
+            rounds: 3,
+        };
+        let out = download_file(&dl, reg.sources(), &me, cfg).await;
         println!(
-            "  connected {}/{}; {} / {size} bytes; complete={}",
-            fetched.peers_connected,
-            fetched.sources_tried,
-            fetched.bytes_present,
-            fetched.completed
+            "  {} / {size} bytes; complete={}",
+            out.bytes_present, out.completed
         );
-        if fetched.completed {
+        if out.completed {
             break;
         }
-        // Ask the server for more sources for the next round.
+        // Ask the server for more sources for the next pass.
         if fs
             .write_packet(&build_get_sources(&hash, size, false))
             .await

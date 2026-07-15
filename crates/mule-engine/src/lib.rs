@@ -29,7 +29,10 @@ pub use connection::{connect_server, login_handshake, ServerEvent, ServerState};
 pub use credits::{resolve_ident_state, score_ratio, score_ratio_ident, IdentState};
 pub use crypt_policy::{should_obfuscate_outbound, should_reject, CryptPrefs};
 pub use engine::{Engine, EngineEvent, EngineState};
-pub use fetch::{fetch_from_sources, FetchOutcome, PeerSource, SourceOrigin, SourceRegistry};
+pub use fetch::{
+    download_file, fetch_from_sources, FetchOutcome, ManagerConfig, PeerSource, SourceOrigin,
+    SourceRegistry,
+};
 pub use framed::{FrameError, FramedStream};
 pub use identity::NodeIdentity;
 pub use kad_live::{KadError, KadNode, ResolveOutcome};

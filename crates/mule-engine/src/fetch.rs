@@ -15,9 +15,11 @@ use crate::multi_source::{download_from_peer, Download};
 use crate::peer::HelloInfo;
 use crate::peer_conn::{connect_peer, connect_peer_obf};
 use crate::sources::FoundSource;
+use std::collections::VecDeque;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
 use tokio::time::timeout;
 
 /// Which discovery backend surfaced a source.
@@ -188,6 +190,85 @@ pub async fn fetch_from_sources(
         out.sources_tried += 1;
         if fetch_one(dl, src, me, per_peer).await.is_ok() {
             out.peers_connected += 1;
+        }
+    }
+    out.completed = dl.is_complete().await;
+    out.bytes_present = dl.size().await - dl.missing().await;
+    out
+}
+
+/// How the download manager runs.
+#[derive(Debug, Clone, Copy)]
+pub struct ManagerConfig {
+    /// Peers to download from concurrently. A `Download` reserves distinct block
+    /// ranges per peer, so parallel peers split the work safely.
+    pub parallel: usize,
+    /// Timeout for one peer session (connect + a burst of blocks).
+    pub per_peer: Duration,
+    /// How many times to sweep the source set. eD2k peers ration upload slots -
+    /// they serve a burst then queue/drop you - so retrying accumulates the file
+    /// across reconnects (the `.part` persists progress between sweeps).
+    pub rounds: usize,
+}
+
+impl Default for ManagerConfig {
+    fn default() -> Self {
+        ManagerConfig {
+            parallel: 4,
+            per_peer: Duration::from_secs(45),
+            rounds: 8,
+        }
+    }
+}
+
+/// The download manager: pull `dl` to completion from `sources`, `parallel` peers
+/// at a time, sweeping the set up to `rounds` times. Stops early once complete.
+/// Source discovery/refresh is the caller's job (re-issue get-sources / a Kad
+/// search between calls and pass a wider set).
+pub async fn download_file(
+    dl: &Arc<Download>,
+    sources: &[PeerSource],
+    me: &HelloInfo,
+    config: ManagerConfig,
+) -> FetchOutcome {
+    let mut out = FetchOutcome::default();
+    let parallel = config.parallel.max(1);
+    for _round in 0..config.rounds.max(1) {
+        if dl.is_complete().await || sources.is_empty() {
+            break;
+        }
+        let queue: Arc<Mutex<VecDeque<PeerSource>>> =
+            Arc::new(Mutex::new(sources.iter().cloned().collect()));
+        let mut handles = Vec::with_capacity(parallel);
+        for _ in 0..parallel {
+            let dl = Arc::clone(dl);
+            let me = me.clone();
+            let queue = Arc::clone(&queue);
+            let per = config.per_peer;
+            handles.push(tokio::spawn(async move {
+                // (sources_tried, peers_connected) for this worker.
+                let mut tried = 0usize;
+                let mut connected = 0usize;
+                loop {
+                    if dl.is_complete().await {
+                        break;
+                    }
+                    let Some(src) = queue.lock().await.pop_front() else {
+                        break;
+                    };
+                    tried += 1;
+                    if fetch_one(&dl, &src, &me, per).await.is_ok() {
+                        connected += 1;
+                    }
+                }
+                (tried, connected)
+            }));
+        }
+        for h in handles {
+            if let Ok((tried, connected)) = h.await {
+                out.sources_tried += tried;
+                out.peers_connected += connected;
+            }
         }
     }
     out.completed = dl.is_complete().await;

@@ -9,10 +9,11 @@ use std::time::Duration;
 
 use mule_engine::peer::HelloInfo;
 use mule_engine::{
-    fetch_from_sources, peer_handshake_inbound, serve_file, Download, FramedStream, PartStore,
-    PeerSource, SourceOrigin,
+    download_file, fetch_from_sources, peer_handshake_inbound, serve_file, Download, FramedStream,
+    ManagerConfig, PartStore, PeerSource, SourceOrigin,
 };
 use mule_proto::ed2k_hash;
+use std::time::Duration as StdDuration;
 use tokio::net::TcpListener;
 
 fn user_hash() -> [u8; 16] {
@@ -79,6 +80,48 @@ async fn fetch_downloads_a_file_from_a_discovered_source() {
         "downloaded bytes must match the ed2k hash"
     );
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn download_manager_completes_from_multiple_parallel_peers() {
+    // Three peers each hold the file; the manager runs them concurrently against
+    // one Download. Block reservation keeps the parallel workers from colliding,
+    // and the reassembled bytes verify.
+    let data: Vec<u8> = (0..300_000u32)
+        .map(|i| (i.wrapping_mul(48271) >> 11) as u8)
+        .collect();
+    let hash = ed2k_hash(&data);
+    let mut sources = Vec::new();
+    for _ in 0..3 {
+        let addr = spawn_server(data.clone(), b"multi.bin".to_vec()).await;
+        sources.push(PeerSource {
+            addr,
+            user_hash: None,
+            origin: SourceOrigin::PeerExchange,
+        });
+    }
+
+    let dir = std::env::temp_dir().join(format!("padmule-mgr-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = PartStore::create(&dir, 1, hash, data.len() as u64, b"multi.bin").unwrap();
+    let dl = Download::new(store);
+    let me = HelloInfo::baseline(user_hash(), 0, 4662, 4672, "padMule");
+
+    let cfg = ManagerConfig {
+        parallel: 3,
+        per_peer: StdDuration::from_secs(20),
+        rounds: 4,
+    };
+    let outcome = download_file(&dl, &sources, &me, cfg).await;
+
+    assert!(outcome.completed, "the manager must complete the file");
+    assert_eq!(outcome.bytes_present, data.len() as u64);
+    assert!(outcome.peers_connected >= 1);
+
+    drop(dl);
+    let got = std::fs::read(dir.join("001.part")).unwrap();
+    assert_eq!(ed2k_hash(&got), hash, "parallel download must verify");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
