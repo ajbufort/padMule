@@ -4,12 +4,14 @@
 //! source/keyword search. See docs/raw/wave6-kad-research-2026-07-14.md.
 
 pub mod frame;
+pub mod hardening;
 pub mod lookup;
 pub mod message;
 pub mod routing;
 pub mod udp_obf;
 
 pub use frame::{pack_kad, unpack_kad, KAD_PACK_THRESHOLD};
+pub use hardening::{is_acceptable_contact, is_acceptable_contact_ip, FloodTracker, FloodVerdict};
 pub use lookup::{Lookup, ALPHA_QUERY};
 pub use message::{
     build_bootstrap_req, build_bootstrap_res, build_hello_req, build_hello_res,
