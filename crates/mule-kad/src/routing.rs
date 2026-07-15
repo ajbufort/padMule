@@ -183,6 +183,14 @@ impl RoutingTable {
         v.len()
     }
 
+    /// Every contact currently held (unordered) - e.g. to checkpoint the table
+    /// to a `nodes.dat`.
+    pub fn contacts(&self) -> Vec<Contact> {
+        let mut v: Vec<&Contact> = Vec::new();
+        self.root.collect(&mut v);
+        v.into_iter().cloned().collect()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
