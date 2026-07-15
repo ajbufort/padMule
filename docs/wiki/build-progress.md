@@ -12,7 +12,7 @@ ends at a differential/round-trip gate.
 |------|-------|------|-------|
 | 1 | `mule-proto`: eD2k/MD4 file hashing | `plans/2026-07-12-wave1-mule-proto-ed2k-hash.md` | DONE. |
 | 1b | `mule-proto`: LE byte I/O + eD2k tag codec | `plans/2026-07-12-wave1b-io-and-tags.md` | DONE. Reviewed + corrected (see below). 20 tests total, clippy clean. |
-| 1c | `mule-proto`: AICH SHA-1 hash tree + search-expr encoding | - | not started (remaining Wave-1 codec slices) |
+| 1c | `mule-proto`: AICH SHA-1 hash tree + search-expr encoding | (implemented directly) | AICH DONE (2026-07-15): mule_proto::aich::aich_master_hash - SHA-1 tree (leaf=SHA1(EMBLOCKSIZE block), node=SHA1(L||R)), verbatim from SHAHashSet.cpp; structurally tested vs SHA1, byte-validation vs a live eMule AICH pending. Search-expression tree (boolean OR/NOT) still deferred. |
 | 2a | `mule-files` crate + `server.met` | `plans/2026-07-12-wave2a-mule-files-server-met.md` | DONE (5 tests). |
 | 2b | `known.met` | `plans/2026-07-12-wave2b-known-met.md` | DONE (10 mule-files tests total). |
 | 2c | `part.met` (+64-bit + gap list) | `plans/2026-07-12-wave2c-part-met.md` | DONE (17 mule-files tests). `nodes.dat` moved to Wave 6 (Kad). |
