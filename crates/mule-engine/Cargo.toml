@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 flate2 = { workspace = true }
 mule-files = { path = "../mule-files" }
+mule-kad = { path = "../mule-kad" }
 mule-proto = { path = "../mule-proto" }
 rsa = { workspace = true }
 sha1 = { workspace = true }

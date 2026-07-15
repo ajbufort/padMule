@@ -22,9 +22,10 @@ use mule_engine::peer::HelloInfo;
 use mule_engine::server_messages::{LoginRequest, DEFAULT_SERVER_FLAGS};
 use mule_engine::{
     connect_peer, connect_peer_obf, download_from_peer, obf_accept, peer_handshake_inbound, serve,
-    Download, FramedStream, ObfDetect, PartStore, ServedFile, ServerEvent, ServerLink, ServerState,
+    Download, FramedStream, KadNode, ObfDetect, PartStore, ServedFile, ServerEvent, ServerLink,
+    ServerState,
 };
-use mule_files::read_server_met;
+use mule_files::{read_nodes_dat, read_server_met};
 use mule_proto::ed2k_hash;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -614,6 +615,86 @@ async fn cmd_peer_download(
     println!("OK: downloaded + verified {size} bytes -> {out} (hash matches, hashset verified)");
 }
 
+/// Wave-6 live gate: load a nodes.dat, then send obfuscated BOOTSTRAP_REQs to
+/// its contacts until one answers - proving the Kad UDP framing, obfuscation,
+/// and message codecs against a real node. On success, follow with a HELLO.
+async fn cmd_kad_bootstrap(nodes_path: &str) {
+    let bytes = match std::fs::read(nodes_path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("cannot read {nodes_path}: {e}");
+            return;
+        }
+    };
+    let parsed = match read_nodes_dat(&bytes) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("bad nodes.dat: {e:?}");
+            return;
+        }
+    };
+    println!(
+        "loaded {} contacts (nodes.dat v{})",
+        parsed.contacts.len(),
+        parsed.version
+    );
+    // Only Kad2 contacts (version >= 2) are reachable with this protocol.
+    let contacts: Vec<_> = parsed
+        .contacts
+        .into_iter()
+        .filter(|c| c.version >= 2)
+        .collect();
+
+    let bind: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 4672);
+    let mut node = match KadNode::bind(bind, 4662).await {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("bind failed: {e}");
+            return;
+        }
+    };
+    println!(
+        "bound Kad UDP on {bind}; our KadID {:08x?}",
+        node.kad_id().words()
+    );
+    println!(
+        "trying BOOTSTRAP_REQ against up to {} contacts...",
+        contacts.len().min(40)
+    );
+
+    match node
+        .bootstrap_any(&contacts, Duration::from_millis(1200), 40)
+        .await
+    {
+        Ok((i, res)) => {
+            println!(
+                "BOOTSTRAP_RES from contact #{i}: responder version {}, tcp {}, {} contacts returned",
+                res.version,
+                res.tcp_port,
+                res.contacts.len()
+            );
+            println!("routing table now holds {} contacts", node.contacts_known());
+            // Follow up with a HELLO to the same contact to exercise 6b's HELLO
+            // path (request an ACK).
+            let responder = &contacts[i];
+            match node.hello(responder, Duration::from_millis(1500)).await {
+                Ok(h) => println!(
+                    "HELLO_RES: id {:08x?}, tcp {}, version {}, udp_port {:?}",
+                    h.id.words(),
+                    h.tcp_port,
+                    h.version,
+                    h.source_udp_port
+                ),
+                Err(e) => println!("HELLO after bootstrap: {e}"),
+            }
+        }
+        Err(e) => {
+            eprintln!("no contact answered a BOOTSTRAP_REQ: {e}");
+            eprintln!("(nodes.dat may be stale, or UDP {} is blocked)", 4672);
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -675,6 +756,7 @@ async fn main() {
                 (_, _, None, _) => eprintln!("bad size: {}", args[5]),
             }
         }
+        Some("kad-bootstrap") if args.len() == 3 => cmd_kad_bootstrap(&args[2]).await,
         _ => {
             eprintln!("usage:");
             eprintln!("  mule-cli login <host> <port>");
@@ -683,6 +765,7 @@ async fn main() {
             eprintln!("  mule-cli hash-file <path>");
             eprintln!("  mule-cli serve-file <port> <path>");
             eprintln!("  mule-cli peer-download <host> <port> <hash> <size> <out> [obf-peer-hash]");
+            eprintln!("  mule-cli kad-bootstrap <nodes.dat>");
         }
     }
 }

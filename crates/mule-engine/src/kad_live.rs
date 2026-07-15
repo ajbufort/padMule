@@ -1,0 +1,241 @@
+//! Live Kad UDP node - the socket driver that turns the Wave 6a/6b/6c codecs
+//! into a real conversation with the Kad network (Wave 6 gate). Sends an
+//! obfuscated BOOTSTRAP_REQ to known contacts, decodes the BOOTSTRAP_RES, and
+//! seeds the routing table; then a HELLO handshake and, later, iterative
+//! lookups.
+//!
+//! IP byte convention (confirmed by live capture, Wave 6b gate): eMule keeps a
+//! contact IP in HOST order (MSByte = first octet) and `WriteUInt32`s it
+//! little-endian to disk/wire, so our `read_u32` (LE) recovers that host-order
+//! value directly - e.g. 95.236.36.250 -> 0x5FEC24FA. The dotted quad is thus
+//! the BIG-endian view of `ip` (`Ipv4Addr::from(ip)`), NOT `to_le_bytes` (which
+//! yields the reversed 250.36.236.95, a multicast address the packet never
+//! reaches). A peer's socket IP converts back with `u32::from(Ipv4Addr)`. The
+//! same u32 feeds `udp_verify_key`, so the key we issue on send matches the one
+//! we recompute on receive (same peer, same convention both directions).
+
+use mule_files::KadContact;
+use mule_kad::{
+    build_bootstrap_req, build_hello_req, kad_deobfuscate, kad_obfuscate_request, pack_kad,
+    parse_bootstrap_res, parse_hello, unpack_kad, BootstrapRes, Hello, RoutingTable,
+    KADEMLIA_VERSION, OP_BOOTSTRAP_RES, OP_HELLO_RES,
+};
+use mule_proto::Kad128;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::time::Duration;
+use tokio::net::UdpSocket;
+use tokio::time::timeout;
+
+/// A contact's host-order `ip` u32 to its socket address (big-endian view).
+fn contact_addr(ip: u32, port: u16) -> SocketAddr {
+    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(ip), port))
+}
+
+/// A peer's socket IP back to the host-order u32 used for keys/records.
+fn ip_u32(addr: &SocketAddr) -> u32 {
+    match addr {
+        SocketAddr::V4(v4) => (*v4.ip()).into(),
+        SocketAddr::V6(_) => 0,
+    }
+}
+
+/// Errors from a live Kad exchange.
+#[derive(Debug)]
+pub enum KadError {
+    Io(std::io::Error),
+    Timeout,
+    /// The datagram was plaintext or matched no key.
+    NotDecryptable,
+    /// A codec/parse error on the decrypted payload.
+    Decode(mule_proto::IoError),
+    /// A valid Kad frame but not the opcode we awaited.
+    Unexpected(u8),
+}
+
+impl std::fmt::Display for KadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KadError::Io(e) => write!(f, "io: {e}"),
+            KadError::Timeout => write!(f, "timed out"),
+            KadError::NotDecryptable => {
+                write!(f, "response not decryptable (plaintext or wrong key)")
+            }
+            KadError::Decode(e) => write!(f, "decode: {e}"),
+            KadError::Unexpected(op) => write!(f, "unexpected opcode 0x{op:02x}"),
+        }
+    }
+}
+
+impl From<std::io::Error> for KadError {
+    fn from(e: std::io::Error) -> Self {
+        KadError::Io(e)
+    }
+}
+impl From<mule_proto::IoError> for KadError {
+    fn from(e: mule_proto::IoError) -> Self {
+        KadError::Decode(e)
+    }
+}
+
+/// A live Kad node: a bound UDP socket plus our identity and routing table.
+pub struct KadNode {
+    socket: UdpSocket,
+    kad_id: Kad128,
+    udp_key: u32,
+    tcp_port: u16,
+    udp_port: u16,
+    routing: RoutingTable,
+}
+
+impl KadNode {
+    /// Bind a Kad node on `bind_addr` (e.g. `0.0.0.0:4672`) with a fresh random
+    /// identity. `tcp_port` is advertised in HELLO.
+    pub async fn bind(bind_addr: SocketAddr, tcp_port: u16) -> Result<Self, KadError> {
+        let socket = UdpSocket::bind(bind_addr).await?;
+        let udp_port = socket.local_addr()?.port();
+        // Random 128-bit Kad ID and 32-bit install key (eMule persists these; a
+        // fresh identity per run is fine for joining/bootstrapping).
+        let kad_id = Kad128::from_words([
+            rand::random(),
+            rand::random(),
+            rand::random(),
+            rand::random(),
+        ]);
+        let udp_key = rand::random();
+        Ok(KadNode {
+            socket,
+            kad_id,
+            udp_key,
+            tcp_port,
+            udp_port,
+            routing: RoutingTable::new(kad_id),
+        })
+    }
+
+    pub fn kad_id(&self) -> Kad128 {
+        self.kad_id
+    }
+    pub fn routing(&self) -> &RoutingTable {
+        &self.routing
+    }
+    pub fn contacts_known(&self) -> usize {
+        self.routing.len()
+    }
+
+    /// Send an obfuscated Kad request (NodeID-keyed on `target_id`, our
+    /// senderVerifyKey issued for `dest`), await one datagram, and return the
+    /// decrypted `(opcode, payload)`.
+    async fn request(
+        &self,
+        target_id: &Kad128,
+        dest: SocketAddr,
+        frame: &[u8],
+        wait: Duration,
+    ) -> Result<(u8, Vec<u8>, SocketAddr), KadError> {
+        let dest_ip = ip_u32(&dest);
+        let sender_vk = mule_kad::udp_verify_key(self.udp_key, dest_ip);
+        let datagram = kad_obfuscate_request(
+            frame,
+            target_id,
+            rand::random(), // random key seed
+            0,              // no receiver key on first contact
+            sender_vk,      // want this echoed to prove our IP
+            rand::random(), // marker randomness
+        );
+        self.socket.send_to(&datagram, dest).await?;
+
+        let mut buf = vec![0u8; 4096];
+        let (n, from) = match timeout(wait, self.socket.recv_from(&mut buf)).await {
+            Ok(r) => r?,
+            Err(_) => return Err(KadError::Timeout),
+        };
+        let dec = kad_deobfuscate(&buf[..n], &self.kad_id, self.udp_key, ip_u32(&from))
+            .ok_or(KadError::NotDecryptable)?;
+        let (op, payload) = unpack_kad(&dec.payload)?;
+        Ok((op, payload, from))
+    }
+
+    /// Send a BOOTSTRAP_REQ to one contact and parse its BOOTSTRAP_RES, seeding
+    /// the routing table with the returned contacts (and the responder itself).
+    pub async fn bootstrap_from(
+        &mut self,
+        contact: &KadContact,
+        wait: Duration,
+    ) -> Result<BootstrapRes, KadError> {
+        let (op, payload) = build_bootstrap_req();
+        let frame = pack_kad(op, payload);
+        let dest = contact_addr(contact.ip, contact.udp_port);
+        let (res_op, res_payload, from) = self.request(&contact.id, dest, &frame, wait).await?;
+        if res_op != OP_BOOTSTRAP_RES {
+            return Err(KadError::Unexpected(res_op));
+        }
+        let res = parse_bootstrap_res(&res_payload)?;
+        // The responder itself, then every listed contact.
+        let from_ip = ip_u32(&from);
+        self.routing
+            .add(res.id, from_ip, from.port(), res.tcp_port, res.version);
+        for c in &res.contacts {
+            self.routing
+                .add(c.id, c.ip, c.udp_port, c.tcp_port, c.version);
+        }
+        Ok(res)
+    }
+
+    /// Try each contact in turn until one answers a BOOTSTRAP_REQ. Returns the
+    /// (contact index, response) of the first success.
+    pub async fn bootstrap_any(
+        &mut self,
+        contacts: &[KadContact],
+        per_contact: Duration,
+        max_tries: usize,
+    ) -> Result<(usize, BootstrapRes), KadError> {
+        let mut last = KadError::Timeout;
+        for (i, c) in contacts.iter().take(max_tries).enumerate() {
+            match self.bootstrap_from(c, per_contact).await {
+                Ok(res) => return Ok((i, res)),
+                Err(e) => last = e,
+            }
+        }
+        Err(last)
+    }
+
+    /// Send a HELLO_REQ to a contact (requesting a HELLO_RES_ACK) and parse the
+    /// HELLO_RES.
+    pub async fn hello(&mut self, contact: &KadContact, wait: Duration) -> Result<Hello, KadError> {
+        // misc_options bit 0x04 requests a HELLO_RES_ACK (v>=8).
+        let (op, payload) =
+            build_hello_req(&self.kad_id, self.tcp_port, Some(self.udp_port), Some(0x04));
+        let _ = KADEMLIA_VERSION; // version is baked into the HELLO body
+        let frame = pack_kad(op, payload);
+        let dest = contact_addr(contact.ip, contact.udp_port);
+        let (res_op, res_payload, _from) = self.request(&contact.id, dest, &frame, wait).await?;
+        if res_op != OP_HELLO_RES {
+            return Err(KadError::Unexpected(res_op));
+        }
+        Ok(parse_hello(&res_payload)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn contact_ip_uses_the_big_endian_view_confirmed_live() {
+        // A real fresh-nodes.dat contact: wire bytes FA 24 EC 5F -> read_u32 LE
+        // 0x5FEC24FA -> the real IP is 95.236.36.250 (a valid public host), NOT
+        // the byte-reversed 250.36.236.95 (multicast). This convention is what
+        // made the live Wave-6 bootstrap gate pass.
+        let ip: u32 = 0x5FEC_24FA;
+        let addr = contact_addr(ip, 4672);
+        assert_eq!(addr, "95.236.36.250:4672".parse().unwrap());
+        // Round-trips back to the same host-order u32 the record stored.
+        assert_eq!(ip_u32(&addr), ip);
+    }
+
+    #[test]
+    fn ip_u32_round_trips_an_arbitrary_v4() {
+        let addr: SocketAddr = "203.0.113.7:1234".parse().unwrap();
+        assert_eq!(contact_addr(ip_u32(&addr), 1234), addr);
+    }
+}
