@@ -250,16 +250,36 @@ impl PartFile {
     /// is what keeps parts finishing (and therefore verifiable and shareable)
     /// instead of leaving every part half-done. `available` says which parts the
     /// source actually holds.
+    /// Pick up to `max` blocks to request from a peer that holds the parts for
+    /// which `available(part)` is true.
+    ///
+    /// `rarity(part)` is the swarm availability of a part (how many peers hold
+    /// it); parts are requested RAREST-FIRST so the least-available data enters
+    /// our copy soonest (it may vanish from the swarm), tie-broken by the usual
+    /// "finish nearly-complete parts first" order. In `endgame` the `reserved`
+    /// list is ignored, so several peers can race the final blocks - a slow or
+    /// queuing peer then can't stall the last block.
     pub fn next_blocks(
         &self,
         available: &dyn Fn(u64) -> bool,
         reserved: &[(u64, u64)],
         max: usize,
+        rarity: &dyn Fn(u64) -> u32,
+        endgame: bool,
     ) -> Vec<(u64, u64)> {
         let mut out: Vec<(u64, u64)> = Vec::new();
-        let mut taken: Vec<(u64, u64)> = reserved.to_vec();
+        let mut taken: Vec<(u64, u64)> = if endgame {
+            Vec::new()
+        } else {
+            reserved.to_vec()
+        };
 
-        for part in self.wanted_parts() {
+        // `wanted_parts()` is already ordered by (missing, part); a stable sort
+        // by rarity puts the rarest first while preserving that tie-break.
+        let mut parts = self.wanted_parts();
+        parts.sort_by_key(|&p| rarity(p));
+
+        for part in parts {
             if !available(part) {
                 continue;
             }
@@ -432,7 +452,7 @@ mod tests {
     #[test]
     fn next_blocks_hands_out_three_distinct_blocks() {
         let pf = PartFile::new(H, 400_000);
-        let blocks = pf.next_blocks(&|_| true, &[], 3);
+        let blocks = pf.next_blocks(&|_| true, &[], 3, &|_| 0, false);
         assert_eq!(blocks.len(), 3);
         assert_eq!(blocks[0], (0, EMBLOCKSIZE));
         assert_eq!(blocks[1], (EMBLOCKSIZE, 2 * EMBLOCKSIZE));
@@ -445,13 +465,13 @@ mod tests {
     fn we_never_request_a_part_the_source_lacks() {
         let pf = PartFile::new(H, 3 * PARTSIZE);
         // Source has ONLY part 2.
-        let blocks = pf.next_blocks(&|p| p == 2, &[], 3);
+        let blocks = pf.next_blocks(&|p| p == 2, &[], 3, &|_| 0, false);
         assert!(!blocks.is_empty());
         for (s, _) in blocks {
             assert!(s >= 2 * PARTSIZE, "requested outside part 2: {s}");
         }
         // A source with nothing gives us nothing.
-        assert!(pf.next_blocks(&|_| false, &[], 3).is_empty());
+        assert!(pf.next_blocks(&|_| false, &[], 3, &|_| 0, false).is_empty());
     }
 
     #[test]
@@ -459,7 +479,7 @@ mod tests {
         let mut pf = PartFile::new(H, 400_000);
         pf.fill_gap(0, 400_000);
         assert!(pf.is_complete());
-        assert!(pf.next_blocks(&|_| true, &[], 3).is_empty());
+        assert!(pf.next_blocks(&|_| true, &[], 3, &|_| 0, false).is_empty());
         assert!(pf.next_block_in_part(0, &[]).is_none());
     }
 
@@ -602,5 +622,34 @@ mod tests {
             ]
         );
         assert_eq!(pf.missing(), 100 + 300);
+    }
+
+    #[test]
+    fn next_blocks_prefers_the_rarest_part() {
+        // Three full parts, all equally incomplete, so the (missing, part)
+        // tie-break alone would pick part 0. Making part 2 the rarest must flip
+        // it to the front.
+        let pf = PartFile::new(H, 3 * PARTSIZE);
+        let rarity = |p: u64| if p == 2 { 0 } else { 9 };
+        let blocks = pf.next_blocks(&|_| true, &[], 1, &rarity, false);
+        assert_eq!(blocks.len(), 1);
+        assert!(
+            blocks[0].0 >= 2 * PARTSIZE,
+            "the rarest part (2) is requested first, got {:?}",
+            blocks[0]
+        );
+        // With uniform rarity, order falls back to the part index (part 0).
+        let flat = pf.next_blocks(&|_| true, &[], 1, &|_| 0, false);
+        assert!(flat[0].0 < PARTSIZE, "uniform rarity -> part 0 first");
+    }
+
+    #[test]
+    fn endgame_re_offers_reserved_blocks() {
+        // A one-block file. Normally a reserved block is skipped; in endgame it
+        // is re-offered so several peers can race the final block.
+        let pf = PartFile::new(H, 100_000); // < EMBLOCKSIZE -> one block
+        let b = pf.next_blocks(&|_| true, &[], 1, &|_| 0, false)[0];
+        assert!(pf.next_blocks(&|_| true, &[b], 1, &|_| 0, false).is_empty());
+        assert_eq!(pf.next_blocks(&|_| true, &[b], 1, &|_| 0, true), vec![b]);
     }
 }

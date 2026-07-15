@@ -31,8 +31,8 @@ pub use credits::{resolve_ident_state, score_ratio, score_ratio_ident, IdentStat
 pub use crypt_policy::{should_obfuscate_outbound, should_reject, CryptPrefs};
 pub use engine::{Engine, EngineEvent, EngineState};
 pub use fetch::{
-    download_file, fetch_from_sources, FetchOutcome, ManagerConfig, PeerSource, SourceOrigin,
-    SourceRegistry,
+    download_file, fetch_from_sources, FetchOutcome, ManagerConfig, PeerScoreboard, PeerSource,
+    SourceOrigin, SourceRegistry,
 };
 pub use framed::{FrameError, FramedStream};
 pub use identity::NodeIdentity;
