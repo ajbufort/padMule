@@ -8,3 +8,4 @@ rust-version.workspace = true
 [dependencies]
 mule-proto = { path = "../mule-proto" }
 mule-files = { path = "../mule-files" }
+md-5 = { workspace = true }
