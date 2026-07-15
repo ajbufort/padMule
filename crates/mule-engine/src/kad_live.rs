@@ -16,10 +16,11 @@
 
 use mule_files::KadContact;
 use mule_kad::{
-    build_bootstrap_req, build_hello_req, build_kad2_req, build_search_source_req, kad_deobfuscate,
-    kad_obfuscate_request, pack_kad, parse_bootstrap_res, parse_hello, parse_kad2_res,
-    parse_search_res, unpack_kad, BootstrapRes, Hello, Lookup, RoutingTable, Source, WireContact,
-    ALPHA_QUERY, K, KAD_FIND_NODE, OP_BOOTSTRAP_RES, OP_HELLO_RES, OP_KAD2_RES, OP_SEARCH_RES,
+    build_bootstrap_req, build_hello_req, build_kad2_req, build_search_key_req,
+    build_search_source_req, kad_deobfuscate, kad_keyword_target, kad_obfuscate_request, pack_kad,
+    parse_bootstrap_res, parse_hello, parse_kad2_res, parse_search_res, unpack_kad, BootstrapRes,
+    FileResult, Hello, Lookup, RoutingTable, Source, WireContact, ALPHA_QUERY, K, KAD_FIND_NODE,
+    OP_BOOTSTRAP_RES, OP_HELLO_RES, OP_KAD2_RES, OP_SEARCH_RES,
 };
 use mule_proto::Kad128;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -348,6 +349,86 @@ impl KadNode {
             }
         }
         Ok(out)
+    }
+
+    /// Ask one node for keyword matches (KADEMLIA2_SEARCH_KEY_REQ) and distil the
+    /// file results from its KADEMLIA2_SEARCH_RES.
+    async fn search_keyword_node(
+        &self,
+        node: &WireContact,
+        target: &Kad128,
+        wait: Duration,
+    ) -> Result<Vec<FileResult>, KadError> {
+        let (op, payload) = build_search_key_req(target, 0);
+        let frame = pack_kad(op, payload);
+        let dest = contact_addr(node.ip, node.udp_port);
+        let res_payload = self
+            .request(&node.id, dest, &frame, OP_SEARCH_RES, wait)
+            .await?;
+        let res = parse_search_res(&res_payload)?;
+        Ok(res.results.iter().filter_map(|r| r.as_file()).collect())
+    }
+
+    /// Resolve a `keyword` to files over the live Kad network: an iterative
+    /// FIND_NODE lookup toward the keyword hash, then KADEMLIA2_SEARCH_KEY_REQ to
+    /// the closest in-tolerance nodes. Results are de-duped by file hash. This is
+    /// a SERVERLESS search - no eD2k server needed.
+    pub async fn resolve_keyword(
+        &mut self,
+        keyword: &str,
+        want: usize,
+        per_query: Duration,
+    ) -> Result<Vec<FileResult>, KadError> {
+        let target = kad_keyword_target(keyword);
+        let seeds: Vec<WireContact> = self
+            .routing
+            .closest_to(&target, 50)
+            .into_iter()
+            .map(|c| WireContact {
+                id: c.id,
+                ip: c.ip,
+                udp_port: c.udp_port,
+                tcp_port: c.tcp_port,
+                version: c.version,
+            })
+            .collect();
+        if seeds.is_empty() {
+            return Err(KadError::NotDecryptable); // bootstrap first
+        }
+        let mut lookup = Lookup::new(target, seeds);
+        for _round in 0..12 {
+            let batch = lookup.next_queries(ALPHA_QUERY, K);
+            if batch.is_empty() {
+                break;
+            }
+            for node in &batch {
+                if let Ok(contacts) = self.find_node(node, &target, per_query).await {
+                    for c in &contacts {
+                        self.routing
+                            .add(c.id, c.ip, c.udp_port, c.tcp_port, c.version);
+                    }
+                    lookup.on_response(contacts);
+                }
+            }
+        }
+
+        let mut files: Vec<FileResult> = Vec::new();
+        for node in lookup.closest(K) {
+            if !target.distance(&node.id).within_tolerance() {
+                continue;
+            }
+            if let Ok(found) = self.search_keyword_node(&node, &target, per_query).await {
+                for f in found {
+                    if !files.iter().any(|e| e.hash == f.hash) {
+                        files.push(f);
+                    }
+                }
+                if files.len() >= want {
+                    break;
+                }
+            }
+        }
+        Ok(files)
     }
 }
 

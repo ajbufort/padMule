@@ -1203,6 +1203,68 @@ async fn cmd_search_download(met_path: &str, keyword: &str, out: &str) {
     }
 }
 
+/// Serverless keyword search over Kad: bootstrap, then resolve a keyword to
+/// files (iterative FIND_NODE toward the keyword hash, then SEARCH_KEY_REQ).
+async fn cmd_kad_keyword(nodes_path: &str, keyword: &str) {
+    let bytes = match std::fs::read(nodes_path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("cannot read {nodes_path}: {e}");
+            return;
+        }
+    };
+    let parsed = match read_nodes_dat(&bytes) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("bad nodes.dat: {e:?}");
+            return;
+        }
+    };
+    let contacts: Vec<_> = parsed
+        .contacts
+        .into_iter()
+        .filter(|c| c.version >= 2)
+        .collect();
+    let bind: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 4672);
+    let mut node = match KadNode::bind(bind, 4662).await {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("bind failed: {e}");
+            return;
+        }
+    };
+    println!("bootstrapping into Kad...");
+    if let Err(e) = node
+        .bootstrap_any(&contacts, Duration::from_millis(1200), 40)
+        .await
+    {
+        eprintln!("bootstrap failed: {e}");
+        return;
+    }
+    println!("searching Kad for keyword '{keyword}' (no server)...");
+    match node
+        .resolve_keyword(keyword, 30, Duration::from_millis(1400))
+        .await
+    {
+        Ok(files) if files.is_empty() => {
+            println!("no files published under '{keyword}' in Kad right now.");
+        }
+        Ok(files) => {
+            println!("found {} file(s):", files.len());
+            for f in files.iter().take(30) {
+                println!(
+                    "  {}  {:>12} B  ~{} srcs  {}",
+                    hex16(&f.hash),
+                    f.size,
+                    f.sources,
+                    f.name
+                );
+            }
+        }
+        Err(e) => eprintln!("keyword search failed: {e}"),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -1272,6 +1334,7 @@ async fn main() {
                 (_, Err(_)) => eprintln!("bad size: {}", args[4]),
             }
         }
+        Some("kad-keyword") if args.len() == 4 => cmd_kad_keyword(&args[2], &args[3]).await,
         Some("kad-fetch") if args.len() == 6 => {
             match (parse_hex16(&args[3]), args[4].parse::<u64>()) {
                 (Some(hash), Ok(size)) => cmd_kad_fetch(&args[2], hash, size, &args[5]).await,
@@ -1293,6 +1356,7 @@ async fn main() {
             eprintln!("  mule-cli kad-bootstrap <nodes.dat>");
             eprintln!("  mule-cli kad-search <nodes.dat> <ed2k-hash-hex> <size>");
             eprintln!("  mule-cli kad-fetch <nodes.dat> <ed2k-hash-hex> <size> <out>");
+            eprintln!("  mule-cli kad-keyword <nodes.dat> <keyword>");
             eprintln!("  mule-cli search-download <server.met> <keyword> <out>");
         }
     }
