@@ -1,6 +1,7 @@
 //! mule-proto: pure eD2k/Kad codec and crypto primitives for padMule.
 //! No I/O. See docs/wiki/protocol-reference.md.
 
+pub mod aich;
 pub mod hash;
 pub mod io;
 pub mod kad_id;
@@ -9,6 +10,7 @@ pub mod packet;
 pub mod rc4;
 pub mod tag;
 
+pub use aich::{aich_master_hash, EMBLOCKSIZE};
 pub use hash::{ed2k_hash, md4, part_count, OLD_MAX_FILE_SIZE, PARTSIZE};
 pub use io::{IoError, Reader, Writer};
 pub use kad_id::Kad128;
