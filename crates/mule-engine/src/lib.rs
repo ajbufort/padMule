@@ -7,6 +7,7 @@ pub mod credits;
 pub mod crypt_policy;
 pub mod fetch;
 pub mod framed;
+pub mod identity;
 pub mod kad_live;
 pub mod link;
 pub mod multi_source;
@@ -28,6 +29,7 @@ pub use credits::{resolve_ident_state, score_ratio, score_ratio_ident, IdentStat
 pub use crypt_policy::{should_obfuscate_outbound, should_reject, CryptPrefs};
 pub use fetch::{fetch_from_sources, FetchOutcome, PeerSource, SourceOrigin, SourceRegistry};
 pub use framed::{FrameError, FramedStream};
+pub use identity::NodeIdentity;
 pub use kad_live::{KadError, KadNode, ResolveOutcome};
 pub use link::ServerLink;
 pub use multi_source::{download_from_peer, Download};
