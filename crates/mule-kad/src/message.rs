@@ -4,7 +4,7 @@
 //! section B, verified against amule-3.0.1 `KademliaUDPListener.cpp` /
 //! `SafeFile.cpp::WriteTag`.
 
-use mule_proto::{IoError, Kad128, Reader, Writer};
+use mule_proto::{md4, IoError, Kad128, Reader, Writer};
 
 // --- Kad2 opcodes (packet byte [1]); Kad1 (even) opcodes are deprecated. ---
 /// Bootstrap request (empty payload).
@@ -22,6 +22,8 @@ pub const OP_HELLO_RES_ACK: u8 = 0x22;
 pub const OP_KAD2_REQ: u8 = 0x21;
 /// FIND_NODE response (Wave 6c).
 pub const OP_KAD2_RES: u8 = 0x29;
+/// Keyword search request.
+pub const OP_SEARCH_KEY_REQ: u8 = 0x33;
 /// Source search request (Wave 6d).
 pub const OP_SEARCH_SOURCE_REQ: u8 = 0x34;
 /// Keyword/source search response (Wave 6d).
@@ -67,6 +69,12 @@ pub const TAG_SOURCETYPE: u8 = 0xFF;
 pub const TAG_SOURCEIP: u8 = 0xFE;
 /// Source TCP port (u16).
 pub const TAG_SOURCEPORT: u8 = 0xFD;
+/// Keyword-result file tags. Filename (string).
+pub const TAG_FILENAME: u8 = 0x01;
+/// File size (u32, or a BSOB u64 for >4GB).
+pub const TAG_FILESIZE: u8 = 0x02;
+/// Advertised source/availability count (u32).
+pub const TAG_SOURCES: u8 = 0x15;
 
 // --- Kad tag wire types (TagTypes.h). ---
 const TT_HASH16: u8 = 0x01;
@@ -590,6 +598,70 @@ impl SearchResult {
     }
 }
 
+/// The Kad keyword-search target: `SetValueBE(MD4(utf8(keyword)))`. Keywords are
+/// lowercased so a search matches a publisher's (case-insensitive) keyword.
+/// eMule `KadGetKeywordHash` (Kademlia.cpp:500).
+pub fn kad_keyword_target(keyword: &str) -> Kad128 {
+    Kad128::from_hash(&md4(keyword.to_lowercase().as_bytes()))
+}
+
+/// Build a KADEMLIA2_SEARCH_KEY_REQ: `target 16 | flags 2`. `flags` is 0 for a
+/// plain keyword search (0x8000 would append a boolean search-expression tree,
+/// not implemented). eMule `Search.cpp:473/506`.
+pub fn build_search_key_req(target: &Kad128, flags: u16) -> (u8, Vec<u8>) {
+    let mut w = Writer::new();
+    w.write_bytes(&target.to_wire());
+    w.write_u16(flags);
+    (OP_SEARCH_KEY_REQ, w.into_inner())
+}
+
+/// A file found by a keyword search (distilled from a KADEMLIA2_SEARCH_RES
+/// result's file tags).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileResult {
+    /// The ed2k file hash (canonical) - feed to a source search / download.
+    pub hash: [u8; 16],
+    pub name: String,
+    pub size: u64,
+    /// Advertised availability (TAG_SOURCES), 0 if absent.
+    pub sources: u32,
+}
+
+impl SearchResult {
+    /// Distil this result's tags into a keyword [`FileResult`]. `None` unless it
+    /// carries a filename and a nonzero size (e.g. a source result, which has no
+    /// filename). The result's answer ID is the file's ed2k hash.
+    pub fn as_file(&self) -> Option<FileResult> {
+        let mut name = None;
+        let mut size = None;
+        let mut sources = 0u32;
+        for t in &self.tags {
+            match (t.name, &t.value) {
+                (TAG_FILENAME, KadTagValue::Str(s)) => {
+                    name = Some(String::from_utf8_lossy(s).into_owned())
+                }
+                (TAG_FILESIZE, KadTagValue::Int(v)) => size = Some(*v),
+                (TAG_FILESIZE, KadTagValue::Bsob(b)) if b.len() == 8 => {
+                    size = Some(u64::from_le_bytes(b[..8].try_into().unwrap()))
+                }
+                (TAG_SOURCES, KadTagValue::Int(v)) => sources = *v as u32,
+                _ => {}
+            }
+        }
+        let name = name?;
+        let size = size?;
+        if size == 0 {
+            return None;
+        }
+        Some(FileResult {
+            hash: self.answer.to_hash(),
+            name,
+            size,
+            sources,
+        })
+    }
+}
+
 /// Read a Kad tag list: `<u8 count>` then `count` tags.
 fn read_kad_taglist(r: &mut Reader) -> Result<Vec<KadTag>, IoError> {
     let count = r.read_u8()? as usize;
@@ -876,6 +948,62 @@ mod tests {
         assert_eq!(src.client_hash, hi.answer);
         // The keyword result is not a source.
         assert!(parsed.results[1].as_source().is_none());
+    }
+
+    #[test]
+    fn keyword_target_is_md4_of_the_lowercased_keyword() {
+        use mule_proto::md4;
+        let t = kad_keyword_target("PadMule");
+        assert_eq!(t, Kad128::from_hash(&md4(b"padmule")));
+        // Case-insensitive: different case -> same target.
+        assert_eq!(kad_keyword_target("padmule"), kad_keyword_target("PADMULE"));
+    }
+
+    #[test]
+    fn search_key_req_is_18_bytes() {
+        let t = kad_keyword_target("linux");
+        let (op, payload) = build_search_key_req(&t, 0);
+        assert_eq!(op, OP_SEARCH_KEY_REQ);
+        assert_eq!(payload.len(), 18); // target 16 + flags 2
+        assert_eq!(&payload[16..18], &[0, 0]);
+        assert_eq!(&payload[..16], &t.to_wire());
+    }
+
+    #[test]
+    fn search_res_distils_a_keyword_file_result() {
+        let file_hash = Kad128::from_hash(&[0xEE; 16]);
+        let r = SearchResult {
+            answer: file_hash,
+            tags: vec![
+                KadTag {
+                    name: TAG_FILENAME,
+                    value: KadTagValue::Str(b"ubuntu.iso".to_vec()),
+                },
+                KadTag {
+                    name: TAG_FILESIZE,
+                    value: KadTagValue::Int(4_000_000),
+                },
+                KadTag {
+                    name: TAG_SOURCES,
+                    value: KadTagValue::Int(42),
+                },
+            ],
+        };
+        let f = r.as_file().unwrap();
+        assert_eq!(f.hash, file_hash.to_hash());
+        assert_eq!(f.name, "ubuntu.iso");
+        assert_eq!(f.size, 4_000_000);
+        assert_eq!(f.sources, 42);
+        // A source result (no filename) is not a file result.
+        assert!(SearchResult {
+            answer: file_hash,
+            tags: vec![KadTag {
+                name: TAG_SOURCETYPE,
+                value: KadTagValue::Int(1)
+            }],
+        }
+        .as_file()
+        .is_none());
     }
 
     #[test]
