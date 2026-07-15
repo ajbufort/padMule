@@ -152,13 +152,15 @@ pub struct FetchOutcome {
 }
 
 /// Connect to `src` (obfuscated if we know its userhash, else plaintext) and
-/// download into `dl` until the peer stops or the deadline hits.
+/// download into `dl` until the peer stops or the deadline hits. `Ok(bytes)`
+/// with the count this source delivered (0 if it connected but only queued us);
+/// `Err(())` if we could not even connect/handshake.
 async fn fetch_one(
     dl: &Download,
     src: &PeerSource,
     me: &HelloInfo,
     per_peer: Duration,
-) -> Result<(), ()> {
+) -> Result<u64, ()> {
     let connect = async {
         match src.user_hash {
             Some(h) => connect_peer_obf(src.addr, me, &h).await,
@@ -169,8 +171,52 @@ async fn fetch_one(
         Ok(Ok(v)) => v,
         _ => return Err(()),
     };
-    let _ = timeout(per_peer, download_from_peer(&mut fs, dl)).await;
-    Ok(())
+    match timeout(per_peer, download_from_peer(&mut fs, dl)).await {
+        Ok(Ok(bytes)) => Ok(bytes),
+        _ => Ok(0), // connected but delivered nothing (queued / dropped)
+    }
+}
+
+/// Per-source delivery history, so the manager tries proven-good sources first.
+#[derive(Debug, Default)]
+pub struct PeerScoreboard {
+    peers: std::collections::HashMap<SocketAddr, PeerStat>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct PeerStat {
+    bytes: u64,
+    sessions: u32,
+    fails: u32,
+}
+
+/// Each connect failure costs this many bytes of "score", so a source that keeps
+/// refusing sinks below untried sources (score 0), which sink below deliverers.
+const FAIL_PENALTY: i64 = 1_000_000;
+
+impl PeerScoreboard {
+    pub fn new() -> Self {
+        PeerScoreboard::default()
+    }
+
+    fn record(&mut self, addr: SocketAddr, bytes: u64) {
+        let e = self.peers.entry(addr).or_default();
+        e.bytes += bytes;
+        e.sessions += 1;
+    }
+
+    fn record_fail(&mut self, addr: SocketAddr) {
+        self.peers.entry(addr).or_default().fails += 1;
+    }
+
+    /// Higher is better. Unknown sources score 0 (tried after proven deliverers,
+    /// before proven failures).
+    pub fn score(&self, addr: &SocketAddr) -> i64 {
+        match self.peers.get(addr) {
+            None => 0,
+            Some(s) => s.bytes as i64 - s.fails as i64 * FAIL_PENALTY,
+        }
+    }
 }
 
 /// Download `dl` from a set of candidate sources, one after another, until the
@@ -233,17 +279,26 @@ pub async fn download_file(
 ) -> FetchOutcome {
     let mut out = FetchOutcome::default();
     let parallel = config.parallel.max(1);
+    // Learned across rounds: which sources actually delivered.
+    let scoreboard = Arc::new(Mutex::new(PeerScoreboard::new()));
     for _round in 0..config.rounds.max(1) {
         if dl.is_complete().await || sources.is_empty() {
             break;
         }
-        let queue: Arc<Mutex<VecDeque<PeerSource>>> =
-            Arc::new(Mutex::new(sources.iter().cloned().collect()));
+        // Order the sweep best-first by what each source delivered in prior
+        // rounds (proven deliverers, then untried, then proven failures).
+        let mut ordered: Vec<PeerSource> = sources.to_vec();
+        {
+            let sb = scoreboard.lock().await;
+            ordered.sort_by_key(|s| std::cmp::Reverse(sb.score(&s.addr)));
+        }
+        let queue: Arc<Mutex<VecDeque<PeerSource>>> = Arc::new(Mutex::new(ordered.into()));
         let mut handles = Vec::with_capacity(parallel);
         for _ in 0..parallel {
             let dl = Arc::clone(dl);
             let me = me.clone();
             let queue = Arc::clone(&queue);
+            let scoreboard = Arc::clone(&scoreboard);
             let per = config.per_peer;
             handles.push(tokio::spawn(async move {
                 // (sources_tried, peers_connected) for this worker.
@@ -257,8 +312,12 @@ pub async fn download_file(
                         break;
                     };
                     tried += 1;
-                    if fetch_one(&dl, &src, &me, per).await.is_ok() {
-                        connected += 1;
+                    match fetch_one(&dl, &src, &me, per).await {
+                        Ok(bytes) => {
+                            connected += 1;
+                            scoreboard.lock().await.record(src.addr, bytes);
+                        }
+                        Err(()) => scoreboard.lock().await.record_fail(src.addr),
                     }
                 }
                 (tried, connected)
@@ -340,6 +399,26 @@ mod tests {
             user_hash: None,
         };
         assert!(PeerSource::from_found(&s).is_none());
+    }
+
+    #[test]
+    fn scoreboard_ranks_deliverers_above_untried_above_failures() {
+        let mut sb = PeerScoreboard::new();
+        let good: SocketAddr = "1.1.1.1:1".parse().unwrap();
+        let bad: SocketAddr = "2.2.2.2:2".parse().unwrap();
+        let untried: SocketAddr = "3.3.3.3:3".parse().unwrap();
+        sb.record(good, 5_000_000);
+        sb.record_fail(bad);
+        sb.record_fail(bad);
+        // Proven deliverer > untried (0) > proven failure.
+        assert!(sb.score(&good) > sb.score(&untried));
+        assert_eq!(sb.score(&untried), 0);
+        assert!(sb.score(&untried) > sb.score(&bad));
+        // A connect that delivered 0 bytes still counts as a (weak) session, not
+        // a failure - it does not go negative.
+        let queued: SocketAddr = "4.4.4.4:4".parse().unwrap();
+        sb.record(queued, 0);
+        assert_eq!(sb.score(&queued), 0);
     }
 
     #[test]

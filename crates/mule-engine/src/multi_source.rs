@@ -41,16 +41,38 @@ struct Inner {
     store: PartStore,
     /// Blocks some peer has asked for and not yet delivered.
     reserved: Vec<(u64, u64)>,
+    /// Per data-part swarm availability: how many peer sessions have reported
+    /// holding each part. Drives rarest-first block selection.
+    availability: Vec<u32>,
 }
+
+/// Once the file is within this many bytes of complete, a peer that finds all
+/// remaining blocks reserved enters endgame and races them - so a slow/queuing
+/// peer can't stall the last block. Kept small (a few blocks) so the redundant
+/// re-requests only touch the tail of the download.
+const ENDGAME_LIMIT: u64 = 4 * crate::transfer::EMBLOCKSIZE;
 
 impl Download {
     pub fn new(store: PartStore) -> Arc<Self> {
+        let parts = data_part_count(store.pf.size) as usize;
         Arc::new(Download {
             inner: Mutex::new(Inner {
                 store,
                 reserved: Vec::new(),
+                availability: vec![0u32; parts],
             }),
         })
+    }
+
+    /// Fold a peer's file-status bitfield into the swarm-availability counts, so
+    /// later block selection knows which parts are rare.
+    pub async fn note_status(&self, status: &FileStatus) {
+        let mut g = self.inner.lock().await;
+        for p in 0..g.availability.len() {
+            if status.has_part(p) {
+                g.availability[p] += 1;
+            }
+        }
     }
 
     pub async fn hash(&self) -> [u8; 16] {
@@ -88,14 +110,21 @@ impl Download {
         g.store.pf.part_hashes = hashes;
     }
 
-    /// Claim up to `max` blocks this peer can actually serve.
+    /// Claim up to `max` blocks this peer can actually serve, rarest-first. If
+    /// nothing fresh is left but the file is nearly done, enter endgame and race
+    /// the final reserved blocks.
     async fn take_blocks(&self, status: &FileStatus, max: usize) -> Vec<(u64, u64)> {
         let mut g = self.inner.lock().await;
         let reserved = g.reserved.clone();
-        let blocks = g
-            .store
-            .pf
-            .next_blocks(&|p| status.has_part(p as usize), &reserved, max);
+        let avail = g.availability.clone();
+        let missing = g.store.pf.missing();
+        let rarity = |p: u64| avail.get(p as usize).copied().unwrap_or(0);
+        let has = |p: u64| status.has_part(p as usize);
+
+        let mut blocks = g.store.pf.next_blocks(&has, &reserved, max, &rarity, false);
+        if blocks.is_empty() && missing > 0 && missing <= ENDGAME_LIMIT {
+            blocks = g.store.pf.next_blocks(&has, &reserved, max, &rarity, true);
+        }
         g.reserved.extend_from_slice(&blocks);
         blocks
     }
@@ -169,10 +198,11 @@ pub fn resume_downloads(dir: &std::path::Path) -> Vec<Arc<Download>> {
 ///
 /// Returns when the file is complete, when this peer holds no block we still
 /// need, or on error. Reservations are released on every one of those paths.
+/// Returns the number of bytes this session delivered (for peer scoring).
 pub async fn download_from_peer<S>(
     fs: &mut FramedStream<S>,
     dl: &Download,
-) -> Result<(), TransferError>
+) -> Result<u64, TransferError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -187,7 +217,7 @@ async fn run_peer<S>(
     fs: &mut FramedStream<S>,
     dl: &Download,
     held: &mut Vec<(u64, u64)>,
-) -> Result<(), TransferError>
+) -> Result<u64, TransferError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -204,6 +234,8 @@ where
             _ => {}
         }
     };
+    // Record what this peer holds so block selection knows which parts are rare.
+    dl.note_status(&status).await;
 
     // A multi-part file cannot be verified without the part hashes.
     if dl.needs_hashset().await {
@@ -229,10 +261,11 @@ where
 
     // Fetch blocks until this peer has nothing we still need.
     let size = dl.size().await;
+    let mut delivered = 0u64;
     loop {
         let blocks = dl.take_blocks(&status, STANDARD_BLOCKS_REQUEST).await;
         if blocks.is_empty() {
-            return Ok(());
+            return Ok(delivered);
         }
         held.extend_from_slice(&blocks);
 
@@ -245,6 +278,7 @@ where
         while !rx.is_done() {
             let pkt = fs.read_packet_unpacked().await?;
             for w in rx.accept(pkt.opcode, &pkt.payload)? {
+                delivered += w.data.len() as u64;
                 dl.commit(w.offset, &w.data)
                     .await
                     .map_err(TransferError::Io)?;
