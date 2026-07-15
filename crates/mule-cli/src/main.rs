@@ -1265,6 +1265,25 @@ async fn cmd_kad_keyword(nodes_path: &str, keyword: &str) {
     }
 }
 
+/// Attempt a NAT-PMP port mapping against the gateway - opens our port for
+/// HighID without a manual forward (on routers that speak NAT-PMP).
+async fn cmd_natpmp(gateway: &str, port: u16) {
+    let gw: std::net::IpAddr = match gateway.parse() {
+        Ok(ip) => ip,
+        Err(_) => {
+            eprintln!("bad gateway IP: {gateway}");
+            return;
+        }
+    };
+    println!("requesting NAT-PMP TCP+UDP map of :{port} from gateway {gw}...");
+    for proto in [mule_engine::Proto::Tcp, mule_engine::Proto::Udp] {
+        match mule_engine::map_port(gw, proto, port, 3600, Duration::from_secs(3)).await {
+            Ok(ext) => println!("  {proto:?}: mapped external port {ext}"),
+            Err(e) => println!("  {proto:?}: {e}"),
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -1335,6 +1354,10 @@ async fn main() {
             }
         }
         Some("kad-keyword") if args.len() == 4 => cmd_kad_keyword(&args[2], &args[3]).await,
+        Some("natpmp") if args.len() == 4 => match args[3].parse::<u16>() {
+            Ok(port) => cmd_natpmp(&args[2], port).await,
+            Err(_) => eprintln!("bad port: {}", args[3]),
+        },
         Some("kad-fetch") if args.len() == 6 => {
             match (parse_hex16(&args[3]), args[4].parse::<u64>()) {
                 (Some(hash), Ok(size)) => cmd_kad_fetch(&args[2], hash, size, &args[5]).await,
