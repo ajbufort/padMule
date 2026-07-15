@@ -39,6 +39,17 @@ pub const KADEMLIA_VERSION_EMULE: u8 = 0x09;
 /// live gate; flipping this constant is the only change needed.
 pub const KADEMLIA_VERSION: u8 = KADEMLIA_VERSION_AMULE;
 
+// --- KADEMLIA2_REQ `type` byte = GetRequestContactCount (opcodes.h:622-625;
+// masked & 0x1F on receive). Selects how many contacts the peer returns. ---
+/// FIND_VALUE (file/keyword/source/notes searches).
+pub const KAD_FIND_VALUE: u8 = 0x02;
+/// STORE (publish/buddy).
+pub const KAD_STORE: u8 = 0x04;
+/// FIND_NODE (node/refresh searches); also the wider FIND_VALUE_MORE reask.
+pub const KAD_FIND_NODE: u8 = 0x0B;
+/// FIND_VALUE_MORE: the wider reask, same byte as FIND_NODE.
+pub const KAD_FIND_VALUE_MORE: u8 = 0x0B;
+
 // --- Kad tag name IDs (single-byte names; amule FileTags.h). ---
 /// Sender's internal Kad UDP port (u16).
 pub const TAG_SOURCEUPORT: u8 = 0xFC;
@@ -202,6 +213,16 @@ fn read_wire_contact(r: &mut Reader) -> Result<WireContact, IoError> {
     })
 }
 
+/// The 25-byte wire contact record: `clientID 16 | IP 4 | UDP 2 | TCP 2 | ver 1`.
+/// Shared by BOOTSTRAP_RES and KADEMLIA2_RES.
+fn write_wire_contact(w: &mut Writer, c: &WireContact) {
+    w.write_bytes(&c.id.to_wire());
+    w.write_u32(c.ip);
+    w.write_u16(c.udp_port);
+    w.write_u16(c.tcp_port);
+    w.write_u8(c.version);
+}
+
 /// Parse a BOOTSTRAP_RES payload: `selfID 16 | tcpPort 2 | version 1 | count 2 |
 /// count x 25-byte contact`.
 pub fn parse_bootstrap_res(payload: &[u8]) -> Result<BootstrapRes, IoError> {
@@ -235,11 +256,7 @@ pub fn build_bootstrap_res(
     w.write_u8(version);
     w.write_u16(contacts.len() as u16);
     for c in contacts {
-        w.write_bytes(&c.id.to_wire());
-        w.write_u32(c.ip);
-        w.write_u16(c.udp_port);
-        w.write_u16(c.tcp_port);
-        w.write_u8(c.version);
+        write_wire_contact(&mut w, c);
     }
     (OP_BOOTSTRAP_RES, w.into_inner())
 }
@@ -374,6 +391,88 @@ pub fn parse_hello_res_ack(payload: &[u8]) -> Result<Kad128, IoError> {
     read_id(&mut r)
 }
 
+// --- FIND_NODE: KADEMLIA2_REQ / KADEMLIA2_RES (iterative lookup, Wave 6c) ---
+
+/// A parsed KADEMLIA2_REQ: `type 1 | target 16 | receiver 16` (33 bytes). eMule
+/// `ProcessKademlia2Request`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Kad2Req {
+    /// Requested contact count / mode (low 5 bits; `& 0x1F` on receive).
+    pub req_type: u8,
+    /// The node ID being searched for.
+    pub target: Kad128,
+    /// The recipient's own Kad ID - a sanity check; the recipient silently drops
+    /// the request unless this equals its KadID.
+    pub receiver: Kad128,
+}
+
+/// Build a KADEMLIA2_REQ. `req_type` is one of [`KAD_FIND_NODE`] /
+/// [`KAD_FIND_VALUE`] / [`KAD_STORE`]; `receiver` is the destination node's Kad
+/// ID (its own-ID sanity check).
+pub fn build_kad2_req(req_type: u8, target: &Kad128, receiver: &Kad128) -> (u8, Vec<u8>) {
+    let mut w = Writer::new();
+    w.write_u8(req_type);
+    w.write_bytes(&target.to_wire());
+    w.write_bytes(&receiver.to_wire());
+    (OP_KAD2_REQ, w.into_inner())
+}
+
+/// Parse a KADEMLIA2_REQ. `req_type` is masked to its low 5 bits as eMule does;
+/// a zero type is rejected.
+pub fn parse_kad2_req(payload: &[u8]) -> Result<Kad2Req, IoError> {
+    let mut r = Reader::new(payload);
+    let req_type = r.read_u8()? & 0x1F;
+    if req_type == 0 {
+        return Err(IoError::BadTag(0));
+    }
+    let target = read_id(&mut r)?;
+    let receiver = read_id(&mut r)?;
+    Ok(Kad2Req {
+        req_type,
+        target,
+        receiver,
+    })
+}
+
+/// A parsed KADEMLIA2_RES: the echoed target plus up to 32 contacts closer to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Kad2Res {
+    pub target: Kad128,
+    pub contacts: Vec<WireContact>,
+}
+
+/// Build a KADEMLIA2_RES: `target 16 | count 1 | count x 25-byte contact`.
+pub fn build_kad2_res(target: &Kad128, contacts: &[WireContact]) -> (u8, Vec<u8>) {
+    let mut w = Writer::new();
+    w.write_bytes(&target.to_wire());
+    w.write_u8(contacts.len() as u8);
+    for c in contacts {
+        write_wire_contact(&mut w, c);
+    }
+    (OP_KAD2_RES, w.into_inner())
+}
+
+/// Parse a KADEMLIA2_RES, enforcing eMule's exact-length check
+/// `len == 17 + 25*count`. Kad1 contacts (version <= 1) are dropped, as eMule
+/// does. Returns every accepted contact; distance/IP filtering is the lookup's
+/// job.
+pub fn parse_kad2_res(payload: &[u8]) -> Result<Kad2Res, IoError> {
+    let mut r = Reader::new(payload);
+    let target = read_id(&mut r)?;
+    let count = r.read_u8()? as usize;
+    if payload.len() != 17 + 25 * count {
+        return Err(IoError::UnexpectedEof);
+    }
+    let mut contacts = Vec::with_capacity(count);
+    for _ in 0..count {
+        let c = read_wire_contact(&mut r)?;
+        if c.version > 1 {
+            contacts.push(c);
+        }
+    }
+    Ok(Kad2Res { target, contacts })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -474,5 +573,78 @@ mod tests {
         bad2.extend_from_slice(&[0x36, 0x12, 0x08, 0x01]); // tcp, ver=8, tagcount=1
         bad2.extend_from_slice(&[0x09, 0x02, 0x00, 0xFC, 0xFD, 0x01]); // nameLen=2
         assert!(parse_hello(&bad2).is_err());
+    }
+
+    #[test]
+    fn kad2_req_is_33_bytes_and_round_trips() {
+        let target = Kad128::from_hash(&[0x11; 16]);
+        let receiver = Kad128::from_hash(&[0x22; 16]);
+        let (op, payload) = build_kad2_req(KAD_FIND_NODE, &target, &receiver);
+        assert_eq!(op, OP_KAD2_REQ);
+        assert_eq!(payload.len(), 33);
+        assert_eq!(payload[0], 0x0B);
+        let req = parse_kad2_req(&payload).unwrap();
+        assert_eq!(req.req_type, KAD_FIND_NODE);
+        assert_eq!(req.target, target);
+        assert_eq!(req.receiver, receiver);
+    }
+
+    #[test]
+    fn kad2_req_masks_type_and_rejects_zero() {
+        let t = Kad128::from_hash(&[0; 16]);
+        // High 3 bits set - must be masked off to the low 5 (0x0B).
+        let (_, mut payload) = build_kad2_req(0x0B, &t, &t);
+        payload[0] = 0xEB; // 0x0B | 0xE0
+        assert_eq!(parse_kad2_req(&payload).unwrap().req_type, 0x0B);
+        // type == 0 is rejected.
+        payload[0] = 0x00;
+        assert!(parse_kad2_req(&payload).is_err());
+    }
+
+    #[test]
+    fn kad2_res_round_trips_and_enforces_exact_length() {
+        let target = Kad128::from_hash(&[0x33; 16]);
+        let contacts: Vec<WireContact> = (0..3u8)
+            .map(|i| WireContact {
+                id: Kad128::from_hash(&[i + 1; 16]),
+                ip: 0x0A00_0000 | i as u32,
+                udp_port: 4000 + i as u16,
+                tcp_port: 5000 + i as u16,
+                version: 8,
+            })
+            .collect();
+        let (op, payload) = build_kad2_res(&target, &contacts);
+        assert_eq!(op, OP_KAD2_RES);
+        assert_eq!(payload.len(), 17 + 25 * 3);
+        let res = parse_kad2_res(&payload).unwrap();
+        assert_eq!(res.target, target);
+        assert_eq!(res.contacts, contacts);
+        // A truncated packet fails the exact-length check.
+        assert!(parse_kad2_res(&payload[..payload.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn kad2_res_drops_kad1_contacts() {
+        let target = Kad128::from_hash(&[0x44; 16]);
+        let contacts = vec![
+            WireContact {
+                id: Kad128::from_hash(&[1; 16]),
+                ip: 1,
+                udp_port: 1,
+                tcp_port: 1,
+                version: 1, // Kad1 -> dropped
+            },
+            WireContact {
+                id: Kad128::from_hash(&[2; 16]),
+                ip: 2,
+                udp_port: 2,
+                tcp_port: 2,
+                version: 8, // kept
+            },
+        ];
+        let (_, payload) = build_kad2_res(&target, &contacts);
+        let res = parse_kad2_res(&payload).unwrap();
+        assert_eq!(res.contacts.len(), 1);
+        assert_eq!(res.contacts[0].version, 8);
     }
 }
