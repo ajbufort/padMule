@@ -17,6 +17,7 @@ pub mod part_file;
 pub mod part_store;
 pub mod peer;
 pub mod peer_conn;
+pub mod portmap;
 pub mod search;
 pub mod secure_ident;
 pub mod server_messages;
@@ -47,6 +48,7 @@ pub use peer::{
 pub use peer_conn::{
     accept_peer, connect_peer, connect_peer_obf, peer_handshake_inbound, peer_handshake_outbound,
 };
+pub use portmap::{map_port, MapResponse, PortMapError, Proto};
 pub use search::{build_search_request, parse_search_result, SearchParams, SearchResultFile};
 pub use secure_ident::{run_secure_ident, verify_v1, Identity, SecureIdentSession};
 pub use server_messages::{
