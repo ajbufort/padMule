@@ -17,10 +17,11 @@
 use mule_files::KadContact;
 use mule_kad::{
     build_bootstrap_req, build_hello_req, build_kad2_req, build_search_key_req,
-    build_search_source_req, kad_deobfuscate, kad_keyword_target, kad_obfuscate_request, pack_kad,
-    parse_bootstrap_res, parse_hello, parse_kad2_res, parse_search_res, unpack_kad, BootstrapRes,
-    FileResult, Hello, Lookup, RoutingTable, Source, WireContact, ALPHA_QUERY, K, KAD_FIND_NODE,
-    OP_BOOTSTRAP_RES, OP_HELLO_RES, OP_KAD2_RES, OP_SEARCH_RES,
+    build_search_source_req, is_acceptable_contact, kad_deobfuscate, kad_keyword_target,
+    kad_obfuscate_request, pack_kad, parse_bootstrap_res, parse_hello, parse_kad2_res,
+    parse_search_res, unpack_kad, BootstrapRes, FileResult, Hello, Lookup, RoutingTable, Source,
+    WireContact, ALPHA_QUERY, K, KAD_FIND_NODE, OP_BOOTSTRAP_RES, OP_HELLO_RES, OP_KAD2_RES,
+    OP_SEARCH_RES,
 };
 use mule_proto::Kad128;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -124,6 +125,15 @@ impl KadNode {
         self.routing.len()
     }
 
+    /// Add a contact to the routing table only if its IP:port is a routable
+    /// public address with a usable UDP port (eMule 0.70b hardening) - junk /
+    /// unroutable / port-0 contacts never enter the table.
+    fn add_contact(&mut self, id: Kad128, ip: u32, udp_port: u16, tcp_port: u16, version: u8) {
+        if is_acceptable_contact(ip, udp_port, /*allow_private=*/ false) {
+            self.routing.add(id, ip, udp_port, tcp_port, version);
+        }
+    }
+
     /// Send an obfuscated Kad request (NodeID-keyed on `target_id`, our
     /// senderVerifyKey issued for `dest`) and wait for a decryptable reply with
     /// opcode `expect` FROM `dest`, ignoring interleaved/stray datagrams (other
@@ -190,7 +200,7 @@ impl KadNode {
             .await?;
         let res = parse_bootstrap_res(&res_payload)?;
         // The responder itself (at the address we reached), then every listed contact.
-        self.routing.add(
+        self.add_contact(
             res.id,
             contact.ip,
             contact.udp_port,
@@ -198,8 +208,7 @@ impl KadNode {
             res.version,
         );
         for c in &res.contacts {
-            self.routing
-                .add(c.id, c.ip, c.udp_port, c.tcp_port, c.version);
+            self.add_contact(c.id, c.ip, c.udp_port, c.tcp_port, c.version);
         }
         Ok(res)
     }
@@ -313,8 +322,7 @@ impl KadNode {
                 if let Ok(contacts) = self.find_node(node, file_hash, per_query).await {
                     out.find_node_responses += 1;
                     for c in &contacts {
-                        self.routing
-                            .add(c.id, c.ip, c.udp_port, c.tcp_port, c.version);
+                        self.add_contact(c.id, c.ip, c.udp_port, c.tcp_port, c.version);
                     }
                     lookup.on_response(contacts);
                 }
@@ -404,8 +412,7 @@ impl KadNode {
             for node in &batch {
                 if let Ok(contacts) = self.find_node(node, &target, per_query).await {
                     for c in &contacts {
-                        self.routing
-                            .add(c.id, c.ip, c.udp_port, c.tcp_port, c.version);
+                        self.add_contact(c.id, c.ip, c.udp_port, c.tcp_port, c.version);
                     }
                     lookup.on_response(contacts);
                 }
