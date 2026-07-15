@@ -1284,6 +1284,83 @@ async fn cmd_natpmp(gateway: &str, port: u16) {
     }
 }
 
+/// Parse an ed2k:// or magnet: link and show what it contains; for a file link
+/// with embedded sources and an out path, download it from those sources.
+async fn cmd_link(link: &str, out: Option<&str>) {
+    let parsed = match mule_proto::parse_link(link) {
+        Some(p) => p,
+        None => {
+            eprintln!("not a recognizable ed2k:// or magnet: link");
+            return;
+        }
+    };
+    match parsed {
+        mule_proto::Ed2kLink::File(f) => {
+            println!("file: {}", f.name);
+            println!("  size:   {} bytes", f.size);
+            println!("  ed2k:   {}", hex16(&f.hash));
+            if let Some(a) = f.aich {
+                let hx: String = a.iter().map(|b| format!("{b:02x}")).collect();
+                println!("  aich:   {hx}");
+            }
+            if f.sources.is_empty() {
+                println!("  sources: none embedded");
+                println!(
+                    "  -> to fetch via Kad: kad-fetch <nodes.dat> {} {} <out>",
+                    hex16(&f.hash),
+                    f.size
+                );
+                return;
+            }
+            println!("  sources: {:?}", f.sources);
+            let Some(out) = out else {
+                println!("  (pass an <out> path to download from these sources)");
+                return;
+            };
+            let sources: Vec<_> = f
+                .sources
+                .iter()
+                .map(|&addr| mule_engine::PeerSource {
+                    addr,
+                    user_hash: None,
+                    origin: mule_engine::SourceOrigin::PeerExchange,
+                })
+                .collect();
+            let dir = std::path::Path::new(out)
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            let store = match PartStore::create(&dir, 1, f.hash, f.size, f.name.as_bytes()) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("cannot create part store: {e}");
+                    return;
+                }
+            };
+            let dl = Download::new(store);
+            let me = HelloInfo::baseline(demo_user_hash(), 0, 4662, 4672, "padMule");
+            println!("downloading from {} embedded source(s)...", sources.len());
+            let cfg = ManagerConfig {
+                parallel: 4,
+                per_peer: Duration::from_secs(60),
+                rounds: 6,
+            };
+            let o = download_file(&dl, &sources, &me, cfg).await;
+            println!(
+                "{} / {} bytes; complete={}",
+                o.bytes_present, f.size, o.completed
+            );
+        }
+        mule_proto::Ed2kLink::Server { host, port } => println!("server: {host}:{port}"),
+        mule_proto::Ed2kLink::ServerList { url } => println!("server list: {url}"),
+        mule_proto::Ed2kLink::Search { term } => {
+            println!("search: '{term}'");
+            println!("  -> run: kad-keyword <nodes.dat> {term}   (or search-download)");
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -1354,6 +1431,9 @@ async fn main() {
             }
         }
         Some("kad-keyword") if args.len() == 4 => cmd_kad_keyword(&args[2], &args[3]).await,
+        Some("link") if args.len() == 3 || args.len() == 4 => {
+            cmd_link(&args[2], args.get(3).map(String::as_str)).await
+        }
         Some("natpmp") if args.len() == 4 => match args[3].parse::<u16>() {
             Ok(port) => cmd_natpmp(&args[2], port).await,
             Err(_) => eprintln!("bad port: {}", args[3]),
@@ -1380,6 +1460,7 @@ async fn main() {
             eprintln!("  mule-cli kad-search <nodes.dat> <ed2k-hash-hex> <size>");
             eprintln!("  mule-cli kad-fetch <nodes.dat> <ed2k-hash-hex> <size> <out>");
             eprintln!("  mule-cli kad-keyword <nodes.dat> <keyword>");
+            eprintln!("  mule-cli link <ed2k-or-magnet-link> [out]");
             eprintln!("  mule-cli search-download <server.met> <keyword> <out>");
         }
     }
