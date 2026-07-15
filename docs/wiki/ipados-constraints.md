@@ -1,6 +1,6 @@
 # iPadOS Platform Constraints (padMule)
 
-Updated: 2026-07-12
+Updated: 2026-07-15
 
 Distilled from adversarially-verified 2026 research. Full reference:
 `docs/raw/ipados-constraints-research-2026-07-12.md`. Target: iPad Pro 4th gen
@@ -33,12 +33,18 @@ except Rust-on-iOS (medium).
   notifications, and (via AltStore + GetMoreRam) the increased-memory-limit
   entitlement. `UIBackgroundModes` keys are not provisioning entitlements, so
   free teams can set them.
-- **Build/deploy with no Mac:** engine develops + unit-tests on WSL (host
-  target); iOS `.a` + XCFramework built on a hosted macOS CI runner
+- **Build/deploy with no (usable) Mac:** engine develops + unit-tests on WSL
+  (host target); iOS `.a` + XCFramework built on a hosted macOS CI runner
   (uniffi-bindgen + `xcodebuild -create-xcframework`); local sign+install from
   Windows via AltStore/Sideloadly with the free Apple ID. Working loop, no Mac.
   (Linux-only iOS builds are technically possible but the C-crypto + SDK/SLA
   friction makes CI-macOS the sound choice.)
+  - **Anthony's 2011 Mac mini does NOT change this (confirmed 2026-07-15):** it
+    maxes at macOS 10.13 -> Xcode 10.1 -> iOS 12 SDK, but the iPad Pro 4th gen is
+    on iPadOS 17/18 and can't downgrade, so the mini CANNOT build/sign for the
+    device (needs Xcode 15 / Ventura+). CI-macOS builds the `.ipa`; AltServer on
+    the WSL2 Windows host sideloads it. The mini is optional (iOS 12 simulator,
+    or OCLP'd to run AltServer). Only the final link+sign needs Apple tooling.
 - **Rust-on-iOS:** tokio+mio staticlib works in-process; UniFFI (0.29+ stable,
   0.32 latest) for the Swift boundary with async + callback interfaces; every
   FFI entry panic-safe; XCFramework (device + sim arm64), no `lipo`, bitcode
