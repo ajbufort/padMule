@@ -144,10 +144,44 @@ pub fn parse_search_result(payload: &[u8]) -> Result<Vec<SearchResultFile>, IoEr
     Ok(out)
 }
 
+/// Which network a search should run on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchMethod {
+    /// eD2k server (local) search - fast, and typically more results for a
+    /// popular file.
+    Server,
+    /// Kad (serverless) search - broader reach, no server needed.
+    Kad,
+}
+
+/// eMule 0.70b's "Automatic" search method: pick the network by connectivity.
+/// Prefer the server when connected (a local search is quick), else fall back to
+/// Kad; `None` if neither network is available.
+pub fn choose_search_method(server_connected: bool, kad_ready: bool) -> Option<SearchMethod> {
+    if server_connected {
+        Some(SearchMethod::Server)
+    } else if kad_ready {
+        Some(SearchMethod::Kad)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use mule_proto::{read_packet, write_packet, TagName, TagValue};
+
+    #[test]
+    fn automatic_search_method_prefers_server_then_kad() {
+        assert_eq!(choose_search_method(true, true), Some(SearchMethod::Server));
+        assert_eq!(
+            choose_search_method(true, false),
+            Some(SearchMethod::Server)
+        );
+        assert_eq!(choose_search_method(false, true), Some(SearchMethod::Kad));
+        assert_eq!(choose_search_method(false, false), None);
+    }
 
     #[test]
     fn single_keyword_has_no_and() {
