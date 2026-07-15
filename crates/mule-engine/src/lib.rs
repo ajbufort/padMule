@@ -5,6 +5,7 @@
 pub mod connection;
 pub mod credits;
 pub mod crypt_policy;
+pub mod engine;
 pub mod fetch;
 pub mod framed;
 pub mod identity;
@@ -27,6 +28,7 @@ pub mod upload_queue;
 pub use connection::{connect_server, login_handshake, ServerEvent, ServerState};
 pub use credits::{resolve_ident_state, score_ratio, score_ratio_ident, IdentState};
 pub use crypt_policy::{should_obfuscate_outbound, should_reject, CryptPrefs};
+pub use engine::{Engine, EngineEvent, EngineState};
 pub use fetch::{fetch_from_sources, FetchOutcome, PeerSource, SourceOrigin, SourceRegistry};
 pub use framed::{FrameError, FramedStream};
 pub use identity::NodeIdentity;
