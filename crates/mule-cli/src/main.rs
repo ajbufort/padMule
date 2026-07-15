@@ -26,7 +26,7 @@ use mule_engine::{
     ServerState,
 };
 use mule_files::{read_nodes_dat, read_server_met};
-use mule_proto::ed2k_hash;
+use mule_proto::{ed2k_hash, Kad128};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -695,6 +695,102 @@ async fn cmd_kad_bootstrap(nodes_path: &str) {
     }
 }
 
+/// Wave-6 GOAL: bootstrap into Kad, then resolve an ed2k file hash to sources
+/// (iterative FIND_NODE lookup toward the hash, then SEARCH_SOURCE_REQ).
+async fn cmd_kad_search(nodes_path: &str, hash: [u8; 16], size: u64) {
+    let bytes = match std::fs::read(nodes_path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("cannot read {nodes_path}: {e}");
+            return;
+        }
+    };
+    let parsed = match read_nodes_dat(&bytes) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("bad nodes.dat: {e:?}");
+            return;
+        }
+    };
+    let contacts: Vec<_> = parsed
+        .contacts
+        .into_iter()
+        .filter(|c| c.version >= 2)
+        .collect();
+
+    let bind: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 4672);
+    let mut node = match KadNode::bind(bind, 4662).await {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("bind failed: {e}");
+            return;
+        }
+    };
+    println!(
+        "bootstrapping into Kad ({} contacts to try)...",
+        contacts.len()
+    );
+    if let Err(e) = node
+        .bootstrap_any(&contacts, Duration::from_millis(1200), 40)
+        .await
+    {
+        eprintln!("bootstrap failed: {e}");
+        return;
+    }
+    println!(
+        "bootstrapped; routing table holds {} contacts",
+        node.contacts_known()
+    );
+
+    // The ed2k file hash becomes the Kad target via the canonical (SetValueBE)
+    // form, matching eMule's CUInt128(fileHash).
+    let target = Kad128::from_hash(&hash);
+    println!(
+        "resolving sources for ed2k hash {} (size {size})...",
+        hex16(&hash)
+    );
+
+    match node
+        .resolve_sources(&target, size, 5, Duration::from_millis(1400))
+        .await
+    {
+        Ok(out) => {
+            println!(
+                "lookup: {}/{} FIND_NODE answered, closest node shares {} bits with the hash; \
+                 routing table now {} contacts",
+                out.find_node_responses,
+                out.nodes_queried,
+                out.closest_prefix_bits,
+                node.contacts_known()
+            );
+            println!(
+                "search: {}/{} in-tolerance nodes returned a SEARCH_RES",
+                out.search_responses, out.nodes_searched
+            );
+            if out.sources.is_empty() {
+                println!(
+                    "no sources for this hash right now (protocol works: lookup converged and \
+                     searches got live responses). Try a hash with current Kad seeders."
+                );
+            } else {
+                println!("RESOLVED {} source(s):", out.sources.len());
+                for s in &out.sources {
+                    let ip = s.ip.map(Ipv4Addr::from);
+                    println!(
+                        "  type={} ip={:?} tcp={:?} udp={:?} clienthash={:08x?}",
+                        s.source_type,
+                        ip,
+                        s.tcp_port,
+                        s.udp_port,
+                        s.client_hash.words()
+                    );
+                }
+            }
+        }
+        Err(e) => eprintln!("resolve failed: {e}"),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -757,6 +853,13 @@ async fn main() {
             }
         }
         Some("kad-bootstrap") if args.len() == 3 => cmd_kad_bootstrap(&args[2]).await,
+        Some("kad-search") if args.len() == 5 => {
+            match (parse_hex16(&args[3]), args[4].parse::<u64>()) {
+                (Some(hash), Ok(size)) => cmd_kad_search(&args[2], hash, size).await,
+                (None, _) => eprintln!("bad hash (need 32 hex chars): {}", args[3]),
+                (_, Err(_)) => eprintln!("bad size: {}", args[4]),
+            }
+        }
         _ => {
             eprintln!("usage:");
             eprintln!("  mule-cli login <host> <port>");
@@ -766,6 +869,7 @@ async fn main() {
             eprintln!("  mule-cli serve-file <port> <path>");
             eprintln!("  mule-cli peer-download <host> <port> <hash> <size> <out> [obf-peer-hash]");
             eprintln!("  mule-cli kad-bootstrap <nodes.dat>");
+            eprintln!("  mule-cli kad-search <nodes.dat> <ed2k-hash-hex> <size>");
         }
     }
 }
