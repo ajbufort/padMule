@@ -19,11 +19,13 @@ use std::path::Path;
 use std::time::Duration;
 
 use mule_engine::peer::HelloInfo;
+use mule_engine::search::{build_search_request, parse_search_result, SearchParams};
 use mule_engine::server_messages::{LoginRequest, DEFAULT_SERVER_FLAGS};
+use mule_engine::sources::{build_get_sources, parse_found_sources};
 use mule_engine::{
-    connect_peer, connect_peer_obf, download_from_peer, fetch_from_sources, obf_accept,
-    peer_handshake_inbound, serve, Download, FramedStream, KadNode, ObfDetect, PartStore,
-    ServedFile, ServerEvent, ServerLink, ServerState, SourceRegistry,
+    connect_peer, connect_peer_obf, connect_server, download_from_peer, fetch_from_sources,
+    login_handshake, obf_accept, peer_handshake_inbound, serve, Download, FramedStream, KadNode,
+    ObfDetect, PartStore, ServedFile, ServerEvent, ServerLink, ServerState, SourceRegistry,
 };
 use mule_files::{read_nodes_dat, read_server_met};
 use mule_proto::{ed2k_hash, Kad128};
@@ -892,6 +894,311 @@ async fn cmd_kad_fetch(nodes_path: &str, hash: [u8; 16], size: u64, out: &str) {
     }
 }
 
+/// Pull a string tag (by eD2k tag id) out of a search result's tags.
+fn result_str(tags: &[mule_proto::Tag], id: u8) -> Option<String> {
+    tags.iter().find_map(|t| match (&t.name, &t.value) {
+        (mule_proto::TagName::Id(n), mule_proto::TagValue::Str(s)) if *n == id => {
+            Some(String::from_utf8_lossy(s).into_owned())
+        }
+        _ => None,
+    })
+}
+
+/// Pull an integer tag (u32/u64) out of a search result's tags.
+fn result_u64(tags: &[mule_proto::Tag], id: u8) -> Option<u64> {
+    tags.iter().find_map(|t| match (&t.name, &t.value) {
+        (mule_proto::TagName::Id(n), mule_proto::TagValue::U32(v)) if *n == id => Some(*v as u64),
+        (mule_proto::TagName::Id(n), mule_proto::TagValue::U64(v)) if *n == id => Some(*v),
+        _ => None,
+    })
+}
+
+/// Read packets from `fs` until one with opcode `want` arrives or the deadline
+/// passes, printing any server messages seen along the way.
+async fn read_until(
+    fs: &mut FramedStream<tokio::net::TcpStream>,
+    want: u8,
+    wait: Duration,
+) -> Option<mule_proto::Packet> {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        match timeout(remaining, fs.read_packet_unpacked()).await {
+            Ok(Ok(pkt)) if pkt.opcode == want => return Some(pkt),
+            Ok(Ok(_)) => continue, // some other server packet; keep waiting
+            _ => return None,
+        }
+    }
+}
+
+/// Live end-to-end over a server: search a keyword, take the first matching
+/// result, get its sources, and download it - the eD2k-network counterpart of
+/// kad-fetch.
+async fn cmd_search_download(met_path: &str, keyword: &str, out: &str) {
+    // Cap the download so a test never pulls a huge file.
+    const MAX_SIZE: u64 = 64 * 1024 * 1024;
+
+    let bytes = match std::fs::read(met_path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("cannot read {met_path}: {e}");
+            return;
+        }
+    };
+    let met = match read_server_met(&bytes) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("bad server.met: {e}");
+            return;
+        }
+    };
+
+    // Connect + login to the first server that answers.
+    let login = LoginRequest {
+        user_hash: demo_user_hash(),
+        client_id: 0,
+        tcp_port: 4662,
+        nick: "padMule".to_string(),
+        server_flags: DEFAULT_SERVER_FLAGS,
+    };
+    let (tx, rx) = mpsc::channel(64);
+    let printer = spawn_event_printer(rx);
+    let mut fs = None;
+    for srv in met.servers.iter().take(8) {
+        let addr = SocketAddr::new(IpAddr::V4(ip_from_met_u32(srv.ip)), srv.port);
+        print!("connecting {addr} ... ");
+        let mut stream = match connect_server(addr).await {
+            Ok(s) => s,
+            Err(_) => {
+                println!("no");
+                continue;
+            }
+        };
+        match timeout(
+            Duration::from_secs(10),
+            login_handshake(&mut stream, &login, &tx),
+        )
+        .await
+        {
+            Ok(Ok(state)) => {
+                println!("logged in ({state:?})");
+                fs = Some(stream);
+                break;
+            }
+            _ => println!("login failed"),
+        }
+    }
+    drop(tx);
+    let _ = printer.await;
+    let mut fs = match fs {
+        Some(f) => f,
+        None => {
+            eprintln!("no server accepted a login");
+            return;
+        }
+    };
+
+    // Search.
+    let params = SearchParams {
+        keyword: keyword.to_string(),
+        file_type: None,
+        min_size: Some(1),
+        max_size: Some(MAX_SIZE as u32),
+        extension: Some(keyword.to_string()),
+    };
+    println!("searching for '{keyword}' ...");
+    if fs
+        .write_packet(&build_search_request(&params))
+        .await
+        .is_err()
+    {
+        eprintln!("failed to send search");
+        return;
+    }
+    let result_pkt = match read_until(
+        &mut fs,
+        mule_engine::search::OP_SEARCHRESULT,
+        Duration::from_secs(20),
+    )
+    .await
+    {
+        Some(p) => p,
+        None => {
+            eprintln!("no search results");
+            return;
+        }
+    };
+    let files = match parse_search_result(&result_pkt.payload) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("cannot parse search results: {e:?}");
+            return;
+        }
+    };
+    println!("{} results", files.len());
+
+    // Candidate .<keyword> files with a size, ranked by advertised source count
+    // (TAG_SOURCES 0x15) - popular files are the ones with a reachable HighID
+    // seeder, and the point is to actually pull bytes.
+    let mut candidates: Vec<([u8; 16], u64, String, u64)> = files
+        .iter()
+        .filter_map(|f| {
+            let name = result_str(&f.tags, 0x01)?;
+            let size = result_u64(&f.tags, 0x02)?;
+            (size > 0 && size <= MAX_SIZE && name.to_lowercase().ends_with(&format!(".{keyword}")))
+                .then(|| (f.hash, size, name, result_u64(&f.tags, 0x15).unwrap_or(0)))
+        })
+        .collect();
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.3));
+    if candidates.is_empty() {
+        eprintln!("no result was a downloadable .{keyword} under {MAX_SIZE} bytes");
+        return;
+    }
+    println!(
+        "{} .{keyword} candidates; probing sources (most-seeded first)...",
+        candidates.len()
+    );
+
+    // Probe get-sources on each candidate until one has a connectable source.
+    let mut chosen: Option<([u8; 16], u64, String, SourceRegistry)> = None;
+    for (hash, size, name, srcs) in candidates.into_iter().take(15) {
+        if fs
+            .write_packet(&build_get_sources(&hash, size, false))
+            .await
+            .is_err()
+        {
+            eprintln!("failed to send get-sources");
+            return;
+        }
+        let found = match read_until(
+            &mut fs,
+            mule_engine::sources::OP_FOUNDSOURCES,
+            Duration::from_secs(12),
+        )
+        .await
+        {
+            Some(p) => parse_found_sources(&p.payload, false)
+                .map(|(_, s)| s)
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let mut reg = SourceRegistry::new();
+        reg.add_found(&found);
+        println!(
+            "  '{}' ({} B, ~{srcs} srcs): {} found, {} connectable",
+            name,
+            size,
+            found.len(),
+            reg.len()
+        );
+        if !reg.is_empty() {
+            chosen = Some((hash, size, name, reg));
+            break;
+        }
+    }
+    let (hash, size, name, reg) = match chosen {
+        Some(v) => v,
+        None => {
+            println!("no candidate had a connectable HighID source (all LowID/firewalled).");
+            println!("Search + get-sources work end to end; there was just no HighID seeder to pull from.");
+            return;
+        }
+    };
+    println!("picked '{name}' ({size} bytes) hash {}", hex16(&hash));
+
+    // Download.
+    let dir = std::path::Path::new(out)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let store = match PartStore::create(&dir, 1, hash, size, name.as_bytes()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("cannot create part store: {e}");
+            return;
+        }
+    };
+    let dl = Download::new(store);
+    let me = HelloInfo::baseline(demo_user_hash(), 0, 4662, 4672, "padMule");
+    let mut reg = reg;
+
+    // A single source usually queues us after an initial burst, so retry a few
+    // rounds: re-fetch sources (accumulating, de-duped) and resume - the .part
+    // persists progress between rounds.
+    for round in 0..6 {
+        if dl.is_complete().await {
+            break;
+        }
+        println!(
+            "round {}: downloading from {} source(s) ({} / {size} bytes so far)...",
+            round + 1,
+            reg.len(),
+            size - dl.missing().await
+        );
+        let fetched = fetch_from_sources(&dl, reg.sources(), &me, Duration::from_secs(45)).await;
+        println!(
+            "  connected {}/{}; {} / {size} bytes; complete={}",
+            fetched.peers_connected,
+            fetched.sources_tried,
+            fetched.bytes_present,
+            fetched.completed
+        );
+        if fetched.completed {
+            break;
+        }
+        // Ask the server for more sources for the next round.
+        if fs
+            .write_packet(&build_get_sources(&hash, size, false))
+            .await
+            .is_ok()
+        {
+            if let Some(p) = read_until(
+                &mut fs,
+                mule_engine::sources::OP_FOUNDSOURCES,
+                Duration::from_secs(10),
+            )
+            .await
+            {
+                if let Ok((_, more)) = parse_found_sources(&p.payload, false) {
+                    reg.add_found(&more);
+                }
+            }
+        }
+    }
+
+    if dl.is_complete().await {
+        // Move the finished .part into place and verify the ed2k hash.
+        drop(dl);
+        let part = dir.join("001.part");
+        match std::fs::read(&part) {
+            Ok(data) if ed2k_hash(&data) == hash => {
+                let _ = std::fs::rename(&part, out);
+                let _ = std::fs::remove_file(dir.join("001.part.met"));
+                println!(
+                    "OK: downloaded + verified '{name}' -> {out} ({} bytes)",
+                    data.len()
+                );
+            }
+            Ok(data) => println!(
+                "downloaded {} bytes but the ed2k hash did NOT match - corrupt",
+                data.len()
+            ),
+            Err(e) => println!("complete but cannot read the .part: {e}"),
+        }
+    } else {
+        let present = size - dl.missing().await;
+        println!(
+            "incomplete: {present} / {size} bytes ({:.0}%). Real bytes transferred from a live \
+             peer; the source(s) queued/dropped us before the full file.",
+            100.0 * present as f64 / size as f64
+        );
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -968,6 +1275,9 @@ async fn main() {
                 (_, Err(_)) => eprintln!("bad size: {}", args[4]),
             }
         }
+        Some("search-download") if args.len() == 5 => {
+            cmd_search_download(&args[2], &args[3], &args[4]).await
+        }
         _ => {
             eprintln!("usage:");
             eprintln!("  mule-cli login <host> <port>");
@@ -979,6 +1289,7 @@ async fn main() {
             eprintln!("  mule-cli kad-bootstrap <nodes.dat>");
             eprintln!("  mule-cli kad-search <nodes.dat> <ed2k-hash-hex> <size>");
             eprintln!("  mule-cli kad-fetch <nodes.dat> <ed2k-hash-hex> <size> <out>");
+            eprintln!("  mule-cli search-download <server.met> <keyword> <out>");
         }
     }
 }
