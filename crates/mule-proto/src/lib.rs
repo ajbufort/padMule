@@ -12,7 +12,7 @@ pub mod rc4;
 pub mod tag;
 
 pub use aich::{aich_master_hash, EMBLOCKSIZE};
-pub use hash::{ed2k_hash, md4, part_count, OLD_MAX_FILE_SIZE, PARTSIZE};
+pub use hash::{ed2k_hash, ed2k_hash_parts, md4, part_count, OLD_MAX_FILE_SIZE, PARTSIZE};
 pub use io::{IoError, Reader, Writer};
 pub use kad_id::Kad128;
 pub use link::{parse_link, Ed2kLink, FileLink};

@@ -10,12 +10,20 @@
 
 use std::sync::Arc;
 
-use mule_engine::{Engine, EngineEvent, EngineState};
+use mule_engine::{AddResult, Engine, EngineEvent, EngineState, Trust};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::Mutex;
 
 uniffi::setup_scaffolding!();
+
+/// Decode a 32-char hex file hash. The UI round-trips whatever `search` handed
+/// it, so a malformed value means a caller bug, not user input.
+fn parse_hash16(hex_str: &str) -> Option<[u8; 16]> {
+    let raw = hex::decode(hex_str).ok()?;
+    let arr: [u8; 16] = raw.try_into().ok()?;
+    Some(arr)
+}
 
 /// The coarse lifecycle state the UI shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
@@ -90,6 +98,48 @@ pub struct DownloadInfo {
     pub complete: bool,
 }
 
+/// One ranked, deduped search hit. `hash` is hex - the handle to pass back to
+/// [`MuleEngine::add_download`].
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct SearchHit {
+    pub hash: String,
+    pub name: String,
+    pub size: u64,
+    /// Best advertised availability seen across the raw results.
+    pub sources: u32,
+    /// False when the metadata is self-contradictory (e.g. one hash advertising
+    /// two sizes). Shown, not hidden: the user decides.
+    pub trusted: bool,
+    /// Why it is not trusted, empty when it is.
+    pub warning: String,
+}
+
+/// What [`MuleEngine::add_download`] did. "No sources" is a normal answer on a
+/// P2P network, so this is a result the UI reports, not an error it throws.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum AddOutcome {
+    Started,
+    AlreadyAdded,
+    NoSources,
+    NoServer,
+    Rejected { reason: String },
+}
+
+impl From<AddResult> for AddOutcome {
+    fn from(r: AddResult) -> Self {
+        match r {
+            AddResult::Started => AddOutcome::Started,
+            AddResult::AlreadyAdded => AddOutcome::AlreadyAdded,
+            AddResult::NoSources => AddOutcome::NoSources,
+            AddResult::NoServer => AddOutcome::NoServer,
+            AddResult::BadRequest(r) => AddOutcome::Rejected {
+                reason: r.to_string(),
+            },
+            AddResult::Failed(m) => AddOutcome::Rejected { reason: m },
+        }
+    }
+}
+
 /// Errors crossing the FFI boundary.
 #[derive(Debug, uniffi::Error)]
 pub enum FfiError {
@@ -118,11 +168,17 @@ pub struct MuleEngine {
 #[uniffi::export]
 impl MuleEngine {
     /// Load (or create) the identity under `config_dir` and build the engine.
+    ///
+    /// `downloads_dir` is where COMPLETED files are moved. The iOS app passes
+    /// its Documents directory so finished downloads appear in the Files app -
+    /// `config_dir` (Application Support) is invisible to the user, and a file
+    /// they cannot open is not really downloaded.
     #[uniffi::constructor]
-    pub fn new(config_dir: String) -> Result<Arc<Self>, FfiError> {
-        let (engine, rx) = Engine::new(&config_dir).map_err(|e| FfiError::Io {
+    pub fn new(config_dir: String, downloads_dir: String) -> Result<Arc<Self>, FfiError> {
+        let (mut engine, rx) = Engine::new(&config_dir).map_err(|e| FfiError::Io {
             message: e.to_string(),
         })?;
+        engine.set_downloads_dir(&downloads_dir);
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -206,7 +262,7 @@ impl MuleEngine {
         self.rt.block_on(async {
             let g = self.inner.lock().await;
             let mut out = Vec::new();
-            for dl in g.downloads() {
+            for dl in g.downloads().await {
                 let size = dl.size().await;
                 let have = size - dl.missing().await;
                 out.push(DownloadInfo {
@@ -218,6 +274,55 @@ impl MuleEngine {
                 });
             }
             out
+        })
+    }
+
+    /// Search the connected server. BLOCKS for up to ~20s waiting on the
+    /// server, so call it off the UI thread. Empty means no server, no answer,
+    /// or genuinely no hits - all of which the UI renders the same way.
+    pub fn search(&self, keyword: String) -> Vec<SearchHit> {
+        self.rt.block_on(async {
+            self.inner
+                .lock()
+                .await
+                .search(&keyword)
+                .await
+                .into_iter()
+                .map(|r| {
+                    let trusted = r.is_trusted();
+                    let warning = match r.trust {
+                        Trust::Ok => String::new(),
+                        Trust::Suspect(why) => why.to_string(),
+                    };
+                    SearchHit {
+                        hash: hex::encode(r.hash),
+                        name: r.name,
+                        size: r.size,
+                        sources: r.sources,
+                        trusted,
+                        warning,
+                    }
+                })
+                .collect()
+        })
+    }
+
+    /// Start downloading a search hit. Returns as soon as the transfer is
+    /// registered, NOT when the file lands - watch `downloads()` for progress.
+    /// Blocks briefly (up to ~10s) asking the server for sources.
+    pub fn add_download(&self, hash: String, size: u64, name: String) -> AddOutcome {
+        let Some(h) = parse_hash16(&hash) else {
+            return AddOutcome::Rejected {
+                reason: "malformed file hash".to_string(),
+            };
+        };
+        self.rt.block_on(async {
+            self.inner
+                .lock()
+                .await
+                .add_download(h, size, &name)
+                .await
+                .into()
         })
     }
 
@@ -252,7 +357,8 @@ mod tests {
     fn facade_drives_lifecycle_and_surfaces_events() {
         let dir = tmp("life");
         let _ = std::fs::remove_dir_all(&dir);
-        let eng = MuleEngine::new(dir.clone()).unwrap();
+        let dl_dir = format!("{dir}-downloads");
+        let eng = MuleEngine::new(dir.clone(), dl_dir.clone()).unwrap();
 
         assert_eq!(eng.state(), EngineStateFfi::Stopped);
         // Identity is a 32-hex-char userhash.
@@ -280,5 +386,6 @@ mod tests {
         eng.shutdown();
         assert_eq!(eng.state(), EngineStateFfi::Stopped);
         let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dl_dir);
     }
 }

@@ -62,6 +62,42 @@ pub fn ed2k_hash(data: &[u8]) -> [u8; 16] {
     md4(&concat)
 }
 
+/// eD2k file hash of a file supplied one part at a time, so a large file is
+/// never held in memory whole. Same rule as [`ed2k_hash`] - and pinned to it by
+/// test for every awkward size - but the caller streams the parts in.
+///
+/// `read_part(i)` must return DATA part `i` (`PARTSIZE` bytes, short on the
+/// last). It is NEVER called for the trailing empty sentinel part that an
+/// exact-multiple file carries: that part has no data to read, and asking a
+/// `PartStore` for it would be an out-of-range read. This is the
+/// `part_count`-vs-`data_part_count` landmine from `part_count`'s docs, handled
+/// here once so callers cannot get it wrong.
+pub fn ed2k_hash_parts<E>(
+    size: u64,
+    mut read_part: impl FnMut(u64) -> Result<Vec<u8>, E>,
+) -> Result<[u8; 16], E> {
+    let n = part_count(size);
+    // One part: the file hash IS that part's MD4. `size == 0` lands here too,
+    // and reads nothing - md4(b"") is exactly right.
+    if n == 1 {
+        let data = if size == 0 { Vec::new() } else { read_part(0)? };
+        return Ok(md4(&data));
+    }
+    let mut concat = Vec::with_capacity(n as usize * 16);
+    for i in 0..n {
+        // The sentinel part exists only when size is an exact multiple, and it
+        // is always the last one. It has no bytes on disk.
+        let start = i * PARTSIZE;
+        let data = if start >= size {
+            Vec::new()
+        } else {
+            read_part(i)?
+        };
+        concat.extend_from_slice(&md4(&data));
+    }
+    Ok(md4(&concat))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,5 +182,52 @@ mod tests {
         assert_eq!(ed2k_hash(&data), expected);
         // And it must NOT equal the naive single-part MD4 of the whole file.
         assert_ne!(ed2k_hash(&data), md4(&data));
+    }
+
+    /// The streaming hash must agree with the in-memory one at EVERY awkward
+    /// size - especially the exact multiples, where a trailing empty sentinel
+    /// part changes the answer and there is no such part to read from disk.
+    #[test]
+    fn streaming_hash_matches_the_in_memory_hash_at_every_boundary() {
+        let ps = PARTSIZE;
+        for size in [
+            0u64,
+            1,
+            1000,
+            ps - 1,
+            ps, // exact multiple: sentinel part appears
+            ps + 1,
+            2 * ps, // exact multiple again
+            2 * ps + 1,
+        ] {
+            // Cheap deterministic filler; content does not matter, length does.
+            let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+            let streamed = ed2k_hash_parts(size, |i| {
+                let start = (i * ps) as usize;
+                let end = core::cmp::min(start + ps as usize, data.len());
+                Ok::<_, ()>(data[start..end].to_vec())
+            })
+            .unwrap();
+            assert_eq!(
+                streamed,
+                ed2k_hash(&data),
+                "streaming != in-memory at size {size}"
+            );
+        }
+    }
+
+    /// The sentinel part must never be read from disk - a PartStore has no such
+    /// part and would error. Pin that we only ask for real data parts.
+    #[test]
+    fn streaming_hash_never_reads_the_sentinel_part() {
+        let size = 2 * PARTSIZE; // exact multiple -> 3 hash parts, 2 data parts
+        assert_eq!(part_count(size), 3);
+        let mut asked = Vec::new();
+        let _ = ed2k_hash_parts(size, |i| {
+            asked.push(i);
+            Ok::<_, ()>(vec![0u8; PARTSIZE as usize])
+        })
+        .unwrap();
+        assert_eq!(asked, vec![0, 1], "only the two DATA parts were read");
     }
 }

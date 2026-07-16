@@ -166,6 +166,21 @@ impl Download {
         Ok(())
     }
 
+    /// Recompute the whole-file ed2k hash from the bytes actually on disk and
+    /// compare it to `want`.
+    ///
+    /// This is the end-to-end proof that what we assembled IS what was asked
+    /// for, and for many files it is the ONLY one: `verify_part` needs the
+    /// peer's hashset, and a file of a single part has no part hashes at all.
+    /// Hashed part-by-part, so a large file is never held in memory.
+    pub async fn verify_whole_file(&self, size: u64, want: [u8; 16]) -> bool {
+        let mut g = self.inner.lock().await;
+        match mule_proto::ed2k_hash_parts(size, |p| g.store.read_part(p)) {
+            Ok(got) => got == want,
+            Err(_) => false,
+        }
+    }
+
     /// Take the finished store back out (to move the file into place).
     pub async fn into_store(self: Arc<Self>) -> Option<PartStore> {
         Arc::try_unwrap(self)

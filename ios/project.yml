@@ -27,6 +27,13 @@ targets:
         CFBundleDisplayName: padMule
         UILaunchScreen: {}
         UIRequiresFullScreen: false
+        # Completed downloads land in Documents/. These two keys are what make
+        # that folder REACHABLE - without them a finished file exists but the
+        # user has no way to open it, which is not a finished download.
+        # UIFileSharingEnabled: expose Documents/ over USB (Finder/iTunes).
+        # LSSupportsOpeningDocumentsInPlace: show it in the Files app, on-device.
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
         UISupportedInterfaceOrientations~ipad:
           - UIInterfaceOrientationPortrait
           - UIInterfaceOrientationPortraitUpsideDown
