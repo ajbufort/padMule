@@ -110,7 +110,23 @@ with a free Apple ID at install, so no Xcode/Apple secrets are involved.
    the system tray.
 4. iPad by USB -> unlock -> **Trust This Computer**. In iTunes tick **"Sync with
    this iPad over Wi-Fi"** (required for AltStore's wireless 7-day refresh).
-5. Tray -> **Install AltStore** -> pick the iPad -> Apple ID (a throwaway ID works).
+5. Tray -> **Install AltStore** -> pick the iPad -> Apple ID.
+   TRAP (hit 2026-07-16): a BRAND-NEW throwaway Apple ID fails instantly with
+   **"This action cannot be completed at this time (-22411)"**. Apple will not
+   issue a free signing cert to an account it has never seen on real hardware -
+   the ID must have been signed in on a device first. Undocumented on AltStore's
+   official error-codes page; the cause is consistent across issue #417 / #785 /
+   #1720 and community writeups.
+   FIX (either):
+   - Activate the throwaway: iPad -> Settings -> [your name] -> **Media &
+     Purchases** -> Sign Out -> sign in as the throwaway -> accept the terms ->
+     sign back in as yourself. This touches ONLY the App Store account, not
+     iCloud. Then retry AltServer with the throwaway.
+   - Or use the primary Apple ID (already device-activated, so it just works).
+     Cost: a free 7-day dev cert attaches to it and it burns App ID slots
+     (10 per 7 days). No account risk.
+   Also confirm AltServer is **>= 1.7.3** (tray -> About) - that release fixed a
+   batch of Apple ID auth failures (error 1100, -22410).
 6. iPad -> Settings -> General -> **VPN & Device Management** -> trust the cert.
    (AltStore's docs call this "Profiles & Device Management" - the older name.)
 7. iPad -> Settings -> Privacy & Security -> **Developer Mode** ON -> restart.
