@@ -6,6 +6,7 @@ members = [
     "crates/mule-kad",
     "crates/mule-engine",
     "crates/mule-cli",
+    "crates/mule-ffi",
 ]
 
 [workspace.package]
@@ -23,3 +24,4 @@ rand = "0.8"
 hex = "0.4"
 flate2 = "1"
 tokio = "1"
+uniffi = "0.28"

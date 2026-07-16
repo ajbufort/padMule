@@ -83,6 +83,11 @@ impl Download {
         self.inner.lock().await.store.pf.size
     }
 
+    /// The download's advertised filename (lossy UTF-8).
+    pub async fn name(&self) -> String {
+        String::from_utf8_lossy(&self.inner.lock().await.store.name).into_owned()
+    }
+
     pub async fn is_complete(&self) -> bool {
         self.inner.lock().await.store.is_complete()
     }
