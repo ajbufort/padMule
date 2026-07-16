@@ -1380,6 +1380,26 @@ async fn cmd_fetch_complete(met_path: &str, keyword: &str, out: &str, max_size: 
             return;
         }
     };
+    // Bind our TCP port and accept inbound handshakes, so the server's HighID
+    // callback during login SUCCEEDS (WSL mirrored-mode forward is active) - a
+    // HighID gets far better upload-queue treatment from sources than a LowID.
+    if let Ok(listener) = TcpListener::bind(("0.0.0.0", 4662)).await {
+        let me_in = HelloInfo::baseline(demo_user_hash(), 0, 4662, 4672, "padMule");
+        tokio::spawn(async move {
+            loop {
+                if let Ok((stream, _)) = listener.accept().await {
+                    let me = me_in.clone();
+                    tokio::spawn(async move {
+                        let mut fs = FramedStream::new(stream);
+                        let _ =
+                            timeout(Duration::from_secs(8), peer_handshake_inbound(&mut fs, &me))
+                                .await;
+                    });
+                }
+            }
+        });
+    }
+
     let login = LoginRequest {
         user_hash: demo_user_hash(),
         client_id: 0,
@@ -1396,15 +1416,18 @@ async fn cmd_fetch_complete(met_path: &str, keyword: &str, out: &str, max_size: 
             Ok(s) => s,
             Err(_) => continue,
         };
-        if let Ok(Ok(_)) = timeout(
-            Duration::from_secs(10),
+        match timeout(
+            Duration::from_secs(12),
             login_handshake(&mut stream, &login, &tx),
         )
         .await
         {
-            println!("logged in to {addr}");
-            fs = Some(stream);
-            break;
+            Ok(Ok(state)) => {
+                println!("logged in to {addr}: {state:?}");
+                fs = Some(stream);
+                break;
+            }
+            _ => continue,
         }
     }
     drop(tx);
@@ -1456,9 +1479,11 @@ async fn cmd_fetch_complete(met_path: &str, keyword: &str, out: &str, max_size: 
                 && r.name.to_lowercase().ends_with(&format!(".{keyword}"))
         })
         .collect();
-    cands.sort_by_key(|r| r.size);
+    // Best-sourced first (more sources -> better odds one grants a slot), then
+    // smallest (finishes in fewer bursts once served).
+    cands.sort_by(|a, b| b.sources.cmp(&a.sources).then(a.size.cmp(&b.size)));
     println!(
-        "{} trusted .{keyword} candidates (smallest first)",
+        "{} trusted .{keyword} candidates (best-sourced first)",
         cands.len()
     );
     if cands.is_empty() {
@@ -1473,7 +1498,7 @@ async fn cmd_fetch_complete(met_path: &str, keyword: &str, out: &str, max_size: 
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     let me = HelloInfo::baseline(demo_user_hash(), 0, 4662, 4672, "padMule");
 
-    for (i, r) in cands.iter().take(30).enumerate() {
+    for (i, r) in cands.iter().take(80).enumerate() {
         // Ask for sources.
         if fs
             .write_packet(&build_get_sources(&r.hash, r.size, false))
@@ -1517,38 +1542,15 @@ async fn cmd_fetch_complete(met_path: &str, keyword: &str, out: &str, max_size: 
             }
         };
         let dl = Download::new(store);
+        // Be PATIENT in the queue: eD2k sources queue you and grant a slot when
+        // your position comes up (fast for a HighID client on a niche file). Wait
+        // out the queue rather than bail, then reconnect once.
         let cfg = ManagerConfig {
             parallel: 6,
-            per_peer: Duration::from_secs(40),
-            rounds: 6,
+            per_peer: Duration::from_secs(30),
+            rounds: 1,
         };
-        // A few passes, refreshing sources between them.
-        for _pass in 0..4 {
-            if dl.is_complete().await {
-                break;
-            }
-            download_file(&dl, reg.sources(), &me, cfg).await;
-            if dl.is_complete().await {
-                break;
-            }
-            if fs
-                .write_packet(&build_get_sources(&r.hash, r.size, false))
-                .await
-                .is_ok()
-            {
-                if let Some(p) = read_until(
-                    &mut fs,
-                    mule_engine::sources::OP_FOUNDSOURCES,
-                    Duration::from_secs(8),
-                )
-                .await
-                {
-                    if let Ok((_, more)) = parse_found_sources(&p.payload, false) {
-                        reg.add_found(&more);
-                    }
-                }
-            }
-        }
+        download_file(&dl, reg.sources(), &me, cfg).await;
         let have = r.size - dl.missing().await;
         if dl.is_complete().await {
             drop(dl);
