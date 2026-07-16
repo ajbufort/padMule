@@ -1,0 +1,103 @@
+# Path C: build padMule's iPad app on a GitHub-hosted macOS runner, with no Mac
+# of our own. Produces an UNSIGNED .ipa artifact; AltStore/Sideloadly re-signs it
+# with your own Apple ID at install time, so this workflow needs NO Apple
+# credentials or secrets. See docs/wiki/mac-toolchain-setup.md.
+#
+# Why unsigned is fine: padMule is sideload-only (a P2P client can never ship on
+# the App Store), and sideloading has no minimum-SDK gate.
+
+name: iOS build (unsigned IPA)
+
+on:
+  workflow_dispatch: # run it by hand from the Actions tab
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "ios/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/ios-build.yml"
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          sw_vers
+
+      - name: Rust toolchain + iOS target
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup target add aarch64-apple-ios
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-ios-${{ hashFiles('Cargo.lock') }}
+
+      # The engine, compiled for the iPad.
+      - name: Build mule-ffi staticlib (aarch64-apple-ios)
+        run: cargo build -p mule-ffi --release --target aarch64-apple-ios
+
+      # Bindings are arch-independent, so generate them from the HOST cdylib -
+      # that is the mode uniffi-bindgen --library is happiest with.
+      - name: Generate Swift bindings
+        run: |
+          cargo build -p mule-ffi --release
+          cargo run -q -p mule-ffi --bin uniffi-bindgen -- generate \
+            --library target/release/libmule_ffi.dylib \
+            --language swift \
+            --out-dir ios/gen
+          # Swift finds a clang module only via a file literally named module.modulemap.
+          mv ios/gen/mule_ffiFFI.modulemap ios/gen/module.modulemap
+          ls -la ios/gen
+
+      - name: Stage the staticlib for the linker
+        run: |
+          mkdir -p ios/libs
+          cp target/aarch64-apple-ios/release/libmule_ffi.a ios/libs/
+          ls -la ios/libs
+
+      - name: Generate the Xcode project
+        run: |
+          brew install xcodegen
+          cd ios && xcodegen generate
+
+      - name: Build unsigned .app
+        run: |
+          cd ios
+          xcodebuild \
+            -project padMule.xcodeproj \
+            -scheme padMule \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package the .ipa
+        run: |
+          cd ios/build/Build/Products/Release-iphoneos
+          mkdir -p Payload
+          cp -R padMule.app Payload/
+          zip -qry padMule.ipa Payload
+          ls -la padMule.ipa
+
+      - name: Upload the .ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: padMule-ipa
+          path: ios/build/Build/Products/Release-iphoneos/padMule.ipa
+          if-no-files-found: error
