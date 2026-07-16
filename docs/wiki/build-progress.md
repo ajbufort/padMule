@@ -43,6 +43,55 @@ ends at a differential/round-trip gate.
 | 8 | `ios/padMule` SwiftUI shell + lifecycle + sideload | (implemented directly) | **BUILDS - a real arm64 .ipa exists (2026-07-16), CI GREEN ON THE FIRST RUN.** Path C from [[mac-toolchain-setup]]: no Apple hardware - a GitHub-hosted macOS runner builds it. `ios/project.yml` (XcodeGen; pbxproj generated in CI, never committed; wires uniffi's module.modulemap + `-lmule_ffi`; iPad-only; deployment target iOS 16 so an older-SDK build installs on iPadOS 26). `ios/padMule/Sources`: PadMuleApp (ScenePhase -> pause/resume, only on `.background`), EngineModel (blocking FFI calls off the main thread; polls `drainEvents()`), ContentView (all three HARD [[lifecycle-and-reactivation]] requirements: honest foreground-only notice, Reconnecting banner, per-transfer Paused badges). `.github/workflows/ios-build.yml` -> `padMule.ipa` artifact, UNSIGNED, needing NO Apple secrets (AltStore re-signs at install; legit because padMule is sideload-only). VERIFIED by downloading the artifact: 588 KB .ipa -> `Payload/padMule.app/padMule` is a **Mach-O 64-bit arm64 executable**; Info.plist = us.ajbconsulting.padMule / MinimumOSVersion 16.0 / UIDeviceFamily [2]; and the Rust engine is genuinely linked in (432 uniffi/mule_ffi strings, `mule_ffi_rustbuffer_free`, `EngineStateFfi`, the "Reconnecting..." string). REMAINING: sideload it to the device and see it run (AltStore + AltServer on the Windows host; Developer Mode on the iPad); then real server/Kad wiring behind the UI. |
 | 9 | (v1.1) seedbox mode | - | not started |
 
+## ENGINE GOES LIVE BEHIND THE UI (2026-07-16)
+
+`Engine::start()` no longer just loads state - it brings the real network up, so
+the iPad app is a real client. Live-verified from an EMPTY config dir (exactly
+what a fresh install sees):
+
+```
+Status("Fetching network lists...")   <- had neither file
+Kad { contacts: 133 }                 <- fetched nodes.dat
+Status("Opening port...")
+Server("Connected to <server> (HighID, id <client-id-hex>)")
+Kad { contacts: 21 }                  <- live Kad bootstrap
+State(Running) / Status("Connected")
+```
+
+Three things worth knowing:
+
+1. **The fresh-install gap.** Nothing fetched `server.met`/`nodes.dat` - they were
+   hand-placed on the dev box, so a real install knew NO servers and NO Kad
+   contacts and could reach nothing. New `bootstrap.rs` fetches both from
+   upd.emule-security.org. We fetch rather than bundle because a bundled list ROTS
+   (the 2026-07-13 log records exactly that failure). The HTTP is hand-rolled,
+   byte-safe (these files are BINARY - UTF-8 decoding corrupts them) and runs on a
+   raw socket, which **sidesteps iOS ATS entirely** (ATS governs URLSession, not
+   BSD sockets) - so a cleartext http:// fetch works on-device with no Info.plist
+   exemption. Fetches are best effort + validated (an HTML error page must never
+   be saved as a server list); a failure means we come up offline, never a crash.
+2. **ORDER MATTERS: listener BEFORE login.** The server decides HighID vs LowID by
+   connecting back to the port we advertise. Without a listener we got **LowID**;
+   binding it first flipped the same code to **HighID** on the next live run. The
+   server's probe is a bare TCP connect+close, so merely ACCEPTING passes it.
+   `map_port()` additionally tries UPnP ([[mac-toolchain-setup]] n/a; see
+   [[net-highid-and-port-forwarding]]) so a real device with no hand-made router
+   rule can still earn HighID.
+3. **pause/resume now moves real sockets.** pause() drops the Kad UDP socket and
+   aborts the listener (freeing 4662); resume() rebinds the port FIRST (same
+   HighID reason), re-runs the server handshake, and re-bootstraps Kad - correct
+   across an IP change, which is the point on a mobile device. `online_status()`
+   is honest: it never claims "Connected" when nothing is.
+
+Testing: the unit suite must never touch the network, so `Engine::set_offline(true)`
+suppresses it (the engine tests went 2.67s -> 0.05s, proving they no longer dial
+out). The real proof is `engine::live::fresh_install_goes_online_and_bootstraps_kad`
+(`#[ignore]`d; run with `--ignored`), which asserts a fresh dir fetches both files,
+logs in, and populates Kad. 352 tests.
+
+REMAINING: search + add-download from the UI (the engine can already do both -
+see the three-file milestone - they are just not exposed through the FFI facade yet).
+
 ## LIVE END-TO-END DOWNLOADS - THREE FILES COMPLETED (2026-07-16)
 
 padMule downloaded THREE real files from the live eD2k network to completion,
