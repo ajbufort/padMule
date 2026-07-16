@@ -23,7 +23,7 @@ use mule_engine::search::{build_search_request, parse_search_result, SearchParam
 use mule_engine::server_messages::{LoginRequest, DEFAULT_SERVER_FLAGS};
 use mule_engine::sources::{build_get_sources, parse_found_sources};
 use mule_engine::{
-    connect_peer, connect_peer_obf, connect_server, download_file, download_from_peer,
+    catalog, connect_peer, connect_peer_obf, connect_server, download_file, download_from_peer,
     fetch_from_sources, login_handshake, obf_accept, peer_handshake_inbound, serve, Download,
     FramedStream, KadNode, ManagerConfig, ObfDetect, PartStore, ServedFile, ServerEvent,
     ServerLink, ServerState, SourceRegistry,
@@ -1361,6 +1361,221 @@ async fn cmd_link(link: &str, out: Option<&str>) {
     }
 }
 
+/// Completion-optimized fetch: search a keyword, catalog + rank the results,
+/// then try SMALL trusted candidates (smallest first - a source serves a burst
+/// then queues us, so small files finish in one shot) until one downloads to
+/// completion and its ed2k hash verifies. Prints the file that completed.
+async fn cmd_fetch_complete(met_path: &str, keyword: &str, out: &str, max_size: u64) {
+    let bytes = match std::fs::read(met_path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("cannot read {met_path}: {e}");
+            return;
+        }
+    };
+    let met = match read_server_met(&bytes) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("bad server.met: {e}");
+            return;
+        }
+    };
+    let login = LoginRequest {
+        user_hash: demo_user_hash(),
+        client_id: 0,
+        tcp_port: 4662,
+        nick: "padMule".to_string(),
+        server_flags: DEFAULT_SERVER_FLAGS,
+    };
+    let (tx, rx) = mpsc::channel(64);
+    let printer = spawn_event_printer(rx);
+    let mut fs = None;
+    for srv in met.servers.iter().take(10) {
+        let addr = SocketAddr::new(IpAddr::V4(ip_from_met_u32(srv.ip)), srv.port);
+        let mut stream = match connect_server(addr).await {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        if let Ok(Ok(_)) = timeout(
+            Duration::from_secs(10),
+            login_handshake(&mut stream, &login, &tx),
+        )
+        .await
+        {
+            println!("logged in to {addr}");
+            fs = Some(stream);
+            break;
+        }
+    }
+    drop(tx);
+    let _ = printer.await;
+    let mut fs = match fs {
+        Some(f) => f,
+        None => {
+            eprintln!("no server accepted a login");
+            return;
+        }
+    };
+
+    let params = SearchParams {
+        keyword: keyword.to_string(),
+        file_type: None,
+        min_size: Some(1),
+        max_size: Some(max_size as u32),
+        extension: Some(keyword.to_string()),
+    };
+    println!("searching '{keyword}' (<= {max_size} bytes) ...");
+    if fs
+        .write_packet(&build_search_request(&params))
+        .await
+        .is_err()
+    {
+        eprintln!("search send failed");
+        return;
+    }
+    let files = match read_until(
+        &mut fs,
+        mule_engine::search::OP_SEARCHRESULT,
+        Duration::from_secs(20),
+    )
+    .await
+    {
+        Some(p) => parse_search_result(&p.payload).unwrap_or_default(),
+        None => Vec::new(),
+    };
+    println!("{} raw results", files.len());
+
+    // Catalog: dedup by hash, rank, trust. Keep trusted .<keyword> files with a
+    // real size <= max, smallest first (most likely to finish in a burst).
+    let mut cands: Vec<_> = catalog(&files)
+        .into_iter()
+        .filter(|r| {
+            r.is_trusted()
+                && r.size > 0
+                && r.size <= max_size
+                && r.name.to_lowercase().ends_with(&format!(".{keyword}"))
+        })
+        .collect();
+    cands.sort_by_key(|r| r.size);
+    println!(
+        "{} trusted .{keyword} candidates (smallest first)",
+        cands.len()
+    );
+    if cands.is_empty() {
+        eprintln!("no suitable candidate");
+        return;
+    }
+
+    let dir = std::path::Path::new(out)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let me = HelloInfo::baseline(demo_user_hash(), 0, 4662, 4672, "padMule");
+
+    for (i, r) in cands.iter().take(30).enumerate() {
+        // Ask for sources.
+        if fs
+            .write_packet(&build_get_sources(&r.hash, r.size, false))
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let found = match read_until(
+            &mut fs,
+            mule_engine::sources::OP_FOUNDSOURCES,
+            Duration::from_secs(10),
+        )
+        .await
+        {
+            Some(p) => parse_found_sources(&p.payload, false)
+                .map(|(_, s)| s)
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let mut reg = SourceRegistry::new();
+        reg.add_found(&found);
+        if reg.is_empty() {
+            continue; // no connectable source; next candidate
+        }
+        println!(
+            "[{}] '{}' {} B, {} connectable source(s) - trying...",
+            i + 1,
+            r.name,
+            r.size,
+            reg.len()
+        );
+
+        let _ = std::fs::remove_file(dir.join("001.part"));
+        let _ = std::fs::remove_file(dir.join("001.part.met"));
+        let store = match PartStore::create(&dir, 1, r.hash, r.size, r.name.as_bytes()) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("part store: {e}");
+                continue;
+            }
+        };
+        let dl = Download::new(store);
+        let cfg = ManagerConfig {
+            parallel: 6,
+            per_peer: Duration::from_secs(40),
+            rounds: 6,
+        };
+        // A few passes, refreshing sources between them.
+        for _pass in 0..4 {
+            if dl.is_complete().await {
+                break;
+            }
+            download_file(&dl, reg.sources(), &me, cfg).await;
+            if dl.is_complete().await {
+                break;
+            }
+            if fs
+                .write_packet(&build_get_sources(&r.hash, r.size, false))
+                .await
+                .is_ok()
+            {
+                if let Some(p) = read_until(
+                    &mut fs,
+                    mule_engine::sources::OP_FOUNDSOURCES,
+                    Duration::from_secs(8),
+                )
+                .await
+                {
+                    if let Ok((_, more)) = parse_found_sources(&p.payload, false) {
+                        reg.add_found(&more);
+                    }
+                }
+            }
+        }
+        let have = r.size - dl.missing().await;
+        if dl.is_complete().await {
+            drop(dl);
+            let part = dir.join("001.part");
+            if let Ok(data) = std::fs::read(&part) {
+                if ed2k_hash(&data) == r.hash {
+                    let _ = std::fs::rename(&part, out);
+                    let _ = std::fs::remove_file(dir.join("001.part.met"));
+                    println!(
+                        "COMPLETE + VERIFIED: '{}' ({} bytes) -> {out}",
+                        r.name,
+                        data.len()
+                    );
+                    return;
+                }
+                println!("completed but hash mismatch - corrupt, trying next");
+            }
+        } else {
+            println!(
+                "  got {have}/{} bytes; source stalled, next candidate",
+                r.size
+            );
+        }
+    }
+    println!("no candidate completed (sources uncooperative). Search + selection worked.");
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -1447,6 +1662,13 @@ async fn main() {
         }
         Some("search-download") if args.len() == 5 => {
             cmd_search_download(&args[2], &args[3], &args[4]).await
+        }
+        Some("fetch-complete") if args.len() == 5 || args.len() == 6 => {
+            let max = args
+                .get(5)
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(8_000_000);
+            cmd_fetch_complete(&args[2], &args[3], &args[4], max).await
         }
         _ => {
             eprintln!("usage:");
