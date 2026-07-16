@@ -2,6 +2,7 @@
 //! server-message codecs (no networking yet; tokio arrives in a later wave).
 //! See docs/wiki/protocol-understanding.md.
 
+pub mod bootstrap;
 pub mod catalog;
 pub mod connection;
 pub mod credits;

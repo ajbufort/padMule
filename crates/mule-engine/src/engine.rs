@@ -16,15 +16,73 @@
 //! and checkpoint. Phases 3/4 fill `start`/`resume`/`checkpoint` with the real
 //! server + Kad + download-manager wiring.
 
+use crate::bootstrap;
+use crate::connection::{ServerEvent, ServerState};
+use crate::framed::FramedStream;
 use crate::identity::NodeIdentity;
+use crate::kad_live::KadNode;
+use crate::link::ServerLink;
 use crate::multi_source::{resume_downloads, Download};
-use mule_files::{read_nodes_dat, write_nodes_dat, KadContact, NodesDat};
+use crate::peer::HelloInfo;
+use crate::peer_conn::peer_handshake_inbound;
+use crate::server_messages::{LoginRequest, DEFAULT_SERVER_FLAGS};
+use mule_files::{read_nodes_dat, read_server_met, write_nodes_dat, KadContact, NodesDat};
 use mule_kad::RoutingTable;
 use mule_proto::Kad128;
 use std::io;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::net::TcpListener;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tokio::time::timeout;
+
+/// The ports padMule advertises and listens on (eD2k TCP, Kad UDP).
+const TCP_PORT: u16 = 4662;
+const KAD_UDP_PORT: u16 = 4672;
+
+/// Decode a server.met IP uint32 (first octet in the LOW byte - the eD2k
+/// convention, not network order).
+fn ip_from_met_u32(ip: u32) -> Ipv4Addr {
+    Ipv4Addr::new(
+        ip as u8,
+        (ip >> 8) as u8,
+        (ip >> 16) as u8,
+        (ip >> 24) as u8,
+    )
+}
+
+/// A routing table's live contacts in the on-disk `nodes.dat` shape. Taking the
+/// table (not a `&[Contact]`) keeps mule-kad's contact type out of this signature.
+fn routing_to_nodes(rt: &RoutingTable) -> Vec<KadContact> {
+    rt.contacts()
+        .into_iter()
+        .map(|c| KadContact {
+            id: c.id,
+            ip: c.ip,
+            udp_port: c.udp_port,
+            tcp_port: c.tcp_port,
+            version: c.version,
+            udp_key: 0,
+            udp_key_ip: 0,
+            verified: false,
+        })
+        .collect()
+}
+
+/// Flatten a server-link event into the UI's event stream.
+fn map_server_event(e: ServerEvent) -> EngineEvent {
+    match e {
+        ServerEvent::State(s) => EngineEvent::Server(format!("{s:?}")),
+        ServerEvent::Message(m) => EngineEvent::Server(m),
+        ServerEvent::Status { users, files } => {
+            EngineEvent::Server(format!("{users} users, {files} files"))
+        }
+        ServerEvent::ServerList(l) => EngineEvent::Server(format!("{} servers known", l.len())),
+    }
+}
 
 /// The coarse lifecycle state the UI shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +126,17 @@ pub struct Engine {
     routing: RoutingTable,
     /// In-progress downloads (resumed from disk on start).
     downloads: Vec<Arc<Download>>,
+    /// The live eD2k server link, once logged in.
+    server: Option<ServerLink>,
+    /// The live Kad node (owns the UDP socket), once bootstrapped.
+    kad: Option<KadNode>,
+    /// The inbound peer listener's accept loop (dropping it frees port 4662).
+    listener: Option<JoinHandle<()>>,
+    /// Sender handed to each ServerLink; its forwarder task is spawned once.
+    server_tx: Option<mpsc::Sender<ServerEvent>>,
+    /// Suppress ALL network activity. Tests set this so the unit suite never
+    /// touches the real network; the UI never does.
+    offline: bool,
 }
 
 impl Engine {
@@ -87,8 +156,39 @@ impl Engine {
             events: tx,
             routing,
             downloads: Vec::new(),
+            server: None,
+            kad: None,
+            listener: None,
+            server_tx: None,
+            offline: false,
         };
         Ok((engine, rx))
+    }
+
+    /// Suppress all network activity (tests only - the UI never calls this).
+    /// Without it the unit suite would fetch lists and dial real servers.
+    pub fn set_offline(&mut self, offline: bool) {
+        self.offline = offline;
+    }
+
+    /// True once an eD2k server has accepted our login.
+    pub fn is_online(&self) -> bool {
+        self.server
+            .as_ref()
+            .map(|s| s.is_connected())
+            .unwrap_or(false)
+    }
+
+    /// An honest one-line status for the UI - never claims a connection we do
+    /// not have.
+    fn online_status(&self) -> String {
+        if self.is_online() {
+            "Connected".to_string()
+        } else if self.offline {
+            "Offline (network disabled)".to_string()
+        } else {
+            "Offline - no server accepted a login".to_string()
+        }
     }
 
     /// The number of Kad contacts currently held.
@@ -133,6 +233,29 @@ impl Engine {
         if self.state == EngineState::Running {
             return;
         }
+        let _ = std::fs::create_dir_all(&self.config_dir);
+
+        // A FRESH INSTALL HAS NEITHER LIST, so it knows no servers and no Kad
+        // contacts and could reach nothing. Fetch them (best effort - a failure
+        // must not stop the engine; we simply come up offline and can retry).
+        if !self.offline {
+            self.emit(EngineEvent::Status("Fetching network lists...".into()));
+            bootstrap::ensure(
+                &self.config_dir,
+                "server.met",
+                bootstrap::SERVER_MET_URL,
+                bootstrap::looks_like_server_met,
+            )
+            .await;
+            bootstrap::ensure(
+                &self.config_dir,
+                "nodes.dat",
+                bootstrap::NODES_DAT_URL,
+                bootstrap::looks_like_nodes_dat,
+            )
+            .await;
+        }
+
         // Persisted Kad contacts.
         if let Ok(bytes) = std::fs::read(self.config_dir.join("nodes.dat")) {
             if let Ok(nd) = read_nodes_dat(&bytes) {
@@ -150,8 +273,150 @@ impl Engine {
             let hash = dl.hash().await;
             self.emit(EngineEvent::Progress { hash, have, total });
         }
+
+        // Go live. ORDER MATTERS: the inbound listener must exist BEFORE we log
+        // in, because the server decides HighID vs LowID by connecting back to
+        // the port we advertise. No listener = LowID = a second-class peer.
+        if !self.offline {
+            self.emit(EngineEvent::Status("Opening port...".into()));
+            self.start_listener().await;
+            self.map_port().await;
+            self.emit(EngineEvent::Status("Connecting...".into()));
+            self.connect_server().await;
+            self.start_kad().await;
+        }
+
         self.set_state(EngineState::Running);
-        self.emit(EngineEvent::Status("Started".into()));
+        self.emit(EngineEvent::Status(self.online_status()));
+    }
+
+    /// Bind the inbound peer port and accept connections. This is what earns a
+    /// HighID: the server's HighID test is a bare TCP connect+close (no eD2k
+    /// HELLO), so simply ACCEPTING is enough to pass it. Real peers that follow
+    /// get a proper hello handshake. Idempotent; a bind failure is survivable
+    /// (we just stay LowID).
+    async fn start_listener(&mut self) {
+        if self.listener.is_some() {
+            return;
+        }
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), TCP_PORT);
+        let Ok(listener) = TcpListener::bind(bind).await else {
+            self.emit(EngineEvent::Server(format!(
+                "port {TCP_PORT} unavailable - expect LowID"
+            )));
+            return;
+        };
+        let me = HelloInfo::baseline(self.identity.userhash, 0, TCP_PORT, KAD_UDP_PORT, "padMule");
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _peer)) = listener.accept().await else {
+                    continue;
+                };
+                let me = me.clone();
+                tokio::spawn(async move {
+                    let mut fs = FramedStream::new(stream);
+                    // A bare connect+close (the server's probe) just ends here.
+                    let _ =
+                        timeout(Duration::from_secs(8), peer_handshake_inbound(&mut fs, &me)).await;
+                });
+            }
+        });
+        self.listener = Some(handle);
+    }
+
+    /// Best-effort: ask the gateway to forward our port, so a real device (which
+    /// has no hand-configured router rule) can still earn a HighID. Tries NAT-PMP
+    /// and UPnP - consumer gateways speak one or the other.
+    async fn map_port(&self) {
+        if let Ok(ext) = crate::upnp::map_port(TCP_PORT, "padMule", 0).await {
+            self.emit(EngineEvent::Server(format!(
+                "UPnP mapped port {TCP_PORT} (external IP {ext})"
+            )));
+        }
+    }
+
+    /// The ServerEvent -> EngineEvent forwarder, spawned exactly once. Must be
+    /// called from inside the runtime (start/resume), never from `new`.
+    fn server_sender(&mut self) -> mpsc::Sender<ServerEvent> {
+        if let Some(tx) = &self.server_tx {
+            return tx.clone();
+        }
+        let (tx, mut rx) = mpsc::channel(64);
+        let out = self.events.clone();
+        tokio::spawn(async move {
+            while let Some(e) = rx.recv().await {
+                let _ = out.send(map_server_event(e));
+            }
+        });
+        self.server_tx = Some(tx.clone());
+        tx
+    }
+
+    /// Try each server in `server.met` until one accepts a login. Best effort:
+    /// coming up offline is a valid outcome, not an error.
+    async fn connect_server(&mut self) {
+        let Ok(bytes) = std::fs::read(self.config_dir.join("server.met")) else {
+            self.emit(EngineEvent::Server("no server list on disk".into()));
+            return;
+        };
+        let Ok(met) = read_server_met(&bytes) else {
+            self.emit(EngineEvent::Server("server list is unreadable".into()));
+            return;
+        };
+        let login = LoginRequest {
+            user_hash: self.identity.userhash,
+            client_id: 0,
+            tcp_port: TCP_PORT,
+            nick: "padMule".to_string(),
+            server_flags: DEFAULT_SERVER_FLAGS,
+        };
+        let tx = self.server_sender();
+        for srv in met.servers.iter().take(10) {
+            let addr = SocketAddr::new(IpAddr::V4(ip_from_met_u32(srv.ip)), srv.port);
+            let mut link = ServerLink::new(addr, login.clone(), tx.clone());
+            if let Ok(Ok(ServerState::Connected { id, low_id })) =
+                timeout(Duration::from_secs(12), link.connect()).await
+            {
+                self.emit(EngineEvent::Server(format!(
+                    "Connected to {addr} ({}, id {id:#x})",
+                    if low_id { "LowID" } else { "HighID" }
+                )));
+                self.server = Some(link);
+                return;
+            }
+        }
+        self.emit(EngineEvent::Server("no server accepted a login".into()));
+    }
+
+    /// Bind the Kad UDP socket and bootstrap off the persisted contacts.
+    async fn start_kad(&mut self) {
+        let contacts: Vec<KadContact> = match std::fs::read(self.config_dir.join("nodes.dat")) {
+            Ok(b) => read_nodes_dat(&b).map(|n| n.contacts).unwrap_or_default(),
+            Err(_) => Vec::new(),
+        };
+        if contacts.is_empty() {
+            self.emit(EngineEvent::Server("no Kad contacts to bootstrap".into()));
+            return;
+        }
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), KAD_UDP_PORT);
+        let Ok(mut node) = KadNode::bind(bind, TCP_PORT).await else {
+            self.emit(EngineEvent::Server("Kad UDP port unavailable".into()));
+            return;
+        };
+        match node
+            .bootstrap_any(&contacts, Duration::from_millis(1200), 40)
+            .await
+        {
+            Ok(_) => {
+                // Fold what Kad learned back into the persisted routing table.
+                self.routing.load_nodes(&routing_to_nodes(node.routing()));
+                self.emit(EngineEvent::Kad {
+                    contacts: node.contacts_known(),
+                });
+                self.kad = Some(node);
+            }
+            Err(_) => self.emit(EngineEvent::Server("Kad bootstrap failed".into())),
+        }
     }
 
     /// App backgrounded: checkpoint to disk and release sockets. Idempotent - a
@@ -159,6 +424,15 @@ impl Engine {
     pub async fn pause(&mut self) {
         if self.state != EngineState::Running {
             return;
+        }
+        // Release the sockets ourselves rather than let iPadOS reclaim them
+        // out from under us - that is what makes resume predictable.
+        if let Some(s) = &mut self.server {
+            s.pause().await;
+        }
+        self.kad = None; // dropping the KadNode closes its UDP socket
+        if let Some(h) = self.listener.take() {
+            h.abort(); // release TCP 4662; resume() rebinds it
         }
         self.checkpoint();
         self.emit(EngineEvent::Status("Paused".into()));
@@ -172,9 +446,31 @@ impl Engine {
         if self.state != EngineState::Paused {
             return;
         }
+        // The banner goes up BEFORE the work, so the UI is honest while we wait.
         self.emit(EngineEvent::Status("Reconnecting...".into()));
         self.set_state(EngineState::Running);
-        self.emit(EngineEvent::Status("Connected".into()));
+
+        if !self.offline {
+            // Rebind the inbound port first - same HighID reason as start().
+            self.start_listener().await;
+            // Re-run the handshake on the existing link, or find a new server if
+            // we never had one (or the old one is gone). Correct across an IP
+            // change, which is the whole point on a mobile device.
+            let resumed = match &mut self.server {
+                Some(s) => matches!(
+                    timeout(Duration::from_secs(12), s.resume()).await,
+                    Ok(Ok(ServerState::Connected { .. }))
+                ),
+                None => false,
+            };
+            if !resumed {
+                self.server = None;
+                self.connect_server().await;
+            }
+            self.start_kad().await;
+        }
+
+        self.emit(EngineEvent::Status(self.online_status()));
     }
 
     /// Final checkpoint and stop. Safe from any state.
@@ -188,21 +484,7 @@ impl Engine {
     /// blocks land, so progress is already durable.
     fn checkpoint(&self) {
         let _ = self.identity.save(&self.config_dir);
-        let contacts: Vec<KadContact> = self
-            .routing
-            .contacts()
-            .into_iter()
-            .map(|c| KadContact {
-                id: c.id,
-                ip: c.ip,
-                udp_port: c.udp_port,
-                tcp_port: c.tcp_port,
-                version: c.version,
-                udp_key: 0,
-                udp_key_ip: 0,
-                verified: false,
-            })
-            .collect();
+        let contacts = routing_to_nodes(&self.routing);
         let nd = NodesDat {
             version: 2,
             contacts,
@@ -249,6 +531,7 @@ mod tests {
         let dir = tmp("life");
         let _ = std::fs::remove_dir_all(&dir);
         let (mut engine, mut rx) = Engine::new(&dir).unwrap();
+        engine.set_offline(true);
 
         engine.start().await;
         assert_eq!(engine.state(), EngineState::Running);
@@ -279,7 +562,13 @@ mod tests {
         );
         // The reconnect banner is emitted on resume.
         assert!(evs.contains(&EngineEvent::Status("Reconnecting...".into())));
-        assert!(evs.contains(&EngineEvent::Status("Connected".into())));
+        // The status after the banner must be HONEST: offline here, because the
+        // test suppresses the network. It must never claim a connection we lack.
+        assert!(
+            evs.iter()
+                .any(|e| matches!(e, EngineEvent::Status(s) if s.starts_with("Offline"))),
+            "resume must report real connectivity, not a hardcoded 'Connected'"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -288,6 +577,7 @@ mod tests {
         let dir = tmp("idem");
         let _ = std::fs::remove_dir_all(&dir);
         let (mut engine, mut rx) = Engine::new(&dir).unwrap();
+        engine.set_offline(true);
 
         // pause/resume before start are no-ops.
         engine.pause().await;
@@ -331,6 +621,7 @@ mod tests {
             .collect();
         {
             let (mut engine, _rx) = Engine::new(&dir).unwrap();
+            engine.set_offline(true);
             engine.add_kad_contacts(&contacts);
             engine.start().await;
             engine.pause().await; // checkpoint writes nodes.dat
@@ -338,6 +629,7 @@ mod tests {
         }
         // A fresh engine on the same dir loads them on start.
         let (mut engine2, mut rx) = Engine::new(&dir).unwrap();
+        engine2.set_offline(true);
         engine2.start().await;
         assert_eq!(engine2.kad_contacts(), 3);
         let evs = drain(&mut rx).await;
@@ -359,6 +651,7 @@ mod tests {
         drop(store); // leaves 001.part + 001.part.met on disk
 
         let (mut engine, mut rx) = Engine::new(&dir).unwrap();
+        engine.set_offline(true);
         engine.start().await;
         assert_eq!(engine.downloads().len(), 1, "the .part is resumed");
         let evs = drain(&mut rx).await;
@@ -374,6 +667,7 @@ mod tests {
         let dir = tmp("ckpt");
         let _ = std::fs::remove_dir_all(&dir);
         let (mut engine, _rx) = Engine::new(&dir).unwrap();
+        engine.set_offline(true);
         let uh = engine.userhash();
         std::fs::remove_file(dir.join("preferences.dat")).unwrap();
         engine.start().await;
@@ -383,6 +677,47 @@ mod tests {
             mule_files::read_preferences_dat(&std::fs::read(dir.join("preferences.dat")).unwrap())
                 .unwrap();
         assert_eq!(re, uh);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod live {
+    use super::*;
+
+    /// The real thing, exactly as a FRESH iPad install experiences it: an empty
+    /// config dir with no server.met and no nodes.dat -> fetch both, log into a
+    /// live eD2k server, bootstrap Kad. Ignored by default (needs the network);
+    /// run with `--ignored`.
+    #[tokio::test]
+    #[ignore]
+    async fn fresh_install_goes_online_and_bootstraps_kad() {
+        let dir = std::env::temp_dir().join(format!("padmule-live-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (mut engine, mut rx) = Engine::new(&dir).unwrap();
+        assert!(!dir.join("server.met").exists(), "fresh: no server list");
+        assert!(!dir.join("nodes.dat").exists(), "fresh: no Kad contacts");
+
+        engine.start().await;
+
+        // It fetched the bootstrap data it had none of.
+        assert!(dir.join("server.met").exists(), "server.met was fetched");
+        assert!(dir.join("nodes.dat").exists(), "nodes.dat was fetched");
+        // It logged into a real server and bootstrapped Kad.
+        assert!(engine.is_online(), "a live server accepted our login");
+        assert!(engine.kad_contacts() > 0, "Kad routing table is populated");
+
+        let mut evs = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            evs.push(e);
+        }
+        println!("--- engine events on a fresh start ---");
+        for e in &evs {
+            println!("{e:?}");
+        }
+        assert!(evs
+            .iter()
+            .any(|e| matches!(e, EngineEvent::Status(s) if s == "Connected")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
