@@ -34,6 +34,22 @@ targets:
           - UIInterfaceOrientationLandscapeRight
         # padMule needs outbound TCP/UDP to arbitrary peers; no ATS exemption is
         # required for raw sockets, but the engine is not HTTP so nothing here.
+        #
+        # Local network access. WITHOUT this key iOS 14+ SILENTLY DROPS every
+        # outgoing packet to the LAN - no error, no failure, just nothing - so
+        # the port-mapping probe cannot work and the prompt has no reason to
+        # show the user. (developer.apple.com/forums/thread/661606)
+        #
+        # NOTE this key alone does NOT revive UPnP: SSDP M-SEARCH goes to the
+        # MULTICAST address 239.255.255.250, and multicast on real hardware also
+        # needs the restricted com.apple.developer.networking.multicast
+        # entitlement, which requires Apple approval and is unreachable for a
+        # free-signed sideloaded app. The way out is unicast port mapping
+        # (NAT-PMP straight at the gateway) - see docs/wiki/mac-toolchain-setup.md.
+        NSLocalNetworkUsageDescription:
+          padMule asks your router to open its port so other peers can reach you
+          directly. Without it you can still download, but connections are
+          slower to establish.
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: us.ajbconsulting.padMule

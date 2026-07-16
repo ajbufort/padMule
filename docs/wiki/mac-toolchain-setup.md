@@ -147,9 +147,42 @@ with a free Apple ID at install, so no Xcode/Apple secrets are involved.
 9. LIMITS of free-ID signing: apps expire every **7 days** (keep AltServer running
    on the same Wi-Fi and AltStore auto-refreshes) and **max 3 sideloaded apps**.
 10. Debug by what the UI shows - there is no Xcode device support for iPadOS 26 on
-    paths A/C, so the app's own status line IS the diagnostic. A healthy first run:
-    "Fetching network lists..." -> Kad count -> "Opening port..." -> "Connected to
-    <server> (HighID|LowID)" -> "Connected".
+    paths A/C, so the app's own status line IS the diagnostic. The Status screen
+    shows State / Status / Server / ID (HighID|LowID) / Kad contacts.
+
+## What the first real device run taught us (2026-07-16)
+
+padMule RAN on the iPad first try: State running, Status Connected, Kad climbing
+21 -> 158 contacts. Two findings, both now fixed or recorded:
+
+1. **The ID type was computed and thrown away.** `start()` emitted
+   `Server("Connected to <addr> (HighID)")` and then `Status("Connected")`; both
+   land in the same 1s `drainEvents()` batch and Swift applied them in order, so
+   the honest line was overwritten before a frame rendered. FIXED: `ServerInfo`
+   is now engine state (not a transient event), `online_status()` carries the ID
+   type, and the UI polls `server_info()` as a SNAPSHOT with its own row. Lesson:
+   **an event is not state** - anything the UI must keep showing has to be
+   readable at any time, not announced once.
+2. **UPnP CANNOT WORK on iOS.** The "find devices on local networks" prompt was
+   `upnp::discover()` firing SSDP M-SEARCH at multicast 239.255.255.250. Blocked
+   twice: (a) `NSLocalNetworkUsageDescription` was missing, and without it iOS 14+
+   **silently drops** every LAN packet - no error (developer.apple.com/forums/thread/661606);
+   (b) multicast on real hardware needs the RESTRICTED
+   `com.apple.developer.networking.multicast` entitlement, which needs Apple
+   approval and is UNREACHABLE for a free-signed sideloaded app.
+   The Info.plist key is added (it gates the unicast paths too), but the entitlement
+   is a hard wall. => **on-device HighID needs UNICAST port mapping**: `portmap.rs`
+   (NAT-PMP, unicast to gateway:5351) is already built but NOT wired into
+   `map_port()`, which only tries UPnP. A unicast M-SEARCH aimed at the gateway is
+   the UPnP-flavoured equivalent. Both still need the Info.plist key + user Allow.
+   NOTE for this dev box specifically: 4662/4672 forward to the WINDOWS host, not
+   the iPad, so the iPad is LowID regardless until that changes. LowID is
+   survivable - the live wav + pdf both arrived via LowID callback.
+
+Also fixed while here: `map_port()` emitted the gateway-reported **public IP** into
+a UI event, and the login event embedded the client id, which ENCODES the public IP
+on HighID. Both removed - this screen gets screenshotted. See
+[[padmule-dev-box-networking]].
 
 ## Related
 
