@@ -163,6 +163,20 @@ bullet each; newest first.
   principle, consistent with replicate-wire/improve-internals: the wire stays
   stock; the intelligence is in selection and scheduling. See [[build-progress]]
   three-file milestone.
+- 2026-07-16 **The differential test catches your OWN optimizations, not just
+  missing features.** Building the padMule enhancement channel, the amuled
+  differential test flagged a regression I had introduced earlier: my queue
+  fast-bail (`TransferError::Queued` on OP_QUEUERANKING) was UNCONDITIONAL, so the
+  single-source `peer-download` aborted the moment amuled rationed its upload slot
+  - the 2nd and 3rd files failed while the 1st (served immediately) passed. A
+  padMule-to-padMule test never sees this because our own `serve()` grants a slot
+  at once; only a real client that RATIONS uploads exposes it - the same class as
+  the Wave-4d extended-requests bug. Fix: make fast-bail a policy - the
+  multi-source hunt bails (it has other sources), a single dedicated source waits
+  in the queue like a normal client (`download_from_peer(.., bail_on_queue)`).
+  Lesson: an optimization that helps one caller can silently break another that
+  shares the code path; re-run the real-peer differential gate after ANY transfer
+  change, not just feature work. See [[padmule-enhancement-channel]].
 
 ## Related
 
