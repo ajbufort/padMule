@@ -1,99 +1,101 @@
-# Mac Toolchain Setup (build padMule for iPad on a 2011 Mac mini)
+# Mac Toolchain Setup (getting padMule onto the iPad)
 
 Updated: 2026-07-16
 
-Runbook for turning Anthony's **2011 Mac mini (Macmini5,x, 32GB RAM, non-Metal
-GPU)** into an Xcode box that can build + sign padMule's iOS app for the iPad Pro
-4th gen. The engine + [[padmule-ios-app-path]] FFI seam are done; this is the
+How to build + sign padMule's iOS app for Anthony's **iPad Pro 4th gen running
+iPadOS 26.5.2**, given the available Mac is a **2011 Mac mini (Macmini5,x, 32GB,
+non-Metal)**. The engine + [[padmule-ios-app-path]] FFI seam are done; this is the
 last piece before the SwiftUI shell (Wave 8, [[build-progress]]).
 
-## The two facts that drive every choice
+## The blocker (verified 2026-07-16)
 
-- **Non-Metal GPU.** A 2011 mini has Intel HD 3000 (or, on the 5,2, a Radeon HD
-  6630M) - both pre-Metal. OpenCore Legacy Patcher (OCLP) runs modern macOS on it
-  via "non-Metal" root patches, but: (a) the IDE UI is sluggish, and (b) **the iOS
-  Simulator will not run** (it needs Metal). => develop by deploying to the
-  PHYSICAL iPad (fine - that is padMule's real target). Compilation is CPU/RAM
-  bound, so 32GB + the CPU + an SSD handle it; just not fast.
-- **Xcode must match the iPad's iPadOS.** CHECK THE IPAD FIRST (Settings ->
-  General -> About -> Software Version). This picks the whole chain:
+The standard chain is broken at the OCLP step:
 
-| iPad is on ... | Target macOS | Xcode | Notes |
-|----------------|-------------|-------|-------|
-| iPadOS <= 17 | **Ventura 13** | Xcode 15.x | BEST for non-Metal (OCLP more stable on Ventura); Xcode 15 SDK deploys to <= 17. |
-| iPadOS 18 | Sonoma 14.5+ | Xcode 16.x | Needed for the iPadOS 18 SDK; non-Metal on Sonoma is rougher. |
+`iPadOS 26.5.2` -> needs **Xcode 26** -> needs **macOS Tahoe 26.2+**
+(developer.apple.com/xcode/system-requirements) -> **OpenCore Legacy Patcher has
+NO Tahoe 26 support** (dortania issue #1167; v3.0 missed its winter-2025 deadline,
+no public update). OCLP's Intel road effectively ENDS at Tahoe for architectural
+reasons - it works by redirecting Intel code that disappears as macOS goes
+Apple-silicon-only. And non-Metal Macs (2011 and older) are a degraded tier
+regardless (graphical glitches; **the iOS Simulator needs Metal and will not run**).
 
-Downgrading the iPad's iPadOS is usually impossible (Apple stops signing old
-versions), so the iPad's CURRENT version basically dictates the row. If it is
-already on 18, you are on the Sonoma+Xcode16 road.
+=> **No configuration of the 2011 mini runs the Xcode this iPad requires.**
 
-## Phase A - prep (do before touching the OS)
+## The escape hatch: padMule is sideload-only anyway
 
-1. Identify the exact model: About This Mac -> System Report -> Model Identifier
-   (Macmini5,1 / 5,2 / 5,3). Confirms non-Metal + which GPU patch OCLP applies.
-2. **SSD**: if it is still on the stock 5400rpm HDD, clone/replace with a SATA SSD
-   FIRST. Single biggest speedup for macOS + Xcode. Keep the 32GB RAM.
-3. Back up anything on the mini.
+Apple's "must build with Xcode 26 / iOS 26 SDK" mandate (from 2026-04-28) applies
+**only to App Store submissions**. padMule can never be App-Store distributed (a
+P2P client - see [[ipados-constraints]]), so it does not bind us. **Sideloading has
+no minimum-SDK gate**, and iOS is backward compatible: an app built against an
+older SDK runs on iPadOS 26 (only ~2 major versions back - 26 is the year-based
+rename of what would have been 19).
 
-## Phase B - OCLP + macOS install
+## The three viable paths
 
-1. On any working Mac (or the mini if it still boots High Sierra), download
-   **OpenCore Legacy Patcher** (github.com/dortania/OpenCore-Legacy-Patcher).
-2. In OCLP: "Create macOS Installer" -> download the target from Phase B table
-   (Ventura or Sonoma) -> flash it to a >= 16GB USB.
-3. OCLP: "Build and Install OpenCore" -> install to the USB (test-boot), then to
-   the mini's internal SSD.
-4. Boot the OpenCore USB, run the macOS installer, install to the SSD.
-5. **Post-Install Root Patch** (OCLP applies the non-Metal graphics patches) ->
-   reboot. Without this the GUI is unaccelerated/broken.
-6. OCLP: set OpenCore to auto-boot the patched disk (so no USB needed).
+| Path | Build machine | Debugger? | Cost |
+|------|---------------|-----------|------|
+| **A. Use the 2011 mini** | OCLP -> macOS **Ventura 13** + **Xcode 15** | No (log-only) | free |
+| **B. Used M1 Mac mini** (RECOMMENDED) | macOS Tahoe 26 + Xcode 26 natively | **Yes**, full | ~$300-400 used |
+| **C. CI, no Mac at all** | GitHub Actions macOS runner (Xcode 26) | No (log-only) | free tier |
 
-Pick a non-Metal-friendly OCLP release; Ventura is the most mature non-Metal
-target. Avoid Sequoia (15) here - its non-Metal support is experimental.
+All three end the same way: produce a signed `.ipa` and **install it with AltStore
+/ Sideloadly**. AltServer runs on Anthony's **Windows host** (the same box as this
+WSL2 dev env). Free-Apple-ID signing expires every **7 days**; AltStore auto-resigns
+over Wi-Fi.
 
-## Phase C - Xcode + Rust toolchain
+Path A costs you the Xcode debugger + Simulator and a slow IDE, but the CPU+32GB
++SSD compile fine. Path B is the only one with real on-device debugging - worth it
+if you will iterate on the UI. Path C needs zero hardware but has the slowest loop
+(push -> CI -> download .ipa -> sideload).
 
-1. Install **Xcode** (15 on Ventura, or 16 on Sonoma) - App Store won't offer old
-   versions; use `xcodes` (github.com/XcodesOrg/xcodes) or Apple's developer
-   downloads to get the exact version. It is a large, slow install.
-2. `xcode-select --install` (command-line tools); open Xcode once to finish setup.
-3. Install Rust: `curl https://sh.rustup.rs -sSf | sh`; then the device target:
-   `rustup target add aarch64-apple-ios` (add `aarch64-apple-ios-sim` only if you
-   ever get a Metal Mac - the Simulator will not run here).
+## DE-RISK FIRST (do this before any OCLP install)
 
-## Phase D - wire padMule into an Xcode app
+Validate the **sideload leg** before investing days in OCLP: get a hello-world
+`.ipa` (from CI/path C, or any borrowed Mac), and confirm **AltStore installs and
+runs it on the iPadOS 26 iPad**. If that works, the whole approach is sound and you
+can then pick a build machine. If it does not, no build machine helps.
+
+## Phase A - the 2011 mini as a build box (path A)
+
+1. Identify the model: About This Mac -> System Report -> Model Identifier
+   (Macmini5,1 / 5,2 / 5,3). All are non-Metal.
+2. **SSD**: if it is still on the stock 5400rpm HDD, replace it first - the single
+   biggest speedup. Keep the 32GB RAM.
+3. OCLP (github.com/dortania/OpenCore-Legacy-Patcher): "Create macOS Installer" ->
+   **Ventura 13** (the mature non-Metal target; do NOT chase Sonoma/Sequoia/Tahoe
+   here) -> flash a >=16GB USB -> "Build and Install OpenCore" to the USB, then the
+   internal SSD -> install macOS -> **run the Post-Install Root Patch** (the
+   non-Metal graphics patches) -> set OpenCore to auto-boot.
+4. Install **Xcode 15** (via `xcodes` - the App Store will not offer old versions);
+   `xcode-select --install`.
+5. Rust: `curl https://sh.rustup.rs -sSf | sh`; `rustup target add aarch64-apple-ios`.
+   (Skip the sim target - the Simulator will not run here.)
+
+## Phase B - wire padMule in (any path)
 
 1. Build the FFI staticlib for the device:
    `cargo build -p mule-ffi --release --target aarch64-apple-ios`
    -> `target/aarch64-apple-ios/release/libmule_ffi.a`.
-2. Generate the Swift bindings (already working on the dev box):
+2. Generate the Swift bindings (this command is proven working on the dev box):
    `cargo run -p mule-ffi --bin uniffi-bindgen -- generate --library
    target/aarch64-apple-ios/release/libmule_ffi.a --language swift --out-dir ios/gen`
    -> `mule_ffi.swift` + `mule_ffiFFI.h` + `mule_ffiFFI.modulemap`.
-3. New Xcode iOS App project (`ios/padMule`). Add `mule_ffi.swift`; add the
-   staticlib to "Link Binary With Libraries"; add the header/modulemap dir to the
-   module search path (or a bridging module). Link `libresolv`/system libs if the
-   linker asks.
-4. Build the SwiftUI shell against `MuleEngine` (the FFI facade): render the honest
-   status notice + Paused badges + Reconnecting banner, and wire SwiftUI
-   `ScenePhase` -> `MuleEngine.pause()/resume()` ([[lifecycle-and-reactivation]]).
+3. Xcode iOS App project (`ios/padMule`); set a LOW deployment target (e.g. iOS 15-17)
+   so an older SDK build still installs on iPadOS 26. Add `mule_ffi.swift`; link
+   `libmule_ffi.a`; add the header/modulemap to the module search path.
+4. Build the SwiftUI shell against `MuleEngine` (the FFI facade): honest status
+   notice + Paused badges + Reconnecting banner; wire `ScenePhase` ->
+   `MuleEngine.pause()/resume()` ([[lifecycle-and-reactivation]]).
 
-## Phase E - sign + deploy to the iPad (sideload)
+## Phase C - sign + install
 
-1. Add a free Apple ID as a "Personal Team" in Xcode -> Settings -> Accounts.
-2. On the iPad: Settings -> Privacy & Security -> **Developer Mode** on; trust the
-   dev certificate after first install (Settings -> General -> VPN & Device Mgmt).
-3. Run to the connected iPad (NOT a simulator). Free-account signing expires every
-   **7 days** - re-run to resign, or use **AltStore** (altstore.io) to auto-resign
-   over Wi-Fi. See [[ipados-constraints]] for the sideload limits.
-
-## Reality check / fallbacks
-
-- Expect slow IDE UI (non-Metal) but workable compiles (CPU+32GB+SSD).
-- No Simulator -> always test on the device.
-- If it is too painful: a used **Apple-Silicon M1 mini** or a **cloud Mac**
-  (or GitHub Actions macOS runners for CI signing) is dramatically better. The
-  OCLP route is the free way to start.
+1. Free Apple ID as a "Personal Team" in Xcode -> Settings -> Accounts; Archive ->
+   export a development-signed `.ipa`.
+2. iPad: Settings -> Privacy & Security -> **Developer Mode** on; trust the cert
+   (Settings -> General -> VPN & Device Management).
+3. Install the `.ipa` with **AltStore** (AltServer on the Windows host) or
+   Sideloadly. Re-sign every 7 days (AltStore automates it over Wi-Fi).
+4. Debug by logs (no Xcode device support for iPadOS 26 on paths A/C).
 
 ## Related
 

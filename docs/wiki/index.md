@@ -15,7 +15,7 @@ the Ingest / Query / Lint workflows.
 ## Platform
 - [[ipados-constraints]] - iPadOS/Rust-on-iOS constraints; foreground-only engine, sockets OK, free-team sideload limits, storage plan (verified 2026).
 - [[lifecycle-and-reactivation]] - HARD requirement: honest status notice + clean pause/resume across focus loss; shapes the engine state model from Wave 3c.
-- [[mac-toolchain-setup]] - runbook to make the 2011 Mac mini (non-Metal, 32GB) an Xcode box via OpenCore Legacy Patcher; iPad-iPadOS-driven Xcode/macOS choice; build+sign+sideload padMule. Simulator won't run (no Metal) -> device-only.
+- [[mac-toolchain-setup]] - getting padMule onto the iPad (iPadOS 26.5.2). VERIFIED blocker: iPadOS 26 needs Xcode 26 needs macOS Tahoe 26.2, and OCLP has no Tahoe support -> the 2011 mini cannot run it. Escape hatch: padMule is sideload-only (the Xcode-26 mandate is App-Store-only), so build with an older Xcode and install via AltStore. Three paths + de-risk step.
 - [[net-highid-and-port-forwarding]] - the 5-link inbound chain (router forward, DHCP reservation, Windows + Hyper-V firewalls, WSL mirrored mode); HighID VALIDATED live 2026-07-14. iPad needs UPnP (Wave 7).
 
 ## Reference
