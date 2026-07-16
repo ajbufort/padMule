@@ -478,10 +478,10 @@ mod tests {
 
     #[test]
     fn extracts_xml_tags_namespace_insensitive() {
-        let xml = "<root><a:NewExternalIPAddress><public-ip></a:NewExternalIPAddress></root>";
+        let xml = "<root><a:NewExternalIPAddress>203.0.113.5</a:NewExternalIPAddress></root>";
         assert_eq!(
             xml_tag(xml, "NewExternalIPAddress"),
-            Some("<public-ip>".into())
+            Some("203.0.113.5".into())
         );
         assert_eq!(xml_tag("<x>hi</x>", "x"), Some("hi".into()));
         assert_eq!(xml_tag("<x>hi</x>", "y"), None);
@@ -578,14 +578,14 @@ mod tests {
     fn parses_external_ip_from_soap_response() {
         // Shape of a real GetExternalIPAddress reply.
         let resp = "<s:Envelope><s:Body><u:GetExternalIPAddressResponse>\
-<NewExternalIPAddress><public-ip></NewExternalIPAddress>\
+<NewExternalIPAddress>203.0.113.5</NewExternalIPAddress>\
 </u:GetExternalIPAddressResponse></s:Body></s:Envelope>";
         assert_eq!(
             xml_tag(resp, "NewExternalIPAddress")
                 .unwrap()
                 .parse::<Ipv4Addr>()
                 .unwrap(),
-            Ipv4Addr::new(73, 37, 21, 82)
+            Ipv4Addr::new(203, 0, 113, 5)
         );
     }
 
@@ -619,7 +619,7 @@ mod tests {
                     desc.clone()
                 } else if req.contains("GetExternalIPAddress") {
                     "<s:Envelope><s:Body><u:GetExternalIPAddressResponse>\
-<NewExternalIPAddress><public-ip></NewExternalIPAddress>\
+<NewExternalIPAddress>203.0.113.5</NewExternalIPAddress>\
 </u:GetExternalIPAddressResponse></s:Body></s:Envelope>"
                         .to_string()
                 } else {
@@ -657,6 +657,6 @@ mod tests {
 
         // GetExternalIPAddress round-trips + parses.
         let ip = external_ip(&svc).await.unwrap();
-        assert_eq!(ip, Ipv4Addr::new(73, 37, 21, 82));
+        assert_eq!(ip, Ipv4Addr::new(203, 0, 113, 5));
     }
 }
