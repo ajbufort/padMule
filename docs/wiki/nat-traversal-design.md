@@ -8,6 +8,11 @@ padMule-only, never perturbs stock peers) and is the marquee enhancement behind
 the LowID<->LowID question. Design only; not built. Source-grounded + SOTA recon
 2026-07-16.
 
+DECISION 2026-07-16: DEFERRED until padMule has an install base. Value is 100%
+gated on padMule<->padMule adoption (mass-adoption goal -> chicken-and-egg); this
+is a ready, de-risked design to pick up when real padMule traffic exists, not
+current work. See [[decisions-and-lessons]].
+
 ## The problem, confirmed from source
 
 Stock eMule 0.50a / aMule 3.0.1 have ZERO hole punching. `CamuleApp::CanDoCallback`

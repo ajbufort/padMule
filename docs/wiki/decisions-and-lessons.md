@@ -177,6 +177,23 @@ bullet each; newest first.
   Lesson: an optimization that helps one caller can silently break another that
   shares the code path; re-run the real-peer differential gate after ANY transfer
   change, not just feature work. See [[padmule-enhancement-channel]].
+- 2026-07-16 **DECISION: build Layer 1 of the enhancement channel, DEFER Layer 2 +
+  NAT traversal until there is an install base.** Every enhancement the channel
+  could carry works ONLY padMule<->padMule, so its value is 100% gated on padMule
+  adoption; on today's ~all-stock network a padMule user almost always talks to a
+  stock peer where Layer 1 returns None and Layer 2 never fires. Goal is mass
+  adoption (Anthony, 2026-07-16), which is a chicken-and-egg: no value from
+  peer-to-peer features until padMule HAS peers, and you get peers by shipping a
+  good client - so building Layer 2/NAT traversal now is a speculative feature
+  (violates the CLAUDE.md "no speculative features" rule). What we KEEP: Layer 1
+  detection (tiny, safe, done - deploys the recognition marker early so capability
+  accrues across the install base for free) and the research (cheap; de-risks
+  Layer 2 + NAT traversal to a few days of ready work - [[padmule-enhancement-channel]],
+  [[nat-traversal-design]]). NEAR-TERM PRIORITY REDIRECTED to adoption drivers,
+  all single-user-valuable on day one: the iPad app (Wave 8 - the entire value
+  prop, there is no aMule on iPad), on-device HighID (UPnP/NAT-PMP -
+  [[net-highid-and-port-forwarding]]), and the already-landing fetch/search/trust
+  quality. Revisit Layer 2 when real padMule<->padMule traffic exists.
 
 ## Related
 

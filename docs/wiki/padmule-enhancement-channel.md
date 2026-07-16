@@ -85,8 +85,13 @@ peer as padMule.
   in every hello - real aMule 3.0.1 completes the handshake and serves all three
   files (single-part, multi-part+hashset) byte-for-byte, proving it ignores the
   marker. eMule 0.50a coverage is source-grounded (no eMule binary on this box).
-- **Layer 2 + enhancements: designed, not built.** The marquee enhancement is
-  NAT traversal (see below).
+- **Layer 2 + enhancements: wire spec'd, DEFERRED (decision 2026-07-16).** Not
+  built. Every enhancement works only padMule<->padMule, so value is gated on
+  adoption; with a mass-adoption goal that is chicken-and-egg, so Layer 2 now would
+  be a speculative feature. Layer 1 stays deployed (cheap early seed); Layer 2 +
+  NAT traversal are a de-risked design to revisit once real padMule<->padMule
+  traffic exists. See [[decisions-and-lessons]]. The marquee enhancement is NAT
+  traversal ([[nat-traversal-design]]).
 
 ## Why NAT traversal is the marquee enhancement (the LowID<->LowID question)
 
