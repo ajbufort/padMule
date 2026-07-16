@@ -1,0 +1,114 @@
+// The SwiftUI-facing wrapper around the Rust engine's FFI facade (MuleEngine,
+// from crates/mule-ffi via uniffi). Every MuleEngine call is synchronous and
+// blocks (the facade drives the async engine on its own tokio runtime), so all
+// of them run on a background queue and only results hop back to the main actor.
+//
+// Events are POLLED via drainEvents() - the MVP shape of the seam; a uniffi
+// callback interface is the later upgrade. See docs/wiki/padmule-enhancement-channel.md
+// ... and docs/wiki/lifecycle-and-reactivation.md for why pause/resume is honest.
+
+import Foundation
+import SwiftUI
+
+@MainActor
+final class EngineModel: ObservableObject {
+    @Published private(set) var state: EngineStateFfi = .stopped
+    @Published private(set) var status: String = "Idle"
+    @Published private(set) var reconnecting: Bool = false
+    @Published private(set) var downloads: [DownloadInfo] = []
+    @Published private(set) var kadContacts: UInt32 = 0
+    @Published private(set) var identity: IdentityInfo?
+    @Published private(set) var bootError: String?
+
+    private var engine: MuleEngine?
+    private var timer: Timer?
+    private let work = DispatchQueue(label: "us.ajbconsulting.padMule.engine")
+
+    /// Create the engine against the app's Application Support dir and start it.
+    /// Idempotent - safe to call from onAppear.
+    func boot() {
+        guard engine == nil, bootError == nil else { return }
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let dir = base.appendingPathComponent("padMule", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+
+        let path = dir.path
+        work.async { [weak self] in
+            do {
+                let e = try MuleEngine(configDir: path)
+                let ident = e.identity()
+                e.start()
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.engine = e
+                    self.identity = ident
+                    self.startPolling()
+                    self.refresh()
+                }
+            } catch {
+                DispatchQueue.main.async { self?.bootError = "\(error)" }
+            }
+        }
+    }
+
+    /// App backgrounded: checkpoint + release sockets. iPadOS would reclaim them
+    /// anyway - doing it explicitly is what makes resume honest.
+    func pause() { run { $0.pause() } }
+
+    /// App foregrounded: rebuild + reconnect.
+    func resume() { run { $0.resume() } }
+
+    func shutdown() { run { $0.shutdown() } }
+
+    private func run(_ body: @escaping (MuleEngine) -> Void) {
+        guard let e = engine else { return }
+        work.async { [weak self] in
+            body(e)
+            DispatchQueue.main.async { self?.refresh() }
+        }
+    }
+
+    private func startPolling() {
+        timer?.invalidate()
+        let t = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.refresh() }
+        }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+    }
+
+    /// Pull a fresh snapshot + drain queued events, all off the main thread.
+    private func refresh() {
+        guard let e = engine else { return }
+        work.async { [weak self] in
+            let st = e.state()
+            let dls = e.downloads()
+            let kad = e.kadContacts()
+            let evs = e.drainEvents()
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.state = st
+                self.downloads = dls
+                self.kadContacts = kad
+                for ev in evs { self.apply(ev) }
+            }
+        }
+    }
+
+    private func apply(_ event: EngineEventFfi) {
+        switch event {
+        case .state(let s):
+            state = s
+        case .status(let text):
+            status = text
+            // The reconnect banner is a HARD lifecycle requirement.
+            reconnecting = (text == "Reconnecting...")
+        case .server(let text):
+            status = text
+        case .kad(let contacts):
+            kadContacts = contacts
+        case .progress:
+            break // downloads() already carries the numbers
+        }
+    }
+}
