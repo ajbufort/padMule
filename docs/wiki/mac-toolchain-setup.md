@@ -94,13 +94,25 @@ with a free Apple ID at install, so no Xcode/Apple secrets are involved.
 
 1. **Get it**: GitHub -> Actions -> latest green run -> Artifacts -> `padMule-ipa`
    (downloads as a **.zip**; unzip to get `padMule.ipa`).
-2. **Windows prep - THE #1 FAILURE**: install **iTunes and iCloud from apple.com**,
-   NOT the Microsoft Store versions. AltServer cannot talk to the Store builds.
-3. Install **AltServer** (altstore.io); it runs in the system tray.
+2. **Windows prep - THE #1 FAILURE**: AltServer needs the STANDALONE iTunes and
+   iCloud, NOT the Microsoft Store builds (it cannot talk to those at all). If the
+   Store versions are installed, UNINSTALL them first.
+   TRAP (hit 2026-07-16): apple.com/itunes now advertises ONLY the Store build -
+   the standalone installers still exist, Apple just stopped linking them. These
+   were verified live 2026-07-16:
+   - iTunes 64-bit: `https://www.apple.com/itunes/download/win64`
+     (301 -> a real iTunes64Setup.exe, ~208 MB, built 2026-03; current, just unlisted)
+   - iCloud: `https://updates.cdn-apple.com/2020/windows/001-39935-20200911-1A70AA56-F448-11EA-8CC0-99D41950005E/iCloudSetup.exe`
+     (~161 MB; the link AltStore's own FAQ specifies. It looks ancient and that is
+     fine - it is the last standalone iCloud Apple shipped.)
+3. Install **AltServer**: `https://cdn.altstore.io/file/altstore/altinstaller.zip`
+   (~9 MB) -> unzip -> Setup.exe. **Run AltServer as administrator.** It lives in
+   the system tray.
 4. iPad by USB -> unlock -> **Trust This Computer**. In iTunes tick **"Sync with
    this iPad over Wi-Fi"** (required for AltStore's wireless 7-day refresh).
 5. Tray -> **Install AltStore** -> pick the iPad -> Apple ID (a throwaway ID works).
 6. iPad -> Settings -> General -> **VPN & Device Management** -> trust the cert.
+   (AltStore's docs call this "Profiles & Device Management" - the older name.)
 7. iPad -> Settings -> Privacy & Security -> **Developer Mode** ON -> restart.
    GOTCHA: the toggle only APPEARS once a dev-signed app has been installed, so do
    step 5 first if you cannot find it.
