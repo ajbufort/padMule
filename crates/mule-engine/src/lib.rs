@@ -2,6 +2,7 @@
 //! server-message codecs (no networking yet; tokio arrives in a later wave).
 //! See docs/wiki/protocol-understanding.md.
 
+pub mod catalog;
 pub mod connection;
 pub mod credits;
 pub mod crypt_policy;
@@ -26,6 +27,7 @@ pub mod transfer;
 pub mod transfer_session;
 pub mod upload_queue;
 
+pub use catalog::{catalog, RankedFile, Trust};
 pub use connection::{connect_server, login_handshake, ServerEvent, ServerState};
 pub use credits::{resolve_ident_state, score_ratio, score_ratio_ident, IdentState};
 pub use crypt_policy::{should_obfuscate_outbound, should_reject, CryptPrefs};
