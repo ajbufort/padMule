@@ -70,6 +70,16 @@ pub struct IdentityInfo {
     pub kad_id: String,
 }
 
+/// The live server login, once one has accepted us. `None` when offline.
+///
+/// Carries no client id by design - a HighID id encodes our public IP and this
+/// goes straight onto a screen. See `mule_engine::ServerInfo`.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ServerInfoFfi {
+    pub addr: String,
+    pub low_id: bool,
+}
+
 /// A snapshot of one in-progress download.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct DownloadInfo {
@@ -166,6 +176,22 @@ impl MuleEngine {
                 userhash: hex::encode(g.userhash()),
                 kad_id: hex::encode(g.kad_id().to_hash()),
             }
+        })
+    }
+
+    /// The live server login (address + HighID/LowID), or `None` when no server
+    /// currently has us. HighID-vs-LowID decides whether peers can reach us, so
+    /// this is the most useful line on the screen.
+    pub fn server_info(&self) -> Option<ServerInfoFfi> {
+        self.rt.block_on(async {
+            self.inner
+                .lock()
+                .await
+                .server_info()
+                .map(|s| ServerInfoFfi {
+                    addr: s.addr,
+                    low_id: s.low_id,
+                })
         })
     }
 

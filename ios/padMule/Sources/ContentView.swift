@@ -23,6 +23,19 @@ struct ContentView: View {
                     Section("Status") {
                         row("State", String(describing: model.state))
                         row("Status", model.status)
+                        // The ID type decides whether peers can reach us at all,
+                        // so it gets its own row instead of riding on the status
+                        // line, where a later event would overwrite it.
+                        if let srv = model.server {
+                            row("Server", srv.addr)
+                            HStack {
+                                Text("ID").foregroundStyle(.secondary)
+                                Spacer()
+                                Text(srv.lowId ? "LowID" : "HighID")
+                                    .foregroundStyle(srv.lowId ? .orange : .green)
+                            }
+                            .font(.callout)
+                        }
                         row("Kad contacts", "\(model.kadContacts)")
                         if let id = model.identity {
                             row("User hash", String(id.userhash.prefix(16)) + "...")

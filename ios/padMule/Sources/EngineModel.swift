@@ -19,6 +19,10 @@ final class EngineModel: ObservableObject {
     @Published private(set) var kadContacts: UInt32 = 0
     @Published private(set) var identity: IdentityInfo?
     @Published private(set) var bootError: String?
+    /// The live login. Polled as a SNAPSHOT rather than tracked from events:
+    /// start() emits Server(...) then Status(...) into the same drain, so an
+    /// event-derived ID is overwritten in the same frame it arrives.
+    @Published private(set) var server: ServerInfoFfi?
 
     private var engine: MuleEngine?
     private var timer: Timer?
@@ -84,12 +88,14 @@ final class EngineModel: ObservableObject {
             let st = e.state()
             let dls = e.downloads()
             let kad = e.kadContacts()
+            let srv = e.serverInfo()
             let evs = e.drainEvents()
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.state = st
                 self.downloads = dls
                 self.kadContacts = kad
+                self.server = srv
                 for ev in evs { self.apply(ev) }
             }
         }

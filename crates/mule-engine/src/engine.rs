@@ -115,6 +115,22 @@ pub enum EngineEvent {
     },
 }
 
+/// What the server told us at login. Kept because HighID-vs-LowID decides
+/// whether peers can reach us at all, and on a sideloaded iPad there is no
+/// debugger - this screen IS the diagnostic.
+///
+/// Deliberately does NOT carry the client id: a HighID id ENCODES our public
+/// IP, and this struct exists to be rendered on a screen that gets
+/// screenshotted. `low_id` is the whole answer; the id itself is not worth the
+/// leak.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerInfo {
+    /// The server we are logged into ("ip:port").
+    pub addr: String,
+    /// True when the server handed us a LowID (no reachable inbound port).
+    pub low_id: bool,
+}
+
 /// The padMule engine. Create with [`Engine::new`], drive with the lifecycle
 /// methods, observe via the returned event receiver.
 pub struct Engine {
@@ -128,6 +144,8 @@ pub struct Engine {
     downloads: Vec<Arc<Download>>,
     /// The live eD2k server link, once logged in.
     server: Option<ServerLink>,
+    /// What that login yielded (server address + HighID/LowID), for the UI.
+    connection: Option<ServerInfo>,
     /// The live Kad node (owns the UDP socket), once bootstrapped.
     kad: Option<KadNode>,
     /// The inbound peer listener's accept loop (dropping it frees port 4662).
@@ -157,6 +175,7 @@ impl Engine {
             routing,
             downloads: Vec::new(),
             server: None,
+            connection: None,
             kad: None,
             listener: None,
             server_tx: None,
@@ -179,11 +198,28 @@ impl Engine {
             .unwrap_or(false)
     }
 
+    /// What our login yielded, once a server has accepted us.
+    pub fn server_info(&self) -> Option<ServerInfo> {
+        if self.is_online() {
+            self.connection.clone()
+        } else {
+            None
+        }
+    }
+
     /// An honest one-line status for the UI - never claims a connection we do
-    /// not have.
+    /// not have. Carries the HighID/LowID answer, because a bare "Connected"
+    /// hides the one fact that decides whether peers can reach us.
     fn online_status(&self) -> String {
         if self.is_online() {
-            "Connected".to_string()
+            match &self.connection {
+                Some(c) => format!(
+                    "Connected to {} ({})",
+                    c.addr,
+                    if c.low_id { "LowID" } else { "HighID" }
+                ),
+                None => "Connected".to_string(),
+            }
         } else if self.offline {
             "Offline (network disabled)".to_string()
         } else {
@@ -328,10 +364,11 @@ impl Engine {
     /// has no hand-configured router rule) can still earn a HighID. Tries NAT-PMP
     /// and UPnP - consumer gateways speak one or the other.
     async fn map_port(&self) {
-        if let Ok(ext) = crate::upnp::map_port(TCP_PORT, "padMule", 0).await {
-            self.emit(EngineEvent::Server(format!(
-                "UPnP mapped port {TCP_PORT} (external IP {ext})"
-            )));
+        if crate::upnp::map_port(TCP_PORT, "padMule", 0).await.is_ok() {
+            // The external IP the gateway reports is deliberately not emitted:
+            // this event reaches the UI, and that is our public IP verbatim.
+            // "it worked" is the whole signal; HighID confirms it end to end.
+            self.emit(EngineEvent::Server(format!("UPnP mapped port {TCP_PORT}")));
         }
     }
 
@@ -374,11 +411,17 @@ impl Engine {
         for srv in met.servers.iter().take(10) {
             let addr = SocketAddr::new(IpAddr::V4(ip_from_met_u32(srv.ip)), srv.port);
             let mut link = ServerLink::new(addr, login.clone(), tx.clone());
-            if let Ok(Ok(ServerState::Connected { id, low_id })) =
+            if let Ok(Ok(ServerState::Connected { low_id, .. })) =
                 timeout(Duration::from_secs(12), link.connect()).await
             {
+                // The client id is deliberately NOT recorded here: a HighID id
+                // encodes our public IP and this text reaches the screen.
+                self.connection = Some(ServerInfo {
+                    addr: addr.to_string(),
+                    low_id,
+                });
                 self.emit(EngineEvent::Server(format!(
-                    "Connected to {addr} ({}, id {id:#x})",
+                    "Connected to {addr} ({})",
                     if low_id { "LowID" } else { "HighID" }
                 )));
                 self.server = Some(link);
@@ -457,14 +500,22 @@ impl Engine {
             // we never had one (or the old one is gone). Correct across an IP
             // change, which is the whole point on a mobile device.
             let resumed = match &mut self.server {
-                Some(s) => matches!(
-                    timeout(Duration::from_secs(12), s.resume()).await,
-                    Ok(Ok(ServerState::Connected { .. }))
-                ),
+                Some(s) => match timeout(Duration::from_secs(12), s.resume()).await {
+                    Ok(Ok(ServerState::Connected { low_id, .. })) => {
+                        // Re-record: the ID can flip across an IP change, which
+                        // is exactly what resume() exists to survive.
+                        if let Some(c) = &mut self.connection {
+                            c.low_id = low_id;
+                        }
+                        true
+                    }
+                    _ => false,
+                },
                 None => false,
             };
             if !resumed {
                 self.server = None;
+                self.connection = None;
                 self.connect_server().await;
             }
             self.start_kad().await;
@@ -523,6 +574,50 @@ mod tests {
         assert_eq!(engine.state(), EngineState::Stopped);
         assert_eq!(engine.userhash()[5], 14, "identity loaded");
         assert!(dir.join("preferences.dat").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The device screen is our only diagnostic, so the ID type must reach it.
+    /// This pins the honesty gate: no server, no claim.
+    #[tokio::test]
+    async fn server_info_is_none_until_a_server_accepts_us() {
+        let dir = tmp("srvinfo");
+        let _ = std::fs::remove_dir_all(&dir);
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+        engine.set_offline(true);
+
+        assert_eq!(engine.server_info(), None, "no login yet");
+        engine.start().await;
+        assert_eq!(
+            engine.server_info(),
+            None,
+            "offline start logs into nothing"
+        );
+        assert!(
+            !engine.online_status().contains("HighID") && !engine.online_status().contains("LowID"),
+            "must not invent an ID we were never given: {}",
+            engine.online_status()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A remembered login must not survive losing the server: `server_info` is
+    /// gated on `is_online`, which pause() falsifies by design.
+    #[tokio::test]
+    async fn server_info_reports_the_id_type_and_clears_when_offline() {
+        let dir = tmp("srvid");
+        let _ = std::fs::remove_dir_all(&dir);
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+        engine.set_offline(true);
+
+        // Stand in for a real login (no server needed to pin the reporting).
+        engine.connection = Some(ServerInfo {
+            addr: "192.0.2.1:4242".to_string(),
+            low_id: true,
+        });
+        // Still not online -> still no claim, remembered or not.
+        assert_eq!(engine.server_info(), None, "is_online gates the claim");
+        assert!(!engine.online_status().contains("LowID"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
