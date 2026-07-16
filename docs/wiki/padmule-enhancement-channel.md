@@ -45,7 +45,35 @@ string-named tag is the safest name space (never in any switch, no id collision)
 - **Layer 2 - negotiation (active, only to a CONFIRMED padMule).** Any
   padMule-specific message rides an unused opcode on 0xC5 and is sent ONLY after
   Layer 1 identifies the peer as padMule, so a stock client never receives it -
-  which sidesteps the unknown-opcode path entirely. DESIGNED, not yet built.
+  which sidesteps the unknown-opcode path entirely. Wire spec'd (below); not built.
+
+## Layer 2 wire (spec'd 2026-07-16, source-grounded)
+
+A 0xC5 extended packet is `[0xC5][u32 packetlength LE][opcode][payload]`, where
+`packetlength = 1 + len(payload)` (counts opcode + payload); total on wire =
+`packetlength + 5`. The receiver drains by the SIZE field and never consults the
+opcode during framing (eMule EMSocket.cpp:367-425 / aMule EMSocket.cpp:199-266),
+so an unknown opcode carrying an arbitrary-length payload does NOT desync a stock
+peer - it is consumed by length and dropped at the switch default with no throw
+and no disconnect (eMule ListenSocket.cpp:2075-2078; aMule
+ClientTCPSocket.cpp:1777-1780). The only framing constraints: the protocol byte
+must stay 0xC5 (or 0xD4 packed), and a client object must exist - which it does,
+because Layer 2 is only ever sent AFTER the hello handshake that identified the
+peer as padMule.
+
+- **Opcode: 0xD8** (secondary 0xC8). Unused on 0xC5 in both clients, in the
+  0xC0-0xDF dead zone, FAR above eMule's current 0xB2 opcode frontier (so a future
+  stock release extending upward won't collide), and not a protocol-byte value
+  (0xC5/0xD4) or an edge (0xFE OP_PORTTEST/0xFF). Do NOT pick 0xB3+ - that is
+  exactly where stock numbering grows next.
+- **Compression:** a Layer-2 message may be zlib-packed exactly like
+  OP_COMPRESSEDPART - build it as 0xC5+0xD8, PackPacket flips the protocol byte to
+  0xD4 leaving the opcode intact, the peer unpacks back to 0xC5+0xD8. Keep the
+  DECOMPRESSED size under the stock 50000-byte default cap (packets.h:44); pack
+  only when it actually shrinks.
+- **First message (planned):** a padMule capability/version detail exchange
+  (richer than the Layer-1 u32 bitmask) - and later the NAT-traversal signaling
+  (endpoint relay + punch coordination), see [[nat-traversal-design]].
 
 ## Status
 
@@ -77,6 +105,7 @@ a real iPad scenario.
 
 ## Related
 
+- [[nat-traversal-design]]
 - [[protocol-understanding]]
 - [[decisions-and-lessons]]
 - [[net-highid-and-port-forwarding]]
