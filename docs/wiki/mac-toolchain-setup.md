@@ -87,15 +87,32 @@ can then pick a build machine. If it does not, no build machine helps.
    notice + Paused badges + Reconnecting banner; wire `ScenePhase` ->
    `MuleEngine.pause()/resume()` ([[lifecycle-and-reactivation]]).
 
-## Phase C - sign + install
+## Phase C - sideload to the iPad (the ACTIVE path; CI builds the .ipa)
 
-1. Free Apple ID as a "Personal Team" in Xcode -> Settings -> Accounts; Archive ->
-   export a development-signed `.ipa`.
-2. iPad: Settings -> Privacy & Security -> **Developer Mode** on; trust the cert
-   (Settings -> General -> VPN & Device Management).
-3. Install the `.ipa` with **AltStore** (AltServer on the Windows host) or
-   Sideloadly. Re-sign every 7 days (AltStore automates it over Wi-Fi).
-4. Debug by logs (no Xcode device support for iPadOS 26 on paths A/C).
+CI (path C) already emits an UNSIGNED `padMule.ipa` artifact - AltStore re-signs it
+with a free Apple ID at install, so no Xcode/Apple secrets are involved.
+
+1. **Get it**: GitHub -> Actions -> latest green run -> Artifacts -> `padMule-ipa`
+   (downloads as a **.zip**; unzip to get `padMule.ipa`).
+2. **Windows prep - THE #1 FAILURE**: install **iTunes and iCloud from apple.com**,
+   NOT the Microsoft Store versions. AltServer cannot talk to the Store builds.
+3. Install **AltServer** (altstore.io); it runs in the system tray.
+4. iPad by USB -> unlock -> **Trust This Computer**. In iTunes tick **"Sync with
+   this iPad over Wi-Fi"** (required for AltStore's wireless 7-day refresh).
+5. Tray -> **Install AltStore** -> pick the iPad -> Apple ID (a throwaway ID works).
+6. iPad -> Settings -> General -> **VPN & Device Management** -> trust the cert.
+7. iPad -> Settings -> Privacy & Security -> **Developer Mode** ON -> restart.
+   GOTCHA: the toggle only APPEARS once a dev-signed app has been installed, so do
+   step 5 first if you cannot find it.
+8. Put the `.ipa` where the iPad's **Files** app can see it (iCloud Drive), then
+   AltStore -> **My Apps** -> **+** -> pick it. Simpler one-shot alternative:
+   **Sideloadly** installs straight from Windows over USB (but no auto-refresh).
+9. LIMITS of free-ID signing: apps expire every **7 days** (keep AltServer running
+   on the same Wi-Fi and AltStore auto-refreshes) and **max 3 sideloaded apps**.
+10. Debug by what the UI shows - there is no Xcode device support for iPadOS 26 on
+    paths A/C, so the app's own status line IS the diagnostic. A healthy first run:
+    "Fetching network lists..." -> Kad count -> "Opening port..." -> "Connected to
+    <server> (HighID|LowID)" -> "Connected".
 
 ## Related
 
