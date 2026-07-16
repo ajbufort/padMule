@@ -9,6 +9,7 @@ import SwiftUI
 
 struct ContentView: View {
     @EnvironmentObject var model: EngineModel
+    @State private var query = ""
 
     var body: some View {
         NavigationStack {
@@ -19,7 +20,45 @@ struct ContentView: View {
                 if let err = model.bootError {
                     banner("Engine failed: \(err)", systemImage: "exclamationmark.triangle", tint: .red)
                 }
+                if let notice = model.notice {
+                    banner(notice, systemImage: "info.circle", tint: .blue)
+                }
                 List {
+                    Section("Search") {
+                        HStack {
+                            TextField("Search the eD2k network", text: $query)
+                                .textInputAutocapitalization(.never)
+                                .disableAutocorrection(true)
+                                .onSubmit { model.search(query) }
+                                .submitLabel(.search)
+                            if model.searching {
+                                ProgressView()
+                            } else if !query.isEmpty {
+                                Button {
+                                    query = ""
+                                    model.clearSearch()
+                                } label: {
+                                    Image(systemName: "xmark.circle.fill")
+                                        .foregroundStyle(.secondary)
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                        if model.searching {
+                            Text("Searching... the server can take a few seconds.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        ForEach(model.results, id: \.hash) { hit in
+                            resultRow(hit)
+                        }
+                        if model.searched, model.results.isEmpty, !model.searching {
+                            Text("No results.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
                     Section("Status") {
                         row("State", String(describing: model.state))
                         row("Status", model.status)
@@ -64,10 +103,46 @@ struct ContentView: View {
                         )
                         .font(.footnote)
                         .foregroundStyle(.secondary)
+                        Label(
+                            "Finished downloads are verified against their eD2k hash and saved "
+                                + "to the Files app, under On My iPad > padMule.",
+                            systemImage: "folder"
+                        )
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
                     }
                 }
             }
             .navigationTitle("padMule")
+        }
+    }
+
+    /// One search hit. Tapping Get starts it; the row reports what the catalog
+    /// knows rather than hiding a suspect file - the user decides.
+    private func resultRow(_ hit: SearchHit) -> some View {
+        HStack(alignment: .top) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(hit.name).lineLimit(2)
+                HStack(spacing: 6) {
+                    Text(bytes(hit.size))
+                    Text("-")
+                    Text("\(hit.sources) source\(hit.sources == 1 ? "" : "s")")
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                if !hit.trusted {
+                    Label(hit.warning, systemImage: "exclamationmark.triangle")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                }
+            }
+            Spacer()
+            if model.adding.contains(hit.hash) {
+                ProgressView()
+            } else {
+                Button("Get") { model.download(hit) }
+                    .buttonStyle(.borderless)
+            }
         }
     }
 

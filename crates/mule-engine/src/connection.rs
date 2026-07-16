@@ -10,7 +10,7 @@ use crate::server_messages::{
     parse_server_status, LoginRequest, OP_IDCHANGE, OP_SERVERLIST, OP_SERVERMESSAGE,
     OP_SERVERSTATUS,
 };
-use mule_proto::{decompress, MAX_PACKET_SIZE, PROT_PACKED};
+use mule_proto::{decompress, Packet, MAX_PACKET_SIZE, PROT_PACKED};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 
@@ -47,6 +47,25 @@ pub enum ServerEvent {
     ServerList(Vec<(u32, u16)>),
 }
 
+/// Map one unsolicited server packet to the event it means, or `None` if it is
+/// not one the UI cares about. A server interleaves these with replies for the
+/// whole life of the connection, not just during login, so both the handshake
+/// and [`crate::link::ServerLink::request`] classify with this.
+pub fn classify_server_packet(pkt: &Packet) -> Option<ServerEvent> {
+    match pkt.opcode {
+        OP_SERVERMESSAGE => parse_server_message(&pkt.payload)
+            .ok()
+            .map(ServerEvent::Message),
+        OP_SERVERSTATUS => parse_server_status(&pkt.payload)
+            .ok()
+            .map(|(users, files)| ServerEvent::Status { users, files }),
+        OP_SERVERLIST => parse_server_list(&pkt.payload)
+            .ok()
+            .map(ServerEvent::ServerList),
+        _ => None,
+    }
+}
+
 /// Send the login and read the server's reply burst until the login answer
 /// (OP_IDCHANGE) arrives, emitting events as packets come in. Returns the final
 /// state (`Connected{..}` or `Rejected`). The caller emits `Connecting` before
@@ -67,19 +86,9 @@ where
             pkt = decompress(&pkt, MAX_PACKET_SIZE)?;
         }
         match pkt.opcode {
-            OP_SERVERMESSAGE => {
-                if let Ok(m) = parse_server_message(&pkt.payload) {
-                    let _ = tx.send(ServerEvent::Message(m)).await;
-                }
-            }
-            OP_SERVERSTATUS => {
-                if let Ok((users, files)) = parse_server_status(&pkt.payload) {
-                    let _ = tx.send(ServerEvent::Status { users, files }).await;
-                }
-            }
-            OP_SERVERLIST => {
-                if let Ok(list) = parse_server_list(&pkt.payload) {
-                    let _ = tx.send(ServerEvent::ServerList(list)).await;
+            OP_SERVERMESSAGE | OP_SERVERSTATUS | OP_SERVERLIST => {
+                if let Some(ev) = classify_server_packet(&pkt) {
+                    let _ = tx.send(ev).await;
                 }
             }
             OP_IDCHANGE => {
