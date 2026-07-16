@@ -144,6 +144,25 @@ bullet each; newest first.
   as the SX record-size error). Diagnosis tip: when the real client's own debug
   logging won't cooperate, trace the wire from our side (`mule-cli peer-probe`) -
   the packet sequence + close point localises the fault faster than the source.
+- 2026-07-16 **On eD2k, completion is a source-availability hunt, not a protocol
+  problem.** Once the wire was proven (Wave 4 differential vs amuled), getting
+  three real files to finish was entirely about HOW we pick files and spend time -
+  all client-side, zero wire change. Five things mattered, each learned from a
+  failed run: (1) earn HighID (bind a listener during login) - it is the key that
+  unlocks the whole LowID source pool via OP_CALLBACKREQUEST; 2 of our 3 files came
+  from firewalled LowID peers dialing us back. (2) Fast-bail an upload queue
+  (OP_QUEUERANKING -> `TransferError::Queued`) - sitting in a queue is dead time
+  for a hunt; a real background client would wait, we move on. (3) A keyword can be
+  SATURATED by one sharer's collection (200 "wav" results from a single IP), so
+  sweep DISTINCT sharers (skip files whose only source is an already-stalled IP)
+  and use `min_size` to filter a collection out of the result cap. (4) NEVER
+  abandon an in-flight callback: wait while bytes are still arriving, and give each
+  candidate its own part directory - a fixed short wait + shared `001.part` once
+  delivered a full 5.9 MB file and then clobbered it. (5) Size-adaptive per-peer
+  timeouts (tiny files sweep fast, larger files pull sustained). The reusable
+  principle, consistent with replicate-wire/improve-internals: the wire stays
+  stock; the intelligence is in selection and scheduling. See [[build-progress]]
+  three-file milestone.
 
 ## Related
 

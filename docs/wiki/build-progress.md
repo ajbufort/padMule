@@ -1,6 +1,6 @@
 # Build Progress
 
-Updated: 2026-07-15
+Updated: 2026-07-16
 
 Wave-by-wave status of the padMule Rust engine (waves defined in
 `docs/superpowers/specs/2026-07-12-padmule-design.md` section 10). Each wave
@@ -35,9 +35,78 @@ ends at a differential/round-trip gate.
 | 6c | iterative node lookup (FIND_NODE) | (implemented directly) | DONE (codec + pure lookup) + source-verified. message.rs: KADEMLIA2_REQ 0x21 (type&0x1F|target|receiver, 33B, zero-type rejected) + KADEMLIA2_RES 0x29 (target|count|25B contacts, exact-len 17+25*count, Kad1 dropped); type bytes FIND_VALUE 0x02 / STORE 0x04 / FIND_NODE=FIND_VALUE_MORE 0x0B (GetRequestContactCount). lookup.rs: Lookup state machine - candidates BTreeMap keyed by XOR distance (injective per id), next_queries(ALPHA=3, frontier) returns closest untried + marks tried, on_response folds in closer contacts, converges when frontier fully queried. Convergence test: 160-node net where each node's knowledge is a real 6a RoutingTable (navigable) -> lookup reaches the exact k-closest. Timers/JumpStart/IP-dedup left to the live layer. REMAINING 6c: drive it live over UDP (self-lookup fills the routing table). |
 | 6d | source/keyword search + differential gate (resolve a hash) | (implemented directly) | **DONE - WAVE 6 GOAL MET (live).** Codecs (mule-kad): SEARCH_SOURCE_REQ 0x34 (target 16|startPos 2 &0x7FFF|fileSize 8 = 26B) + SEARCH_RES 0x3B (responderID 16|keyID 16|count 2|count x {answer 16|taglist}); SearchResult::as_source distils source tags (SOURCETYPE 0xFF/SOURCEIP 0xFE/SOURCEPORT 0xFD/SOURCEUPORT 0xFC; accepts types {1,3,4,5,6}). read_kad_tag relaxed to eMule behavior (name = length-prefixed string, any length; unknown TYPE still errors). Driver (kad_live): find_node+search_source drive resolve_sources (iterative lookup toward the hash, then SEARCH_SOURCE_REQ to closest in-tolerance); ed2k hash -> Kad target via from_hash (SetValueBE). mule-cli `kad-search <nodes.dat> <hash> <size>`. LIVE: bootstrap -> 15/16 nodes answer FIND_NODE -> 5/10 in-tolerance return SEARCH_RES -> resolves a real source (type 3, real IP:port), reliably. |
 | 7 | end-to-end fetch (give a hash, get the file) - RE-SCOPED from EC | (implemented directly) | DONE (orchestration) + loopback-validated + live discovery/connect. mule-engine::fetch: PeerSource unifies Kad/server/peer sources (reconciles the TWO IP conventions in one place - Kad TAG_SOURCEIP = host-order/big-endian view Ipv4Addr::from(ip); server FOUNDSOURCES = eD2k low-byte; verified vs DownloadQueue::KademliaSearchFile). SourceRegistry dedups by addr; fetch_from_sources drives Download across sources (obf when userhash known). Only HighID Kad types {1,4} + non-LowID server ids connectable. mule-cli kad-fetch <nodes.dat> <hash> <size> <out>. 5 unit tests (IP conventions/filtering/dedup) + loopback test (serve->fetch->verify ed2k hash) + dead-source test. LIVE: kad-fetch bootstrapped, resolved a HighID source, completed an OBFUSCATED handshake with a real internet peer (1/1); 0 bytes only because the degenerate test hash isn't a file that peer holds. NOTE: EC protocol deferred (iPad seam is FFI/Wave 8, not a separate EC daemon; EC would be interop-only). |
-| 7.5 | pre-Wave-8 engine hardening (identity, Engine facade+lifecycle, resume, download mgr) | (implemented directly) | DONE (WSL-tested). NodeIdentity (persistent userhash/KadID/udpkey/RSA; aMule-compat preferences.dat/preferencesKad.dat). Engine facade = the UniFFI seam: EngineState/EngineEvent + idempotent pause/resume lifecycle (foreground-only). start() loads nodes.dat + resumes .part downloads; checkpoint() saves identity+nodes.dat. download_file = parallel multi-source + retry manager (rides out eD2k upload-queue rationing). 300 tests. Optional coverage remaining: AICH, LowID callback, UPnP, Kad keyword search. |
+| 7.5 | pre-Wave-8 engine hardening (identity, Engine facade+lifecycle, resume, download mgr) | (implemented directly) | DONE (WSL-tested). NodeIdentity (persistent userhash/KadID/udpkey/RSA; aMule-compat preferences.dat/preferencesKad.dat). Engine facade = the UniFFI seam: EngineState/EngineEvent + idempotent pause/resume lifecycle (foreground-only). start() loads nodes.dat + resumes .part downloads; checkpoint() saves identity+nodes.dat. download_file = parallel multi-source + retry manager (rides out eD2k upload-queue rationing). 300 tests. Optional coverage remaining: AICH, LowID callback, UPnP, Kad keyword search. LowID callback since PROVEN live (see the three-file milestone below); UPnP/NAT-PMP codec done (portmap.rs). |
+| 7.6 | intelligent fetch engine + LIVE three-file completion | (implemented directly) | **DONE - live-proven (2026-07-16).** Search catalog (catalog.rs: dedup by ed2k hash, aggregate availability FT_SOURCES/FT_COMPLETE_SOURCES, trust flags, rank Ok-before-suspect then sources-desc) + completion-optimized fetcher (mule-cli fetch-complete). Downloaded THREE real files to completion, one each from a pdf/wav/txt keyword search, every one ed2k-hash-verified. See the milestone section below. |
 | 8 | `mule-ffi` + `ios/padMule` SwiftUI shell + lifecycle + sideload | - | not started. Must render the honest status notice + per-transfer Paused badges + Reconnecting banner, and wire ScenePhase -> engine pause()/resume() ([[lifecycle-and-reactivation]]). |
 | 9 | (v1.1) seedbox mode | - | not started |
+
+## LIVE END-TO-END DOWNLOADS - THREE FILES COMPLETED (2026-07-16)
+
+padMule downloaded THREE real files from the live eD2k network to completion,
+one each from a keyword search for `pdf`, `wav`, `txt`, every one verified by
+recomputing its ed2k hash and matching the search result:
+
+| search | file | bytes | ed2k hash |
+|--------|------|-------|-----------|
+| txt | Chicks.txt | 1416 | c0e97d89f3cd58b42c38e15c15f27275 |
+| wav | T.I. Feat. Rihanna - Live Your Life ( 2oo8).WAV | 5888780 | df13c362a9f3bc6c4a3b3014819c1462 |
+| pdf | ESAMI URINE .pdf | 4232 | 40b3fc7ade0afa2c5b339ee3475192c8 |
+
+(P2P content is uncontrolled; only the technical result - name/size/hash - is
+recorded. The .WAV was an MP3 mislabeled by its sharer; padMule's job is a
+hash-exact fetch of the named file, which it did.)
+
+Driver: `mule-cli fetch-complete <server.met> <keyword> <out> [max_size]
+[min_size]`. It logs in (binding a listener FIRST so the server's HighID
+callback succeeds - HighID is what lets us receive LowID callbacks), searches,
+catalogs (dedup/rank/trust), then sweeps candidates best-sourced-first and pulls
+the first that completes. What it took to actually COMPLETE downloads (each a
+real lesson, all client-side, zero wire changes):
+
+1. **HighID is the key that unlocks the LowID source pool.** All three files
+   completed only once we were HighID and listening. Two of the three (wav, pdf)
+   were delivered by **firewalled LowID sources via OP_CALLBACKREQUEST** - we ask
+   the server to tell the LowID peer to dial US; it connects back to our listener
+   and streams the file. The wav's entire 5.9 MB arrived this way. See
+   [[net-highid-and-port-forwarding]].
+2. **Queue fast-bail.** eD2k sources ration upload slots; most answer
+   OP_STARTUPLOADREQ with OP_QUEUERANKING (you are queued), not
+   OP_ACCEPTUPLOADREQ. Sitting in a queue is dead time for a completion hunt, so
+   `run_peer` now returns `TransferError::Queued` the instant it is queued -
+   turning a 25 s dead-end into ~2 s and letting the sweep reach a free source
+   fast. (A real background client would instead keep the slot and wait.)
+3. **Diversity-aware sweeping.** A keyword can be SATURATED by one sharer's
+   collection: "wav" returned 200 results that were ALL <100 KB Age-of-Empires
+   game sounds from a SINGLE IP. Sweeping them is pointless (same busy peer). The
+   fetcher records each HighID source that stalls and skips other files whose only
+   source is that dead IP - so the sweep spends its time on DISTINCT sharers.
+4. **`min_size` to escape a saturated keyword.** Because the tiny game-sound
+   collection filled the server's 200-result cap, no diverse wav could surface.
+   Asking the server for `wav` files >= 800 KB filtered the collection out and
+   revealed real audio files from other sharers (the T.I. song among them).
+5. **Progress-aware callback wait + per-candidate part dirs.** A LowID callback
+   can take many seconds to connect and then streams the whole file. A fixed short
+   wait abandoned the transfer mid-flight, and a shared `001.part` let the next
+   candidate clobber it - which is exactly why an earlier run delivered a full
+   5.9 MB file and then LOST it. Fix: each candidate downloads into its own
+   directory, and we wait WHILE bytes keep arriving (patient before the first
+   byte, bail a few seconds after progress stalls, hard cap 300 s). With that, the
+   wav completed on candidate [1] via its own callback.
+6. **Size-adaptive transfer config.** Tiny files sweep fast (12 s/peer, 1 round);
+   larger files get sustained pulling (40 s/peer, 5 rounds). A partial HighID pull
+   (331 KB of a 627 KB pdf before it stalled) confirmed multi-block HighID
+   transfer on the live network too.
+
+Files: `crates/mule-engine/src/catalog.rs` (search intelligence + trust),
+`crates/mule-cli/src/main.rs::cmd_fetch_complete` (the fetcher + callback
+listener), `crates/mule-engine/src/multi_source.rs` (queue fast-bail),
+`crates/mule-engine/src/transfer_session.rs` (`TransferError::Queued`).
+
+**Lesson:** completion on eD2k is a source-availability hunt, not a protocol
+problem - the wire was already right (Wave 4 differential test). The wins were all
+in HOW we pick files and spend time: earn HighID, use callbacks, fast-bail queues,
+chase distinct sharers, and never abandon an in-flight callback. Recorded in
+[[decisions-and-lessons]].
 
 ## Wave 4d notes - aMule bugs we deliberately do NOT replicate (2026-07-14)
 
