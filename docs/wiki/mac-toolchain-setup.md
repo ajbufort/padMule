@@ -110,31 +110,40 @@ with a free Apple ID at install, so no Xcode/Apple secrets are involved.
    the system tray.
 4. iPad by USB -> unlock -> **Trust This Computer**. In iTunes tick **"Sync with
    this iPad over Wi-Fi"** (required for AltStore's wireless 7-day refresh).
-5. Tray -> **Install AltStore** -> pick the iPad -> Apple ID.
-   TRAP (hit 2026-07-16): a BRAND-NEW throwaway Apple ID fails instantly with
-   **"This action cannot be completed at this time (-22411)"**. Apple will not
-   issue a free signing cert to an account it has never seen on real hardware -
-   the ID must have been signed in on a device first. Undocumented on AltStore's
-   official error-codes page; the cause is consistent across issue #417 / #785 /
-   #1720 and community writeups.
-   FIX (either):
-   - Activate the throwaway: iPad -> Settings -> [your name] -> **Media &
-     Purchases** -> Sign Out -> sign in as the throwaway -> accept the terms ->
-     sign back in as yourself. This touches ONLY the App Store account, not
-     iCloud. Then retry AltServer with the throwaway.
-   - Or use the primary Apple ID (already device-activated, so it just works).
-     Cost: a free 7-day dev cert attaches to it and it burns App ID slots
-     (10 per 7 days). No account risk.
-   Also confirm AltServer is **>= 1.7.3** (tray -> About) - that release fixed a
-   batch of Apple ID auth failures (error 1100, -22410).
+5. Tray -> **Install AltStore** -> pick the iPad -> Apple ID (Anthony's primary,
+   already device-activated). 2FA prompts for a 6-digit code.
+   TRAP (hit 2026-07-16, UNRESOLVED): **"This action cannot be completed at this
+   time (-22411)"**. This is Apple's generic developer-service failure surfaced
+   through AltServer, raised during the portal steps (register device -> create
+   App ID -> issue provisioning profile). It has **no documented root cause**:
+   AltStore's own error-codes page lists -22410 but NOT -22411, the
+   troubleshooting guide never mentions it, and issues #417/#785/#1720 are open
+   with reinstall-everything reported as not helping.
+   One commonly cited trigger is an Apple ID never signed in on real hardware
+   (Apple will not issue a free cert to an account it has not seen on a device).
+   That is a REAL cause but was NOT ours - Anthony used his primary ID.
+   Cheap checks, in order: Apple System Status (developer services);
+   AltServer >= 1.7.3 (tray -> About; it fixed auth failures 1100/-22410); any
+   MDM profile on the iPad (implicated in several reports); retry later (some
+   reports are transient).
+   => DO NOT SINK TIME HERE. Use **Sideloadly** instead (step 8) - an
+   independent implementation of the same free-signing trick that does not share
+   AltServer's Apple-auth path. Confirmed working on iPadOS 26 / Windows.
 6. iPad -> Settings -> General -> **VPN & Device Management** -> trust the cert.
    (AltStore's docs call this "Profiles & Device Management" - the older name.)
 7. iPad -> Settings -> Privacy & Security -> **Developer Mode** ON -> restart.
    GOTCHA: the toggle only APPEARS once a dev-signed app has been installed, so do
    step 5 first if you cannot find it.
 8. Put the `.ipa` where the iPad's **Files** app can see it (iCloud Drive), then
-   AltStore -> **My Apps** -> **+** -> pick it. Simpler one-shot alternative:
-   **Sideloadly** installs straight from Windows over USB (but no auto-refresh).
+   AltStore -> **My Apps** -> **+** -> pick it.
+   **Sideloadly (sideloadly.io) is the RECOMMENDED route** after the -22411 wall:
+   install it on Windows, plug the iPad in by USB, drag `padMule.ipa` onto it,
+   enter the Apple ID, hit Start. No AltStore, no Files-app shuffle, no Wi-Fi
+   sync, and it does not consume an AltStore app slot. It reuses the SAME free
+   7-day certificate mechanism (so steps 6/7 - trust the cert, Developer Mode -
+   still apply), but it is a separate codebase that does not share AltServer's
+   Apple-auth path. Tradeoff: no auto-refresh - re-run it every 7 days by hand.
+   For proving the sideload leg works at all, that tradeoff is irrelevant.
 9. LIMITS of free-ID signing: apps expire every **7 days** (keep AltServer running
    on the same Wi-Fi and AltStore auto-refreshes) and **max 3 sideloaded apps**.
 10. Debug by what the UI shows - there is no Xcode device support for iPadOS 26 on
