@@ -171,7 +171,9 @@ async fn fetch_one(
         Ok(Ok(v)) => v,
         _ => return Err(()),
     };
-    match timeout(per_peer, download_from_peer(&mut fs, dl)).await {
+    // Multi-source manager: bail the instant this peer queues us and try another
+    // source rather than burning `per_peer` in its queue.
+    match timeout(per_peer, download_from_peer(&mut fs, dl, true)).await {
         Ok(Ok(bytes)) => Ok(bytes),
         _ => Ok(0), // connected but delivered nothing (queued / dropped)
     }

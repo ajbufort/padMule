@@ -554,7 +554,12 @@ async fn cmd_peer_download(
     };
     let dl = Download::new(store);
 
-    match timeout(Duration::from_secs(120), download_from_peer(&mut fs, &dl)).await {
+    match timeout(
+        Duration::from_secs(120),
+        download_from_peer(&mut fs, &dl, false),
+    )
+    .await
+    {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => {
             eprintln!("download failed: {e:?}");
@@ -1411,7 +1416,7 @@ async fn cmd_fetch_complete(
                             if let Some(dl) = dl {
                                 if let Ok(Ok(bytes)) = timeout(
                                     Duration::from_secs(60),
-                                    download_from_peer(&mut fs, &dl),
+                                    download_from_peer(&mut fs, &dl, false),
                                 )
                                 .await
                                 {

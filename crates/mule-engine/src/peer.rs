@@ -26,6 +26,24 @@ const CT_EMULE_MISCOPTIONS1: u8 = 0xFA;
 const CT_EMULE_VERSION: u8 = 0xFB;
 const CT_EMULE_MISCOPTIONS2: u8 = 0xFE;
 
+/// padMule-to-padMule enhancement-channel marker (Layer 1 detection). Carried as
+/// one extra STRING-named tag in every peer HELLO/HELLOANSWER. Stock eMule 0.50a
+/// and aMule 3.0.1 iterate the hello taglist and switch on NUMERIC tag ids only -
+/// aMule has no `default` case (BaseClient.cpp:477-478,635), eMule's is benign
+/// (BaseClient.cpp:585-592) - so a string-named tag carrying a STANDARD UINT32
+/// value is read-and-skipped by both, with no throw and no disconnect (the tag is
+/// fully consumed by the CTag reader, Tag.cpp:110-169). It lets one padMule
+/// recognize another with zero effect on stock peers. Value layout: low byte =
+/// channel version (>= 1), high 24 bits = enhancement-capability flags.
+///
+/// CRITICAL: the value MUST use a standard tag TYPE byte. A nonstandard type
+/// makes aMule THROW and disconnect (Tag.cpp:179) and eMule silently DESYNC its
+/// whole parse (packets.cpp:565-572) - so never carry the marker as a custom type.
+const PADMULE_HELLO_TAG: &[u8] = b"padMule";
+
+/// The enhancement-channel protocol version padMule advertises.
+pub const PADMULE_CHANNEL_VERSION: u8 = 1;
+
 /// The Kad protocol version padMule advertises (KADEMLIA_VERSION 0.49b).
 pub const KADEMLIA_VERSION: u32 = 0x08;
 
@@ -131,11 +149,23 @@ impl HelloInfo {
     }
 }
 
+/// Build the padMule enhancement-channel marker tag (Layer 1 detection). `caps`
+/// is the enhancement-capability bitmask (0 = presence only). NEVER set a bit for
+/// a capability padMule does not actually honor - the Wave 4d differential test
+/// proved a real peer punishes an advertised-but-unhonoured capability.
+fn padmule_marker_tag(caps: u32) -> Tag {
+    let value = (caps << 8) | PADMULE_CHANNEL_VERSION as u32;
+    Tag {
+        name: TagName::Str(PADMULE_HELLO_TAG.to_vec()),
+        value: TagValue::U32(value),
+    }
+}
+
 fn write_hello_body(w: &mut Writer, h: &HelloInfo) {
     w.write_bytes(&h.user_hash);
     w.write_u32(h.client_id);
     w.write_u16(h.tcp_port);
-    w.write_u32(7); // tag count (baseline, no buddy tags)
+    w.write_u32(8); // tag count: 7 baseline + 1 padMule marker
     write_tag(
         w,
         &Tag::id(CT_NAME, TagValue::Str(h.nick.as_bytes().to_vec())),
@@ -159,6 +189,10 @@ fn write_hello_body(w: &mut Writer, h: &HelloInfo) {
         w,
         &Tag::id(CT_EMULECOMPAT_OPTIONS, TagValue::U32(h.compat_options)),
     );
+    // padMule enhancement-channel marker (Layer 1). Provably ignored by stock
+    // eMule/aMule; recognized by another padMule. caps=0 = presence only (no
+    // enhancement is implemented yet, so we honour nothing beyond "I am padMule").
+    write_tag(w, &padmule_marker_tag(0));
     w.write_u32(h.server_ip);
     w.write_u16(h.server_port);
 }
@@ -221,6 +255,35 @@ impl ParsedHello {
             kad_version: (m2 & 0xF) as u8,
         })
     }
+
+    /// If this peer is a padMule client, its enhancement-channel info - detected
+    /// by the string-named "padMule" marker tag (Layer 1). Returns None for every
+    /// stock eMule/aMule peer, which never sends it. Once this is Some, and only
+    /// then, it is safe to send padMule-specific Layer-2 messages (a stock peer
+    /// would otherwise see an unknown opcode); see [`PADMULE_HELLO_TAG`].
+    pub fn padmule(&self) -> Option<PadMuleInfo> {
+        let v = self.tags.iter().find_map(|t| match (&t.name, &t.value) {
+            (TagName::Str(n), TagValue::U32(v)) if n.as_slice() == PADMULE_HELLO_TAG => Some(*v),
+            _ => None,
+        })?;
+        let channel_version = (v & 0xFF) as u8;
+        if channel_version == 0 {
+            return None; // malformed marker - treat as not-padMule
+        }
+        Some(PadMuleInfo {
+            channel_version,
+            capabilities: v >> 8,
+        })
+    }
+}
+
+/// padMule enhancement-channel info, decoded from a peer's HELLO marker tag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PadMuleInfo {
+    /// Enhancement-channel protocol version (>= 1).
+    pub channel_version: u8,
+    /// Enhancement-capability bitmask (0 = presence only).
+    pub capabilities: u32,
 }
 
 /// A peer's decoded capability set (from MISCOPTIONS1/2).
@@ -339,5 +402,70 @@ mod tests {
         let parsed = parse_hello(&pkt.payload, true).unwrap();
         let udp = parsed.tag_u32(CT_EMULE_UDPPORTS).unwrap();
         assert_eq!(udp, 0x1234_5678);
+    }
+
+    #[test]
+    fn padmule_marker_round_trips_and_is_detected() {
+        // Our own hello carries the marker; another padMule (this parser) sees it.
+        let pkt = build_hello(&sample());
+        let parsed = parse_hello(&pkt.payload, true).unwrap();
+        let pm = parsed.padmule().expect("our own hello must be detected");
+        assert_eq!(pm.channel_version, PADMULE_CHANNEL_VERSION);
+        assert_eq!(pm.capabilities, 0, "no enhancement advertised yet");
+        // The marker must NOT disturb the standard tags or the trailing fields:
+        // an off-by-one tag count would corrupt these.
+        assert!(parsed.capabilities().is_some());
+        assert_eq!(parsed.server_ip, 0);
+        assert_eq!(parsed.server_port, 0);
+    }
+
+    #[test]
+    fn marker_is_a_string_named_uint32_the_provably_ignored_shape() {
+        // The safety property: stock eMule/aMule ignore a string-named tag with a
+        // STANDARD type byte, but throw/desync on a nonstandard type. Pin both.
+        let pkt = build_hello(&sample());
+        let parsed = parse_hello(&pkt.payload, true).unwrap();
+        let marker = parsed
+            .tags
+            .iter()
+            .find(|t| matches!(&t.name, TagName::Str(n) if n.as_slice() == PADMULE_HELLO_TAG))
+            .expect("marker present");
+        assert!(
+            matches!(marker.value, TagValue::U32(_)),
+            "marker must be a standard UINT32, never a custom type"
+        );
+    }
+
+    #[test]
+    fn stock_hello_is_not_detected_as_padmule() {
+        // A hello with only standard tags (what every eMule/aMule sends) -> None.
+        let stock = ParsedHello {
+            user_hash: [0; 16],
+            client_id: 0,
+            tcp_port: 0,
+            tags: vec![
+                Tag::id(CT_NAME, TagValue::Str(b"eMule".to_vec())),
+                Tag::id(CT_EMULE_MISCOPTIONS1, TagValue::U32(0x3410_3212)),
+            ],
+            server_ip: 0,
+            server_port: 0,
+        };
+        assert!(stock.padmule().is_none());
+    }
+
+    #[test]
+    fn marker_encodes_version_and_capabilities() {
+        // caps ride the high 24 bits, version the low byte.
+        let parsed = ParsedHello {
+            user_hash: [0; 16],
+            client_id: 0,
+            tcp_port: 0,
+            tags: vec![padmule_marker_tag(0x00AB_CDEF)],
+            server_ip: 0,
+            server_port: 0,
+        };
+        let pm = parsed.padmule().unwrap();
+        assert_eq!(pm.channel_version, PADMULE_CHANNEL_VERSION);
+        assert_eq!(pm.capabilities, 0x00AB_CDEF);
     }
 }
