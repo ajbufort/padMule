@@ -23,6 +23,9 @@ pub enum TransferError {
     NoFile,
     /// The peer sent a data packet outside what we asked for (see `BlockError`).
     BadBlock,
+    /// The peer queued us instead of granting an upload slot (OP_QUEUERANKING).
+    /// Not a real error - it just means "no free slot here, move on".
+    Queued,
     /// Writing to the `.part` file failed.
     Io(std::io::Error),
 }

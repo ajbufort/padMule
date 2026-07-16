@@ -21,7 +21,7 @@ use std::time::Duration;
 use mule_engine::peer::HelloInfo;
 use mule_engine::search::{build_search_request, parse_search_result, SearchParams};
 use mule_engine::server_messages::{LoginRequest, DEFAULT_SERVER_FLAGS};
-use mule_engine::sources::{build_get_sources, parse_found_sources};
+use mule_engine::sources::{build_callback_request, build_get_sources, parse_found_sources};
 use mule_engine::{
     catalog, connect_peer, connect_peer_obf, connect_server, download_file, download_from_peer,
     fetch_from_sources, login_handshake, obf_accept, peer_handshake_inbound, serve, Download,
@@ -1365,7 +1365,13 @@ async fn cmd_link(link: &str, out: Option<&str>) {
 /// then try SMALL trusted candidates (smallest first - a source serves a burst
 /// then queues us, so small files finish in one shot) until one downloads to
 /// completion and its ed2k hash verifies. Prints the file that completed.
-async fn cmd_fetch_complete(met_path: &str, keyword: &str, out: &str, max_size: u64) {
+async fn cmd_fetch_complete(
+    met_path: &str,
+    keyword: &str,
+    out: &str,
+    max_size: u64,
+    min_size: u64,
+) {
     let bytes = match std::fs::read(met_path) {
         Ok(b) => b,
         Err(e) => {
@@ -1380,20 +1386,41 @@ async fn cmd_fetch_complete(met_path: &str, keyword: &str, out: &str, max_size: 
             return;
         }
     };
-    // Bind our TCP port and accept inbound handshakes, so the server's HighID
-    // callback during login SUCCEEDS (WSL mirrored-mode forward is active) - a
-    // HighID gets far better upload-queue treatment from sources than a LowID.
+    // Bind our TCP port and accept inbound handshakes, so (a) the server's HighID
+    // callback during login SUCCEEDS (a HighID gets far better upload-queue
+    // treatment than a LowID) and (b) LowID sources we asked the server to poke
+    // can connect back to us. Any inbound peer is fed into the ACTIVE download,
+    // so a called-back LowID source delivers just like a HighID one.
+    let active: std::sync::Arc<tokio::sync::Mutex<Option<std::sync::Arc<Download>>>> =
+        std::sync::Arc::new(tokio::sync::Mutex::new(None));
     if let Ok(listener) = TcpListener::bind(("0.0.0.0", 4662)).await {
         let me_in = HelloInfo::baseline(demo_user_hash(), 0, 4662, 4672, "padMule");
+        let active_l = active.clone();
         tokio::spawn(async move {
             loop {
                 if let Ok((stream, _)) = listener.accept().await {
                     let me = me_in.clone();
+                    let active_l = active_l.clone();
                     tokio::spawn(async move {
                         let mut fs = FramedStream::new(stream);
-                        let _ =
-                            timeout(Duration::from_secs(8), peer_handshake_inbound(&mut fs, &me))
-                                .await;
+                        if timeout(Duration::from_secs(8), peer_handshake_inbound(&mut fs, &me))
+                            .await
+                            .is_ok()
+                        {
+                            let dl = active_l.lock().await.clone();
+                            if let Some(dl) = dl {
+                                if let Ok(Ok(bytes)) = timeout(
+                                    Duration::from_secs(60),
+                                    download_from_peer(&mut fs, &dl),
+                                )
+                                .await
+                                {
+                                    if bytes > 0 {
+                                        eprintln!("  [callback] a called-back peer delivered {bytes} bytes");
+                                    }
+                                }
+                            }
+                        }
                     });
                 }
             }
@@ -1443,11 +1470,11 @@ async fn cmd_fetch_complete(met_path: &str, keyword: &str, out: &str, max_size: 
     let params = SearchParams {
         keyword: keyword.to_string(),
         file_type: None,
-        min_size: Some(1),
+        min_size: Some(min_size.max(1) as u32),
         max_size: Some(max_size as u32),
         extension: Some(keyword.to_string()),
     };
-    println!("searching '{keyword}' (<= {max_size} bytes) ...");
+    println!("searching '{keyword}' ({min_size}..={max_size} bytes) ...");
     if fs
         .write_packet(&build_search_request(&params))
         .await
@@ -1474,7 +1501,7 @@ async fn cmd_fetch_complete(met_path: &str, keyword: &str, out: &str, max_size: 
         .into_iter()
         .filter(|r| {
             r.is_trusted()
-                && r.size > 0
+                && r.size >= min_size.max(1)
                 && r.size <= max_size
                 && r.name.to_lowercase().ends_with(&format!(".{keyword}"))
         })
@@ -1498,6 +1525,10 @@ async fn cmd_fetch_complete(met_path: &str, keyword: &str, out: &str, max_size: 
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     let me = HelloInfo::baseline(demo_user_hash(), 0, 4662, 4672, "padMule");
 
+    // HighID source addresses we have already watched stall (queue us / go
+    // silent). Used to skip other files whose only source is that same busy peer.
+    let mut dead: std::collections::HashSet<std::net::SocketAddr> =
+        std::collections::HashSet::new();
     for (i, r) in cands.iter().take(80).enumerate() {
         // Ask for sources.
         if fs
@@ -1521,20 +1552,41 @@ async fn cmd_fetch_complete(met_path: &str, keyword: &str, out: &str, max_size: 
         };
         let mut reg = SourceRegistry::new();
         reg.add_found(&found);
-        if reg.is_empty() {
-            continue; // no connectable source; next candidate
+        // LowID sources (their "ip" field is really a LowID client id < 0x01000000)
+        // cannot accept our connection - we ask the SERVER to have them call US
+        // back (we are HighID + listening).
+        let lowids: Vec<u32> = found
+            .iter()
+            .filter(|s| s.ip != 0 && s.ip < 0x0100_0000 && s.port != 0)
+            .map(|s| s.ip)
+            .collect();
+        if reg.is_empty() && lowids.is_empty() {
+            continue; // no usable source at all
         }
+        let hi_addrs: Vec<std::net::SocketAddr> = reg.sources().iter().map(|s| s.addr).collect();
+        // Skip files whose only source(s) are peers we already saw stall, unless
+        // there is a LowID callback still worth trying.
+        if lowids.is_empty() && !hi_addrs.is_empty() && hi_addrs.iter().all(|a| dead.contains(a)) {
+            continue;
+        }
+        let hi_ips: Vec<String> = hi_addrs.iter().map(|a| a.to_string()).collect();
         println!(
-            "[{}] '{}' {} B, {} connectable source(s) - trying...",
+            "[{}] '{}' {} B - {} HighID {:?} + {} LowID(callback) source(s)",
             i + 1,
             r.name,
             r.size,
-            reg.len()
+            reg.len(),
+            hi_ips,
+            lowids.len()
         );
 
-        let _ = std::fs::remove_file(dir.join("001.part"));
-        let _ = std::fs::remove_file(dir.join("001.part.met"));
-        let store = match PartStore::create(&dir, 1, r.hash, r.size, r.name.as_bytes()) {
+        // Each candidate gets its OWN part directory. A LowID callback can keep
+        // delivering into a Download after we would otherwise move on; a shared
+        // 001.part would let the next candidate clobber an in-flight transfer.
+        let cdir = dir.join(format!(".dl{i}"));
+        let _ = std::fs::remove_dir_all(&cdir);
+        let _ = std::fs::create_dir_all(&cdir);
+        let store = match PartStore::create(&cdir, 1, r.hash, r.size, r.name.as_bytes()) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("part store: {e}");
@@ -1542,23 +1594,70 @@ async fn cmd_fetch_complete(met_path: &str, keyword: &str, out: &str, max_size: 
             }
         };
         let dl = Download::new(store);
-        // Be PATIENT in the queue: eD2k sources queue you and grant a slot when
-        // your position comes up (fast for a HighID client on a niche file). Wait
-        // out the queue rather than bail, then reconnect once.
-        let cfg = ManagerConfig {
-            parallel: 6,
-            per_peer: Duration::from_secs(30),
-            rounds: 1,
+        // Route callback peers into this download, then poke the LowID sources.
+        *active.lock().await = Some(dl.clone());
+        for id in &lowids {
+            let _ = fs.write_packet(&build_callback_request(*id)).await;
+        }
+        // Size-adaptive: a tiny file finishes in one burst, so sweep fast (12s,
+        // one round) to hunt across many thin sources. A larger file needs
+        // sustained multi-source pulling, so give each source more time and
+        // re-sweep its sources several rounds.
+        let cfg = if r.size <= 1_000_000 {
+            ManagerConfig {
+                parallel: 6,
+                per_peer: Duration::from_secs(12),
+                rounds: 1,
+            }
+        } else {
+            ManagerConfig {
+                parallel: 8,
+                per_peer: Duration::from_secs(40),
+                rounds: 5,
+            }
         };
+        // Direct HighID sources (each bails in ~2s if it queues us rather than
+        // granting a slot, so this whole call is fast when nobody is free)...
         download_file(&dl, reg.sources(), &me, cfg).await;
+        // ...then, if we asked LowID sources to call back, wait WHILE they keep
+        // delivering. A callback can take many seconds to connect and then streams
+        // the whole file, so a fixed short wait would abandon an in-flight
+        // transfer. Be patient before the first byte (connect latency), then bail
+        // a few seconds after progress stalls, with a hard cap.
+        if !lowids.is_empty() {
+            let start = dl.missing().await;
+            let mut last = start;
+            let mut idle = 0u32;
+            let mut total = 0u32;
+            loop {
+                if dl.is_complete().await {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                total += 2;
+                let now = dl.missing().await;
+                if now < last {
+                    last = now;
+                    idle = 0;
+                } else {
+                    idle += 2;
+                    // Patient before the first delivered byte, strict afterwards.
+                    let limit = if last == start { 30 } else { 12 };
+                    if idle >= limit || total >= 300 {
+                        break;
+                    }
+                }
+            }
+        }
+        *active.lock().await = None; // stop feeding this download
         let have = r.size - dl.missing().await;
         if dl.is_complete().await {
             drop(dl);
-            let part = dir.join("001.part");
+            let part = cdir.join("001.part");
             if let Ok(data) = std::fs::read(&part) {
                 if ed2k_hash(&data) == r.hash {
                     let _ = std::fs::rename(&part, out);
-                    let _ = std::fs::remove_file(dir.join("001.part.met"));
+                    let _ = std::fs::remove_dir_all(&cdir);
                     println!(
                         "COMPLETE + VERIFIED: '{}' ({} bytes) -> {out}",
                         r.name,
@@ -1568,11 +1667,20 @@ async fn cmd_fetch_complete(met_path: &str, keyword: &str, out: &str, max_size: 
                 }
                 println!("completed but hash mismatch - corrupt, trying next");
             }
+            let _ = std::fs::remove_dir_all(&cdir);
         } else {
             println!(
                 "  got {have}/{} bytes; source stalled, next candidate",
                 r.size
             );
+            // Nothing arrived - remember these peers as busy so we don't retry the
+            // rest of the same sharer's collection.
+            if have == 0 {
+                for a in &hi_addrs {
+                    dead.insert(*a);
+                }
+            }
+            let _ = std::fs::remove_dir_all(&cdir);
         }
     }
     println!("no candidate completed (sources uncooperative). Search + selection worked.");
@@ -1665,12 +1773,13 @@ async fn main() {
         Some("search-download") if args.len() == 5 => {
             cmd_search_download(&args[2], &args[3], &args[4]).await
         }
-        Some("fetch-complete") if args.len() == 5 || args.len() == 6 => {
+        Some("fetch-complete") if (5..=7).contains(&args.len()) => {
             let max = args
                 .get(5)
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(8_000_000);
-            cmd_fetch_complete(&args[2], &args[3], &args[4], max).await
+            let min = args.get(6).and_then(|s| s.parse::<u64>().ok()).unwrap_or(1);
+            cmd_fetch_complete(&args[2], &args[3], &args[4], max, min).await
         }
         _ => {
             eprintln!("usage:");

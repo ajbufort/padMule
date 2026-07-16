@@ -26,7 +26,7 @@ use crate::part_store::PartStore;
 use crate::transfer::{
     build_hashset_request, build_request_filename_ext, build_request_parts, build_set_req_file_id,
     build_start_upload_req, parse_file_status, parse_hashset_answer, BlockReceiver, FileStatus,
-    OP_ACCEPTUPLOADREQ, OP_FILEREQANSNOFIL, OP_FILESTATUS, OP_HASHSETANSWER,
+    OP_ACCEPTUPLOADREQ, OP_FILEREQANSNOFIL, OP_FILESTATUS, OP_HASHSETANSWER, OP_QUEUERANKING,
     STANDARD_BLOCKS_REQUEST,
 };
 use crate::transfer_session::TransferError;
@@ -250,12 +250,18 @@ where
         }
     }
 
-    // Queue up and wait for a slot. OP_QUEUERANKING may arrive first, repeatedly.
+    // Ask for a slot. A peer with a free slot answers OP_ACCEPTUPLOADREQ; a busy
+    // one answers OP_QUEUERANKING (we are now Nth in its queue). For a completion
+    // hunt across many thin sources, sitting in a queue is dead time - bail the
+    // instant we are queued so the sweep moves to the next source. A real
+    // background client would instead keep the slot and wait its turn.
     fs.write_packet(&build_start_upload_req(&hash)).await?;
     loop {
         let pkt = fs.read_packet_unpacked().await?;
-        if pkt.opcode == OP_ACCEPTUPLOADREQ {
-            break;
+        match pkt.opcode {
+            OP_ACCEPTUPLOADREQ => break,
+            OP_QUEUERANKING => return Err(TransferError::Queued),
+            _ => {}
         }
     }
 
