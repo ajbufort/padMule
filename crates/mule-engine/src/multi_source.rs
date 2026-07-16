@@ -199,15 +199,22 @@ pub fn resume_downloads(dir: &std::path::Path) -> Vec<Arc<Download>> {
 /// Returns when the file is complete, when this peer holds no block we still
 /// need, or on error. Reservations are released on every one of those paths.
 /// Returns the number of bytes this session delivered (for peer scoring).
+///
+/// `bail_on_queue`: what to do when the peer answers OP_STARTUPLOADREQ with a
+/// queue ranking instead of an accept. `true` (a multi-source hunt with other
+/// sources to try) returns `TransferError::Queued` immediately so the caller
+/// moves on; `false` (a single dedicated source, e.g. a direct peer download or a
+/// called-back peer) waits in the queue for the slot, like a normal client.
 pub async fn download_from_peer<S>(
     fs: &mut FramedStream<S>,
     dl: &Download,
+    bail_on_queue: bool,
 ) -> Result<u64, TransferError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut held: Vec<(u64, u64)> = Vec::new();
-    let r = run_peer(fs, dl, &mut held).await;
+    let r = run_peer(fs, dl, &mut held, bail_on_queue).await;
     // Whatever happened, do not strand blocks nobody else will be offered.
     dl.release(&held).await;
     r
@@ -217,6 +224,7 @@ async fn run_peer<S>(
     fs: &mut FramedStream<S>,
     dl: &Download,
     held: &mut Vec<(u64, u64)>,
+    bail_on_queue: bool,
 ) -> Result<u64, TransferError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -260,7 +268,7 @@ where
         let pkt = fs.read_packet_unpacked().await?;
         match pkt.opcode {
             OP_ACCEPTUPLOADREQ => break,
-            OP_QUEUERANKING => return Err(TransferError::Queued),
+            OP_QUEUERANKING if bail_on_queue => return Err(TransferError::Queued),
             _ => {}
         }
     }
@@ -380,7 +388,7 @@ mod tests {
             tasks.push(tokio::spawn(async move {
                 let me = HelloInfo::baseline([0xAA; 16], 0x0A00_0001, 4663 + i as u16, 4673, "dl");
                 let (_p, mut fs) = connect_peer(addr, &me).await.unwrap();
-                download_from_peer(&mut fs, &dl).await
+                download_from_peer(&mut fs, &dl, false).await
             }));
         }
         for t in tasks {
@@ -444,7 +452,7 @@ mod tests {
             tasks.push(tokio::spawn(async move {
                 let me = HelloInfo::baseline([0xAA; 16], 0x0A00_0001, 4700 + i as u16, 4673, "dl");
                 let (_p, mut fs) = connect_peer(addr, &me).await.unwrap();
-                download_from_peer(&mut fs, &dl).await
+                download_from_peer(&mut fs, &dl, false).await
             }));
         }
         for t in tasks {
@@ -487,7 +495,7 @@ mod tests {
         let me = HelloInfo::baseline([0xAA; 16], 0x0A00_0001, 4800, 4673, "dl");
         if let Ok((_p, mut fs)) = connect_peer(dead_addr, &me).await {
             // Expected to fail - the point is what it leaves behind.
-            let _ = download_from_peer(&mut fs, &dl).await;
+            let _ = download_from_peer(&mut fs, &dl, false).await;
         }
 
         // Nothing must remain reserved, or a healthy peer would never be offered
@@ -501,7 +509,7 @@ mod tests {
         let good = spawn_server(file.clone(), hash, vec![], None, 0xEE).await;
         let me = HelloInfo::baseline([0xAB; 16], 0x0A00_0001, 4801, 4673, "dl2");
         let (_p, mut fs) = connect_peer(good, &me).await.unwrap();
-        download_from_peer(&mut fs, &dl).await.unwrap();
+        download_from_peer(&mut fs, &dl, false).await.unwrap();
 
         assert!(dl.is_complete().await);
         let mut store = dl.into_store().await.unwrap();

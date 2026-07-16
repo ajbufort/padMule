@@ -45,7 +45,8 @@ pub use obf_handshake::{obf_accept, obf_initiate, ObfDetect};
 pub use part_file::{data_part_count, part_size, PartFile};
 pub use part_store::PartStore;
 pub use peer::{
-    build_hello, build_hello_answer, parse_hello, Capabilities, HelloInfo, ParsedHello,
+    build_hello, build_hello_answer, parse_hello, Capabilities, HelloInfo, PadMuleInfo,
+    ParsedHello, PADMULE_CHANNEL_VERSION,
 };
 pub use peer_conn::{
     accept_peer, connect_peer, connect_peer_obf, peer_handshake_inbound, peer_handshake_outbound,
