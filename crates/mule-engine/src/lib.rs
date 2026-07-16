@@ -26,6 +26,7 @@ pub mod sources;
 pub mod transfer;
 pub mod transfer_session;
 pub mod upload_queue;
+pub mod upnp;
 
 pub use catalog::{catalog, RankedFile, Trust};
 pub use connection::{connect_server, login_handshake, ServerEvent, ServerState};

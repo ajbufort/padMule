@@ -1289,6 +1289,19 @@ async fn cmd_natpmp(gateway: &str, port: u16) {
     }
 }
 
+/// Discover a UPnP-IGD gateway and map our listening port, for on-device HighID.
+/// Unlike NAT-PMP this needs no gateway IP - SSDP finds it.
+async fn cmd_upnp(port: u16) {
+    println!("UPnP: discovering gateway and mapping TCP :{port} ...");
+    match mule_engine::upnp::map_port(port, "padMule", 0).await {
+        Ok(ext_ip) => {
+            println!("  mapped :{port} TCP; gateway external IP = {ext_ip}");
+            println!("  (point an external port checker at {ext_ip}:{port} to confirm HighID)");
+        }
+        Err(e) => println!("  UPnP failed: {e}"),
+    }
+}
+
 /// Parse an ed2k:// or magnet: link and show what it contains; for a file link
 /// with embedded sources and an out path, download it from those sources.
 async fn cmd_link(link: &str, out: Option<&str>) {
@@ -1764,6 +1777,10 @@ async fn main() {
         Some("link") if args.len() == 3 || args.len() == 4 => {
             cmd_link(&args[2], args.get(3).map(String::as_str)).await
         }
+        Some("upnp") if args.len() == 3 => match args[2].parse::<u16>() {
+            Ok(port) => cmd_upnp(port).await,
+            Err(_) => eprintln!("bad port: {}", args[2]),
+        },
         Some("natpmp") if args.len() == 4 => match args[3].parse::<u16>() {
             Ok(port) => cmd_natpmp(&args[2], port).await,
             Err(_) => eprintln!("bad port: {}", args[3]),
