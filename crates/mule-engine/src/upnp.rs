@@ -1,14 +1,26 @@
 //! UPnP-IGD port mapping - ask the gateway to open our listening port so the
 //! device becomes HighID. This is the heavier cousin of [`crate::portmap`]
-//! (NAT-PMP): UPnP needs SSDP multicast discovery, an HTTP GET of the device
-//! description, then a SOAP/XML control call. Many consumer gateways (incl. the
-//! dev box's Xfinity gateway) speak UPnP but NOT NAT-PMP, so a real client tries
-//! both.
+//! (NAT-PMP): UPnP needs SSDP discovery, an HTTP GET of the device description,
+//! then a SOAP/XML control call. Many consumer gateways (incl. the dev box's
+//! Xfinity gateway) speak UPnP but NOT NAT-PMP, so a real client tries both.
+//!
+//! # Discovery: multicast on desktop, UNICAST on iOS
+//!
+//! Standard SSDP discovery multicasts M-SEARCH to 239.255.255.250. iOS SILENTLY
+//! DROPS multicast without the restricted `com.apple.developer.networking.
+//! multicast` entitlement, which is unreachable for a free-signed sideloaded app.
+//! So on-device we discover by UNICAST M-SEARCH aimed straight at the inferred
+//! gateway ([`discover_unicast`]) - same UPnP protocol, no multicast, no
+//! entitlement. [`map_port`] tries multicast first, then falls back to unicast,
+//! so the SAME binary earns HighID on both a desktop and the iPad. The catch is
+//! that iOS exposes no default-gateway API, so the gateway is inferred from our
+//! own LAN /24 ([`gateway_candidates`]).
 //!
 //! Hand-rolled with zero new dependencies (tokio sockets + minimal HTTP/XML
 //! extraction), the same dependency-light style as `link.rs`/`portmap.rs`, so it
 //! cross-compiles cleanly to iOS. The parsing/SOAP-building is pure and unit
-//! tested; the network calls are exercised live via `mule-cli upnp`.
+//! tested; the unicast discovery path is tested against a mock gateway over
+//! loopback, and the live network calls are exercised via `mule-cli upnp`.
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -259,6 +271,50 @@ async fn local_ip_toward(gateway: IpAddr) -> Result<Ipv4Addr, UpnpError> {
     }
 }
 
+/// Build an SSDP M-SEARCH request. `mx` (max wait, seconds) is included only for
+/// MULTICAST discovery, where it spreads responses over time; a UNICAST search
+/// aimed at one gateway omits it (UPnP 1.1 unicast M-SEARCH). `host` is the HOST
+/// header value - the multicast group for multicast, the gateway for unicast.
+fn msearch_message(host: &str, st: &str, mx: Option<u32>) -> String {
+    let mx_line = match mx {
+        Some(mx) => format!("MX: {mx}\r\n"),
+        None => String::new(),
+    };
+    format!(
+        "M-SEARCH * HTTP/1.1\r\n\
+HOST: {host}\r\n\
+MAN: \"ssdp:discover\"\r\n\
+{mx_line}\
+ST: {st}\r\n\r\n"
+    )
+}
+
+/// The likely default-gateway addresses for the /24 that `local` sits on: the
+/// `.1` and `.254` hosts, which cover the overwhelming majority of home
+/// gateways. A heuristic, used ONLY because iOS exposes no default-gateway API
+/// (the alternative is parsing the BSD routing table via sysctl). `local` itself
+/// is never returned.
+pub fn gateway_candidates(local: Ipv4Addr) -> Vec<Ipv4Addr> {
+    let o = local.octets();
+    [1u8, 254]
+        .into_iter()
+        .map(|host| Ipv4Addr::new(o[0], o[1], o[2], host))
+        .filter(|cand| *cand != local)
+        .collect()
+}
+
+/// The device's own LAN IPv4, learned by asking the OS which source address it
+/// would use to reach a public host. No packet is sent - `connect` on a UDP
+/// socket only selects the route - so this needs no traffic, just a bound socket.
+async fn local_lan_ip() -> Option<Ipv4Addr> {
+    let sock = UdpSocket::bind(("0.0.0.0", 0)).await.ok()?;
+    sock.connect("8.8.8.8:53").await.ok()?;
+    match sock.local_addr().ok()? {
+        SocketAddr::V4(a) => Some(*a.ip()),
+        _ => None,
+    }
+}
+
 /// SSDP-discover an IGD: multicast M-SEARCH, take the first response with a
 /// LOCATION, GET its description, and pull out a WAN connection service.
 pub async fn discover(search_timeout: Duration) -> Result<(WanService, IpAddr), UpnpError> {
@@ -268,13 +324,7 @@ pub async fn discover(search_timeout: Duration) -> Result<(WanService, IpAddr), 
     let ssdp: SocketAddr = SSDP_ADDR.parse().unwrap();
 
     for st in SEARCH_TARGETS {
-        let msg = format!(
-            "M-SEARCH * HTTP/1.1\r\n\
-HOST: {SSDP_ADDR}\r\n\
-MAN: \"ssdp:discover\"\r\n\
-MX: 2\r\n\
-ST: {st}\r\n\r\n"
-        );
+        let msg = msearch_message(SSDP_ADDR, st, Some(2));
         sock.send_to(msg.as_bytes(), ssdp)
             .await
             .map_err(|e| UpnpError::Io(e.to_string()))?;
@@ -305,14 +355,72 @@ ST: {st}\r\n\r\n"
     }
 }
 
+/// Discover an IGD by UNICAST M-SEARCH aimed straight at each candidate gateway,
+/// bypassing multicast entirely - which iOS silently drops without the
+/// restricted `com.apple.developer.networking.multicast` entitlement (see
+/// ios/project.yml). This is what earns a HighID on the device. Returns the
+/// first candidate that answers with a usable WAN service; `per` bounds the wait
+/// per candidate. Only replies from the queried address are trusted.
+pub async fn discover_unicast(
+    candidates: &[SocketAddr],
+    per: Duration,
+) -> Result<(WanService, IpAddr), UpnpError> {
+    let sock = UdpSocket::bind(("0.0.0.0", 0))
+        .await
+        .map_err(|e| UpnpError::Io(e.to_string()))?;
+    for gw in candidates {
+        let host = format!("{}:{}", gw.ip(), gw.port());
+        for st in SEARCH_TARGETS {
+            let msg = msearch_message(&host, st, None);
+            let _ = sock.send_to(msg.as_bytes(), gw).await;
+        }
+        let deadline = tokio::time::Instant::now() + per;
+        let mut buf = vec![0u8; 4096];
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let (n, from) = match timeout(remaining, sock.recv_from(&mut buf)).await {
+                Ok(Ok(v)) => v,
+                _ => break,
+            };
+            // Trust only the gateway we asked - a stray reply proves nothing.
+            if from.ip() != gw.ip() {
+                continue;
+            }
+            let resp = String::from_utf8_lossy(&buf[..n]);
+            let Some(location) = header_value(&resp, "LOCATION") else {
+                continue;
+            };
+            if let Ok(desc) = http_get(&location).await {
+                if let Some(svc) = parse_wan_service(&desc, &location) {
+                    return Ok((svc, from.ip()));
+                }
+            }
+        }
+    }
+    Err(UpnpError::NoGateway)
+}
+
 /// Discover the IGD and map `port` (TCP) to this device, returning the gateway's
 /// external IP on success. `lease_secs = 0` requests a permanent mapping.
+///
+/// Tries MULTICAST discovery first (works on desktop), then falls back to
+/// UNICAST M-SEARCH aimed at the inferred gateway - the only route that works on
+/// iOS, where multicast is silently dropped. So a real device still earns HighID.
 pub async fn map_port(
     port: u16,
     description: &str,
     lease_secs: u32,
 ) -> Result<Ipv4Addr, UpnpError> {
-    let (svc, gateway) = discover(Duration::from_secs(3)).await?;
+    let (svc, gateway) = match discover(Duration::from_secs(3)).await {
+        Ok(v) => v,
+        Err(_) => {
+            let candidates = unicast_candidates().await;
+            discover_unicast(&candidates, Duration::from_secs(2)).await?
+        }
+    };
     let client = local_ip_toward(gateway).await?;
     soap_add_mapping(
         &svc,
@@ -325,6 +433,42 @@ pub async fn map_port(
     )
     .await?;
     external_ip(&svc).await
+}
+
+/// Map `port` using ONLY the unicast path (skip multicast entirely). Same result
+/// as [`map_port`] on iOS, but callable on a desktop to prove the unicast route
+/// works against a real gateway before trusting it on a device you cannot debug.
+pub async fn map_port_unicast(
+    port: u16,
+    description: &str,
+    lease_secs: u32,
+) -> Result<Ipv4Addr, UpnpError> {
+    let (svc, gateway) =
+        discover_unicast(&unicast_candidates().await, Duration::from_secs(2)).await?;
+    let client = local_ip_toward(gateway).await?;
+    soap_add_mapping(
+        &svc,
+        port,
+        Proto::Tcp,
+        port,
+        client,
+        description,
+        lease_secs,
+    )
+    .await?;
+    external_ip(&svc).await
+}
+
+/// The gateway `ip:1900` endpoints to try a unicast M-SEARCH against, inferred
+/// from our own LAN address. Empty if we cannot even determine our LAN IP.
+async fn unicast_candidates() -> Vec<SocketAddr> {
+    match local_lan_ip().await {
+        Some(ip) => gateway_candidates(ip)
+            .into_iter()
+            .map(|gw| SocketAddr::new(IpAddr::V4(gw), 1900))
+            .collect(),
+        None => Vec::new(),
+    }
 }
 
 /// POST an AddPortMapping SOAP action.
@@ -587,6 +731,93 @@ mod tests {
                 .unwrap(),
             Ipv4Addr::new(203, 0, 113, 5)
         );
+    }
+
+    #[test]
+    fn gateway_candidates_are_the_dot_one_and_dot_254_of_the_24() {
+        assert_eq!(
+            gateway_candidates(Ipv4Addr::new(10, 0, 0, 33)),
+            vec![Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 254)]
+        );
+        // The device's own address is never proposed as its gateway.
+        assert_eq!(
+            gateway_candidates(Ipv4Addr::new(192, 168, 1, 1)),
+            vec![Ipv4Addr::new(192, 168, 1, 254)]
+        );
+        assert_eq!(
+            gateway_candidates(Ipv4Addr::new(192, 168, 0, 254)),
+            vec![Ipv4Addr::new(192, 168, 0, 1)]
+        );
+    }
+
+    #[test]
+    fn unicast_msearch_omits_mx_and_targets_the_gateway() {
+        let uni = msearch_message("192.168.1.1:1900", "urn:x:1", None);
+        assert!(uni.contains("HOST: 192.168.1.1:1900\r\n"));
+        assert!(uni.contains("MAN: \"ssdp:discover\"\r\n"));
+        assert!(uni.contains("ST: urn:x:1\r\n"));
+        assert!(!uni.contains("MX:"), "unicast M-SEARCH must not send MX");
+
+        // Multicast form still carries MX (it spreads responses over time).
+        let multi = msearch_message(SSDP_ADDR, "urn:x:1", Some(2));
+        assert!(multi.contains("MX: 2\r\n"));
+        assert!(multi.contains(&format!("HOST: {SSDP_ADDR}\r\n")));
+    }
+
+    // The unicast discovery path end-to-end over loopback: a mock UDP "gateway"
+    // that answers M-SEARCH with a LOCATION, and a mock TCP server that serves
+    // the device description there. Proves everything except talking to a real
+    // IGD - the piece that earns HighID on iOS, where multicast is impossible.
+    #[tokio::test]
+    async fn discover_unicast_against_a_mock_gateway() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // Mock IGD description server (the LOCATION target).
+        let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http_addr = http.local_addr().unwrap();
+        let location = format!("http://{http_addr}/rootDesc.xml");
+        let desc = "<root><device><serviceList>\
+<service><serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType>\
+<controlURL>/ctl</controlURL></service></serviceList></device></root>"
+            .to_string();
+        tokio::spawn(async move {
+            let (mut s, _) = http.accept().await.unwrap();
+            let mut b = vec![0u8; 4096];
+            let _ = s.read(&mut b).await.unwrap();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                desc.len(),
+                desc
+            );
+            s.write_all(resp.as_bytes()).await.unwrap();
+            s.shutdown().await.unwrap();
+        });
+
+        // Mock UDP gateway: answers the first M-SEARCH with the LOCATION.
+        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let gw_addr = udp.local_addr().unwrap();
+        let loc = location.clone();
+        tokio::spawn(async move {
+            let mut b = vec![0u8; 2048];
+            let (n, from) = udp.recv_from(&mut b).await.unwrap();
+            assert!(String::from_utf8_lossy(&b[..n]).starts_with("M-SEARCH"));
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nLOCATION: {loc}\r\n\
+ST: urn:schemas-upnp-org:service:WANIPConnection:1\r\n\r\n"
+            );
+            udp.send_to(reply.as_bytes(), from).await.unwrap();
+        });
+
+        let (svc, gw) = discover_unicast(&[gw_addr], Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(gw, gw_addr.ip());
+        assert_eq!(
+            svc.service_type,
+            "urn:schemas-upnp-org:service:WANIPConnection:1"
+        );
+        assert_eq!(svc.control_url, format!("http://{http_addr}/ctl"));
     }
 
     // Integration test of the real HTTP+SOAP network path (everything except SSDP
