@@ -1,0 +1,36 @@
+padMule
+Copyright (C) 2026 Anthony Bufort <ajbufort@ajbconsulting.us>
+
+padMule is free software: you can redistribute it and/or modify it under the
+terms of the GNU General Public License as published by the Free Software
+Foundation, either version 2 of the License, or (at your option) any later
+version (GPL-2.0-or-later). See the LICENSE file for the full text.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+-------------------------------------------------------------------------------
+Derivation and third-party code
+-------------------------------------------------------------------------------
+
+padMule is a port of aMule to iPadOS. The engine is a Rust rewrite (crates/), and
+the native shell is SwiftUI (ios/). It derives from, and in places ports code
+and on-disk/wire formats from:
+
+  aMule 3.0.1
+    Copyright (C) The aMule Team and contributors
+    Licensed GPL-2.0-or-later.
+    The upstream source is vendored, unmodified, under amule-3.0.1/ and serves as
+    the reference oracle for this port. Its own license, authors, and credits are
+    preserved there:
+      amule-3.0.1/LICENSE.md      (GNU GPL v2)
+      amule-3.0.1/docs/COPYING    (GNU GPL v2, identical to this repo's LICENSE)
+      amule-3.0.1/docs/AUTHORS.md (the aMule Team)
+
+  aMule itself descends from eMule (GPL-2.0-or-later, (C) the eMule Team). Where
+  padMule follows eMule 0.50a as the wire/format authority, that too is GPL code.
+
+Because padMule reuses and ports GPL-2.0-or-later code, padMule as a whole is
+licensed GPL-2.0-or-later. Any file borrowed from aMule, eMule, or another fork
+keeps its original copyright and license notices.
