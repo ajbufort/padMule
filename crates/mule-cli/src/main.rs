@@ -1302,6 +1302,22 @@ async fn cmd_upnp(port: u16) {
     }
 }
 
+/// UNICAST-only UPnP mapping: the exact path the iPad uses (multicast skipped).
+/// Run this on the dev box to prove the on-device route works against the real
+/// gateway before trusting it on a device with no debugger.
+async fn cmd_upnp_unicast(port: u16) {
+    println!(
+        "UPnP (unicast, the iOS path): M-SEARCH straight at the gateway, mapping TCP :{port} ..."
+    );
+    match mule_engine::upnp::map_port_unicast(port, "padMule", 0).await {
+        Ok(ext_ip) => {
+            println!("  mapped :{port} TCP via unicast; gateway external IP = {ext_ip}");
+            println!("  this is the route the iPad takes - if it works here, it should work there");
+        }
+        Err(e) => println!("  unicast UPnP failed: {e}"),
+    }
+}
+
 /// Parse an ed2k:// or magnet: link and show what it contains; for a file link
 /// with embedded sources and an out path, download it from those sources.
 async fn cmd_link(link: &str, out: Option<&str>) {
@@ -1781,6 +1797,10 @@ async fn main() {
             Ok(port) => cmd_upnp(port).await,
             Err(_) => eprintln!("bad port: {}", args[2]),
         },
+        Some("upnp-unicast") if args.len() == 3 => match args[2].parse::<u16>() {
+            Ok(port) => cmd_upnp_unicast(port).await,
+            Err(_) => eprintln!("bad port: {}", args[2]),
+        },
         Some("natpmp") if args.len() == 4 => match args[3].parse::<u16>() {
             Ok(port) => cmd_natpmp(&args[2], port).await,
             Err(_) => eprintln!("bad port: {}", args[3]),
@@ -1817,6 +1837,10 @@ async fn main() {
             eprintln!("  mule-cli kad-keyword <nodes.dat> <keyword>");
             eprintln!("  mule-cli link <ed2k-or-magnet-link> [out]");
             eprintln!("  mule-cli search-download <server.met> <keyword> <out>");
+            eprintln!("  mule-cli upnp <port>");
+            eprintln!(
+                "  mule-cli upnp-unicast <port>   (the iOS path: unicast M-SEARCH at the gateway)"
+            );
         }
     }
 }
