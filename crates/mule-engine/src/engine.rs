@@ -30,16 +30,20 @@ use crate::peer::HelloInfo;
 use crate::peer_conn::peer_handshake_inbound;
 use crate::search::SearchParams;
 use crate::server_messages::{LoginRequest, DEFAULT_SERVER_FLAGS};
+use crate::share::{head_hash, is_upload_request, serve_shared, SharedFile};
+use crate::transfer::build_file_req_ans_no_fil;
 use mule_files::{read_nodes_dat, read_server_met, write_nodes_dat, KadContact, NodesDat};
 use mule_kad::RoutingTable;
-use mule_proto::Kad128;
+use mule_proto::{Kad128, Packet};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
@@ -80,6 +84,17 @@ fn routing_to_nodes(rt: &RoutingTable) -> Vec<KadContact> {
 /// well under this or not at all.
 const SEARCH_WAIT: Duration = Duration::from_secs(20);
 const SOURCES_WAIT: Duration = Duration::from_secs(10);
+
+/// How long to wait for an inbound peer to speak first. A leecher sends
+/// OP_REQUESTFILENAME within a round-trip; a called-back LowID source stays
+/// silent, waiting for us to drive the download of one of OUR files. This
+/// timeout is what routes each connection to the right half of the listener.
+const SERVE_PEEK: Duration = Duration::from_secs(3);
+
+/// The most simultaneous uploads we grant. Modest by desktop standards (aMule
+/// floors at 20) because an iPad on a phone uplink is not a seedbox; a peer that
+/// finds us full is answered "no file" and moves on rather than swamping us.
+const MAX_UPLOAD_SLOTS: usize = 8;
 
 /// The next free `NNN.part` index in `dir`. aMule numbers part files this way and
 /// `resume_downloads` finds them by that name, so a new download MUST NOT reuse
@@ -159,6 +174,7 @@ fn unique_dest(dest: PathBuf) -> PathBuf {
 async fn finish_download(
     dl: Arc<Download>,
     registry: Arc<Mutex<Vec<Arc<Download>>>>,
+    shared: Arc<Mutex<Vec<SharedFile>>>,
     hash: [u8; 16],
     size: u64,
     dest: PathBuf,
@@ -172,6 +188,9 @@ async fn finish_download(
         )));
         return;
     }
+    // Capture the hashset BEFORE into_store consumes the store: a finished file
+    // becomes a shared source, and answering OP_HASHSETREQUEST needs these.
+    let part_hashes = dl.part_hashes().await;
     // Drop our registry handle so the store can be taken back out of the Arc.
     registry.lock().await.retain(|d| !Arc::ptr_eq(d, &dl));
     let Some(store) = dl.into_store().await else {
@@ -186,6 +205,15 @@ async fn finish_download(
     let dest = unique_dest(dest);
     match store.finish(&dest) {
         Ok(()) => {
+            // Seed it: a verified, complete file is a full source other peers can
+            // pull. The listener only serves it while sharing is on.
+            shared.lock().await.push(SharedFile {
+                hash,
+                size,
+                name: name.clone().into_bytes(),
+                part_hashes,
+                path: dest.clone(),
+            });
             let _ = events.send(EngineEvent::Server(format!(
                 "Saved '{}'",
                 dest.file_name().unwrap_or_default().to_string_lossy()
@@ -195,6 +223,36 @@ async fn finish_download(
             let _ = events.send(EngineEvent::Server(format!("could not save '{name}': {e}")));
         }
     }
+}
+
+/// Serve one leecher: a peer that reached our listener and asked for a file
+/// (`first` is the request packet the listener already read). Refuses with "no
+/// file" when Leech Mode is on or we are at capacity, so the peer moves on
+/// cleanly instead of hanging. Holds an upload permit for the whole session.
+async fn serve_inbound<S>(
+    fs: &mut FramedStream<S>,
+    shared: &Arc<Mutex<Vec<SharedFile>>>,
+    sharing: &Arc<AtomicBool>,
+    slots: &Arc<Semaphore>,
+    first: Packet,
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let refuse = |op_payload: &[u8]| head_hash(op_payload).map(|h| build_file_req_ans_no_fil(&h));
+    // Leech Mode, or already at the upload cap: decline and let the peer move on.
+    let permit = if sharing.load(Ordering::Relaxed) {
+        Arc::clone(slots).try_acquire_owned().ok()
+    } else {
+        None
+    };
+    let Some(_permit) = permit else {
+        if let Some(pkt) = refuse(&first.payload) {
+            let _ = fs.write_packet(&pkt).await;
+        }
+        return;
+    };
+    let library = shared.lock().await.clone();
+    let _ = serve_shared(fs, &library, Some(first)).await;
 }
 
 /// What [`Engine::add_download`] did. Not an Error type: "no sources yet" is a
@@ -292,6 +350,14 @@ pub struct Engine {
     /// iOS the app passes its Documents dir so the Files app can see them - a
     /// finished file nobody can open is not a finished download.
     downloads_dir: PathBuf,
+    /// Complete files we will serve to peers, populated as downloads finish.
+    /// Shared with the listener, which serves them on request (the upload side).
+    shared: Arc<Mutex<Vec<SharedFile>>>,
+    /// The upload switch. `false` is "Leech Mode": we still download, but serve
+    /// nothing. An atomic so the listener task reads it without taking a lock.
+    sharing: Arc<AtomicBool>,
+    /// Caps concurrent uploads (see `MAX_UPLOAD_SLOTS`). Shared with the listener.
+    upload_slots: Arc<Semaphore>,
     /// The live eD2k server link, once logged in.
     server: Option<ServerLink>,
     /// What that login yielded (server address + HighID/LowID), for the UI.
@@ -325,6 +391,9 @@ impl Engine {
             events: tx,
             routing,
             downloads: Arc::new(Mutex::new(Vec::new())),
+            shared: Arc::new(Mutex::new(Vec::new())),
+            sharing: Arc::new(AtomicBool::new(true)),
+            upload_slots: Arc::new(Semaphore::new(MAX_UPLOAD_SLOTS)),
             server: None,
             connection: None,
             kad: None,
@@ -392,6 +461,18 @@ impl Engine {
     /// so finished downloads show up in the Files app.
     pub fn set_downloads_dir(&mut self, dir: impl AsRef<Path>) {
         self.downloads_dir = dir.as_ref().to_path_buf();
+    }
+
+    /// Whether padMule serves files to peers. `false` is "Leech Mode":
+    /// downloading still works, but we upload nothing.
+    pub fn is_sharing(&self) -> bool {
+        self.sharing.load(Ordering::Relaxed)
+    }
+
+    /// Turn uploading on or off. Off is the download-only "Leech Mode"; the
+    /// listener consults this per connection, so it takes effect immediately.
+    pub fn set_sharing(&self, on: bool) {
+        self.sharing.store(on, Ordering::Relaxed);
     }
 
     pub fn state(&self) -> EngineState {
@@ -489,6 +570,12 @@ impl Engine {
     /// HELLO), so simply ACCEPTING is enough to pass it. Real peers that follow
     /// get a proper hello handshake. Idempotent; a bind failure is survivable
     /// (we just stay LowID).
+    ///
+    /// An accepted peer plays one of two roles, told apart by who speaks first
+    /// (see [`SERVE_PEEK`]): a LEECHER wants to download from us and sends
+    /// OP_REQUESTFILENAME straight away, so we serve it from our shared files; a
+    /// called-back LowID SOURCE for one of our downloads stays silent, so we
+    /// drive the download instead.
     async fn start_listener(&mut self) {
         if self.listener.is_some() {
             return;
@@ -502,6 +589,9 @@ impl Engine {
         };
         let me = HelloInfo::baseline(self.identity.userhash, 0, TCP_PORT, KAD_UDP_PORT, "padMule");
         let downloads = Arc::clone(&self.downloads);
+        let shared = Arc::clone(&self.shared);
+        let sharing = Arc::clone(&self.sharing);
+        let slots = Arc::clone(&self.upload_slots);
         let handle = tokio::spawn(async move {
             loop {
                 let Ok((stream, _peer)) = listener.accept().await else {
@@ -509,6 +599,9 @@ impl Engine {
                 };
                 let me = me.clone();
                 let downloads = Arc::clone(&downloads);
+                let shared = Arc::clone(&shared);
+                let sharing = Arc::clone(&sharing);
+                let slots = Arc::clone(&slots);
                 tokio::spawn(async move {
                     let mut fs = FramedStream::new(stream);
                     // A bare connect+close (the server's HighID probe) ends here.
@@ -518,28 +611,39 @@ impl Engine {
                     {
                         return;
                     }
-                    // A real peer reached us - almost certainly a LowID source
-                    // the server told to call us back. Offer it every unfinished
-                    // download and let it serve whichever it actually has; a
-                    // peer that has none simply declines each in turn.
-                    // Do NOT hold the lock across the transfer.
-                    let pending: Vec<Arc<Download>> = downloads.lock().await.clone();
-                    for dl in pending {
-                        if dl.is_complete().await {
-                            continue;
+                    // Peek who speaks first. Cancel-safe: a silent source buffers
+                    // no bytes, so a timeout here loses nothing and the download
+                    // path below reads cleanly (see framed::read_packet).
+                    match timeout(SERVE_PEEK, fs.read_packet_unpacked()).await {
+                        Ok(Ok(pkt)) if is_upload_request(pkt.opcode) => {
+                            serve_inbound(&mut fs, &shared, &sharing, &slots, pkt).await;
                         }
-                        match timeout(
-                            Duration::from_secs(120),
-                            download_from_peer(&mut fs, &dl, false),
-                        )
-                        .await
-                        {
-                            // Delivered something - it had this file; keep it on
-                            // this download rather than offering it others.
-                            Ok(Ok(n)) if n > 0 => break,
-                            // Connection is spent either way once it errors.
-                            Ok(Err(_)) | Err(_) => break,
-                            Ok(Ok(_)) => {}
+                        // Spoke, but not an upload request, or the link errored:
+                        // nothing we can do with it.
+                        Ok(_) => {}
+                        // Silent: a called-back source. Offer it every unfinished
+                        // download and let it serve whichever it actually has.
+                        // Do NOT hold the lock across the transfer.
+                        Err(_) => {
+                            let pending: Vec<Arc<Download>> = downloads.lock().await.clone();
+                            for dl in pending {
+                                if dl.is_complete().await {
+                                    continue;
+                                }
+                                match timeout(
+                                    Duration::from_secs(120),
+                                    download_from_peer(&mut fs, &dl, false),
+                                )
+                                .await
+                                {
+                                    // Delivered something - keep it on this
+                                    // download rather than offering it others.
+                                    Ok(Ok(n)) if n > 0 => break,
+                                    // Connection is spent either way once it errors.
+                                    Ok(Err(_)) | Err(_) => break,
+                                    Ok(Ok(_)) => {}
+                                }
+                            }
                         }
                     }
                 });
@@ -748,6 +852,7 @@ impl Engine {
         let dest = self.downloads_dir.join(safe_filename(name));
         let events = self.events.clone();
         let registry = Arc::clone(&self.downloads);
+        let shared = Arc::clone(&self.shared);
         let dl_task = Arc::clone(&dl);
         tokio::spawn(async move {
             download_file(&dl_task, &sources, &me, ManagerConfig::default()).await;
@@ -755,7 +860,7 @@ impl Engine {
             let have = total - dl_task.missing().await;
             let _ = events.send(EngineEvent::Progress { hash, have, total });
             if dl_task.is_complete().await {
-                finish_download(dl_task, registry, hash, size, dest, events).await;
+                finish_download(dl_task, registry, shared, hash, size, dest, events).await;
             }
         });
         AddResult::Started
@@ -863,6 +968,81 @@ mod tests {
             out.push(e);
         }
         out
+    }
+
+    #[tokio::test]
+    async fn leech_mode_refuses_a_file_we_actually_hold() {
+        use crate::transfer::{build_request_filename_ext, OP_FILEREQANSNOFIL};
+        // We DO hold this hash, but sharing is off - so the honest answer to a
+        // leecher is "no file", not a transfer.
+        let hash = [0x5A; 16];
+        let shared = Arc::new(Mutex::new(vec![SharedFile {
+            hash,
+            size: 100,
+            name: b"held.bin".to_vec(),
+            part_hashes: vec![],
+            path: PathBuf::from("/does/not/matter"),
+        }]));
+        let sharing = Arc::new(AtomicBool::new(false)); // Leech Mode
+        let slots = Arc::new(Semaphore::new(MAX_UPLOAD_SLOTS));
+
+        let (client, server) = tokio::io::duplex(8192);
+        let mut server_fs = FramedStream::new(server);
+        let mut client_fs = FramedStream::new(client);
+
+        let first = build_request_filename_ext(&hash);
+        let srv = tokio::spawn(async move {
+            serve_inbound(&mut server_fs, &shared, &sharing, &slots, first).await
+        });
+
+        let reply = client_fs.read_packet_unpacked().await.unwrap();
+        assert_eq!(
+            reply.opcode, OP_FILEREQANSNOFIL,
+            "Leech Mode must decline, not serve"
+        );
+        srv.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sharing_on_serves_a_held_file_to_a_leecher() {
+        let dir = tmp("serve-inbound");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let data: Vec<u8> = (0..300_000u32)
+            .map(|i| (i.wrapping_mul(29)) as u8)
+            .collect();
+        let hash = mule_proto::ed2k_hash(&data);
+        let path = dir.join("f.bin");
+        std::fs::write(&path, &data).unwrap();
+        let shared = Arc::new(Mutex::new(vec![SharedFile {
+            hash,
+            size: data.len() as u64,
+            name: b"f.bin".to_vec(),
+            part_hashes: vec![],
+            path,
+        }]));
+        let sharing = Arc::new(AtomicBool::new(true));
+        let slots = Arc::new(Semaphore::new(MAX_UPLOAD_SLOTS));
+
+        let (client, server) = tokio::io::duplex(128 * 1024);
+        let mut server_fs = FramedStream::new(server);
+        let mut client_fs = FramedStream::new(client);
+
+        let srv = tokio::spawn(async move {
+            // The listener peeks the first packet before deciding; do the same.
+            let first = server_fs.read_packet_unpacked().await.unwrap();
+            serve_inbound(&mut server_fs, &shared, &sharing, &slots, first).await;
+        });
+
+        let got = crate::transfer_session::download_file(&mut client_fs, &hash, data.len() as u64)
+            .await
+            .unwrap();
+        assert_eq!(got, data);
+        assert_eq!(mule_proto::ed2k_hash(&got), hash);
+
+        drop(client_fs);
+        srv.await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

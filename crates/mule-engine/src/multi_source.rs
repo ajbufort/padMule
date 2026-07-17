@@ -115,6 +115,13 @@ impl Download {
         g.store.pf.part_hashes = hashes;
     }
 
+    /// The per-part MD4s, if a hashset was fetched (empty for a single-part
+    /// file). Captured when a finished download becomes a shared source, so we
+    /// can answer OP_HASHSETREQUEST without re-reading the file.
+    pub async fn part_hashes(&self) -> Vec<[u8; 16]> {
+        self.inner.lock().await.store.pf.part_hashes.clone()
+    }
+
     /// Claim up to `max` blocks this peer can actually serve, rarest-first. If
     /// nothing fresh is left but the file is nearly done, enter endgame and race
     /// the final reserved blocks.
