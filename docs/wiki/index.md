@@ -24,7 +24,7 @@ the Ingest / Query / Lint workflows.
 
 ## Process
 - [[decisions-and-lessons]] - locked decisions, rejected approaches, gotchas.
-- [[build-progress]] - wave-by-wave build status; Wave 1 eD2k hashing done.
+- [[build-progress]] - wave-by-wave build status. Engine complete through Kad + multi-source fetch; padMule RUNS on the iPad and does the full search->download->verify->save loop on-device; on-device feature round (uploads + Leech toggle, cancel, Kad-in-search, unicast-SSDP HighID) DONE 2026-07-17. Repo now has LICENSE (GPL v2) + NOTICE + README.
 
 ## Backlog / feature ideas
 - [[feature-server-hunter]] - discover + verify live eD2k servers (auto-update, health-check, server-graph crawl); NOT literal whole-net scanning. Future work.
