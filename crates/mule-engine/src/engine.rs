@@ -856,6 +856,11 @@ impl Engine {
         let dl_task = Arc::clone(&dl);
         tokio::spawn(async move {
             download_file(&dl_task, &sources, &me, ManagerConfig::default()).await;
+            // Cancelled while in flight: the engine already removed it and deleted
+            // the .part. Do NOT finish or emit - there is nothing to save.
+            if dl_task.is_cancelled() {
+                return;
+            }
             let total = dl_task.size().await;
             let have = total - dl_task.missing().await;
             let _ = events.send(EngineEvent::Progress { hash, have, total });
@@ -864,6 +869,31 @@ impl Engine {
             }
         });
         AddResult::Started
+    }
+
+    /// Cancel and remove an in-progress download, deleting its `.part` files.
+    /// Returns false if no download with that hash is active (already finished,
+    /// or never started). The fetch workers stop within a block of `cancel()`,
+    /// and the outer task then bails without saving.
+    pub async fn cancel_download(&mut self, hash: [u8; 16]) -> bool {
+        let mut guard = self.downloads.lock().await;
+        let mut found = None;
+        for (i, dl) in guard.iter().enumerate() {
+            if dl.hash().await == hash {
+                found = Some(i);
+                break;
+            }
+        }
+        let Some(i) = found else {
+            return false;
+        };
+        let dl = guard.remove(i);
+        drop(guard);
+        dl.cancel();
+        dl.discard_files().await;
+        let name = dl.name().await;
+        self.emit(EngineEvent::Server(format!("Removed '{name}'")));
+        true
     }
 
     /// App backgrounded: checkpoint to disk and release sockets. Idempotent - a
@@ -968,6 +998,31 @@ mod tests {
             out.push(e);
         }
         out
+    }
+
+    #[tokio::test]
+    async fn cancel_download_removes_it_and_deletes_the_part_files() {
+        let dir = tmp("cancel");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+
+        // Register an in-progress download backed by a real .part in config_dir.
+        let store = PartStore::create(&dir, 1, [0xAB; 16], 1000, b"x.bin").unwrap();
+        engine.downloads.lock().await.push(Download::new(store));
+        assert!(dir.join("001.part").exists());
+        assert!(dir.join("001.part.met").exists());
+
+        // Cancelling it removes it from the list and deletes both files.
+        assert!(engine.cancel_download([0xAB; 16]).await, "should cancel");
+        assert!(engine.downloads().await.is_empty());
+        assert!(!dir.join("001.part").exists());
+        assert!(!dir.join("001.part.met").exists());
+
+        // Cancelling a hash we are not downloading is a no-op, not a lie.
+        assert!(!engine.cancel_download([0x00; 16]).await);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

@@ -284,7 +284,7 @@ pub async fn download_file(
     // Learned across rounds: which sources actually delivered.
     let scoreboard = Arc::new(Mutex::new(PeerScoreboard::new()));
     for _round in 0..config.rounds.max(1) {
-        if dl.is_complete().await || sources.is_empty() {
+        if dl.is_complete().await || dl.is_cancelled() || sources.is_empty() {
             break;
         }
         // Order the sweep best-first by what each source delivered in prior
@@ -307,7 +307,7 @@ pub async fn download_file(
                 let mut tried = 0usize;
                 let mut connected = 0usize;
                 loop {
-                    if dl.is_complete().await {
+                    if dl.is_complete().await || dl.is_cancelled() {
                         break;
                     }
                     let Some(src) = queue.lock().await.pop_front() else {

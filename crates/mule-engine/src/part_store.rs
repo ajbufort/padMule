@@ -241,6 +241,14 @@ impl PartStore {
         let _ = fs::remove_file(&self.met_path);
         Ok(())
     }
+
+    /// Delete the backing `.part` and `.part.met` (best effort). Used when a
+    /// download is cancelled. Any open handle keeps the bytes readable until it
+    /// drops, but the paths leave disk at once so a restart will not resume them.
+    pub fn remove_backing_files(&self) {
+        let _ = fs::remove_file(&self.part_path);
+        let _ = fs::remove_file(&self.met_path);
+    }
 }
 
 fn paths(dir: &Path, index: u32) -> (PathBuf, PathBuf) {

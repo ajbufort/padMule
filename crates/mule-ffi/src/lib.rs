@@ -340,6 +340,16 @@ impl MuleEngine {
         })
     }
 
+    /// Cancel and remove an in-progress download, deleting its part files.
+    /// Returns false if no download with that hash is active. Blocks briefly.
+    pub fn cancel_download(&self, hash: String) -> bool {
+        let Some(h) = parse_hash16(&hash) else {
+            return false;
+        };
+        self.rt
+            .block_on(async { self.inner.lock().await.cancel_download(h).await })
+    }
+
     /// Drain and return every engine event queued since the last call. The UI
     /// polls this (e.g. on a timer) to observe state/progress changes.
     pub fn drain_events(&self) -> Vec<EngineEventFfi> {

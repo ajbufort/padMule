@@ -137,6 +137,16 @@ final class EngineModel: ObservableObject {
         }
     }
 
+    /// Cancel and remove an in-progress download, deleting its part files. The
+    /// engine owns the truth; refresh() pulls the updated list right after.
+    func cancel(_ hash: String) {
+        guard let e = engine else { return }
+        work.async { [weak self] in
+            _ = e.cancelDownload(hash: hash)
+            DispatchQueue.main.async { self?.refresh() }
+        }
+    }
+
     /// App backgrounded: checkpoint + release sockets. iPadOS would reclaim them
     /// anyway - doing it explicitly is what makes resume honest.
     func pause() { run { $0.pause() } }
