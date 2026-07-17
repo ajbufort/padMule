@@ -32,6 +32,10 @@ final class EngineModel: ObservableObject {
     @Published private(set) var adding: Set<String> = []
     /// A transient line reporting what just happened.
     @Published var notice: String?
+    /// Whether padMule serves files to peers. Off is "Leech Mode". Polled as a
+    /// SNAPSHOT, like the server login: the engine owns the truth, the UI mirrors
+    /// it. Defaults to true so the switch reads correctly before the first poll.
+    @Published private(set) var sharing = true
 
     private var engine: MuleEngine?
     private var timer: Timer?
@@ -97,6 +101,14 @@ final class EngineModel: ObservableObject {
         notice = nil
     }
 
+    /// Toggle uploading. Off is "Leech Mode": padMule keeps downloading but stops
+    /// serving files to peers. Optimistic - refresh() reconciles from the engine.
+    func setSharing(_ on: Bool) {
+        guard let e = engine else { return }
+        sharing = on
+        work.async { e.setSharing(on: on) }
+    }
+
     /// Start downloading a hit. Blocks briefly (asking the server for sources),
     /// so it too goes through the work queue.
     func download(_ hit: SearchHit) {
@@ -159,6 +171,7 @@ final class EngineModel: ObservableObject {
             let dls = e.downloads()
             let kad = e.kadContacts()
             let srv = e.serverInfo()
+            let shr = e.isSharing()
             let evs = e.drainEvents()
             DispatchQueue.main.async {
                 guard let self else { return }
@@ -166,6 +179,7 @@ final class EngineModel: ObservableObject {
                 self.downloads = dls
                 self.kadContacts = kad
                 self.server = srv
+                self.sharing = shr
                 for ev in evs { self.apply(ev) }
             }
         }

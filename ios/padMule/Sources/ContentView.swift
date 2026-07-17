@@ -82,6 +82,18 @@ struct ContentView: View {
                         }
                     }
 
+                    Section("Sharing") {
+                        Toggle("Share uploads", isOn: Binding(
+                            get: { model.sharing },
+                            set: { model.setSharing($0) }
+                        ))
+                        Text(model.sharing
+                            ? "padMule serves files you've downloaded to other peers while it's open. Sharing earns you better standing in their queues, so your own downloads go faster."
+                            : "Leech Mode: downloading only. padMule is not serving any files to peers.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
                     Section("Transfers") {
                         if model.downloads.isEmpty {
                             Text("No transfers").foregroundStyle(.secondary)

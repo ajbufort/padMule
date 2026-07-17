@@ -23,6 +23,7 @@ pub mod portmap;
 pub mod search;
 pub mod secure_ident;
 pub mod server_messages;
+pub mod share;
 pub mod sources;
 pub mod transfer;
 pub mod transfer_session;
@@ -64,6 +65,7 @@ pub use server_messages::{
     parse_server_message, parse_server_status, IdChange, LoginRequest, ServerIdent,
     DEFAULT_SERVER_FLAGS, EMULE_VERSION_TAG,
 };
+pub use share::{serve_shared, SharedFile};
 pub use sources::{
     build_answer_sources, build_callback_request, build_get_sources, build_request_sources,
     build_request_sources2, parse_answer_sources, parse_callback_requested, parse_found_sources,

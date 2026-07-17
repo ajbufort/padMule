@@ -257,6 +257,20 @@ impl MuleEngine {
             .block_on(async { self.inner.lock().await.kad_contacts() as u32 })
     }
 
+    /// Whether padMule serves the files it has to other peers. `false` is
+    /// "Leech Mode": downloading still works, but nothing is uploaded.
+    pub fn is_sharing(&self) -> bool {
+        self.rt
+            .block_on(async { self.inner.lock().await.is_sharing() })
+    }
+
+    /// Turn uploading on or off. Off is the download-only "Leech Mode"; it takes
+    /// effect on the next inbound peer, so no reconnect is needed.
+    pub fn set_sharing(&self, on: bool) {
+        self.rt
+            .block_on(async { self.inner.lock().await.set_sharing(on) });
+    }
+
     /// Snapshots of every in-progress download.
     pub fn downloads(&self) -> Vec<DownloadInfo> {
         self.rt.block_on(async {
