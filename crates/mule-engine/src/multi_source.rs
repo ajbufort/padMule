@@ -15,6 +15,7 @@
 //!   with no visible error.
 
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -35,6 +36,9 @@ use mule_proto::PARTSIZE;
 /// One file being pulled from many peers.
 pub struct Download {
     inner: Mutex<Inner>,
+    /// Set when the user cancels. The fetch workers check it and stop; a
+    /// lock-free atomic so cancelling never has to wait on the transfer lock.
+    cancelled: AtomicBool,
 }
 
 struct Inner {
@@ -61,7 +65,26 @@ impl Download {
                 reserved: Vec::new(),
                 availability: vec![0u32; parts],
             }),
+            cancelled: AtomicBool::new(false),
         })
+    }
+
+    /// Mark this download cancelled. The fetch workers notice within a block and
+    /// stop; the engine then removes it and deletes the `.part`.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether cancellation has been requested.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Relaxed)
+    }
+
+    /// Delete the backing `.part` and `.part.met`. Best effort: an open file
+    /// handle a worker still holds keeps the bytes readable until it drops, but
+    /// the files are gone from disk at once so a restart will not resume them.
+    pub async fn discard_files(&self) {
+        self.inner.lock().await.store.remove_backing_files();
     }
 
     /// Fold a peer's file-status bitfield into the swarm-availability counts, so
@@ -126,6 +149,11 @@ impl Download {
     /// nothing fresh is left but the file is nearly done, enter endgame and race
     /// the final reserved blocks.
     async fn take_blocks(&self, status: &FileStatus, max: usize) -> Vec<(u64, u64)> {
+        // Cancelled: hand out nothing, so the peer session ends and the worker
+        // loop falls through to its cancellation check.
+        if self.is_cancelled() {
+            return Vec::new();
+        }
         let mut g = self.inner.lock().await;
         let reserved = g.reserved.clone();
         let avail = g.availability.clone();
@@ -347,6 +375,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_download_hands_out_no_more_blocks() {
+        use crate::transfer::{build_file_status_complete, parse_file_status};
+        let dir = tmpdir("cancel-blocks");
+        let hash = [0xCD; 16];
+        let store = PartStore::create(&dir, 1, hash, 400_000, b"y.bin").unwrap();
+        let dl = Download::new(store);
+        // A complete source has every part, so a live download claims blocks...
+        let status = parse_file_status(&build_file_status_complete(&hash).payload).unwrap();
+        assert!(
+            !dl.take_blocks(&status, 3).await.is_empty(),
+            "a live download should hand out blocks"
+        );
+        // ...until it is cancelled, after which it claims none and the workers stop.
+        dl.cancel();
+        assert!(
+            dl.take_blocks(&status, 3).await.is_empty(),
+            "a cancelled download must hand out no blocks"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

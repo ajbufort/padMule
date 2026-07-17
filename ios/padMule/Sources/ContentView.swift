@@ -100,6 +100,13 @@ struct ContentView: View {
                         } else {
                             ForEach(model.downloads, id: \.hash) { dl in
                                 transferRow(dl)
+                                    .swipeActions(edge: .trailing) {
+                                        Button(role: .destructive) {
+                                            model.cancel(dl.hash)
+                                        } label: {
+                                            Label("Remove", systemImage: "trash")
+                                        }
+                                    }
                             }
                         }
                     }
