@@ -28,13 +28,13 @@ use crate::multi_source::{download_from_peer, resume_downloads, Download};
 use crate::part_store::PartStore;
 use crate::peer::HelloInfo;
 use crate::peer_conn::peer_handshake_inbound;
-use crate::search::SearchParams;
+use crate::search::{SearchParams, SearchResultFile};
 use crate::server_messages::{LoginRequest, DEFAULT_SERVER_FLAGS};
 use crate::share::{head_hash, is_upload_request, serve_shared, SharedFile};
 use crate::transfer::build_file_req_ans_no_fil;
 use mule_files::{read_nodes_dat, read_server_met, write_nodes_dat, KadContact, NodesDat};
 use mule_kad::RoutingTable;
-use mule_proto::{Kad128, Packet};
+use mule_proto::{Kad128, Packet, Tag, TagValue};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -84,6 +84,13 @@ fn routing_to_nodes(rt: &RoutingTable) -> Vec<KadContact> {
 /// well under this or not at all.
 const SEARCH_WAIT: Duration = Duration::from_secs(20);
 const SOURCES_WAIT: Duration = Duration::from_secs(10);
+
+/// How long a Kad keyword lookup may run before we take whatever it has found.
+/// Kad is the serverless half of search; bounded so a slow lookup never hangs
+/// the box, and it runs concurrently with the server search so it is usually free.
+const KAD_SEARCH_WAIT: Duration = Duration::from_secs(15);
+/// Per-node wait during a Kad keyword lookup.
+const KAD_PER_QUERY: Duration = Duration::from_millis(750);
 
 /// How long to wait for an inbound peer to speak first. A leecher sends
 /// OP_REQUESTFILENAME within a round-trip; a called-back LowID source stays
@@ -271,6 +278,22 @@ pub enum AddResult {
     BadRequest(&'static str),
     /// Could not create the part file.
     Failed(String),
+}
+
+/// A distilled Kad keyword result in the raw tagged shape the [`catalog`]
+/// expects, so server and Kad hits for one hash dedupe and rank together. The id
+/// tags mirror `catalog`'s: 0x01 filename, 0x02 filesize, 0x15 sources.
+fn kad_to_search(f: &mule_kad::FileResult) -> SearchResultFile {
+    SearchResultFile {
+        hash: f.hash,
+        id: 0,
+        port: 0,
+        tags: vec![
+            Tag::id(0x01, TagValue::Str(f.name.as_bytes().to_vec())),
+            Tag::id(0x02, TagValue::U64(f.size)),
+            Tag::id(0x15, TagValue::U32(f.sources)),
+        ],
+    }
 }
 
 /// Flatten a server-link event into the UI's event stream.
@@ -754,33 +777,61 @@ impl Engine {
         }
     }
 
-    /// Search the connected server's index, deduped + ranked by [`catalog`].
-    /// Empty when no server has us - a search is not worth an error type the UI
-    /// would only render as "no results" anyway.
+    /// Search BOTH the connected server AND the Kad network, deduped + ranked by
+    /// [`catalog`]. Either half may be absent: a serverless client still gets Kad
+    /// hits, a client with no Kad contacts still gets server hits, and a file on
+    /// both merges by hash. Empty only when neither has anything (or we are
+    /// offline) - not worth an error the UI would render as "no results" anyway.
     ///
-    /// Blocks for up to `SEARCH_WAIT`: the caller (the FFI facade) runs it off
-    /// the UI thread.
+    /// The two run concurrently, so the wait is the SLOWER of the two, not the
+    /// sum. Blocks up to `SEARCH_WAIT`; the FFI facade runs it off the UI thread.
     pub async fn search(&mut self, keyword: &str) -> Vec<RankedFile> {
-        if self.offline || keyword.trim().is_empty() {
+        let keyword = keyword.trim();
+        if self.offline || keyword.is_empty() {
             return Vec::new();
         }
-        let Some(link) = self.server.as_mut() else {
-            return Vec::new();
-        };
         let params = SearchParams {
-            keyword: keyword.trim().to_string(),
+            keyword: keyword.to_string(),
             file_type: None,
             min_size: None,
             max_size: None,
-            // NOT the keyword: mule-cli's fetch-complete pins the extension
-            // because it hunts for a ".pdf" when asked for "pdf". A user typing
-            // in a search box means the word, not the file type.
+            // NOT the keyword: the search box means the word, not the file type
+            // (mule-cli's fetch-complete pins an extension only because it hunts
+            // for a ".pdf" when asked for "pdf").
             extension: None,
         };
-        match link.search(&params, SEARCH_WAIT).await {
-            Ok(files) => catalog(&files),
-            Err(_) => Vec::new(),
-        }
+        // The server link and the Kad node are separate fields, so both can be
+        // borrowed and driven at once.
+        let server = self.server.as_mut();
+        let kad = self.kad.as_mut();
+        let (server_files, kad_files) = tokio::join!(
+            async {
+                match server {
+                    Some(link) => link.search(&params, SEARCH_WAIT).await.unwrap_or_default(),
+                    None => Vec::new(),
+                }
+            },
+            async {
+                match kad {
+                    // Bounded so a slow lookup cannot hang the search; a lookup
+                    // that misses the budget just contributes nothing this time.
+                    Some(node) => timeout(
+                        KAD_SEARCH_WAIT,
+                        node.resolve_keyword(keyword, 50, KAD_PER_QUERY),
+                    )
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .unwrap_or_default(),
+                    None => Vec::new(),
+                }
+            },
+        );
+        // Fold the Kad hits (already distilled) into the same shape the server
+        // hits arrive in, so a single catalog pass dedupes across both by hash.
+        let mut combined = server_files;
+        combined.extend(kad_files.iter().map(kad_to_search));
+        catalog(&combined)
     }
 
     /// Start downloading `hash`. Asks the server who has it, creates the part
@@ -1023,6 +1074,37 @@ mod tests {
         assert!(!engine.cancel_download([0x00; 16]).await);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn kad_hits_flow_through_the_catalog_and_merge_with_server_hits() {
+        // A Kad result and a server result for the SAME hash must collapse to one
+        // ranked file with the better availability - the whole point of merging
+        // the two discovery paths into one search.
+        let h = [0x42; 16];
+        let server = SearchResultFile {
+            hash: h,
+            id: 0,
+            port: 0,
+            tags: vec![
+                Tag::id(0x01, TagValue::Str(b"clip.mp4".to_vec())),
+                Tag::id(0x02, TagValue::U32(1000)),
+                Tag::id(0x15, TagValue::U32(4)),
+            ],
+        };
+        let kad = mule_kad::FileResult {
+            hash: h,
+            name: "clip.mp4".into(),
+            size: 1000,
+            sources: 30,
+        };
+        let combined = vec![server, kad_to_search(&kad)];
+        let cat = catalog(&combined);
+        assert_eq!(cat.len(), 1, "same hash from both sources merges to one");
+        assert_eq!(cat[0].sources, 30, "the better availability wins");
+        assert_eq!(cat[0].size, 1000);
+        assert_eq!(cat[0].name, "clip.mp4");
+        assert!(cat[0].is_trusted());
     }
 
     #[tokio::test]

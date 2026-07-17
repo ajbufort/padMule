@@ -14,7 +14,7 @@ rsa = { workspace = true }
 sha1 = { workspace = true }
 base64 = { workspace = true }
 rand = { workspace = true }
-tokio = { workspace = true, features = ["net", "io-util", "sync", "rt", "time"] }
+tokio = { workspace = true, features = ["net", "io-util", "sync", "rt", "time", "macros"] }
 
 [dev-dependencies]
 hex = { workspace = true }
