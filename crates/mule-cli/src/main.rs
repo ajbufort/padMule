@@ -1339,8 +1339,10 @@ async fn cmd_upnp_unicast(port: u16) {
 /// Load an ipfilter.dat/.p2p list, report how many ranges block, and optionally
 /// test whether a given IP is blocked.
 fn cmd_ipfilter(path: &str, test_ip: Option<&str>) {
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
+    // Bytes + lossy, not read_to_string: community lists carry Latin-1 bytes in
+    // the description; strict UTF-8 would reject the whole file.
+    let text = match std::fs::read(path) {
+        Ok(b) => String::from_utf8_lossy(&b).into_owned(),
         Err(e) => {
             eprintln!("cannot read {path}: {e}");
             return;
