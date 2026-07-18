@@ -2,9 +2,10 @@
 # gnarly .pbxproj is never hand-written or committed. See
 # docs/wiki/mac-toolchain-setup.md.
 #
-# The FFI wiring: uniffi emits gen/mule_ffi.swift (the Swift API) + gen/module.modulemap
-# (+ mule_ffiFFI.h), and cargo emits libs/libmule_ffi.a. Swift needs the modulemap on
-# its include path to `import mule_ffiFFI`, and the linker needs -lmule_ffi.
+# The FFI wiring: uniffi emits gen/mule_ffi.swift (the Swift API) + gen/mule_ffiFFI.modulemap
+# (+ mule_ffiFFI.h) - CI renames the modulemap to gen/module.modulemap, which is the
+# name Swift's include-path lookup requires - and cargo emits libs/libmule_ffi.a.
+# Swift needs that modulemap to `import mule_ffiFFI`, and the linker needs -lmule_ffi.
 name: padMule
 options:
   bundleIdPrefix: us.ajbconsulting

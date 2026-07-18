@@ -299,12 +299,14 @@ impl PartFile {
         out
     }
 
-    /// Parts that still have missing bytes, rarest-first ordering aside.
+    /// Parts that still have missing bytes, most-complete-first.
     ///
     /// Upstream ranks these by a 4-criteria formula (rarity, preview, already-
-    /// requested, completion) with a random tie-break. We keep the ordering
-    /// simple - most-complete-first, so parts finish and become shareable - and
-    /// leave rarity weighting for when we actually track per-part source counts.
+    /// requested, completion) with a random tie-break. Here the ordering stays
+    /// simple - most-complete-first, so parts finish and become shareable.
+    /// Rarity IS tracked and applied one level up: `multi_source` folds each
+    /// peer's OP_FILESTATUS into per-part availability and `take_blocks`
+    /// selects rarest-first over this list.
     pub fn wanted_parts(&self) -> Vec<u64> {
         let n = data_part_count(self.size);
         let mut parts: Vec<(u64, u64)> = (0..n)

@@ -1,7 +1,8 @@
-//! mule-kad: the Kademlia DHT for padMule. Wave 6a: node IDs (in mule-proto) and
-//! the routing table. Wave 6b: the UDP wire - framing, obfuscation, and the
-//! bootstrap/hello handshake. Later slices add iterative lookups and
-//! source/keyword search. See docs/raw/wave6-kad-research-2026-07-14.md.
+//! mule-kad: the Kademlia DHT for padMule - node IDs (in mule-proto), the
+//! routing table, the UDP wire (framing, obfuscation, bootstrap/hello), the
+//! pure iterative lookup, source/keyword search codecs, and anti-abuse
+//! hardening. All offline-testable; `mule_engine::kad_live` drives it over
+//! real sockets. See docs/raw/wave6-kad-research-2026-07-14.md.
 
 pub mod frame;
 pub mod hardening;

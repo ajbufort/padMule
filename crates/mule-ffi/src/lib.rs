@@ -5,8 +5,9 @@
 //! exported methods are simple and synchronous.
 //!
 //! The Swift bindings are generated from the compiled cdylib by the
-//! `uniffi-bindgen` bin target (see its docs). On-device wiring is Wave 8; this
-//! crate is validated here by compiling + generating bindings + Rust-side tests.
+//! `uniffi-bindgen` bin target (see its docs) - in CI for the device build.
+//! The SwiftUI app (`ios/`) consumes this surface on-device; Rust-side tests
+//! here validate the facade without Apple tooling.
 
 use std::sync::Arc;
 

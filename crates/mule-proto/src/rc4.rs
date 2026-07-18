@@ -4,7 +4,7 @@
 //! the TCP obfuscation layer discards the first 1024 keystream bytes after
 //! keying (`Rc4::new_discard(key, 1024)`), while the UDP layer discards none.
 //! The obfuscation key itself is always a 16-byte MD5 digest (see
-//! `crate::obf_key`).
+//! `crate::obf` for the derivations).
 //!
 //! RC4 is cryptographically broken and used here ONLY because the eMule wire
 //! protocol mandates it for obfuscation; it is not a security feature, it is an

@@ -4,9 +4,11 @@
 //!
 //! Three crypt bits are exchanged in the hello (CT_EMULE_MISCOPTIONS2 bits
 //! 7/8/9): a peer SUPPORTS, REQUESTS, or REQUIRES obfuscation. We hold the same
-//! three as local preferences. The peer's bits must be sanitized on read
-//! (requires implies requests implies supports); [`Capabilities`] already does
-//! this at parse time.
+//! three as local preferences. NOTE: [`Capabilities`] decodes the peer's bits
+//! RAW - no implication sanitization (requires implies requests implies
+//! supports) is applied anywhere yet, so an incoherent peer (requires without
+//! supports) passes `should_reject` but fails `should_obfuscate_outbound`,
+//! yielding a doomed plaintext connect. Candidate hardening.
 
 use crate::peer::Capabilities;
 

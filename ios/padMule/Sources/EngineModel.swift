@@ -122,7 +122,8 @@ final class EngineModel: ObservableObject {
     }
 
     /// Toggle uploading. Off is "Leech Mode": padMule keeps downloading but stops
-    /// serving files to peers. Optimistic - refresh() reconciles from the engine.
+    /// serving files to peers. Optimistic - the 1s poll timer's refresh()
+    /// reconciles from the engine.
     func setSharing(_ on: Bool) {
         guard let e = engine else { return }
         sharing = on
