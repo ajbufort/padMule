@@ -33,7 +33,7 @@ use crate::peer::HelloInfo;
 use crate::peer_conn::peer_handshake_inbound;
 use crate::search::{SearchParams, SearchResultFile};
 use crate::server_messages::{LoginRequest, DEFAULT_SERVER_FLAGS};
-use crate::share::{head_hash, is_upload_request, serve_shared, SharedFile};
+use crate::share::{head_hash, is_upload_request, serve_shared, SharedFile, UploadGate};
 use crate::transfer::build_file_req_ans_no_fil;
 use mule_files::{read_nodes_dat, read_server_met, write_nodes_dat, KadContact, NodesDat};
 use mule_kad::RoutingTable;
@@ -105,6 +105,11 @@ const SERVE_PEEK: Duration = Duration::from_secs(3);
 /// floors at 20) because an iPad on a phone uplink is not a seedbox; a peer that
 /// finds us full is answered "no file" and moves on rather than swamping us.
 const MAX_UPLOAD_SLOTS: usize = 8;
+/// How many peers may wait for a slot before we decline further requests. A
+/// small cap is honest for a foreground-only client (eMule's desktop default is
+/// thousands, which assumes an always-on seedbox); a queued peer holds an open
+/// connection here, so this also bounds fd/memory use.
+const UPLOAD_QUEUE_CAP: usize = 32;
 
 /// The next free `NNN.part` index in `dir`. aMule numbers part files this way and
 /// `resume_downloads` finds them by that name, so a new download MUST NOT reuse
@@ -341,33 +346,31 @@ async fn finish_download(
 }
 
 /// Serve one leecher: a peer that reached our listener and asked for a file
-/// (`first` is the request packet the listener already read). Refuses with "no
-/// file" when Leech Mode is on or we are at capacity, so the peer moves on
-/// cleanly instead of hanging. Holds an upload permit for the whole session.
+/// (`first` is the request packet the listener already read).
+///
+/// In Leech Mode (sharing off) we honestly decline with "no file" so the peer
+/// moves on. Otherwise we serve, and [`serve_shared`] handles the slot: it
+/// grants one immediately if free, or QUEUES the peer (OP_QUEUERANKING) and
+/// grants a freed slot in place. The permit is held inside serve_shared for the
+/// whole session.
 async fn serve_inbound<S>(
     fs: &mut FramedStream<S>,
     shared: &Arc<Mutex<Vec<SharedFile>>>,
     sharing: &Arc<AtomicBool>,
-    slots: &Arc<Semaphore>,
+    gate: &Arc<UploadGate>,
     first: Packet,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let refuse = |op_payload: &[u8]| head_hash(op_payload).map(|h| build_file_req_ans_no_fil(&h));
-    // Leech Mode, or already at the upload cap: decline and let the peer move on.
-    let permit = if sharing.load(Ordering::Relaxed) {
-        Arc::clone(slots).try_acquire_owned().ok()
-    } else {
-        None
-    };
-    let Some(_permit) = permit else {
-        if let Some(pkt) = refuse(&first.payload) {
-            let _ = fs.write_packet(&pkt).await;
+    if !sharing.load(Ordering::Relaxed) {
+        // Leech Mode: we may hold the file, but we are not sharing - say so.
+        if let Some(h) = head_hash(&first.payload) {
+            let _ = fs.write_packet(&build_file_req_ans_no_fil(&h)).await;
         }
         return;
-    };
+    }
     let library = shared.lock().await.clone();
-    let _ = serve_shared(fs, &library, Some(first)).await;
+    let _ = serve_shared(fs, &library, Some(first), Some(gate)).await;
 }
 
 /// What [`Engine::add_download`] did. Not an Error type: "no sources yet" is a
@@ -498,8 +501,9 @@ pub struct Engine {
     /// The upload switch. `false` is "Leech Mode": we still download, but serve
     /// nothing. An atomic so the listener task reads it without taking a lock.
     sharing: Arc<AtomicBool>,
-    /// Caps concurrent uploads (see `MAX_UPLOAD_SLOTS`). Shared with the listener.
-    upload_slots: Arc<Semaphore>,
+    /// Upload slots + wait queue (see `MAX_UPLOAD_SLOTS` / `UPLOAD_QUEUE_CAP`).
+    /// Shared with the listener; serve_shared grants/queues against it.
+    upload_gate: Arc<UploadGate>,
     /// The live eD2k server link, once logged in.
     server: Option<ServerLink>,
     /// What that login yielded (server address + HighID/LowID), for the UI.
@@ -535,7 +539,10 @@ impl Engine {
             downloads: Arc::new(Mutex::new(Vec::new())),
             shared: Arc::new(Mutex::new(Vec::new())),
             sharing: Arc::new(AtomicBool::new(true)),
-            upload_slots: Arc::new(Semaphore::new(MAX_UPLOAD_SLOTS)),
+            upload_gate: Arc::new(UploadGate::new(
+                Arc::new(Semaphore::new(MAX_UPLOAD_SLOTS)),
+                UPLOAD_QUEUE_CAP,
+            )),
             server: None,
             connection: None,
             kad: None,
@@ -742,7 +749,7 @@ impl Engine {
         let downloads = Arc::clone(&self.downloads);
         let shared = Arc::clone(&self.shared);
         let sharing = Arc::clone(&self.sharing);
-        let slots = Arc::clone(&self.upload_slots);
+        let gate = Arc::clone(&self.upload_gate);
         let handle = tokio::spawn(async move {
             loop {
                 let Ok((stream, _peer)) = listener.accept().await else {
@@ -752,7 +759,7 @@ impl Engine {
                 let downloads = Arc::clone(&downloads);
                 let shared = Arc::clone(&shared);
                 let sharing = Arc::clone(&sharing);
-                let slots = Arc::clone(&slots);
+                let gate = Arc::clone(&gate);
                 tokio::spawn(async move {
                     let mut fs = FramedStream::new(stream);
                     // A bare connect+close (the server's HighID probe) ends here.
@@ -767,7 +774,7 @@ impl Engine {
                     // path below reads cleanly (see framed::read_packet).
                     match timeout(SERVE_PEEK, fs.read_packet_unpacked()).await {
                         Ok(Ok(pkt)) if is_upload_request(pkt.opcode) => {
-                            serve_inbound(&mut fs, &shared, &sharing, &slots, pkt).await;
+                            serve_inbound(&mut fs, &shared, &sharing, &gate, pkt).await;
                         }
                         // Spoke, but not an upload request, or the link errored:
                         // nothing we can do with it.
@@ -1399,7 +1406,10 @@ mod tests {
             path: PathBuf::from("/does/not/matter"),
         }]));
         let sharing = Arc::new(AtomicBool::new(false)); // Leech Mode
-        let slots = Arc::new(Semaphore::new(MAX_UPLOAD_SLOTS));
+        let gate = Arc::new(UploadGate::new(
+            Arc::new(Semaphore::new(MAX_UPLOAD_SLOTS)),
+            UPLOAD_QUEUE_CAP,
+        ));
 
         let (client, server) = tokio::io::duplex(8192);
         let mut server_fs = FramedStream::new(server);
@@ -1407,7 +1417,7 @@ mod tests {
 
         let first = build_request_filename_ext(&hash);
         let srv = tokio::spawn(async move {
-            serve_inbound(&mut server_fs, &shared, &sharing, &slots, first).await
+            serve_inbound(&mut server_fs, &shared, &sharing, &gate, first).await
         });
 
         let reply = client_fs.read_packet_unpacked().await.unwrap();
@@ -1415,6 +1425,67 @@ mod tests {
             reply.opcode, OP_FILEREQANSNOFIL,
             "Leech Mode must decline, not serve"
         );
+        srv.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_full_queue_ranks_the_peer_then_grants_when_a_slot_frees() {
+        use crate::transfer::{
+            build_request_filename_ext, build_start_upload_req, parse_queue_ranking,
+            OP_ACCEPTUPLOADREQ, OP_QUEUERANKING,
+        };
+        // One slot, already occupied by a held permit, so the next requester must
+        // queue instead of being served or refused.
+        let sem = Arc::new(Semaphore::new(1));
+        let held = Arc::clone(&sem).try_acquire_owned().unwrap();
+        let gate = Arc::new(UploadGate::new(Arc::clone(&sem), UPLOAD_QUEUE_CAP));
+
+        let hash = [0x7C; 16];
+        let shared = vec![SharedFile {
+            hash,
+            size: 100,
+            name: b"q.bin".to_vec(),
+            part_hashes: vec![],
+            path: PathBuf::from("/does/not/matter"),
+        }];
+
+        let (client, server) = tokio::io::duplex(8192);
+        let mut server_fs = FramedStream::new(server);
+        let mut client_fs = FramedStream::new(client);
+
+        let gate2 = Arc::clone(&gate);
+        let srv = tokio::spawn(async move {
+            let _ = serve_shared(&mut server_fs, &shared, None, Some(&gate2)).await;
+        });
+
+        // Name the file, then ask to upload - the slot is taken, so we are queued.
+        client_fs
+            .write_packet(&build_request_filename_ext(&hash))
+            .await
+            .unwrap();
+        let _ = client_fs.read_packet_unpacked().await.unwrap(); // filename answer
+        client_fs
+            .write_packet(&build_start_upload_req(&hash))
+            .await
+            .unwrap();
+        let ranked = client_fs.read_packet_unpacked().await.unwrap();
+        assert_eq!(ranked.opcode, OP_QUEUERANKING, "at capacity -> a rank");
+        assert_eq!(
+            parse_queue_ranking(&ranked.payload).unwrap(),
+            1,
+            "first in line"
+        );
+        assert_eq!(gate.waiting(), 1);
+
+        // Free the slot -> the queued peer is granted IN PLACE (no reconnect).
+        drop(held);
+        let accepted = client_fs.read_packet_unpacked().await.unwrap();
+        assert_eq!(
+            accepted.opcode, OP_ACCEPTUPLOADREQ,
+            "the freed slot is granted"
+        );
+
+        drop(client_fs);
         srv.await.unwrap();
     }
 
@@ -1437,7 +1508,10 @@ mod tests {
             path,
         }]));
         let sharing = Arc::new(AtomicBool::new(true));
-        let slots = Arc::new(Semaphore::new(MAX_UPLOAD_SLOTS));
+        let gate = Arc::new(UploadGate::new(
+            Arc::new(Semaphore::new(MAX_UPLOAD_SLOTS)),
+            UPLOAD_QUEUE_CAP,
+        ));
 
         let (client, server) = tokio::io::duplex(128 * 1024);
         let mut server_fs = FramedStream::new(server);
@@ -1446,7 +1520,7 @@ mod tests {
         let srv = tokio::spawn(async move {
             // The listener peeks the first packet before deciding; do the same.
             let first = server_fs.read_packet_unpacked().await.unwrap();
-            serve_inbound(&mut server_fs, &shared, &sharing, &slots, first).await;
+            serve_inbound(&mut server_fs, &shared, &sharing, &gate, first).await;
         });
 
         let got = crate::transfer_session::download_file(&mut client_fs, &hash, data.len() as u64)
