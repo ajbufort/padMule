@@ -200,8 +200,12 @@ fn load_ip_filter(config_dir: &Path) -> Option<Arc<IpFilter>> {
     let candidates = ["ipfilter.dat", "ipfilter.p2p", "guarding.p2p"];
     let mut text = String::new();
     for name in candidates {
-        if let Ok(s) = std::fs::read_to_string(config_dir.join(name)) {
-            text.push_str(&s);
+        // Read as bytes + lossy, NOT read_to_string: real community lists carry
+        // Latin-1/Windows-1252 bytes in the description field, and strict UTF-8
+        // would discard the whole file (fail-open). The parser ignores
+        // descriptions, so a lossy decode loads identical ranges.
+        if let Ok(bytes) = std::fs::read(config_dir.join(name)) {
+            text.push_str(&String::from_utf8_lossy(&bytes));
             text.push('\n');
         }
     }
@@ -2106,16 +2110,22 @@ mod tests {
         let dir = tmp("ipfilter-load");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        // A Latin-1 byte (0xE9) in the description, as real community lists have:
+        // the file must still load (bytes + lossy, not strict UTF-8).
         std::fs::write(
             dir.join("ipfilter.dat"),
-            "# test list\n10.0.0.0 - 10.0.0.255 , 0 , bad range\n",
+            b"# test list\n10.0.0.0 - 10.0.0.255 , 0 , R\xE9seau bad range\n",
         )
         .unwrap();
         let (mut engine, _rx) = Engine::new(&dir).unwrap();
         engine.set_offline(true);
         assert_eq!(engine.ip_filter_ranges(), 0, "not loaded until start");
         engine.start().await;
-        assert_eq!(engine.ip_filter_ranges(), 1, "start() loads ipfilter.dat");
+        assert_eq!(
+            engine.ip_filter_ranges(),
+            1,
+            "start() loads ipfilter.dat despite a non-UTF-8 description byte"
+        );
         assert!(engine
             .ip_filter
             .as_ref()
