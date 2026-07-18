@@ -24,6 +24,22 @@ final class EngineModel: ObservableObject {
     /// event-derived ID is overwritten in the same frame it arrives.
     @Published private(set) var server: ServerInfoFfi?
     @Published private(set) var results: [SearchHit] = []
+    // Sort / filter inputs (UI-owned; applied client-side over `results`).
+    @Published var sortKey: SortKey = .sources
+    @Published var sortAscending: Bool = false
+    @Published var nameFilter: String = ""
+    @Published var typeFilter: String?
+    @Published var trustedOnly: Bool = false
+    @Published var hideHave: Bool = false
+
+    /// The results after the current sort + filter. Recomputed on demand (cheap:
+    /// a few hundred rows) so any input change reorders instantly.
+    var presentedResults: [SearchHit] {
+        present(results, sort: sortKey, ascending: sortAscending,
+                nameFilter: nameFilter, typeFilter: typeFilter,
+                trustedOnly: trustedOnly, hideHave: hideHave)
+    }
+
     @Published private(set) var searching = false
     /// True once a search has actually run, so "no results" is only ever shown
     /// about a real search - never about a box the user has not used yet.
