@@ -20,6 +20,7 @@ struct SearchDetailView: View {
                     row("Size", ByteCountFormatter.string(fromByteCount: Int64(hit.size), countStyle: .file))
                     row("Sources", "\(hit.sources)"
                         + (hit.completeSources > 0 ? " (\(hit.completeSources) complete)" : ""))
+                    if hit.rating > 0 { row("Rating", ratingText(hit.rating)) }
                     if hit.lengthSecs > 0 { row("Length", "\(hit.lengthSecs)s") }
                     if hit.bitrate > 0 { row("Bitrate", "\(hit.bitrate) kbps") }
                     if !hit.codec.isEmpty { row("Codec", hit.codec) }
@@ -53,6 +54,16 @@ struct SearchDetailView: View {
                     Button("Done") { dismiss() }
                 }
             }
+        }
+    }
+
+    private func ratingText(_ rating: UInt8) -> String {
+        switch rating {
+        case 1: return "Fake / Invalid"
+        case 2: return "Poor"
+        case 3: return "Fair"
+        case 4: return "Good"
+        default: return "Excellent"
         }
     }
 

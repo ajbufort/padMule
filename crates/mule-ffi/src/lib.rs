@@ -168,6 +168,9 @@ pub struct SearchHit {
     pub length_secs: u32,
     pub bitrate: u32,
     pub codec: String,
+    /// Server rating 0-5 (0 = none, 1 = Fake, 2 = Poor, 3 = Fair, 4 = Good,
+    /// 5 = Excellent). Usually 0 - most servers do not advertise a rating.
+    pub rating: u8,
     /// False when the metadata is self-contradictory (e.g. one hash advertising
     /// two sizes). Shown, not hidden: the user decides.
     pub trusted: bool,
@@ -408,6 +411,7 @@ impl MuleEngine {
                     length_secs: r.length_secs,
                     bitrate: r.bitrate,
                     codec: r.codec,
+                    rating: r.rating,
                     trusted,
                     warning,
                     status,
@@ -487,11 +491,13 @@ mod tests {
             length_secs: 10,
             bitrate: 128,
             codec: "mp3".to_string(),
+            rating: 4,
             trusted: true,
             warning: String::new(),
             status: HitStatusFfi::New,
         };
         assert_eq!(h.file_type, "Audio");
+        assert_eq!(h.rating, 4);
         assert_eq!(h.status, HitStatusFfi::New);
     }
 

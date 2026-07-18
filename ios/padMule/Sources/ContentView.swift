@@ -326,7 +326,10 @@ struct ContentView: View {
             statusDot(hit.status)
                 .padding(.top, 5)
             VStack(alignment: .leading, spacing: 2) {
-                Text(hit.name).lineLimit(2)
+                HStack(spacing: 6) {
+                    Text(hit.name).lineLimit(2)
+                    ratingBadge(hit.rating)
+                }
                 if let meta = metaLine(hit) {
                     Text(meta).font(.caption).foregroundStyle(.secondary)
                 }
@@ -363,6 +366,31 @@ struct ContentView: View {
             Image(systemName: "arrow.down.circle.fill").foregroundStyle(.orange)
         case .new:
             Image(systemName: "circle").foregroundStyle(.secondary)
+        }
+    }
+
+    /// A colored rating pill (server FT_FILERATING). Hidden when unrated (0).
+    @ViewBuilder
+    private func ratingBadge(_ rating: UInt8) -> some View {
+        if rating > 0 {
+            let (label, color) = ratingStyle(rating)
+            Text(label)
+                .font(.caption2)
+                .padding(.horizontal, 5)
+                .padding(.vertical, 1)
+                .background(color.opacity(0.2))
+                .foregroundStyle(color)
+                .clipShape(Capsule())
+        }
+    }
+
+    private func ratingStyle(_ rating: UInt8) -> (String, Color) {
+        switch rating {
+        case 1: return ("Fake", .red)
+        case 2: return ("Poor", .orange)
+        case 3: return ("Fair", .yellow)
+        case 4: return ("Good", .green)
+        default: return ("Excellent", .green)
         }
     }
 
