@@ -15,17 +15,53 @@
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use mule_proto::Packet;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::framed::{FrameError, FramedStream};
 use crate::transfer::{
     build_accept_upload, build_file_req_ans_no_fil, build_file_status_complete,
-    build_hashset_answer, build_req_filename_answer, build_sending_part, parse_request_parts,
-    OP_HASHSETREQUEST, OP_REQUESTFILENAME, OP_REQUESTPARTS, OP_REQUESTPARTS_I64, OP_SETREQFILEID,
-    OP_STARTUPLOADREQ,
+    build_hashset_answer, build_queue_ranking, build_req_filename_answer, build_sending_part,
+    parse_request_parts, OP_HASHSETREQUEST, OP_REQUESTFILENAME, OP_REQUESTPARTS,
+    OP_REQUESTPARTS_I64, OP_SETREQFILEID, OP_STARTUPLOADREQ,
 };
+
+/// A bounded upload gate: `slots` concurrent uploads plus a wait queue. When
+/// every slot is busy, a new requester is queued and told its 1-based place
+/// (OP_QUEUERANKING), then granted a slot IN PLACE on the connection we already
+/// hold open the moment one frees.
+///
+/// Deliberately scoped to that held connection: no cross-connection queue
+/// persistence, no slot-grant dial-out to an idled peer, and no UDP
+/// OP_REASKFILEPING handling. Those are the always-on desktop-seedbox parts of
+/// eMule's design; padMule is foreground-only (sockets die on background), so a
+/// long-lived queue would be dishonest here. Rank is arrival-order (FIFO); the
+/// wire number is truthful for that ordering, and eMule's score-ordered queue
+/// is wire-neutral local policy we can layer on later.
+pub struct UploadGate {
+    slots: Arc<Semaphore>,
+    waiting: AtomicUsize,
+    queue_cap: usize,
+}
+
+impl UploadGate {
+    pub fn new(slots: Arc<Semaphore>, queue_cap: usize) -> Self {
+        UploadGate {
+            slots,
+            waiting: AtomicUsize::new(0),
+            queue_cap,
+        }
+    }
+
+    /// Currently-waiting (queued, not yet granted) peers. For tests/telemetry.
+    pub fn waiting(&self) -> usize {
+        self.waiting.load(Ordering::Acquire)
+    }
+}
 
 /// A complete file we will serve to peers.
 #[derive(Debug, Clone)]
@@ -79,6 +115,7 @@ pub async fn serve_shared<S>(
     fs: &mut FramedStream<S>,
     library: &[SharedFile],
     first: Option<Packet>,
+    gate: Option<&UploadGate>,
 ) -> Result<(), FrameError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -88,6 +125,10 @@ where
     };
     // The file this peer is after, once it names one.
     let mut file: Option<SharedFile> = None;
+    // The upload slot, held for the whole session once granted (immediately if a
+    // slot is free, or after queueing). Kept alive here so dropping it on return
+    // frees the slot for the next waiter.
+    let mut permit: Option<OwnedSemaphorePermit> = None;
     let mut pending = first;
     loop {
         let pkt = match pending.take() {
@@ -136,8 +177,49 @@ where
                 }
             }
             OP_STARTUPLOADREQ => {
-                if file.is_some() {
+                let Some(f) = file.clone() else { continue };
+                // Already holding a slot (e.g. the peer re-asks): re-accept.
+                if permit.is_some() {
                     fs.write_packet(&build_accept_upload()).await?;
+                    continue;
+                }
+                match gate {
+                    // Ungated (tests / the differential serve path): grant freely.
+                    None => fs.write_packet(&build_accept_upload()).await?,
+                    Some(g) => {
+                        match Arc::clone(&g.slots).try_acquire_owned() {
+                            // A slot was free - grant it right away.
+                            Ok(p) => {
+                                permit = Some(p);
+                                fs.write_packet(&build_accept_upload()).await?;
+                            }
+                            // At capacity: queue this peer (bounded) and send its
+                            // 1-based rank, then wait in place for a slot.
+                            Err(_) => {
+                                let ahead = g.waiting.fetch_add(1, Ordering::AcqRel);
+                                if ahead >= g.queue_cap {
+                                    g.waiting.fetch_sub(1, Ordering::AcqRel);
+                                    fs.write_packet(&build_file_req_ans_no_fil(&f.hash)).await?;
+                                    return Ok(());
+                                }
+                                let rank = ahead.saturating_add(1).min(u16::MAX as usize) as u16;
+                                // eMule bans a peer that receives an UNSOLICITED
+                                // rank; only ever send it in reply to this ask.
+                                fs.write_packet(&build_queue_ranking(rank)).await?;
+                                // The fair semaphore hands the freed slot to the
+                                // longest waiter, so grants are FIFO.
+                                let granted = Arc::clone(&g.slots).acquire_owned().await;
+                                g.waiting.fetch_sub(1, Ordering::AcqRel);
+                                match granted {
+                                    Ok(p) => {
+                                        permit = Some(p);
+                                        fs.write_packet(&build_accept_upload()).await?;
+                                    }
+                                    Err(_) => return Ok(()), // gate closed
+                                }
+                            }
+                        }
+                    }
                 }
             }
             OP_REQUESTPARTS | OP_REQUESTPARTS_I64 => {
@@ -202,7 +284,7 @@ mod tests {
         let up = tokio::spawn(async move {
             let me = HelloInfo::baseline([0xBB; 16], 0, 4662, 4672, "seed");
             if let Ok((_p, mut fs)) = accept_peer(&listener, &me).await {
-                let _ = serve_shared(&mut fs, &shared, None).await;
+                let _ = serve_shared(&mut fs, &shared, None, None).await;
             }
         });
 
@@ -228,7 +310,7 @@ mod tests {
         let up = tokio::spawn(async move {
             let me = HelloInfo::baseline([0xBB; 16], 0, 4662, 4672, "seed");
             if let Ok((_p, mut fs)) = accept_peer(&listener, &me).await {
-                let _ = serve_shared(&mut fs, &[], None).await;
+                let _ = serve_shared(&mut fs, &[], None, None).await;
             }
         });
 
@@ -272,7 +354,7 @@ mod tests {
         let up = tokio::spawn(async move {
             let me = HelloInfo::baseline([0xBB; 16], 0, 4662, 4672, "seed");
             if let Ok((_p, mut fs)) = accept_peer(&listener, &me).await {
-                let _ = serve_shared(&mut fs, &shared, None).await;
+                let _ = serve_shared(&mut fs, &shared, None, None).await;
             }
         });
 

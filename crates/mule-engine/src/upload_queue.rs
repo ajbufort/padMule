@@ -2,11 +2,14 @@
 //! See docs/raw/wave4d-upstream-research-2026-07-14.md section 2
 //! (UploadQueue.cpp:304-333 slots, UploadClient.cpp:75-148 scoring).
 //!
-//! This is local policy, not wire format. NOTE: the live serve path does not
-//! use this queue yet - `share.rs` grants slots from a Semaphore and REFUSES
-//! at capacity with OP_FILEREQANSNOFIL, so padMule never sends the
-//! OP_QUEUERANKING this module can rank for. Wiring real queueing into serve
-//! is an open candidate feature (stock clients queue waiting peers).
+//! This is local policy, not wire format. NOTE: the live serve path uses a
+//! SIMPLER queue than this module - `share.rs::UploadGate` queues a peer at
+//! capacity and sends it OP_QUEUERANKING, granting a freed slot in arrival
+//! (FIFO) order on the connection padMule holds open. This module's
+//! SCORE-ordered ranking (credits x file-priority x wait-time) is not wired in;
+//! reordering the queue by score is wire-neutral policy that can layer onto the
+//! gate later. The wait clock and clients.met persistence below are the pieces
+//! that upgrade would reuse.
 //!
 //! The wait clock is deliberately keyed to a peer's PERSISTED wait-start (which
 //! upstream stores in clients.met), so a peer that reconnects does not lose its
