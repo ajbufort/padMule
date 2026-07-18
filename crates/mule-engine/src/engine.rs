@@ -305,10 +305,33 @@ fn persist_shared_file(config_dir: &Path, sf: &SharedFile) {
     // Atomic: write a temp file then rename over known.met, so a crash mid-write
     // cannot leave a torn file that load_shared_library would read as empty and
     // silently reset the whole library.
-    let bytes = mule_files::write_known_met(&met);
+    write_known_met_atomic(&path, &met);
+}
+
+/// Remove one file (by hash) from `known.met` so it is not re-shared on restart.
+/// Caller must hold the known.met lock. A no-op if the file is absent.
+fn forget_shared_file(config_dir: &Path, hash: [u8; 16]) {
+    let path = config_dir.join(KNOWN_MET);
+    let Some(mut met) = std::fs::read(&path)
+        .ok()
+        .and_then(|b| mule_files::read_known_met(&b).ok())
+    else {
+        return;
+    };
+    let before = met.entries.len();
+    met.entries.retain(|e| e.file_hash != hash);
+    if met.entries.len() != before {
+        write_known_met_atomic(&path, &met);
+    }
+}
+
+/// Write `met` to `path` atomically (temp file + rename), so a crash mid-write
+/// never leaves a torn known.met that would read back as an empty library.
+fn write_known_met_atomic(path: &Path, met: &mule_files::KnownMet) {
+    let bytes = mule_files::write_known_met(met);
     let tmp = path.with_extension("met.tmp");
     if std::fs::write(&tmp, &bytes).is_ok() {
-        let _ = std::fs::rename(&tmp, &path);
+        let _ = std::fs::rename(&tmp, path);
     }
 }
 
@@ -1369,6 +1392,24 @@ impl Engine {
         true
     }
 
+    /// Stop serving one shared file, keeping the file itself on disk. Removes it
+    /// from the live library AND from `known.met`, so it does not re-share on the
+    /// next start. Returns false if we were not sharing that hash.
+    pub async fn unshare_file(&mut self, hash: [u8; 16]) -> bool {
+        let removed = {
+            let mut guard = self.shared.lock().await;
+            let before = guard.len();
+            guard.retain(|s| s.hash != hash);
+            before != guard.len()
+        };
+        if removed {
+            let _g = self.known_met_lock.lock().await;
+            forget_shared_file(&self.config_dir, hash);
+            self.emit(EngineEvent::Server("Stopped sharing a file".into()));
+        }
+        removed
+    }
+
     /// App backgrounded: checkpoint to disk and release sockets. Idempotent - a
     /// no-op unless currently `Running`. `Running` -> `Paused`.
     pub async fn pause(&mut self) {
@@ -2131,6 +2172,56 @@ mod tests {
             .as_ref()
             .unwrap()
             .is_blocked("10.0.0.9".parse().unwrap()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn unshare_removes_from_the_library_and_known_met() {
+        let dir = tmp("unshare");
+        let _ = std::fs::remove_dir_all(&dir);
+        let downloads = dir.join("downloads");
+        std::fs::create_dir_all(&downloads).unwrap();
+        std::fs::write(downloads.join("keep.bin"), b"a").unwrap();
+        std::fs::write(downloads.join("drop.bin"), b"bb").unwrap();
+        let keep = SharedFile {
+            hash: [0xAA; 16],
+            size: 1,
+            name: b"keep.bin".to_vec(),
+            part_hashes: vec![],
+            path: downloads.join("keep.bin"),
+        };
+        let drop = SharedFile {
+            hash: [0xBB; 16],
+            size: 2,
+            name: b"drop.bin".to_vec(),
+            part_hashes: vec![],
+            path: downloads.join("drop.bin"),
+        };
+        persist_shared_file(&dir, &keep);
+        persist_shared_file(&dir, &drop);
+
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+        engine.set_offline(true);
+        engine.shared.lock().await.push(keep);
+        engine.shared.lock().await.push(drop);
+
+        assert!(engine.unshare_file([0xBB; 16]).await, "found and removed");
+        assert!(
+            !engine.unshare_file([0xCC; 16]).await,
+            "unknown hash is false"
+        );
+        // Gone from the live library...
+        assert_eq!(engine.shared.lock().await.len(), 1);
+        assert_eq!(engine.shared.lock().await[0].hash, [0xAA; 16]);
+        // ...and from known.met, so a reload does not re-share it (the file is
+        // still on disk).
+        let lib = load_shared_library(&dir, &downloads);
+        assert_eq!(lib.len(), 1);
+        assert_eq!(lib[0].hash, [0xAA; 16]);
+        assert!(
+            downloads.join("drop.bin").exists(),
+            "the file itself is kept"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

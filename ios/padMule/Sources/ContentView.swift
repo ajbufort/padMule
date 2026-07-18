@@ -275,6 +275,15 @@ struct ContentView: View {
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
+                        .swipeActions(edge: .trailing) {
+                            // Stop serving this file; the file stays in your Files.
+                            Button {
+                                model.unshare(f.hash)
+                            } label: {
+                                Label("Unshare", systemImage: "xmark.circle")
+                            }
+                            .tint(.orange)
+                        }
                     }
                 }
             }
