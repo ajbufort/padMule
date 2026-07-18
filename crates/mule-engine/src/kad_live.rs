@@ -92,19 +92,31 @@ pub struct KadNode {
 
 impl KadNode {
     /// Bind a Kad node on `bind_addr` (e.g. `0.0.0.0:4672`) with a fresh random
-    /// identity. `tcp_port` is advertised in HELLO.
+    /// identity. `tcp_port` is advertised in HELLO. For one-shot CLI use; a
+    /// long-lived client should pass its persisted identity via
+    /// [`KadNode::bind_with_identity`] (eMule persists both values - a stable
+    /// ID keeps routing-table reciprocity, and a stable install key keeps the
+    /// UDP verify keys peers stored for us valid across restarts).
     pub async fn bind(bind_addr: SocketAddr, tcp_port: u16) -> Result<Self, KadError> {
-        let socket = UdpSocket::bind(bind_addr).await?;
-        let udp_port = socket.local_addr()?.port();
-        // Random 128-bit Kad ID and 32-bit install key (eMule persists these; a
-        // fresh identity per run is fine for joining/bootstrapping).
         let kad_id = Kad128::from_words([
             rand::random(),
             rand::random(),
             rand::random(),
             rand::random(),
         ]);
-        let udp_key = rand::random();
+        Self::bind_with_identity(bind_addr, tcp_port, kad_id, rand::random()).await
+    }
+
+    /// Bind a Kad node using a persisted identity (`NodeIdentity::kad_id` /
+    /// `kad_udp_key`).
+    pub async fn bind_with_identity(
+        bind_addr: SocketAddr,
+        tcp_port: u16,
+        kad_id: Kad128,
+        udp_key: u32,
+    ) -> Result<Self, KadError> {
+        let socket = UdpSocket::bind(bind_addr).await?;
+        let udp_port = socket.local_addr()?.port();
         Ok(KadNode {
             socket,
             kad_id,
@@ -490,5 +502,19 @@ mod tests {
     fn ip_u32_round_trips_an_arbitrary_v4() {
         let addr: SocketAddr = "203.0.113.7:1234".parse().unwrap();
         assert_eq!(contact_addr(ip_u32(&addr), 1234), addr);
+    }
+
+    #[tokio::test]
+    async fn bind_with_identity_keeps_the_persisted_id_and_key() {
+        // The engine passes NodeIdentity::{kad_id, kad_udp_key}; the node must
+        // adopt them verbatim (a fresh random identity here would silently
+        // re-key Kad on every app start - the bug this constructor fixes).
+        let id = Kad128::from_words([1, 2, 3, 4]);
+        let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let node = KadNode::bind_with_identity(bind, 4662, id, 0xDEAD_BEEF)
+            .await
+            .unwrap();
+        assert_eq!(node.kad_id(), id);
+        assert_eq!(node.udp_key, 0xDEAD_BEEF);
     }
 }
