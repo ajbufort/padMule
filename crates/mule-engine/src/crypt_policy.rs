@@ -4,11 +4,16 @@
 //!
 //! Three crypt bits are exchanged in the hello (CT_EMULE_MISCOPTIONS2 bits
 //! 7/8/9): a peer SUPPORTS, REQUESTS, or REQUIRES obfuscation. We hold the same
-//! three as local preferences. NOTE: [`Capabilities`] decodes the peer's bits
-//! RAW - no implication sanitization (requires implies requests implies
-//! supports) is applied anywhere yet, so an incoherent peer (requires without
-//! supports) passes `should_reject` but fails `should_obfuscate_outbound`,
-//! yielding a doomed plaintext connect. Candidate hardening.
+//! three as local preferences. [`Capabilities`] decodes the peer's bits RAW, on
+//! purpose: eMule 0.50a does NOT sanitize them either (SetConnectOptions,
+//! BaseClient.cpp:3190-3192, sets each bit independently), and the two
+//! predicates below are byte-identical to eMule's own (reject at
+//! BaseClient.cpp:1437, obfuscate at :1647). An incoherent peer (requires
+//! without supports) therefore resolves EXACTLY as eMule resolves it: not
+//! rejected (we support crypt), not obfuscated (the peer does not), so a
+//! plaintext connect that the malformed peer can accept or drop. Adding an
+//! implication sanitizer here would DIVERGE from the wire authority, so we do
+//! not - matching eMule is the point.
 
 use crate::peer::Capabilities;
 
