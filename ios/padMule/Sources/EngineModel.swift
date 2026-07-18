@@ -28,6 +28,13 @@ final class EngineModel: ObservableObject {
     /// event-derived ID is overwritten in the same frame it arrives.
     @Published private(set) var server: ServerInfoFfi?
     @Published private(set) var results: [SearchHit] = []
+    // Pre-search WIRE filters (sent to the server so it pre-filters the capped
+    // result set), distinct from the client-side sort/filter chips below which
+    // refine what came back. `mb` values are megabytes; 0 = no bound.
+    @Published var wireCompleteOnly = false
+    @Published var wireMinSizeMb: UInt64 = 0
+    @Published var wireMaxSizeMb: UInt64 = 0
+
     // Sort / filter inputs (UI-owned; applied client-side over `results`).
     @Published var sortKey: SortKey = .sources
     @Published var sortAscending: Bool = false
@@ -113,8 +120,14 @@ final class EngineModel: ObservableObject {
         recordRecent(q)
         searching = true
         notice = nil
+        let mb: UInt64 = 1_048_576
+        let filters = SearchFilters(
+            completeOnly: wireCompleteOnly,
+            minSize: wireMinSizeMb * mb,
+            maxSize: wireMaxSizeMb * mb
+        )
         work.async { [weak self] in
-            let hits = e.search(keyword: q)
+            let hits = e.search(keyword: q, filters: filters)
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.searching = false

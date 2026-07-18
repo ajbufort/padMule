@@ -1007,6 +1007,7 @@ async fn cmd_search_download(met_path: &str, keyword: &str, out: &str) {
         file_type: None,
         min_size: Some(1),
         max_size: Some(MAX_SIZE as u32),
+        min_sources: None,
         extension: Some(keyword.to_string()),
     };
     println!("searching for '{keyword}' ...");
@@ -1556,6 +1557,7 @@ async fn cmd_fetch_complete(
         // and let the client-side u64 filter enforce the real bound.
         min_size: Some(min_size.clamp(1, u32::MAX as u64) as u32),
         max_size: (max_size <= u32::MAX as u64).then_some(max_size as u32),
+        min_sources: None,
         extension: Some(keyword.to_string()),
     };
     println!("searching '{keyword}' ({min_size}..={max_size} bytes) ...");

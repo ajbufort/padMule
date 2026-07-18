@@ -118,6 +118,18 @@ struct ContentView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+                // Pre-search filters: the server applies these to what it returns,
+                // so the capped result set fills with matches instead of junk.
+                Toggle("Complete sources only", isOn: $model.wireCompleteOnly)
+                    .font(.caption)
+                HStack {
+                    Text("Size").font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    sizeMenu("Min", selection: $model.wireMinSizeMb)
+                    Text("-").foregroundStyle(.secondary)
+                    sizeMenu("Max", selection: $model.wireMaxSizeMb)
+                }
+                .font(.caption)
                 if model.searched && !model.results.isEmpty {
                     HStack {
                         Menu {
@@ -414,6 +426,22 @@ struct ContentView: View {
             Text(v).multilineTextAlignment(.trailing)
         }
         .font(.callout)
+    }
+
+    /// A size-preset menu (megabytes; 0 = "Any") for the pre-search size bounds.
+    private func sizeMenu(_ label: String, selection: Binding<UInt64>) -> some View {
+        let presets: [UInt64] = [0, 1, 10, 100, 700, 1024, 4096]
+        return Menu {
+            ForEach(presets, id: \.self) { mb in
+                Button(mb == 0 ? "Any" : sizeLabel(mb)) { selection.wrappedValue = mb }
+            }
+        } label: {
+            Text(selection.wrappedValue == 0 ? "\(label): Any" : "\(label): \(sizeLabel(selection.wrappedValue))")
+        }
+    }
+
+    private func sizeLabel(_ mb: UInt64) -> String {
+        mb >= 1024 ? "\(mb / 1024) GB" : "\(mb) MB"
     }
 
     private func banner(_ text: String, systemImage: String, tint: Color) -> some View {
