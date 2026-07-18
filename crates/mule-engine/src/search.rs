@@ -23,6 +23,7 @@ pub const ED2K_SEARCH_OP_LESS: u8 = 2;
 const FT_FILESIZE: u8 = 0x02;
 const FT_FILETYPE: u8 = 0x03;
 const FT_FILEFORMAT: u8 = 0x04;
+const FT_SOURCES: u8 = 0x15;
 
 /// A server search query. Only `keyword` is required; the rest are AND filters.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -32,6 +33,9 @@ pub struct SearchParams {
     pub file_type: Option<String>,
     pub min_size: Option<u32>,
     pub max_size: Option<u32>,
+    /// Minimum availability (sources). eMule queries FT_SOURCES; we express `>=N`
+    /// as `> N-1` so old dserver-only indexes (no GREATER_EQUAL op) honor it too.
+    pub min_sources: Option<u32>,
     /// e.g. "avi" (FT_FILEFORMAT).
     pub extension: Option<String>,
 }
@@ -87,6 +91,16 @@ pub fn build_search_request(p: &SearchParams) -> Packet {
     }
     if let Some(sz) = p.max_size {
         terms.push(Term::NumericMeta(FT_FILESIZE, ED2K_SEARCH_OP_LESS, sz));
+    }
+    if let Some(min) = p.min_sources {
+        // `>= min` as `> min-1`; min 0 is a no-op filter, so skip it.
+        if min > 0 {
+            terms.push(Term::NumericMeta(
+                FT_SOURCES,
+                ED2K_SEARCH_OP_GREATER,
+                min - 1,
+            ));
+        }
     }
     if let Some(ext) = &p.extension {
         terms.push(Term::StringMeta(FT_FILEFORMAT, ext));
@@ -242,21 +256,61 @@ mod tests {
             file_type: Some("Video".to_string()),
             min_size: Some(1),
             max_size: Some(2),
+            min_sources: Some(5),
             extension: Some("avi".to_string()),
         };
         let pkt = build_search_request(&p);
-        // 5 terms -> 4 ANDs before terms 0..3, none before the last.
+        // 6 terms -> 5 ANDs before terms 0..4, none before the last.
         let and_count = pkt
             .payload
             .windows(2)
             .filter(|w| w == &[0x00u8, 0x00])
             .count();
-        assert!(and_count >= 4);
+        assert!(and_count >= 5);
         // Framing round-trip.
         let wire = write_packet(&pkt);
         let (parsed, consumed) = read_packet(&wire).unwrap().unwrap();
         assert_eq!(parsed, pkt);
         assert_eq!(consumed, wire.len());
+    }
+
+    #[test]
+    fn min_sources_becomes_a_greater_than_n_minus_one_term() {
+        // `>= 1` availability must serialize as FT_SOURCES > 0, so old
+        // dserver-only indexes (which lack the GREATER_EQUAL op) still honor it.
+        let p = SearchParams {
+            keyword: "x".to_string(),
+            min_sources: Some(1),
+            ..Default::default()
+        };
+        let pkt = build_search_request(&p);
+        // Numeric-meta term: [int32 value=0][op=GREATER][taglen=1,0][FT_SOURCES].
+        let expected_term = [
+            0x00,
+            0x00,
+            0x00,
+            0x00, // value 0 (= 1 - 1)
+            ED2K_SEARCH_OP_GREATER,
+            0x01,
+            0x00,
+            FT_SOURCES,
+        ];
+        assert!(
+            pkt.payload
+                .windows(expected_term.len())
+                .any(|w| w == expected_term),
+            "min_sources 1 -> FT_SOURCES > 0"
+        );
+        // min_sources 0 must add NO term (a no-op filter).
+        let none = SearchParams {
+            keyword: "x".to_string(),
+            min_sources: Some(0),
+            ..Default::default()
+        };
+        assert!(!build_search_request(&none)
+            .payload
+            .windows(1)
+            .any(|w| w == [FT_SOURCES]));
     }
 
     #[test]

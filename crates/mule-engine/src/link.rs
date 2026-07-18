@@ -347,6 +347,7 @@ mod tests {
             file_type: None,
             min_size: None,
             max_size: None,
+            min_sources: None,
             extension: None,
         };
         let files = link.search(&params, Duration::from_secs(5)).await.unwrap();
@@ -374,6 +375,7 @@ mod tests {
             file_type: None,
             min_size: None,
             max_size: None,
+            min_sources: None,
             extension: None,
         };
         assert!(link.search(&params, Duration::from_secs(1)).await.is_err());

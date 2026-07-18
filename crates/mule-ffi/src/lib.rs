@@ -11,7 +11,10 @@
 
 use std::sync::Arc;
 
-use mule_engine::{AddResult, Engine, EngineEvent, EngineState, HitStatus, Trust};
+use mule_engine::{
+    AddResult, Engine, EngineEvent, EngineState, HitStatus, SearchFilters as EngineSearchFilters,
+    Trust,
+};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::Mutex;
@@ -105,6 +108,26 @@ pub struct SharedFileInfo {
     pub hash: String,
     pub name: String,
     pub size: u64,
+}
+
+/// Pre-search filters pushed onto the server query. A `0` field means "unset".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct SearchFilters {
+    /// True = only files with at least one source (availability >= 1).
+    pub complete_only: bool,
+    /// Minimum / maximum size in BYTES; 0 = no bound.
+    pub min_size: u64,
+    pub max_size: u64,
+}
+
+impl From<SearchFilters> for EngineSearchFilters {
+    fn from(f: SearchFilters) -> Self {
+        EngineSearchFilters {
+            min_sources: if f.complete_only { Some(1) } else { None },
+            min_size: (f.min_size > 0).then_some(f.min_size),
+            max_size: (f.max_size > 0).then_some(f.max_size),
+        }
+    }
 }
 
 /// A search hit's local state (already have / fetching / new).
@@ -358,10 +381,10 @@ impl MuleEngine {
     /// Search the connected server. BLOCKS for up to ~20s waiting on the
     /// server, so call it off the UI thread. Empty means no server, no answer,
     /// or genuinely no hits - all of which the UI renders the same way.
-    pub fn search(&self, keyword: String) -> Vec<SearchHit> {
+    pub fn search(&self, keyword: String, filters: SearchFilters) -> Vec<SearchHit> {
         self.rt.block_on(async {
             let mut g = self.inner.lock().await;
-            let ranked = g.search(&keyword).await;
+            let ranked = g.search(&keyword, filters.into()).await;
             let mut out = Vec::with_capacity(ranked.len());
             for r in ranked {
                 // hit_status (&self) is called after search (&mut self) has

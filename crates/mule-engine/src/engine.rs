@@ -532,6 +532,17 @@ pub struct ServerInfo {
     pub low_id: bool,
 }
 
+/// Optional pre-search filters pushed onto the server query (and re-applied to
+/// the merged result set so Kad hits obey them too). `None` = unfiltered.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SearchFilters {
+    /// Minimum availability (source count). `Some(1)` = complete/live only.
+    pub min_sources: Option<u32>,
+    /// Minimum / maximum file size in BYTES.
+    pub min_size: Option<u64>,
+    pub max_size: Option<u64>,
+}
+
 /// The padMule engine. Create with [`Engine::new`], drive with the lifecycle
 /// methods, observe via the returned event receiver.
 pub struct Engine {
@@ -1050,7 +1061,9 @@ impl Engine {
     ///
     /// The two run concurrently, so the wait is the SLOWER of the two, not the
     /// sum. Blocks up to `SEARCH_WAIT`; the FFI facade runs it off the UI thread.
-    pub async fn search(&mut self, keyword: &str) -> Vec<RankedFile> {
+    /// Filters (bounds in BYTES) are applied on the server wire query and to the
+    /// merged set.
+    pub async fn search(&mut self, keyword: &str, filters: SearchFilters) -> Vec<RankedFile> {
         let keyword = keyword.trim();
         if self.offline || keyword.is_empty() {
             return Vec::new();
@@ -1058,8 +1071,15 @@ impl Engine {
         let params = SearchParams {
             keyword: keyword.to_string(),
             file_type: None,
-            min_size: None,
-            max_size: None,
+            // Push size + availability onto the server query so the ~200-result
+            // cap fills with matches instead of junk. Min size clamps to 32-bit
+            // (widening only); a max above 4 GiB is omitted from the wire and
+            // enforced client-side below (see mule-cli fetch-complete).
+            min_size: filters.min_size.map(|b| b.min(u32::MAX as u64) as u32),
+            max_size: filters
+                .max_size
+                .and_then(|b| (b <= u32::MAX as u64).then_some(b as u32)),
+            min_sources: filters.min_sources,
             // NOT the keyword: the search box means the word, not the file type
             // (mule-cli's fetch-complete pins an extension only because it hunts
             // for a ".pdf" when asked for "pdf").
@@ -1096,7 +1116,15 @@ impl Engine {
         // hits arrive in, so a single catalog pass dedupes across both by hash.
         let mut combined = server_files;
         combined.extend(kad_files.iter().map(kad_to_search));
-        catalog(&combined)
+        let mut ranked = catalog(&combined);
+        // Apply the same bounds to the merged set, so Kad hits (not filtered on
+        // the wire) and any server slack obey the user's filters too.
+        ranked.retain(|r| {
+            filters.min_sources.is_none_or(|m| r.sources >= m)
+                && filters.min_size.is_none_or(|m| r.size >= m)
+                && filters.max_size.is_none_or(|m| r.size <= m)
+        });
+        ranked
     }
 
     /// Classify a search hit's hash against our downloads + shared files, so the
@@ -1844,9 +1872,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let (mut engine, _rx) = Engine::new(&dir).unwrap();
         engine.set_offline(true);
-        assert!(engine.search("anything").await.is_empty());
+        let f = SearchFilters::default();
+        assert!(engine.search("anything", f).await.is_empty());
         assert!(
-            engine.search("").await.is_empty(),
+            engine.search("", f).await.is_empty(),
             "empty keyword is a no-op"
         );
         let _ = std::fs::remove_dir_all(&dir);
