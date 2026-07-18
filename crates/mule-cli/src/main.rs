@@ -1302,6 +1302,27 @@ async fn cmd_upnp(port: u16) {
     }
 }
 
+/// Ask the gateway which internal device currently holds a TCP port (unicast).
+/// A port already mapped to a DIFFERENT device is why a second device stays LowID.
+async fn cmd_upnp_query(port: u16) {
+    println!("UPnP: who holds TCP :{port} on the gateway (unicast) ...");
+    match mule_engine::upnp::who_maps_unicast(port).await {
+        Ok(Some(client)) => println!("  :{port} -> {client}"),
+        Ok(None) => println!("  :{port} is NOT mapped (free to claim)"),
+        Err(e) => println!("  query failed: {e}"),
+    }
+}
+
+/// Delete a TCP port mapping on the gateway (unicast), freeing it. Use it to clear
+/// a stale mapping so another device can claim the port and earn HighID.
+async fn cmd_upnp_unmap(port: u16) {
+    println!("UPnP: deleting the TCP :{port} mapping (unicast) ...");
+    match mule_engine::upnp::unmap_port_unicast(port).await {
+        Ok(()) => println!("  :{port} mapping removed (or was already gone)"),
+        Err(e) => println!("  unmap failed: {e}"),
+    }
+}
+
 /// UNICAST-only UPnP mapping: the exact path the iPad uses (multicast skipped).
 /// Run this on the dev box to prove the on-device route works against the real
 /// gateway before trusting it on a device with no debugger.
@@ -1799,6 +1820,14 @@ async fn main() {
         },
         Some("upnp-unicast") if args.len() == 3 => match args[2].parse::<u16>() {
             Ok(port) => cmd_upnp_unicast(port).await,
+            Err(_) => eprintln!("bad port: {}", args[2]),
+        },
+        Some("upnp-query") if args.len() == 3 => match args[2].parse::<u16>() {
+            Ok(port) => cmd_upnp_query(port).await,
+            Err(_) => eprintln!("bad port: {}", args[2]),
+        },
+        Some("upnp-unmap") if args.len() == 3 => match args[2].parse::<u16>() {
+            Ok(port) => cmd_upnp_unmap(port).await,
             Err(_) => eprintln!("bad port: {}", args[2]),
         },
         Some("natpmp") if args.len() == 4 => match args[3].parse::<u16>() {

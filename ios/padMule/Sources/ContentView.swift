@@ -76,6 +76,9 @@ struct ContentView: View {
                             .font(.callout)
                         }
                         row("Kad contacts", "\(model.kadContacts)")
+                        // The port-mapping result: the direct answer to "why am I
+                        // LowID?" when the router should have opened the port.
+                        row("Port mapping", model.upnpStatus ?? "checking...")
                         if let id = model.identity {
                             row("User hash", String(id.userhash.prefix(16)) + "...")
                             row("Kad ID", String(id.kadId.prefix(16)) + "...")
