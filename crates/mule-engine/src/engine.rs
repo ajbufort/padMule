@@ -35,7 +35,10 @@ use crate::search::{SearchParams, SearchResultFile};
 use crate::server_messages::{LoginRequest, DEFAULT_SERVER_FLAGS};
 use crate::share::{head_hash, is_upload_request, serve_shared, SharedFile, UploadGate};
 use crate::transfer::build_file_req_ans_no_fil;
-use mule_files::{read_nodes_dat, read_server_met, write_nodes_dat, KadContact, NodesDat};
+use mule_files::{
+    read_nodes_dat, read_server_met, write_nodes_dat, IpFilter, KadContact, NodesDat,
+    DEFAULT_IPFILTER_LEVEL,
+};
 use mule_kad::RoutingTable;
 use mule_proto::{Kad128, Packet, Tag, TagValue};
 use std::io;
@@ -189,6 +192,29 @@ fn unique_dest(dest: PathBuf) -> PathBuf {
 const KNOWN_MET: &str = "known.met";
 const FT_FILENAME: u8 = 0x01;
 const FT_FILESIZE: u8 = 0x02;
+
+/// Load the IP blocklist from the config dir if present. Reads `ipfilter.dat`
+/// then `.p2p`/`guarding.p2p` (both text line-forms parse the same), at the
+/// default filter level. Returns `None` if no file exists or nothing blocks.
+fn load_ip_filter(config_dir: &Path) -> Option<Arc<IpFilter>> {
+    let candidates = ["ipfilter.dat", "ipfilter.p2p", "guarding.p2p"];
+    let mut text = String::new();
+    for name in candidates {
+        if let Ok(s) = std::fs::read_to_string(config_dir.join(name)) {
+            text.push_str(&s);
+            text.push('\n');
+        }
+    }
+    if text.trim().is_empty() {
+        return None;
+    }
+    let filter = IpFilter::parse(&text, DEFAULT_IPFILTER_LEVEL);
+    if filter.is_empty() {
+        None
+    } else {
+        Some(Arc::new(filter))
+    }
+}
 
 /// Rebuild the shared library from `known.met`: every complete file a prior
 /// session saved that STILL exists on disk (a user can delete a file from the
@@ -545,6 +571,9 @@ pub struct Engine {
     listener: Option<JoinHandle<()>>,
     /// Sender handed to each ServerLink; its forwarder task is spawned once.
     server_tx: Option<mpsc::Sender<ServerEvent>>,
+    /// The IP blocklist (ipfilter.dat / .p2p), if the user placed one. Shared with
+    /// the listener task so inbound peers are gated too. `None` = no filtering.
+    ip_filter: Option<Arc<IpFilter>>,
     /// Suppress ALL network activity. Tests set this so the unit suite never
     /// touches the real network; the UI never does.
     offline: bool,
@@ -575,6 +604,7 @@ impl Engine {
                 UPLOAD_QUEUE_CAP,
             )),
             known_met_lock: Arc::new(Mutex::new(())),
+            ip_filter: None,
             server: None,
             connection: None,
             kad: None,
@@ -636,6 +666,11 @@ impl Engine {
     /// The in-progress downloads. Cheap: clones `Arc`s, not files.
     pub async fn downloads(&self) -> Vec<Arc<Download>> {
         self.downloads.lock().await.clone()
+    }
+
+    /// How many IP-blocklist ranges are loaded (0 = no filter). For the UI.
+    pub fn ip_filter_ranges(&self) -> usize {
+        self.ip_filter.as_ref().map_or(0, |f| f.len())
     }
 
     /// The complete files we are currently serving to peers, as (hash, name,
@@ -707,6 +742,16 @@ impl Engine {
             return;
         }
         let _ = std::fs::create_dir_all(&self.config_dir);
+
+        // Load the IP blocklist if the user placed one. Best-effort: absent or
+        // unparseable means no filtering (never a startup failure).
+        self.ip_filter = load_ip_filter(&self.config_dir);
+        if let Some(f) = &self.ip_filter {
+            self.emit(EngineEvent::Server(format!(
+                "IP filter: {} ranges blocked",
+                f.len()
+            )));
+        }
 
         // A FRESH INSTALL HAS NEITHER LIST, so it knows no servers and no Kad
         // contacts and could reach nothing. Fetch them (best effort - a failure
@@ -805,9 +850,10 @@ impl Engine {
         let shared = Arc::clone(&self.shared);
         let sharing = Arc::clone(&self.sharing);
         let gate = Arc::clone(&self.upload_gate);
+        let ip_filter = self.ip_filter.clone();
         let handle = tokio::spawn(async move {
             loop {
-                let Ok((stream, _peer)) = listener.accept().await else {
+                let Ok((stream, peer)) = listener.accept().await else {
                     continue;
                 };
                 let me = me.clone();
@@ -815,6 +861,7 @@ impl Engine {
                 let shared = Arc::clone(&shared);
                 let sharing = Arc::clone(&sharing);
                 let gate = Arc::clone(&gate);
+                let ip_filter = ip_filter.clone();
                 tokio::spawn(async move {
                     let mut fs = FramedStream::new(stream);
                     // A bare connect+close (the server's HighID probe) ends here.
@@ -823,6 +870,15 @@ impl Engine {
                         .is_err()
                     {
                         return;
+                    }
+                    // Drop a blocklisted PEER now (after the handshake, so the
+                    // server's bare-connect HighID probe - which never completes a
+                    // handshake and already returned above - is never filtered and
+                    // HighID is safe).
+                    if let (Some(f), SocketAddr::V4(v4)) = (&ip_filter, peer) {
+                        if f.is_blocked(*v4.ip()) {
+                            return;
+                        }
                     }
                     // Peek who speaks first. Cancel-safe: a silent source buffers
                     // no bytes, so a timeout here loses nothing and the download
@@ -1145,6 +1201,15 @@ impl Engine {
         let mut reg = SourceRegistry::new();
         reg.add_found(&found);
         reg.add_kad(&kad_sources);
+        // Never dial a blocklisted peer. LowID callback sources are gated on the
+        // inbound side instead (they dial US), so only direct sources are dropped
+        // here.
+        if let Some(filter) = &self.ip_filter {
+            reg.drop_blocked(|addr| match addr {
+                SocketAddr::V4(v4) => filter.is_blocked(*v4.ip()),
+                SocketAddr::V6(_) => false,
+            });
+        }
         // A LowID source cannot accept our connection; the server has to poke it
         // for us. Only worth asking if WE are reachable - a LowID asking a LowID
         // to call back is the one case eD2k simply cannot route.
@@ -2004,6 +2069,29 @@ mod tests {
         assert_eq!(lib[0].hash, [0x11; 16]);
         assert_eq!(lib[0].size, 5);
         assert_eq!(lib[0].name, b"kept.bin");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn start_loads_an_ip_filter_when_present() {
+        let dir = tmp("ipfilter-load");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("ipfilter.dat"),
+            "# test list\n10.0.0.0 - 10.0.0.255 , 0 , bad range\n",
+        )
+        .unwrap();
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+        engine.set_offline(true);
+        assert_eq!(engine.ip_filter_ranges(), 0, "not loaded until start");
+        engine.start().await;
+        assert_eq!(engine.ip_filter_ranges(), 1, "start() loads ipfilter.dat");
+        assert!(engine
+            .ip_filter
+            .as_ref()
+            .unwrap()
+            .is_blocked("10.0.0.9".parse().unwrap()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
