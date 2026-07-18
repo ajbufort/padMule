@@ -1,6 +1,6 @@
 # Build Progress
 
-Updated: 2026-07-18
+Updated: 2026-07-18 (code-fix round)
 
 Wave-by-wave status of the padMule Rust engine (waves defined in
 `docs/superpowers/specs/2026-07-12-padmule-design.md` section 10). Each wave
@@ -44,7 +44,59 @@ ends at a differential/round-trip gate.
 | 8b | on-device search + download + HighID/LowID surfaced | (implemented directly) | **DONE + on-device-proven (2026-07-16/17).** Search + add-download exposed through the FFI (`MuleEngine::search`/`add_download`, SearchHit/AddOutcome records) and wired to a SwiftUI search box + Get buttons. `finish_download` re-derives the whole-file ed2k hash (the only check for a single-part file) before saving to Documents (Files-app visible). ServerInfo made durable state + polled snapshot after the "an event is not state" bug hid the ID type. FULL LOOP PROVEN ON THE IPAD: a `test` search -> Get -> a 168KB .doc pulled from one HighID source -> hash-verified -> saved -> opened in Files. Two public-IP leaks aimed at the screenshotted screen closed. |
 | 8c | on-device feature round: uploads, cancel, Kad-in-search, unicast HighID | (implemented directly) | **DONE (2026-07-17).** Four features on the running app: (1) **upload/serve** completed files + a "Share uploads"/Leech-Mode toggle (`share.rs` serve_shared reads blocks off disk; the listener PEEKS the first packet to tell a leecher from a called-back source; AtomicBool sharing switch + 8-slot cap; `serve_inbound`). (2) **cancel/delete** a download (cooperative AtomicBool cancel checked in take_blocks + the fetch loops; `.part` deleted; SwiftUI swipe-to-delete). (3) **Kad keyword search merged INTO the search box** (server + Kad concurrently via `tokio::join!` over the disjoint link+node fields; Kad FileResult -> synthetic tagged SearchResultFile so ONE catalog pass dedupes across both by hash; either half may be absent). (4) **on-device HighID via UNICAST SSDP** M-SEARCH at the inferred gateway (`upnp::discover_unicast`; `map_port` falls back multicast->unicast; iOS has no gateway API so infer .1/.254 of our /24; `mule-cli upnp-unicast` for live checks). Feature 4 was initially LIVE-UNVERIFIED (the Xfinity XB8's UPnP toggle is cosmetic - it never answers SSDP, confirmed exhaustively from Windows natively), but is now **LIVE-VALIDATED (2026-07-17)**: Anthony bridged the XB8 behind a TP-Link Archer BE9700, and `mule-cli upnp-unicast 4662` mapped the port against the BE9700's real IGD and returned the real public IP (no double-NAT) - proving the exact iOS unicast-SSDP path end to end. Then confirmed ON THE IPAD itself: padMule earned HighID, the "Port mapping" row read "UPnP: mapped port 4662", and the BE9700's UPnP client list shows `padMule 192.168.0.182 4662->4662`. (Root cause of the earlier LowID: a leftover permanent 4662->dev-box mapping from a validation run squatted the port + a lenient query masked it; fixed with delete-then-add + an honest query.) See [[net-highid-and-port-forwarding]]. Also landed: root LICENSE (GPL v2) + NOTICE + README. 374 workspace tests, clippy + fmt + ASCII clean. |
 | 8d | search-panel eMule parity + launch splash + app icon | docs/superpowers/plans/2026-07-17-search-richness-and-splash.md | **DONE + MERGED to main (2026-07-18).** Search now matches eMule's SearchListCtrl FUNCTIONALITY (touch-native, not the 15-col grid): rich rows (New/Downloading/Have status dot, type + media metadata line, complete-sources), client-side sort (7 keys asc/desc) + filter (name/type/trusted/hide-have), and a detail sheet (all fields, ed2k link copy, Download, Search-related). Engine `catalog` surfaces type + media tags it already receives (FT_FILETYPE/FT_MEDIA_* pinned from opcodes.h) + `hit_status` (New/Downloading/Have). FFI `SearchHit` + `HitStatusFfi`. No wire change; sort/filter is pure client-side over the fetched set. Also: a 3s launch splash (2px-stroked splash.png) and the app icon (mascot; white corners flood-filled to an opaque 1024 square since iOS icons cannot have alpha). 379 Rust tests, clippy/fmt/ASCII clean; Swift verified by CI. Brainstorm->spec->plan->execute (specs/plans in docs/superpowers/). |
+| 8e | code-fix round (7 fixes from the 2026-07-18 lint) | - | **DONE (2026-07-18).** See the code-fix-round section below. |
 | 9 | (v1.1) seedbox mode | - | not started |
+
+## CODE-FIX ROUND (2026-07-18)
+
+Seven fixes from the full-repo lint pass, each gated (383 workspace tests +
+clippy + fmt + the amuled differential test still passes byte-for-byte on all
+three files). Wire-touching fixes were checked against eMule 0.50a first.
+
+1. **Persisted Kad identity now used.** `KadNode::bind` generated a fresh random
+   Kad ID + UDP install key every run, re-keying Kad on every app start (the
+   failure `identity.rs` exists to prevent - lost routing reciprocity, stale UDP
+   verify keys peers stored for us). New `bind_with_identity` takes
+   `NodeIdentity::{kad_id, kad_udp_key}`; `start_kad` passes them. `bind()` keeps
+   the fresh-identity path for one-shot CLI use.
+2. **Resumed downloads now fetch (+ Kad merged into source-finding).** `start`
+   loaded `.part` downloads into the registry but only `add_download` spawned a
+   fetch task, so a resumed download progressed only via an inbound callback.
+   Extracted `find_sources` (server get_sources AND Kad `resolve_sources`
+   concurrently via `tokio::join!`, one `SourceRegistry` - either half may be
+   absent, so a serverless client can now download what Kad search found),
+   `request_callbacks`, `spawn_fetch`; new `resume_fetches` drives every
+   incomplete resumed download through the same pipeline once the network is up.
+3. **Shared library persists (`known.met`).** The share list was session-only, so
+   uploads forgot their library on every launch. `finish_download` appends each
+   verified file to a byte-compatible `known.met` (idempotent by hash; large-file
+   header + U64 size past the 32-bit boundary), storing the ACTUAL on-disk name so
+   the path rebuilds as `downloads_dir/name`; `start` reloads and re-shares every
+   entry whose file still exists (skips ones deleted from Files).
+4. **Real upload queueing (OP_QUEUERANKING).** At capacity padMule used to answer
+   OP_FILEREQANSNOFIL - lying "no file" about a file it holds. Now
+   `share.rs::UploadGate` serves filename/status truthfully and, at
+   OP_STARTUPLOADREQ, grants a free slot or QUEUES the peer (bounded,
+   UPLOAD_QUEUE_CAP=32), sends its 1-based OP_QUEUERANKING (0x60, exactly 12-byte
+   payload per eMule 0.50a - receivers hard-reject any other size), and grants a
+   freed slot IN PLACE on the held connection. Rank sent ONLY in reply to the ask
+   (eMule flood-bans 3 unsolicited ranks). DELIBERATELY SCOPED to the held
+   connection: no cross-connection queue persistence, no slot-grant dial-out, no
+   UDP OP_REASKFILEPING - those are always-on desktop-seedbox parts that do not
+   fit a foreground-only iOS client. Rank is FIFO (wire-neutral policy; eMule's
+   score-ordering can layer on later - `upload_queue.rs` holds that scoring, still
+   unwired). Not amuled-differential-testable (the amuled-pull direction is
+   blocked); covered padMule-to-padMule.
+5-6. **Two "hardening" items turned out to be already faithful** - see
+   [[decisions-and-lessons]] (verifying against eMule BEFORE fixing avoided two
+   wire-divergence regressions): crypt-bit sanitization (eMule reads the bits raw
+   too; predicates byte-identical) and sig-before-pubkey (eMule drops it too).
+   Doc corrections only.
+7. **Nits:** `KadError::NotReady` (stop overloading `NotDecryptable`); collapse a
+   duplicated `verify_ready_parts` branch; saturate the u64->u32 size-filter casts
+   in `fetch-complete`; drop a redundant `Duration` alias; remove the unused
+   `mule-proto` dep from `mule-ffi`; doc-only notes on the ED2Kv2 decompress
+   asymmetry, `choose_search_method`, and the iOS-16 `onChange` form.
 
 ## ENGINE GOES LIVE BEHIND THE UI (2026-07-16)
 

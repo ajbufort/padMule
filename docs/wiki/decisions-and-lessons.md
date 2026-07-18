@@ -198,6 +198,33 @@ bullet each; Locked decisions newest first, Lessons in the order learned.
   prop, there is no aMule on iPad), on-device HighID (UPnP/NAT-PMP -
   [[net-highid-and-port-forwarding]]), and the already-landing fetch/search/trust
   quality. Revisit Layer 2 when real padMule<->padMule traffic exists.
+- 2026-07-18 **DECISION: upload queueing is scoped to the held connection, not a
+  desktop-style persistent queue.** At capacity padMule now queues a leecher and
+  sends OP_QUEUERANKING, granting a freed slot IN PLACE on the connection it
+  already holds open. It deliberately does NOT implement eMule's cross-connection
+  queue persistence, slot-grant dial-out (uploader connects back to an idled
+  HighID downloader), or UDP OP_REASKFILEPING refresh. Those exist because a
+  desktop client is always-on and a queued peer idles its TCP out after 40s;
+  padMule is FOREGROUND-ONLY ([[ipados-constraints]]) - its sockets and the app
+  itself die on background - so a long-lived queue would be dishonest. Holding
+  the connection and granting in place is faithful on the wire (correct opcode +
+  12-byte payload) and fits the platform. Rank is FIFO; eMule's score-ordering
+  ([[build-progress]] upload_queue.rs scoring) is wire-neutral policy for later.
+- 2026-07-18 **LESSON: verify a "hardening" idea against the wire authority BEFORE
+  writing it - replicate-then-improve cuts both ways.** The 2026-07-18 lint flagged
+  two "candidate hardening" items (sanitize a peer's crypt bits so requires implies
+  supports; buffer a secure-ident signature that arrives before the pubkey).
+  Checking eMule 0.50a first showed BOTH padMule behaviors were ALREADY faithful and
+  the "fix" would have DIVERGED from the wire: eMule reads the crypt bits raw
+  (SetConnectOptions, BaseClient.cpp:3190-3192) with reject/obfuscate predicates
+  byte-identical to ours (:1437/:1647), and it DROPS a signature that arrives before
+  the pubkey (ProcessSignaturePacket, BaseClient.cpp:2133, returns when
+  GetSecIDKeyLen()==0). The lint's own doc comments (written the same day) had
+  mis-framed faithful behavior as bugs. Rule: for anything a peer observes, a
+  proposed improvement is a HYPOTHESIS until checked against eMule - "more robust"
+  and "interoperable" are not the same, and diverging silently breaks interop the
+  way the SX/extended-requests bugs did, just in the other direction. Same spirit as
+  the "agent-derived constants are a hypothesis" lesson above.
 
 ## Related
 
