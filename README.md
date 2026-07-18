@@ -15,7 +15,8 @@ padMule reimplements the engine below the UI rather than porting the GUI.
 
 padMule runs on a real iPad, built with no Apple hardware in the loop (GitHub
 Actions produces an unsigned `.ipa`, which is re-signed at install time with a
-free Apple ID via Sideloadly or AltStore). What works today, proven on-device:
+free Apple ID via Sideloadly - the path proven here; AltStore may also work but
+failed for us). What works today, proven on-device:
 
 - **Connect** to live eD2k servers and bootstrap the Kad DHT.
 - **Search** the connected server and the Kad network together, deduped and
@@ -75,7 +76,8 @@ There is no Mac in the pipeline. GitHub Actions (a macOS runner) generates the
 Xcode project with XcodeGen, builds the Rust static library and its Swift
 bindings, and produces an **unsigned** `.ipa` as a build artifact. That artifact
 is re-signed and installed on-device with a free Apple ID using **Sideloadly**
-(or AltStore). The setup is documented in `docs/wiki/mac-toolchain-setup.md`.
+(the proven path; AltStore/AltServer failed here with error -22411). The setup
+is documented in `docs/wiki/mac-toolchain-setup.md`.
 
 ## License
 

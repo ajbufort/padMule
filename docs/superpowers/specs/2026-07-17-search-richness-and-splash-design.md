@@ -1,7 +1,12 @@
 # padMule: Search-Result Richness + Launch Splash - Design Spec
 
 Date: 2026-07-17
-Status: approved design, pre-implementation
+Status: implemented + merged to main 2026-07-18 (build-progress row 8d)
+
+As-built divergence (2026-07-18 note): media fields (artist/album/title/codec)
+use first-non-empty-wins in catalog.rs, not the most-common-value rule this
+spec describes for name/size. An unplanned addition also rode along: the app
+icon (mascot, corners flood-filled opaque - iOS icons cannot have alpha).
 
 ## Goal
 
