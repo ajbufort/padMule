@@ -23,7 +23,7 @@ FAIL=0
 # signal (exit 128+SIG), and `wait` would surface that as the script's status.
 cleanup() {
   [ -n "${AM_PID:-}" ] && kill "$AM_PID" 2>/dev/null
-  # give it a moment to release the port; disown so its signal death is not ours
+  # give it a moment to release the port (the disown happens at spawn time)
   sleep 1
 }
 trap cleanup EXIT
@@ -69,8 +69,7 @@ echo "== starting amuled on 127.0.0.1:$PORT (sharing Incoming) =="
 AM_PID=$!
 disown "$AM_PID" 2>/dev/null || true
 
-# Wait until amuled is listening on the TCP port. known.met grows past its 5-byte
-# empty header once the shared files are hashed.
+# Wait until amuled is listening on the TCP port.
 LISTENING=0
 for _ in $(seq 1 60); do
   if ss -ltn 2>/dev/null | grep -q ":$PORT "; then LISTENING=1; break; fi

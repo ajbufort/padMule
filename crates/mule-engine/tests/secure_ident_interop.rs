@@ -14,7 +14,7 @@ fn loads_a_real_amule_cryptkey_dat_and_the_key_works() {
     let id = Identity::from_cryptkey_dat(AMULE_CRYPTKEY)
         .expect("padMule must be able to load a real aMule cryptkey.dat");
 
-    // The derived public key is a valid PKCS#1 RSAPublicKey within the wire cap.
+    // The derived public key is valid X.509 SPKI DER within the 80-byte wire cap.
     let pk = id.public_key_der();
     assert!(!pk.is_empty() && pk.len() <= 80);
 

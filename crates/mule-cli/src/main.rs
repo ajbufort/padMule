@@ -1,18 +1,12 @@
-//! mule-cli: a headless harness for driving the engine on Linux. This wave
-//! exercises the eD2k server login handshake and the pause/resume lifecycle.
-//!
-//! Usage:
-//!   mule-cli login <host> <port>          connect + login to one server, then
-//!                                         demonstrate pause/resume
-//!   mule-cli login-any <server.met>       try each server in a server.met until
-//!                                         one logs in
-//!   mule-cli listen [port]                bind an inbound peer listener (default
-//!                                         4662) and report connections - used to
-//!                                         validate HighID port forwarding
-//!   mule-cli hash-file <path>             print a file's ed2k hash and size
-//!   mule-cli peer-download <host> <port> <hash-hex> <size> <out>
-//!                                         download a file from ONE peer (used for
-//!                                         the differential test against amuled)
+//! mule-cli: the headless dev + live-network harness for the engine on Linux.
+//! 20 subcommands across the whole surface: server login + lifecycle (login,
+//! login-any, listen), hashing + serving (hash-file, serve-file), peer
+//! transfer + diagnostics (peer-download, peer-probe, sec-ident), the full
+//! Kad surface (kad-bootstrap, kad-search, kad-fetch, kad-keyword), links
+//! (link), port mapping (upnp, upnp-unicast, upnp-query, upnp-unmap, natpmp),
+//! and the completion-optimized fetchers (search-download, fetch-complete).
+//! Run with no arguments for usage; the match in `main` is the authoritative
+//! list.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::path::Path;
@@ -1860,16 +1854,24 @@ async fn main() {
             eprintln!("  mule-cli hash-file <path>");
             eprintln!("  mule-cli serve-file <port> <path>");
             eprintln!("  mule-cli peer-download <host> <port> <hash> <size> <out> [obf-peer-hash]");
+            eprintln!("  mule-cli peer-probe <host> <port> <hash> <size>");
+            eprintln!("  mule-cli sec-ident <host> <port> [obf-peer-hash]");
             eprintln!("  mule-cli kad-bootstrap <nodes.dat>");
             eprintln!("  mule-cli kad-search <nodes.dat> <ed2k-hash-hex> <size>");
             eprintln!("  mule-cli kad-fetch <nodes.dat> <ed2k-hash-hex> <size> <out>");
             eprintln!("  mule-cli kad-keyword <nodes.dat> <keyword>");
             eprintln!("  mule-cli link <ed2k-or-magnet-link> [out]");
             eprintln!("  mule-cli search-download <server.met> <keyword> <out>");
+            eprintln!(
+                "  mule-cli fetch-complete <server.met> <keyword> <out> [max_size] [min_size]"
+            );
             eprintln!("  mule-cli upnp <port>");
             eprintln!(
                 "  mule-cli upnp-unicast <port>   (the iOS path: unicast M-SEARCH at the gateway)"
             );
+            eprintln!("  mule-cli upnp-query <port>");
+            eprintln!("  mule-cli upnp-unmap <port>");
+            eprintln!("  mule-cli natpmp <gateway-ip> <port>");
         }
     }
 }

@@ -6,15 +6,18 @@
 //! The lifecycle is the biggest deviation from desktop aMule (see
 //! docs/wiki/ipados-constraints.md): iPadOS suspends a backgrounded app and
 //! reclaims its sockets, so the honest model is foreground-only -
-//!   - `pause()` (app backgrounded): checkpoint to disk, tear down sockets, mark
-//!     transfers paused. Idempotent.
-//!   - `resume()` (app foregrounded): rebuild sockets, reconnect the server,
-//!     re-bootstrap Kad, resume transfers - emitting "Reconnecting..." then
-//!     "Connected". Idempotent, and correct across an IP change.
+//!   - `pause()` (app backgrounded): checkpoint to disk, pause the server link,
+//!     drop the Kad socket, abort the listener. Idempotent.
+//!   - `resume()` (app foregrounded): rebind the listener FIRST (the HighID
+//!     ordering), reconnect the server, re-bootstrap Kad - emitting
+//!     "Reconnecting..." then "Connected". Idempotent, correct across an IP
+//!     change.
 //!
-//! Phase 2 lands the lifecycle state machine, identity ownership, event stream,
-//! and checkpoint. Phases 3/4 fill `start`/`resume`/`checkpoint` with the real
-//! server + Kad + download-manager wiring.
+//! KNOWN GAP (candidate fix, not yet built): neither touches DOWNLOADS. An
+//! in-flight fetch task keeps its own peer sockets across pause(), and a
+//! download resumed from disk by `start()` gets no fetch task at all - only
+//! `add_download` spawns one - so a restarted `.part` progresses only when a
+//! called-back peer dials our listener.
 
 use crate::bootstrap;
 use crate::catalog::{catalog, RankedFile};
@@ -1006,8 +1009,8 @@ impl Engine {
     }
 
     /// App foregrounded: rebuild sockets, reconnect, re-bootstrap. Idempotent - a
-    /// no-op unless currently `Paused`. `Paused` -> `Running`. Phase 3 does the
-    /// real reconnect between the two status lines.
+    /// no-op unless currently `Paused`. `Paused` -> `Running`. The real reconnect
+    /// (listener rebind, server link, Kad) runs between the two status lines.
     pub async fn resume(&mut self) {
         if self.state != EngineState::Paused {
             return;

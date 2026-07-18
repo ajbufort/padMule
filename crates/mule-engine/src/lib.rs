@@ -1,5 +1,7 @@
-//! mule-engine: the eD2k/Kad engine for padMule. This wave adds the pure
-//! server-message codecs (no networking yet; tokio arrives in a later wave).
+//! mule-engine: the live eD2k/Kad engine for padMule - pure message codecs
+//! plus the tokio networking that drives them (server link, peer transfer,
+//! obfuscation, secure ident, Kad node, fetch/search, share/upload, UPnP) and
+//! the `Engine` lifecycle facade the FFI wraps.
 //! See docs/wiki/protocol-understanding.md.
 
 pub mod bootstrap;

@@ -303,8 +303,10 @@ impl SecureIdentSession {
             OP_PUBLICKEY => {
                 let key = parse_public_key(payload)?;
                 self.peer_pubkey = Some(key);
-                // Now that we hold the peer's key we may be able to sign and/or
-                // verify a signature that arrived first.
+                // Now that we hold the peer's key we can sign a deferred request.
+                // A signature that arrived BEFORE this key is NOT handled (it was
+                // never stored) - real clients send the pubkey first, so the
+                // out-of-order case is latent. Candidate hardening.
                 self.try_sign(id, &mut out);
             }
             OP_SIGNATURE => {
@@ -444,7 +446,8 @@ mod tests {
     #[test]
     fn generated_identity_has_a_sane_public_key() {
         let id = Identity::generate();
-        // PKCS#1 RSAPublicKey DER for a 384-bit key is ~58-60 bytes, under 80.
+        // X.509 SPKI DER for a 384-bit key is 78 bytes, under the 80-byte cap
+        // (the wire format is SPKI, not PKCS#1 - see the 5d milestone).
         assert!(id.public_key_der().len() <= MAX_PUBKEY_SIZE);
         assert!(id.public_key_der().len() >= 50);
     }

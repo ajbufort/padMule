@@ -2,8 +2,11 @@
 //! See docs/raw/wave4d-upstream-research-2026-07-14.md section 2
 //! (UploadQueue.cpp:304-333 slots, UploadClient.cpp:75-148 scoring).
 //!
-//! This is local policy, not wire format - but it is what makes padMule a good
-//! citizen rather than a leech, and the QUEUERANKING it produces IS on the wire.
+//! This is local policy, not wire format. NOTE: the live serve path does not
+//! use this queue yet - `share.rs` grants slots from a Semaphore and REFUSES
+//! at capacity with OP_FILEREQANSNOFIL, so padMule never sends the
+//! OP_QUEUERANKING this module can rank for. Wiring real queueing into serve
+//! is an open candidate feature (stock clients queue waiting peers).
 //!
 //! The wait clock is deliberately keyed to a peer's PERSISTED wait-start (which
 //! upstream stores in clients.met), so a peer that reconnects does not lose its

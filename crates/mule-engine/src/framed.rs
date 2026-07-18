@@ -67,8 +67,8 @@ where
     }
 
     /// Wrap `stream` as an OBFUSCATED connection whose handshake has already run,
-    /// yielding `ciphers`. `prefix` is any already-read plaintext bytes to
-    /// re-inject (normally empty for the obfuscated case).
+    /// yielding `ciphers`. (For re-injecting already-read plaintext bytes, see
+    /// [`FramedStream::plaintext_with_prefix`].)
     pub fn obfuscated(stream: S, ciphers: mule_proto::StreamCiphers) -> Self {
         FramedStream {
             stream,

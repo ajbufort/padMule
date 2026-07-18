@@ -1,6 +1,6 @@
 //! Client-to-client file-transfer message codecs (the download side). See
 //! BaseClient.cpp / DownloadClient.cpp / PartFile.cpp and protocol-understanding
-//! Part 2. Pure; the transfer state machine that drives these lands next.
+//! Part 2. Pure; driven by `transfer_session` / `multi_source` / `fetch`.
 //!
 //! Offsets follow aMule's wire convention: block ends are EXCLUSIVE on the wire
 //! (aMule writes `EndOffset + 1`), so this module's `(start, end)` pairs are
