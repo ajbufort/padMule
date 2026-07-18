@@ -780,7 +780,17 @@ impl Engine {
             return;
         }
         let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), KAD_UDP_PORT);
-        let Ok(mut node) = KadNode::bind(bind, TCP_PORT).await else {
+        // The PERSISTED identity, so our Kad ID and the UDP verify keys peers
+        // stored for us survive a restart (identity.rs names re-keying Kad on
+        // every start as the failure a stable identity exists to prevent).
+        let Ok(mut node) = KadNode::bind_with_identity(
+            bind,
+            TCP_PORT,
+            self.identity.kad_id,
+            self.identity.kad_udp_key,
+        )
+        .await
+        else {
             self.emit(EngineEvent::Server("Kad UDP port unavailable".into()));
             return;
         };
