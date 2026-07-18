@@ -304,12 +304,16 @@ impl SecureIdentSession {
                 let key = parse_public_key(payload)?;
                 self.peer_pubkey = Some(key);
                 // Now that we hold the peer's key we can sign a deferred request.
-                // A signature that arrived BEFORE this key is NOT handled (it was
-                // never stored) - real clients send the pubkey first, so the
-                // out-of-order case is latent. Candidate hardening.
                 self.try_sign(id, &mut out);
             }
             OP_SIGNATURE => {
+                // A signature is verified only if we already hold the peer's
+                // pubkey (try_verify no-ops otherwise). Dropping a sig that
+                // arrives BEFORE the key is faithful, not a gap: eMule does the
+                // same (ProcessSignaturePacket, BaseClient.cpp:2133, returns when
+                // GetSecIDKeyLen()==0). The real sequence is always PUBLICKEY then
+                // SIGNATURE; buffering an early sig would diverge from the wire
+                // authority for no real peer's benefit.
                 let sig = parse_signature(payload)?;
                 self.try_verify(&sig);
             }
