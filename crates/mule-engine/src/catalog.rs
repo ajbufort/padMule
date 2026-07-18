@@ -20,6 +20,15 @@ const FT_MEDIA_TITLE: u8 = 0xD2;
 const FT_MEDIA_LENGTH: u8 = 0xD3;
 const FT_MEDIA_BITRATE: u8 = 0xD4;
 const FT_MEDIA_CODEC: u8 = 0xD5;
+const FT_FILERATING: u8 = 0xF7;
+
+/// Decode a server search-result FT_FILERATING tag to a 0-5 rating. The tag is a
+/// masked field, NOT a plain 0-5: aMule reads `(value & 0xF) / 3`
+/// (SearchFile.cpp:77). 0 = not rated, 1 = Fake/Invalid, 2 = Poor, 3 = Fair,
+/// 4 = Good, 5 = Excellent. Clamped to 5.
+fn decode_rating(tag_value: u64) -> u8 {
+    (((tag_value & 0xF) / 3) as u8).min(5)
+}
 
 pub(crate) fn tag_str(tags: &[mule_proto::Tag], id: u8) -> Option<String> {
     tags.iter().find_map(|t| match (&t.name, &t.value) {
@@ -75,6 +84,9 @@ pub struct RankedFile {
     pub length_secs: u32,
     pub bitrate: u32,
     pub codec: String,
+    /// Server-advertised rating 0-5 (0 = none/not rated, 1 = Fake, ... 5 =
+    /// Excellent). Sparse - most server results carry no rating.
+    pub rating: u8,
 }
 
 #[derive(Default)]
@@ -90,6 +102,7 @@ struct Group {
     length: u32,
     bitrate: u32,
     codec: String,
+    rating: u8, // best (max) FT_FILERATING seen, 0-5
 }
 
 /// Map a filename extension to a display category. eMule's FT_FILETYPE tag is
@@ -169,6 +182,11 @@ pub fn catalog(files: &[SearchResultFile]) -> Vec<RankedFile> {
         if g.bitrate == 0 {
             g.bitrate = tag_u64(&f.tags, FT_MEDIA_BITRATE).unwrap_or(0) as u32;
         }
+        // Server rating (sparse; most servers do not populate it). Keep the best
+        // one seen across a hash's duplicate rows.
+        if let Some(r) = tag_u64(&f.tags, FT_FILERATING) {
+            g.rating = g.rating.max(decode_rating(r));
+        }
     }
 
     let mut out: Vec<RankedFile> = groups
@@ -192,6 +210,9 @@ pub fn catalog(files: &[SearchResultFile]) -> Vec<RankedFile> {
                 Trust::Suspect("sources disagree on size for this hash")
             } else if size == 0 {
                 Trust::Suspect("no advertised size")
+            } else if g.rating == 1 {
+                // eMule rating 1 = Invalid/Corrupt/Fake.
+                Trust::Suspect("rated fake")
             } else if g.sources == 0 && name_variants > 3 {
                 Trust::Suspect("many names, no sources")
             } else {
@@ -218,6 +239,7 @@ pub fn catalog(files: &[SearchResultFile]) -> Vec<RankedFile> {
                 length_secs: g.length,
                 bitrate: g.bitrate,
                 codec: g.codec,
+                rating: g.rating,
             }
         })
         .collect();
@@ -244,6 +266,50 @@ impl RankedFile {
 mod tests {
     use super::*;
     use mule_proto::Tag;
+
+    #[test]
+    fn rating_tag_decodes_and_a_fake_is_flagged() {
+        // FT_FILERATING is masked: aMule reads (value & 0xF) / 3. So a raw 15
+        // decodes to 5 (Excellent) and a raw 3 decodes to 1 (Fake).
+        assert_eq!(decode_rating(15), 5);
+        assert_eq!(decode_rating(12), 4);
+        assert_eq!(decode_rating(3), 1);
+        assert_eq!(decode_rating(0), 0);
+        assert_eq!(decode_rating(0xFF), 5); // high bits ignored, clamped
+
+        let rated = |hash: [u8; 16], raw: u32| SearchResultFile {
+            hash,
+            id: 0,
+            port: 0,
+            tags: vec![
+                Tag {
+                    name: TagName::Id(FT_FILENAME),
+                    value: TagValue::Str(b"f.bin".to_vec()),
+                },
+                Tag {
+                    name: TagName::Id(FT_FILESIZE),
+                    value: TagValue::U32(100),
+                },
+                Tag {
+                    name: TagName::Id(FT_SOURCES),
+                    value: TagValue::U32(5),
+                },
+                Tag {
+                    name: TagName::Id(FT_FILERATING),
+                    value: TagValue::U32(raw),
+                },
+            ],
+        };
+        // Excellent (raw 15 -> 5): trusted, rating carried.
+        let good = catalog(&[rated([0x01; 16], 15)]);
+        assert_eq!(good[0].rating, 5);
+        assert!(good[0].is_trusted());
+        // Fake (raw 3 -> 1): flagged suspect and not trusted.
+        let fake = catalog(&[rated([0x02; 16], 3)]);
+        assert_eq!(fake[0].rating, 1);
+        assert!(!fake[0].is_trusted());
+        assert!(matches!(fake[0].trust, Trust::Suspect(_)));
+    }
 
     fn result(hash: [u8; 16], name: &str, size: u64, sources: u32) -> SearchResultFile {
         SearchResultFile {
