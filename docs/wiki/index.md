@@ -28,6 +28,7 @@ the Ingest / Query / Lint workflows.
 
 ## Backlog / feature ideas
 - [[feature-server-hunter]] - discover + verify live eD2k servers (auto-update, health-check, server-graph crawl); NOT literal whole-net scanning. Future work.
+- [[emule-070b-features]] - ranked backlog of eMule 0.70b features to adopt (34 items; Tier 1 do-soon = IP filter, search history, wire-side search filters, verified badge, categories, ratings-read); first-slice recommendation. From the 2026-07-18 dive.
 
 ## Strategy
 (All the big forks are LOCKED and executed - Rust engine rewrite, no-Mac
