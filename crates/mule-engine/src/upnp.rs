@@ -463,6 +463,11 @@ pub async fn map_port(
         }
     };
     let client = local_ip_toward(gateway).await?;
+    // Claim the port even if a stale mapping still holds it - our OWN previous
+    // DHCP IP after a lease change, or a leftover permanent mapping. Strict IGDs
+    // (TP-Link) return ConflictInMappingEntry instead of overwriting, so clear it
+    // first. Delete is idempotent: a free port just returns "no such entry".
+    let _ = soap_delete_mapping(&svc, port, Proto::Tcp).await;
     soap_add_mapping(
         &svc,
         port,
@@ -487,6 +492,11 @@ pub async fn map_port_unicast(
     let (svc, gateway) =
         discover_unicast(&unicast_candidates().await, Duration::from_secs(2)).await?;
     let client = local_ip_toward(gateway).await?;
+    // Claim the port even if a stale mapping still holds it - our OWN previous
+    // DHCP IP after a lease change, or a leftover permanent mapping. Strict IGDs
+    // (TP-Link) return ConflictInMappingEntry instead of overwriting, so clear it
+    // first. Delete is idempotent: a free port just returns "no such entry".
+    let _ = soap_delete_mapping(&svc, port, Proto::Tcp).await;
     soap_add_mapping(
         &svc,
         port,
@@ -591,10 +601,18 @@ pub async fn query_specific_mapping(
     )
     .await?;
     if status == 200 {
-        Ok(xml_tag(&resp, "NewInternalClient").map(|s| s.trim().to_string()))
-    } else {
-        // A SOAP fault here is almost always 714 (no such mapping) = free.
+        return Ok(xml_tag(&resp, "NewInternalClient").map(|s| s.trim().to_string()));
+    }
+    // ONLY 714 (NoSuchEntryInArray) means genuinely free. Any other fault is a
+    // real error to surface, not silently report as "free" - that false "free" is
+    // exactly what hid a stale mapping and cost a long debugging detour.
+    let code = xml_tag(&resp, "errorCode").and_then(|s| s.trim().parse::<u32>().ok());
+    if code == Some(714) {
         Ok(None)
+    } else {
+        Err(UpnpError::Gateway(
+            xml_tag(&resp, "errorDescription").unwrap_or_else(|| format!("HTTP {status}")),
+        ))
     }
 }
 
