@@ -129,6 +129,14 @@ impl SourceRegistry {
         &self.sources
     }
 
+    /// Drop sources for which `blocked` is true (e.g. an IP-filter hit). Returns
+    /// how many were removed.
+    pub fn drop_blocked(&mut self, blocked: impl Fn(SocketAddr) -> bool) -> usize {
+        let before = self.sources.len();
+        self.sources.retain(|s| !blocked(s.addr));
+        before - self.sources.len()
+    }
+
     pub fn len(&self) -> usize {
         self.sources.len()
     }
@@ -401,6 +409,32 @@ mod tests {
             user_hash: None,
         };
         assert!(PeerSource::from_found(&s).is_none());
+    }
+
+    #[test]
+    fn drop_blocked_removes_filtered_sources() {
+        use mule_files::{IpFilter, DEFAULT_IPFILTER_LEVEL};
+        let mut reg = SourceRegistry::new();
+        // Two directly-connectable server sources: one blocked, one not.
+        let bad_ip = 10u32 | (5 << 24); // eD2k low-byte 10.0.0.5
+        let ok_ip = 8u32 | (8 << 8) | (8 << 16) | (8 << 24); // 8.8.8.8
+        for ip in [bad_ip, ok_ip] {
+            reg.add_found(&[FoundSource {
+                ip,
+                port: 4662,
+                crypt: None,
+                user_hash: None,
+            }]);
+        }
+        assert_eq!(reg.len(), 2);
+        let filter = IpFilter::parse("10.0.0.0 - 10.0.0.255 , 0 , x\n", DEFAULT_IPFILTER_LEVEL);
+        let dropped = reg.drop_blocked(|addr| match addr {
+            SocketAddr::V4(v4) => filter.is_blocked(*v4.ip()),
+            SocketAddr::V6(_) => false,
+        });
+        assert_eq!(dropped, 1);
+        assert_eq!(reg.len(), 1);
+        assert_eq!(reg.sources()[0].addr, "8.8.8.8:4662".parse().unwrap());
     }
 
     #[test]

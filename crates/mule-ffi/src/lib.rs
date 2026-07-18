@@ -331,6 +331,12 @@ impl MuleEngine {
         })
     }
 
+    /// How many IP-blocklist ranges are loaded (0 = no filter placed).
+    pub fn ip_filter_ranges(&self) -> u32 {
+        self.rt
+            .block_on(async { self.inner.lock().await.ip_filter_ranges() as u32 })
+    }
+
     /// Snapshots of the shared library - the complete files we serve to peers.
     pub fn shared_files(&self) -> Vec<SharedFileInfo> {
         self.rt.block_on(async {

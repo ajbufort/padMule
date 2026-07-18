@@ -19,6 +19,8 @@ final class EngineModel: ObservableObject {
     /// The files we are serving to peers (the persisted + session shared library).
     @Published private(set) var sharedFiles: [SharedFileInfo] = []
     @Published private(set) var kadContacts: UInt32 = 0
+    /// How many IP-blocklist ranges are loaded (0 = no ipfilter placed).
+    @Published private(set) var ipFilterRanges: UInt32 = 0
     @Published private(set) var identity: IdentityInfo?
     @Published private(set) var bootError: String?
     /// The live login. Polled as a SNAPSHOT rather than tracked from events:
@@ -204,6 +206,7 @@ final class EngineModel: ObservableObject {
             let dls = e.downloads()
             let shf = e.sharedFiles()
             let kad = e.kadContacts()
+            let ipf = e.ipFilterRanges()
             let srv = e.serverInfo()
             let shr = e.isSharing()
             let evs = e.drainEvents()
@@ -213,6 +216,7 @@ final class EngineModel: ObservableObject {
                 self.downloads = dls
                 self.sharedFiles = shf
                 self.kadContacts = kad
+                self.ipFilterRanges = ipf
                 self.server = srv
                 self.sharing = shr
                 for ev in evs { self.apply(ev) }

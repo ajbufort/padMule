@@ -1335,6 +1335,37 @@ async fn cmd_upnp_unicast(port: u16) {
 
 /// Parse an ed2k:// or magnet: link and show what it contains; for a file link
 /// with embedded sources and an out path, download it from those sources.
+/// Load an ipfilter.dat/.p2p list, report how many ranges block, and optionally
+/// test whether a given IP is blocked.
+fn cmd_ipfilter(path: &str, test_ip: Option<&str>) {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("cannot read {path}: {e}");
+            return;
+        }
+    };
+    let filter = mule_files::IpFilter::parse(&text, mule_files::DEFAULT_IPFILTER_LEVEL);
+    println!(
+        "loaded {} blocking range(s) at level {}",
+        filter.len(),
+        mule_files::DEFAULT_IPFILTER_LEVEL
+    );
+    if let Some(ip) = test_ip {
+        match ip.parse::<std::net::Ipv4Addr>() {
+            Ok(addr) => println!(
+                "{addr} is {}",
+                if filter.is_blocked(addr) {
+                    "BLOCKED"
+                } else {
+                    "allowed"
+                }
+            ),
+            Err(_) => eprintln!("bad IP: {ip}"),
+        }
+    }
+}
+
 async fn cmd_link(link: &str, out: Option<&str>) {
     let parsed = match mule_proto::parse_link(link) {
         Some(p) => p,
@@ -1812,6 +1843,9 @@ async fn main() {
         Some("link") if args.len() == 3 || args.len() == 4 => {
             cmd_link(&args[2], args.get(3).map(String::as_str)).await
         }
+        Some("ipfilter") if args.len() == 3 || args.len() == 4 => {
+            cmd_ipfilter(&args[2], args.get(3).map(String::as_str))
+        }
         Some("upnp") if args.len() == 3 => match args[2].parse::<u16>() {
             Ok(port) => cmd_upnp(port).await,
             Err(_) => eprintln!("bad port: {}", args[2]),
@@ -1865,6 +1899,7 @@ async fn main() {
             eprintln!("  mule-cli kad-fetch <nodes.dat> <ed2k-hash-hex> <size> <out>");
             eprintln!("  mule-cli kad-keyword <nodes.dat> <keyword>");
             eprintln!("  mule-cli link <ed2k-or-magnet-link> [out]");
+            eprintln!("  mule-cli ipfilter <ipfilter.dat|.p2p> [test-ip]");
             eprintln!("  mule-cli search-download <server.met> <keyword> <out>");
             eprintln!(
                 "  mule-cli fetch-complete <server.met> <keyword> <out> [max_size] [min_size]"

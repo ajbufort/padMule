@@ -3,6 +3,7 @@
 //! See docs/wiki/protocol-reference.md.
 
 pub mod clients_met;
+pub mod ipfilter;
 pub mod known_met;
 pub mod nodes_dat;
 pub mod part_met;
@@ -13,6 +14,7 @@ pub use clients_met::{
     read_clients_met, write_clients_met, ClientsMet, CreditEntry, CREDIT_EXPIRE_SECS,
     CREDIT_FILE_VERSION,
 };
+pub use ipfilter::{IpFilter, DEFAULT_IPFILTER_LEVEL};
 pub use known_met::{
     read_known_met, write_known_met, KnownFileEntry, KnownMet, MET_HEADER,
     MET_HEADER_WITH_LARGEFILES,

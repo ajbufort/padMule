@@ -270,6 +270,9 @@ struct ContentView: View {
                 // The port-mapping result: the direct answer to "why am I LowID?"
                 // when the router should have opened the port.
                 row("Port mapping", model.upnpStatus ?? "checking...")
+                row("IP filter", model.ipFilterRanges == 0
+                    ? "off"
+                    : "\(model.ipFilterRanges) ranges blocked")
                 if let id = model.identity {
                     row("User hash", String(id.userhash.prefix(16)) + "...")
                     row("Kad ID", String(id.kadId.prefix(16)) + "...")
