@@ -40,10 +40,15 @@ pub(crate) fn tag_str(tags: &[mule_proto::Tag], id: u8) -> Option<String> {
 }
 
 pub(crate) fn tag_u64(tags: &[mule_proto::Tag], id: u8) -> Option<u64> {
+    // Match every integer width, including U8: aMule's CTag::GetInt normalizes
+    // all of them (Tag.cpp:128-131), and the compact "new ed2k tag" encoding
+    // writes any value <= 0xFF as TAGTYPE_UINT8 - so a small FT_FILERATING /
+    // FT_SOURCES / bitrate arrives as U8. Omitting it silently dropped those.
     tags.iter().find_map(|t| match (&t.name, &t.value) {
+        (TagName::Id(n), TagValue::U8(v)) if *n == id => Some(*v as u64),
+        (TagName::Id(n), TagValue::U16(v)) if *n == id => Some(*v as u64),
         (TagName::Id(n), TagValue::U32(v)) if *n == id => Some(*v as u64),
         (TagName::Id(n), TagValue::U64(v)) if *n == id => Some(*v),
-        (TagName::Id(n), TagValue::U16(v)) if *n == id => Some(*v as u64),
         _ => None,
     })
 }
@@ -102,7 +107,9 @@ struct Group {
     length: u32,
     bitrate: u32,
     codec: String,
-    rating: u8, // best (max) FT_FILERATING seen, 0-5
+    // Sum + count of RATED rows (rating != 0), for aMule's average aggregation.
+    rating_sum: u32,
+    rating_count: u32,
 }
 
 /// Map a filename extension to a display category. eMule's FT_FILETYPE tag is
@@ -182,10 +189,16 @@ pub fn catalog(files: &[SearchResultFile]) -> Vec<RankedFile> {
         if g.bitrate == 0 {
             g.bitrate = tag_u64(&f.tags, FT_MEDIA_BITRATE).unwrap_or(0) as u32;
         }
-        // Server rating (sparse; most servers do not populate it). Keep the best
-        // one seen across a hash's duplicate rows.
+        // Server rating (sparse; most servers do not populate it). aMule averages
+        // the ratings across a hash's rated rows (SearchFile.cpp:299-300), so a
+        // lone spoofed "Excellent" cannot bury a chorus of "Fake" - accumulate
+        // sum + count of the RATED rows and divide at the end.
         if let Some(r) = tag_u64(&f.tags, FT_FILERATING) {
-            g.rating = g.rating.max(decode_rating(r));
+            let decoded = decode_rating(r);
+            if decoded > 0 {
+                g.rating_sum += decoded as u32;
+                g.rating_count += 1;
+            }
         }
     }
 
@@ -206,11 +219,13 @@ pub fn catalog(files: &[SearchResultFile]) -> Vec<RankedFile> {
                 .map(|(n, _)| n.clone())
                 .unwrap_or_default();
             let name_variants = g.names.len();
+            // Average rating over rated rows (integer, aMule-style); 0 = unrated.
+            let rating = g.rating_sum.checked_div(g.rating_count).unwrap_or(0) as u8;
             let trust = if g.sizes.len() > 1 {
                 Trust::Suspect("sources disagree on size for this hash")
             } else if size == 0 {
                 Trust::Suspect("no advertised size")
-            } else if g.rating == 1 {
+            } else if rating == 1 {
                 // eMule rating 1 = Invalid/Corrupt/Fake.
                 Trust::Suspect("rated fake")
             } else if g.sources == 0 && name_variants > 3 {
@@ -239,7 +254,7 @@ pub fn catalog(files: &[SearchResultFile]) -> Vec<RankedFile> {
                 length_secs: g.length,
                 bitrate: g.bitrate,
                 codec: g.codec,
-                rating: g.rating,
+                rating,
             }
         })
         .collect();
@@ -277,7 +292,10 @@ mod tests {
         assert_eq!(decode_rating(0), 0);
         assert_eq!(decode_rating(0xFF), 5); // high bits ignored, clamped
 
-        let rated = |hash: [u8; 16], raw: u32| SearchResultFile {
+        // Build the rating tag as UINT8 - the natural wire encoding for a value
+        // <= 0xFF. tag_u64 MUST read it (a U8-only reader once dropped it, so a
+        // fake was silently shown Trusted).
+        let rated = |hash: [u8; 16], raw: u8| SearchResultFile {
             hash,
             id: 0,
             port: 0,
@@ -296,11 +314,11 @@ mod tests {
                 },
                 Tag {
                     name: TagName::Id(FT_FILERATING),
-                    value: TagValue::U32(raw),
+                    value: TagValue::U8(raw),
                 },
             ],
         };
-        // Excellent (raw 15 -> 5): trusted, rating carried.
+        // Excellent (raw 15 -> 5): trusted, rating carried (via the U8 path).
         let good = catalog(&[rated([0x01; 16], 15)]);
         assert_eq!(good[0].rating, 5);
         assert!(good[0].is_trusted());
@@ -309,6 +327,18 @@ mod tests {
         assert_eq!(fake[0].rating, 1);
         assert!(!fake[0].is_trusted());
         assert!(matches!(fake[0].trust, Trust::Suspect(_)));
+
+        // AVERAGE, not max (aMule SearchFile.cpp:299): three Fake rows and one
+        // Fair row average to 1 (Fake), so a lone dissenting rating cannot bury
+        // the chorus - the file is still flagged.
+        let mixed = catalog(&[
+            rated([0x03; 16], 3),  // 1 (Fake)
+            rated([0x03; 16], 3),  // 1
+            rated([0x03; 16], 3),  // 1
+            rated([0x03; 16], 12), // 4 (Good)
+        ]);
+        assert_eq!(mixed[0].rating, 1, "avg (1+1+1+4)/4 = 1, not max 4");
+        assert!(!mixed[0].is_trusted());
     }
 
     fn result(hash: [u8; 16], name: &str, size: u64, sources: u32) -> SearchResultFile {
