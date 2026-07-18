@@ -99,6 +99,14 @@ pub struct DownloadInfo {
     pub complete: bool,
 }
 
+/// One complete file we are serving to peers (the shared library).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct SharedFileInfo {
+    pub hash: String,
+    pub name: String,
+    pub size: u64,
+}
+
 /// A search hit's local state (already have / fetching / new).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum HitStatusFfi {
@@ -320,6 +328,24 @@ impl MuleEngine {
                 });
             }
             out
+        })
+    }
+
+    /// Snapshots of the shared library - the complete files we serve to peers.
+    pub fn shared_files(&self) -> Vec<SharedFileInfo> {
+        self.rt.block_on(async {
+            self.inner
+                .lock()
+                .await
+                .shared_files()
+                .await
+                .into_iter()
+                .map(|(hash, name, size)| SharedFileInfo {
+                    hash: hex::encode(hash),
+                    name,
+                    size,
+                })
+                .collect()
         })
     }
 

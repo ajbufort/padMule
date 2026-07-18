@@ -638,6 +638,24 @@ impl Engine {
         self.downloads.lock().await.clone()
     }
 
+    /// The complete files we are currently serving to peers, as (hash, name,
+    /// size). Reflects the persisted library plus anything finished this session;
+    /// empty in Leech Mode is still what we HOLD, not what we serve.
+    pub async fn shared_files(&self) -> Vec<([u8; 16], String, u64)> {
+        self.shared
+            .lock()
+            .await
+            .iter()
+            .map(|s| {
+                (
+                    s.hash,
+                    String::from_utf8_lossy(&s.name).into_owned(),
+                    s.size,
+                )
+            })
+            .collect()
+    }
+
     /// Where completed files land. The iOS app points this at its Documents dir
     /// so finished downloads show up in the Files app.
     pub fn set_downloads_dir(&mut self, dir: impl AsRef<Path>) {
