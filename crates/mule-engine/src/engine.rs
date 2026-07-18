@@ -20,7 +20,7 @@
 //! called-back peer dials our listener.
 
 use crate::bootstrap;
-use crate::catalog::{catalog, RankedFile};
+use crate::catalog::{catalog, tag_str, tag_u64, RankedFile};
 use crate::connection::{ServerEvent, ServerState};
 use crate::fetch::{download_file, ManagerConfig, PeerSource, SourceRegistry};
 use crate::framed::FramedStream;
@@ -173,6 +173,90 @@ fn unique_dest(dest: PathBuf) -> PathBuf {
     dest
 }
 
+/// The persisted shared-library file (upstream-faithful `known.met`): the
+/// complete files we will re-serve after a restart. Lives in the config dir
+/// alongside the other `.met` files; the actual bytes are in the downloads dir.
+const KNOWN_MET: &str = "known.met";
+const FT_FILENAME: u8 = 0x01;
+const FT_FILESIZE: u8 = 0x02;
+
+/// Rebuild the shared library from `known.met`: every complete file a prior
+/// session saved that STILL exists on disk (a user can delete a file from the
+/// Files app, and we must not advertise a source we can no longer serve). The
+/// on-disk name is stored verbatim, so the path is `downloads_dir / name`.
+fn load_shared_library(config_dir: &Path, downloads_dir: &Path) -> Vec<SharedFile> {
+    let Ok(bytes) = std::fs::read(config_dir.join(KNOWN_MET)) else {
+        return Vec::new();
+    };
+    let Ok(met) = mule_files::read_known_met(&bytes) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for e in met.entries {
+        let (Some(name), Some(size)) =
+            (tag_str(&e.tags, FT_FILENAME), tag_u64(&e.tags, FT_FILESIZE))
+        else {
+            continue;
+        };
+        let path = downloads_dir.join(&name);
+        if !path.exists() {
+            continue;
+        }
+        out.push(SharedFile {
+            hash: e.file_hash,
+            size,
+            name: name.into_bytes(),
+            part_hashes: e.part_hashes,
+            path,
+        });
+    }
+    out
+}
+
+/// Append one finished file to `known.met` so it re-shares after a restart.
+/// Idempotent by hash. Best-effort: a write failure just means it will not
+/// persist, never a crash (the in-memory share still works this session).
+fn persist_shared_file(config_dir: &Path, sf: &SharedFile) {
+    let path = config_dir.join(KNOWN_MET);
+    let mut met = std::fs::read(&path)
+        .ok()
+        .and_then(|b| mule_files::read_known_met(&b).ok())
+        .unwrap_or(mule_files::KnownMet {
+            header: mule_files::MET_HEADER,
+            entries: Vec::new(),
+        });
+    if met.entries.iter().any(|e| e.file_hash == sf.hash) {
+        return;
+    }
+    // A file past the 32-bit boundary needs the large-file header + a U64 size
+    // tag; otherwise the 32-bit form (matches mule-files' own writer choice).
+    let large = sf.size > mule_proto::OLD_MAX_FILE_SIZE;
+    if large {
+        met.header = mule_files::MET_HEADER_WITH_LARGEFILES;
+    }
+    let size_val = if large {
+        TagValue::U64(sf.size)
+    } else {
+        TagValue::U32(sf.size as u32)
+    };
+    let date = std::fs::metadata(&sf.path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as u32)
+        .unwrap_or(0);
+    met.entries.push(mule_files::KnownFileEntry {
+        date,
+        file_hash: sf.hash,
+        part_hashes: sf.part_hashes.clone(),
+        tags: vec![
+            Tag::id(FT_FILENAME, TagValue::Str(sf.name.clone())),
+            Tag::id(FT_FILESIZE, size_val),
+        ],
+    });
+    let _ = std::fs::write(&path, mule_files::write_known_met(&met));
+}
+
 /// Verify a finished download and move it into place.
 ///
 /// The whole-file ed2k hash is checked FIRST, and this is not belt-and-braces:
@@ -181,15 +265,28 @@ fn unique_dest(dest: PathBuf) -> PathBuf {
 /// between corrupt bytes and the user's Files app. We asked for hash X; we hand
 /// over hash X or nothing. It is computed part-by-part so a large file is never
 /// held in memory.
-async fn finish_download(
-    dl: Arc<Download>,
+/// The engine-side handles a finished download needs, bundled so the completion
+/// tail spawned in [`Engine::spawn_fetch`] can hand them off in one move.
+struct FinishCtx {
     registry: Arc<Mutex<Vec<Arc<Download>>>>,
     shared: Arc<Mutex<Vec<SharedFile>>>,
+    config_dir: PathBuf,
+    events: mpsc::UnboundedSender<EngineEvent>,
+}
+
+async fn finish_download(
+    dl: Arc<Download>,
+    ctx: FinishCtx,
     hash: [u8; 16],
     size: u64,
     dest: PathBuf,
-    events: mpsc::UnboundedSender<EngineEvent>,
 ) {
+    let FinishCtx {
+        registry,
+        shared,
+        config_dir,
+        events,
+    } = ctx;
     let name = dl.name().await;
     let verified = dl.verify_whole_file(size, hash).await;
     if !verified {
@@ -216,14 +313,22 @@ async fn finish_download(
     match store.finish(&dest) {
         Ok(()) => {
             // Seed it: a verified, complete file is a full source other peers can
-            // pull. The listener only serves it while sharing is on.
-            shared.lock().await.push(SharedFile {
+            // pull. The listener only serves it while sharing is on. Use the
+            // ACTUAL on-disk name (unique_dest may have renamed it), so the
+            // persisted library can rebuild `path` as downloads_dir / name.
+            let on_disk_name = dest
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or(name.clone());
+            let sf = SharedFile {
                 hash,
                 size,
-                name: name.clone().into_bytes(),
+                name: on_disk_name.into_bytes(),
                 part_hashes,
                 path: dest.clone(),
-            });
+            };
+            persist_shared_file(&config_dir, &sf); // re-share after a restart
+            shared.lock().await.push(sf);
             let _ = events.send(EngineEvent::Server(format!(
                 "Saved '{}'",
                 dest.file_name().unwrap_or_default().to_string_lossy()
@@ -585,6 +690,11 @@ impl Engine {
             self.emit(EngineEvent::Progress { hash, have, total });
         }
         *self.downloads.lock().await = resumed;
+
+        // Complete files from prior sessions - re-share them (the list was
+        // session-only before, so uploads forgot their library on every launch).
+        let library = load_shared_library(&self.config_dir, &self.downloads_dir);
+        *self.shared.lock().await = library;
 
         // Go live. ORDER MATTERS: the inbound listener must exist BEFORE we log
         // in, because the server decides HighID vs LowID by connecting back to
@@ -1010,8 +1120,12 @@ impl Engine {
         let me = HelloInfo::baseline(self.identity.userhash, 0, TCP_PORT, KAD_UDP_PORT, "padMule");
         let dest = self.downloads_dir.join(safe_filename(name));
         let events = self.events.clone();
-        let registry = Arc::clone(&self.downloads);
-        let shared = Arc::clone(&self.shared);
+        let ctx = FinishCtx {
+            registry: Arc::clone(&self.downloads),
+            shared: Arc::clone(&self.shared),
+            config_dir: self.config_dir.clone(),
+            events: events.clone(),
+        };
         let dl_task = dl;
         tokio::spawn(async move {
             download_file(&dl_task, &sources, &me, ManagerConfig::default()).await;
@@ -1024,7 +1138,7 @@ impl Engine {
             let have = total - dl_task.missing().await;
             let _ = events.send(EngineEvent::Progress { hash, have, total });
             if dl_task.is_complete().await {
-                finish_download(dl_task, registry, shared, hash, size, dest, events).await;
+                finish_download(dl_task, ctx, hash, size, dest).await;
             }
         });
     }
@@ -1655,6 +1769,46 @@ mod tests {
             e,
             EngineEvent::Progress { total, have, .. } if *total == 5000 && *have == 0
         )));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shared_library_persists_reloads_and_skips_deleted() {
+        let dir = tmp("known-met-roundtrip");
+        let _ = std::fs::remove_dir_all(&dir);
+        let downloads = dir.join("downloads");
+        std::fs::create_dir_all(&downloads).unwrap();
+        // One file still on disk, one the user later deleted from Files.
+        std::fs::write(downloads.join("kept.bin"), b"hello").unwrap();
+        let kept = SharedFile {
+            hash: [0x11; 16],
+            size: 5,
+            name: b"kept.bin".to_vec(),
+            part_hashes: vec![],
+            path: downloads.join("kept.bin"),
+        };
+        let gone = SharedFile {
+            hash: [0x22; 16],
+            size: 9,
+            name: b"gone.bin".to_vec(),
+            part_hashes: vec![[0xAB; 16], [0xCD; 16]],
+            path: downloads.join("gone.bin"), // never written to disk
+        };
+        persist_shared_file(&dir, &kept);
+        persist_shared_file(&dir, &gone);
+        persist_shared_file(&dir, &kept); // idempotent by hash
+
+        // known.met stayed byte-valid and holds both entries once each.
+        let met =
+            mule_files::read_known_met(&std::fs::read(dir.join("known.met")).unwrap()).unwrap();
+        assert_eq!(met.entries.len(), 2, "each hash persisted exactly once");
+
+        // Reload only re-shares the file that still exists on disk.
+        let lib = load_shared_library(&dir, &downloads);
+        assert_eq!(lib.len(), 1);
+        assert_eq!(lib[0].hash, [0x11; 16]);
+        assert_eq!(lib[0].size, 5);
+        assert_eq!(lib[0].name, b"kept.bin");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
