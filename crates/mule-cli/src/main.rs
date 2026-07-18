@@ -1519,8 +1519,10 @@ async fn cmd_fetch_complete(
     let params = SearchParams {
         keyword: keyword.to_string(),
         file_type: None,
-        min_size: Some(min_size.max(1) as u32),
-        max_size: Some(max_size as u32),
+        // Saturate: the server-side size filter is 32-bit, so a > 4 GiB bound
+        // clamps to u32::MAX rather than wrapping to a tiny value.
+        min_size: Some(min_size.clamp(1, u32::MAX as u64) as u32),
+        max_size: Some(max_size.min(u32::MAX as u64) as u32),
         extension: Some(keyword.to_string()),
     };
     println!("searching '{keyword}' ({min_size}..={max_size} bytes) ...");

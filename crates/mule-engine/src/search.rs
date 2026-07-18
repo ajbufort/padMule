@@ -157,6 +157,11 @@ pub enum SearchMethod {
 /// eMule 0.70b's "Automatic" search method: pick the network by connectivity.
 /// Prefer the server when connected (a local search is quick), else fall back to
 /// Kad; `None` if neither network is available.
+///
+/// NOT on padMule's current search path: `Engine::search` queries the server
+/// AND Kad concurrently and merges (better than either alone), so it never
+/// chooses one. Kept as the connectivity-selection primitive for a future
+/// bandwidth-constrained "one network only" mode.
 pub fn choose_search_method(server_connected: bool, kad_ready: bool) -> Option<SearchMethod> {
     if server_connected {
         Some(SearchMethod::Server)

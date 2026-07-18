@@ -49,6 +49,8 @@ pub enum KadError {
     Timeout,
     /// The datagram was plaintext or matched no key.
     NotDecryptable,
+    /// The node has no routing contacts yet (bootstrap first).
+    NotReady,
     /// A codec/parse error on the decrypted payload.
     Decode(mule_proto::IoError),
     /// A valid Kad frame but not the opcode we awaited.
@@ -63,6 +65,7 @@ impl std::fmt::Display for KadError {
             KadError::NotDecryptable => {
                 write!(f, "response not decryptable (plaintext or wrong key)")
             }
+            KadError::NotReady => write!(f, "no Kad contacts yet (bootstrap first)"),
             KadError::Decode(e) => write!(f, "decode: {e}"),
             KadError::Unexpected(op) => write!(f, "unexpected opcode 0x{op:02x}"),
         }
@@ -318,7 +321,7 @@ impl KadNode {
             })
             .collect();
         if seeds.is_empty() {
-            return Err(KadError::NotDecryptable); // no routing table - bootstrap first
+            return Err(KadError::NotReady); // no routing table - bootstrap first
         }
         let mut lookup = Lookup::new(*file_hash, seeds);
         let mut out = ResolveOutcome::default();
@@ -413,7 +416,7 @@ impl KadNode {
             })
             .collect();
         if seeds.is_empty() {
-            return Err(KadError::NotDecryptable); // bootstrap first
+            return Err(KadError::NotReady); // bootstrap first
         }
         let mut lookup = Lookup::new(target, seeds);
         for _round in 0..12 {

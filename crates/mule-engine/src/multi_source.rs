@@ -190,10 +190,9 @@ impl Download {
         let mut g = self.inner.lock().await;
         let n = data_part_count(g.store.pf.size);
         for part in 0..n {
-            if g.store.pf.is_part_complete(part) && g.store.pf.corrupted().contains(&part) {
-                // Bytes are back after a corruption; re-check it.
-                g.store.verify_part(part)?;
-            } else if g.store.pf.is_part_complete(part) {
+            // Verify any part whose bytes have all arrived (this re-checks a
+            // previously-corrupted part too, now that its bytes are back).
+            if g.store.pf.is_part_complete(part) {
                 g.store.verify_part(part)?;
             }
         }
