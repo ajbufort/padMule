@@ -146,6 +146,12 @@ pub fn compress(p: &Packet) -> Packet {
 /// zlib-decompress a packed packet (`0xD4`/`0xF5` -> `0xC5`, `0xE5` -> `0xE4`),
 /// bounding the output to `max_size` bytes. Errors if `p` is not a packed
 /// packet, the output would exceed `max_size`, or the zlib stream is invalid.
+///
+/// Note the ED2Kv2 asymmetry with [`compress`] (which maps `0xF4` -> `0xF5`):
+/// decompress folds `0xF5` back to `0xC5`, not `0xF4`. This is intentional and
+/// unreachable in practice - padMule never advertises VBT, so it never emits an
+/// ED2Kv2 packet to compress, and a decompressed packed body is dispatched under
+/// the eMule protocol exactly as eMule handles OP_PACKEDPROT (EMSocket.cpp:373).
 pub fn decompress(p: &Packet, max_size: usize) -> Result<Packet, IoError> {
     let protocol = match p.protocol {
         PROT_PACKED | PROT_ED2KV2_PACKED => PROT_EMULE,

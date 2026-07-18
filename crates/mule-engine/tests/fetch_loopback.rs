@@ -13,7 +13,6 @@ use mule_engine::{
     ManagerConfig, PartStore, PeerSource, SourceOrigin,
 };
 use mule_proto::ed2k_hash;
-use std::time::Duration as StdDuration;
 use tokio::net::TcpListener;
 
 fn user_hash() -> [u8; 16] {
@@ -110,7 +109,7 @@ async fn download_manager_completes_from_multiple_parallel_peers() {
 
     let cfg = ManagerConfig {
         parallel: 3,
-        per_peer: StdDuration::from_secs(20),
+        per_peer: Duration::from_secs(20),
         rounds: 4,
     };
     let outcome = download_file(&dl, &sources, &me, cfg).await;

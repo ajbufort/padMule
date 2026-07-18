@@ -504,7 +504,6 @@ version = "0.0.0"
 dependencies = [
  "hex",
  "mule-engine",
- "mule-proto",
  "tokio",
  "uniffi",
 ]

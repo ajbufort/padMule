@@ -29,6 +29,9 @@ struct PadMuleApp: App {
                 withAnimation(.easeOut(duration: 0.35)) { showSplash = false }
             }
         }
+        // Single-parameter onChange is deprecated in iOS 17 but is the correct
+        // form for our iOS 16 deployment target; the two-parameter overload does
+        // not exist on 16. Keep as-is until the target moves past 16.
         .onChange(of: scenePhase) { phase in
             switch phase {
             case .active:
