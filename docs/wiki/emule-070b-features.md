@@ -1,6 +1,11 @@
 # eMule 0.70b Feature Backlog (mined for padMule)
 
-Updated: 2026-07-18
+Updated: 2026-07-18 (first slice landed)
+
+**First slice DONE (2026-07-18):** #1 IP filter, #2 search history, #3 wire-side
+search filters (availability + size). See the code-fix-round-adjacent commits +
+[[build-progress]]. #4 verified-identity badge is deferred - it needs a
+per-source detail sheet (#21) to render on, which does not exist yet.
 
 A ranked proposal of features padMule could adopt from eMule 0.70b, from a
 4-surveyor + synthesis dive over `refs/emule-0.70b`. Scope: GUI/feature-level
@@ -12,17 +17,17 @@ parsing, Kad anti-abuse hardening, and the "Automatic" search method). Ranked by
 
 ## Tier 1 - do soon (high value, mostly safe)
 
-1. **IP filter** (small, low risk). Parse `ipfilter.dat`/`.p2p` range blocklists,
-   drop connections to bad-actor ranges; optional URL auto-update. The cheapest
-   trust/safety win; pure engine-local gate, no protocol change. padMule lacks
-   it. (The KB long listed ipfilter as a Wave-7 fixture - it is not implemented.)
-2. **Search history / autocomplete** (small, no wire). Persisted recents under
-   the search box, swipe-to-delete. Trivial local MRU; big touch QoL.
-3. **Push filters into the search PACKET** (small, low risk). Turn padMule's
-   client-side filter chips into AND-ed wire query tags (FT_COMPLETE_SOURCES>=1,
-   FT_FILESIZE GE/LE, type, extension) so the server pre-filters and the ~200-300
-   result cap fills with relevant hits. Complete-sources>=1 is the best single
-   relevance lever. Kad quirk: map `>=v` to `>v-1` for old nodes.
+1. **IP filter** - DONE (2026-07-18). `mule-files::ipfilter` parses ipfilter.dat +
+   .p2p (format-faithful to aMule), blocks ranges with level < 127; engine gates
+   outbound sources + inbound peers (after handshake, so the server's HighID
+   probe is never filtered). FFI count + Status row; `mule-cli ipfilter`.
+2. **Search history / autocomplete** - DONE (2026-07-18). UserDefaults-backed MRU
+   (12, case-insensitive de-dupe) as a "Recent" section, tap-to-rerun,
+   swipe-to-delete. Swift-only.
+3. **Push filters into the search PACKET** - DONE (2026-07-18). SearchParams
+   min_sources -> FT_SOURCES `> N-1` (universal op); size min/max on the wire
+   (max > 4 GiB omitted, enforced client-side). FFI SearchFilters +
+   "Complete sources only" toggle + size preset menus. Type stays client-side.
 4. **Verified-identity badge + obfuscation glyph** (small, no wire). padMule
    already runs secure-ident (`credits`/`identity.rs`) but shows no badge; a
    verified checkmark + a lock glyph are pure presentation of held state.
