@@ -161,6 +161,29 @@ struct ContentView: View {
                         .foregroundStyle(.secondary)
                 }
             }
+
+            // Recent queries: shown when the box is empty, so you can re-run a
+            // search with one tap instead of retyping. Swipe a row to forget it.
+            if query.isEmpty, !model.recentSearches.isEmpty {
+                Section("Recent") {
+                    ForEach(model.recentSearches, id: \.self) { q in
+                        Button {
+                            query = q
+                            model.search(q)
+                        } label: {
+                            Label(q, systemImage: "clock.arrow.circlepath")
+                                .foregroundStyle(.primary)
+                        }
+                        .swipeActions(edge: .trailing) {
+                            Button(role: .destructive) {
+                                model.removeRecent(q)
+                            } label: {
+                                Label("Delete", systemImage: "trash")
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
