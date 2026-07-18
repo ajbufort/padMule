@@ -21,6 +21,38 @@ use std::sync::Arc;
 use mule_proto::Packet;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::time::{timeout, Duration};
+
+/// Drop a serve connection that goes silent this long between packets. Bounds
+/// idle pre-upload sessions (a peer that names a file then never asks) - eMule
+/// reaps at CONNECTION_TIMEOUT=40s; we allow more slack for a slow link.
+const SERVE_IDLE: Duration = Duration::from_secs(60);
+/// Longest a queued peer waits in place for a slot before we close its
+/// connection (it can reconnect). Bounds how long a waiter ties up a task/fd.
+const QUEUE_WAIT: Duration = Duration::from_secs(120);
+
+/// Undoes an `UploadGate` wait-count increment on drop, so a peer that
+/// disconnects while queued (a write error, or the serve future being dropped
+/// mid-await) can never leak queue capacity. Without this, `waiting` would
+/// ratchet up until `queue_cap` is reached and no peer is ever queued again.
+struct WaitTicket<'a> {
+    gate: &'a UploadGate,
+}
+
+impl<'a> WaitTicket<'a> {
+    /// Take a queue ticket. Returns the guard plus how many peers were already
+    /// waiting ahead (the caller's 0-based position).
+    fn enter(gate: &'a UploadGate) -> (Self, usize) {
+        let ahead = gate.waiting.fetch_add(1, Ordering::AcqRel);
+        (WaitTicket { gate }, ahead)
+    }
+}
+
+impl Drop for WaitTicket<'_> {
+    fn drop(&mut self) {
+        self.gate.waiting.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 use crate::framed::{FrameError, FramedStream};
 use crate::transfer::{
@@ -42,6 +74,12 @@ use crate::transfer::{
 /// long-lived queue would be dishonest here. Rank is arrival-order (FIFO); the
 /// wire number is truthful for that ordering, and eMule's score-ordered queue
 /// is wire-neutral local policy we can layer on later.
+///
+/// The announced rank is a BEST-EFFORT snapshot taken when the peer is queued,
+/// not a promise: a slot that frees while the peer is still writing its rank can
+/// be taken by a peer already parked in `acquire_owned` or by a newcomer's
+/// `try_acquire_owned`, so actual grant order is only approximately FIFO. eMule
+/// ranks are likewise advisory (recomputed on demand, not a reservation).
 pub struct UploadGate {
     slots: Arc<Semaphore>,
     waiting: AtomicUsize,
@@ -133,10 +171,14 @@ where
     loop {
         let pkt = match pending.take() {
             Some(p) => p,
-            None => match fs.read_packet_unpacked().await {
-                Ok(p) => p,
-                Err(FrameError::Closed) => return Ok(()),
-                Err(e) => return Err(e),
+            // Bound idle time: a peer that stops sending (never asks to upload,
+            // or stalls mid-transfer) is dropped rather than holding a task + fd
+            // forever. An active transfer keeps packets flowing well within this.
+            None => match timeout(SERVE_IDLE, fs.read_packet_unpacked()).await {
+                Ok(Ok(p)) => p,
+                Ok(Err(FrameError::Closed)) => return Ok(()),
+                Ok(Err(e)) => return Err(e),
+                Err(_) => return Ok(()), // idle timeout
             },
         };
         match pkt.opcode {
@@ -194,11 +236,14 @@ where
                                 fs.write_packet(&build_accept_upload()).await?;
                             }
                             // At capacity: queue this peer (bounded) and send its
-                            // 1-based rank, then wait in place for a slot.
+                            // 1-based rank, then wait in place for a slot. The
+                            // ticket decrements `waiting` on EVERY exit (a write
+                            // error or a dropped future included), so the count
+                            // cannot leak.
                             Err(_) => {
-                                let ahead = g.waiting.fetch_add(1, Ordering::AcqRel);
+                                let (ticket, ahead) = WaitTicket::enter(g);
                                 if ahead >= g.queue_cap {
-                                    g.waiting.fetch_sub(1, Ordering::AcqRel);
+                                    drop(ticket);
                                     fs.write_packet(&build_file_req_ans_no_fil(&f.hash)).await?;
                                     return Ok(());
                                 }
@@ -206,16 +251,20 @@ where
                                 // eMule bans a peer that receives an UNSOLICITED
                                 // rank; only ever send it in reply to this ask.
                                 fs.write_packet(&build_queue_ranking(rank)).await?;
-                                // The fair semaphore hands the freed slot to the
-                                // longest waiter, so grants are FIFO.
-                                let granted = Arc::clone(&g.slots).acquire_owned().await;
-                                g.waiting.fetch_sub(1, Ordering::AcqRel);
+                                // Wait in place for a freed slot (the fair
+                                // semaphore favours the longest waiter), bounded so
+                                // a waiter cannot tie up the connection forever.
+                                let granted =
+                                    timeout(QUEUE_WAIT, Arc::clone(&g.slots).acquire_owned()).await;
+                                drop(ticket); // no longer waiting, however this went
                                 match granted {
-                                    Ok(p) => {
+                                    Ok(Ok(p)) => {
                                         permit = Some(p);
                                         fs.write_packet(&build_accept_upload()).await?;
                                     }
-                                    Err(_) => return Ok(()), // gate closed
+                                    // Timed out, or the gate closed: close the
+                                    // connection; the peer may reconnect.
+                                    _ => return Ok(()),
                                 }
                             }
                         }
@@ -224,6 +273,13 @@ where
             }
             OP_REQUESTPARTS | OP_REQUESTPARTS_I64 => {
                 let Some(f) = file.clone() else { continue };
+                // A gated peer must hold a granted slot before we stream data -
+                // otherwise a peer that skips OP_STARTUPLOADREQ would bypass the
+                // slot cap and the queue entirely. Ungated callers (tests / the
+                // differential serve path) have no gate and serve freely.
+                if gate.is_some() && permit.is_none() {
+                    continue;
+                }
                 let is_i64 = pkt.opcode == OP_REQUESTPARTS_I64;
                 let (_h, blocks) = match parse_request_parts(&pkt.payload, is_i64) {
                     Ok(v) => v,
@@ -253,6 +309,24 @@ mod tests {
     use crate::transfer_session::{download_file, TransferError};
     use mule_proto::{ed2k_hash, md4, PARTSIZE};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn wait_ticket_increments_on_enter_and_decrements_on_drop() {
+        // The RAII guard is what keeps a disconnect-while-queued from leaking
+        // queue capacity: whatever exit path the serve loop takes, the ticket's
+        // Drop runs and undoes the increment.
+        let gate = UploadGate::new(std::sync::Arc::new(Semaphore::new(1)), 32);
+        assert_eq!(gate.waiting(), 0);
+        {
+            let (_t, ahead) = WaitTicket::enter(&gate);
+            assert_eq!(ahead, 0, "first waiter sees nobody ahead");
+            assert_eq!(gate.waiting(), 1);
+            let (_t2, ahead2) = WaitTicket::enter(&gate);
+            assert_eq!(ahead2, 1, "second waiter sees one ahead");
+            assert_eq!(gate.waiting(), 2);
+        } // both tickets drop here (as they would on any serve-loop exit)
+        assert_eq!(gate.waiting(), 0, "the count is fully released on drop");
+    }
 
     fn tmpdir(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("padmule-share-{tag}-{}", std::process::id()));
