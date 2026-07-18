@@ -10,6 +10,7 @@ import SwiftUI
 struct ContentView: View {
     @EnvironmentObject var model: EngineModel
     @State private var query = ""
+    @State private var detail: SearchHit?
 
     var body: some View {
         NavigationStack {
@@ -49,8 +50,10 @@ struct ContentView: View {
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
-                        ForEach(model.results, id: \.hash) { hit in
+                        ForEach(model.presentedResults, id: \.hash) { hit in
                             resultRow(hit)
+                                .contentShape(Rectangle())
+                                .onTapGesture { detail = hit }
                         }
                         if model.searched, model.results.isEmpty, !model.searching {
                             Text("No results.")
@@ -139,24 +142,29 @@ struct ContentView: View {
         }
     }
 
-    /// One search hit. Tapping Get starts it; the row reports what the catalog
-    /// knows rather than hiding a suspect file - the user decides.
+    /// One search hit: a status dot, the name, a metadata line (type + media when
+    /// present), and the size/sources/complete stats. Tapping the row opens the
+    /// detail sheet; the trailing Get button starts a download directly.
     private func resultRow(_ hit: SearchHit) -> some View {
-        HStack(alignment: .top) {
+        HStack(alignment: .top, spacing: 8) {
+            statusDot(hit.status)
+                .padding(.top, 5)
             VStack(alignment: .leading, spacing: 2) {
                 Text(hit.name).lineLimit(2)
+                if let meta = metaLine(hit) {
+                    Text(meta).font(.caption).foregroundStyle(.secondary)
+                }
                 HStack(spacing: 6) {
                     Text(bytes(hit.size))
                     Text("-")
-                    Text("\(hit.sources) source\(hit.sources == 1 ? "" : "s")")
+                    Text("\(hit.sources) src\(hit.sources == 1 ? "" : "s")"
+                        + (hit.completeSources > 0 ? " (\(hit.completeSources) full)" : ""))
+                    if !hit.trusted {
+                        Text(hit.warning).foregroundStyle(.orange)
+                    }
                 }
                 .font(.caption)
                 .foregroundStyle(.secondary)
-                if !hit.trusted {
-                    Label(hit.warning, systemImage: "exclamationmark.triangle")
-                        .font(.caption2)
-                        .foregroundStyle(.orange)
-                }
             }
             Spacer()
             if model.adding.contains(hit.hash) {
@@ -166,6 +174,40 @@ struct ContentView: View {
                     .buttonStyle(.borderless)
             }
         }
+    }
+
+    /// The eMule-style state indicator: green check if we have it, orange arrow
+    /// if it is downloading, an empty circle if new.
+    @ViewBuilder
+    private func statusDot(_ s: HitStatusFfi) -> some View {
+        switch s {
+        case .have:
+            Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+        case .downloading:
+            Image(systemName: "arrow.down.circle.fill").foregroundStyle(.orange)
+        case .new:
+            Image(systemName: "circle").foregroundStyle(.secondary)
+        }
+    }
+
+    /// Type + media summary, only when there is something to show.
+    private func metaLine(_ hit: SearchHit) -> String? {
+        var parts: [String] = []
+        if !hit.fileType.isEmpty && hit.fileType != "Other" { parts.append(hit.fileType) }
+        if hit.lengthSecs > 0 { parts.append(duration(hit.lengthSecs)) }
+        if hit.bitrate > 0 { parts.append("\(hit.bitrate) kbps") }
+        if !hit.artist.isEmpty { parts.append(hit.artist) }
+        return parts.isEmpty ? nil : parts.joined(separator: "  -  ")
+    }
+
+    private func duration(_ secs: UInt32) -> String {
+        let s = Int(secs)
+        let h = s / 3600
+        let m = (s % 3600) / 60
+        let sec = s % 60
+        return h > 0
+            ? String(format: "%d:%02d:%02d", h, m, sec)
+            : String(format: "%d:%02d", m, sec)
     }
 
     private func transferRow(_ dl: DownloadInfo) -> some View {
@@ -217,4 +259,9 @@ struct ContentView: View {
             .padding(8)
             .background(tint.opacity(0.15))
     }
+}
+
+/// The hex hash uniquely identifies a hit - enough for SwiftUI's item-based sheet.
+extension SearchHit: Identifiable {
+    public var id: String { hash }
 }
