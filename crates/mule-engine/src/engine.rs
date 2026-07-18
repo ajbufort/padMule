@@ -22,7 +22,7 @@
 use crate::bootstrap;
 use crate::catalog::{catalog, RankedFile};
 use crate::connection::{ServerEvent, ServerState};
-use crate::fetch::{download_file, ManagerConfig, SourceRegistry};
+use crate::fetch::{download_file, ManagerConfig, PeerSource, SourceRegistry};
 use crate::framed::FramedStream;
 use crate::identity::NodeIdentity;
 use crate::kad_live::KadNode;
@@ -596,6 +596,10 @@ impl Engine {
             self.emit(EngineEvent::Status("Connecting...".into()));
             self.connect_server().await;
             self.start_kad().await;
+            // Downloads resumed from disk above were registered but have no
+            // transfer task yet; now that the server + Kad are up, find sources
+            // and drive them (otherwise they wait passively for a callback).
+            self.resume_fetches().await;
         }
 
         self.set_state(EngineState::Running);
@@ -885,10 +889,11 @@ impl Engine {
         HitStatus::New
     }
 
-    /// Start downloading `hash`. Asks the server who has it, creates the part
-    /// file, registers the download, and spawns the transfer - returning as soon
-    /// as it is registered, NOT when the file lands. Progress is observed via
-    /// [`Engine::downloads`]; the finished file is moved to `downloads_dir`.
+    /// Start downloading `hash`. Asks the server AND Kad who has it (see
+    /// [`Engine::find_sources`]), creates the part file, registers the download,
+    /// and spawns the transfer - returning as soon as it is registered, NOT when
+    /// the file lands. Progress is observed via [`Engine::downloads`]; the
+    /// finished file is moved to `downloads_dir`.
     ///
     /// Idempotent: asking twice for the same hash is a no-op, not a second
     /// part file racing the first.
@@ -904,31 +909,10 @@ impl Engine {
         if self.offline {
             return AddResult::NoServer;
         }
-        // Who has it? Only the server can say; Kad source-finding is a later
-        // wave (the engine can do it - see mule-cli kad-fetch - but wiring a
-        // second discovery path is not what makes this button work).
-        let low_id = self.connection.as_ref().map(|c| c.low_id).unwrap_or(true);
-        let found = match self.server.as_mut() {
-            Some(link) => link
-                .get_sources(&hash, size, SOURCES_WAIT)
-                .await
-                .unwrap_or_default(),
-            None => return AddResult::NoServer,
-        };
-        let mut reg = SourceRegistry::new();
-        reg.add_found(&found);
-        // A LowID source cannot accept our connection; the server has to poke it
-        // for us. Only worth asking if WE are reachable - a LowID asking a LowID
-        // to call back is the one case eD2k simply cannot route.
-        let lowids: Vec<u32> = if low_id {
-            Vec::new()
-        } else {
-            found
-                .iter()
-                .filter(|s| s.ip != 0 && s.ip < 0x0100_0000 && s.port != 0)
-                .map(|s| s.ip)
-                .collect()
-        };
+        if self.server.is_none() {
+            return AddResult::NoServer;
+        }
+        let (reg, lowids) = self.find_sources(hash, size).await;
         if reg.is_empty() && lowids.is_empty() {
             return AddResult::NoSources;
         }
@@ -943,19 +927,92 @@ impl Engine {
         let dl = Download::new(store);
         self.downloads.lock().await.push(Arc::clone(&dl));
 
-        for id in &lowids {
+        self.request_callbacks(&lowids).await;
+        self.spawn_fetch(dl, hash, size, name, reg.sources().to_vec());
+        AddResult::Started
+    }
+
+    /// Discover who has `hash`: the connected server (get_sources) AND Kad
+    /// (resolve_sources) CONCURRENTLY, folding both into one registry so a
+    /// serverless client still gets Kad sources and vice versa. Returns the
+    /// registry plus the LowID source IPs worth a server callback (empty unless
+    /// WE are HighID - a LowID cannot receive a callback).
+    async fn find_sources(&mut self, hash: [u8; 16], size: u64) -> (SourceRegistry, Vec<u32>) {
+        let low_id = self.connection.as_ref().map(|c| c.low_id).unwrap_or(true);
+        // The two lookups touch disjoint fields (server link vs Kad node), so
+        // run them together; the wait is the slower of the two, not the sum.
+        let server = self.server.as_mut();
+        let kad = self.kad.as_mut();
+        let (found, kad_sources) = tokio::join!(
+            async {
+                match server {
+                    Some(link) => link
+                        .get_sources(&hash, size, SOURCES_WAIT)
+                        .await
+                        .unwrap_or_default(),
+                    None => Vec::new(),
+                }
+            },
+            async {
+                match kad {
+                    // Bounded like the search path: a slow lookup contributes
+                    // nothing rather than hanging the Get.
+                    Some(node) => timeout(
+                        KAD_SEARCH_WAIT,
+                        node.resolve_sources(&Kad128::from_hash(&hash), size, 20, KAD_PER_QUERY),
+                    )
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .map(|o| o.sources)
+                    .unwrap_or_default(),
+                    None => Vec::new(),
+                }
+            }
+        );
+        let mut reg = SourceRegistry::new();
+        reg.add_found(&found);
+        reg.add_kad(&kad_sources);
+        // A LowID source cannot accept our connection; the server has to poke it
+        // for us. Only worth asking if WE are reachable - a LowID asking a LowID
+        // to call back is the one case eD2k simply cannot route.
+        let lowids: Vec<u32> = if low_id {
+            Vec::new()
+        } else {
+            found
+                .iter()
+                .filter(|s| s.ip != 0 && s.ip < 0x0100_0000 && s.port != 0)
+                .map(|s| s.ip)
+                .collect()
+        };
+        (reg, lowids)
+    }
+
+    /// Ask the server to poke each LowID source so it dials our listener.
+    async fn request_callbacks(&mut self, lowids: &[u32]) {
+        for id in lowids {
             if let Some(link) = self.server.as_mut() {
                 let _ = link.request_callback(*id).await;
             }
         }
+    }
 
-        let sources: Vec<_> = reg.sources().to_vec();
+    /// Spawn the transfer task for an already-registered download: pull from
+    /// `sources`, then verify + save on completion (or bail if cancelled).
+    fn spawn_fetch(
+        &self,
+        dl: Arc<Download>,
+        hash: [u8; 16],
+        size: u64,
+        name: &str,
+        sources: Vec<PeerSource>,
+    ) {
         let me = HelloInfo::baseline(self.identity.userhash, 0, TCP_PORT, KAD_UDP_PORT, "padMule");
         let dest = self.downloads_dir.join(safe_filename(name));
         let events = self.events.clone();
         let registry = Arc::clone(&self.downloads);
         let shared = Arc::clone(&self.shared);
-        let dl_task = Arc::clone(&dl);
+        let dl_task = dl;
         tokio::spawn(async move {
             download_file(&dl_task, &sources, &me, ManagerConfig::default()).await;
             // Cancelled while in flight: the engine already removed it and deleted
@@ -970,7 +1027,35 @@ impl Engine {
                 finish_download(dl_task, registry, shared, hash, size, dest, events).await;
             }
         });
-        AddResult::Started
+    }
+
+    /// Re-drive downloads resumed from disk by `start()`. Each was registered but
+    /// had NO transfer task, so it progressed only if a called-back peer happened
+    /// to dial our listener; this finds fresh sources and spawns the fetch, the
+    /// same pipeline `add_download` uses. Best-effort: a resumed download with no
+    /// sources right now stays registered and idle (a later run may find some).
+    async fn resume_fetches(&mut self) {
+        let pending: Vec<Arc<Download>> = {
+            let guard = self.downloads.lock().await;
+            let mut v = Vec::new();
+            for dl in guard.iter() {
+                if !dl.is_complete().await && !dl.is_cancelled() {
+                    v.push(Arc::clone(dl));
+                }
+            }
+            v
+        };
+        for dl in pending {
+            let hash = dl.hash().await;
+            let size = dl.size().await;
+            let name = dl.name().await;
+            let (reg, lowids) = self.find_sources(hash, size).await;
+            if reg.is_empty() && lowids.is_empty() {
+                continue;
+            }
+            self.request_callbacks(&lowids).await;
+            self.spawn_fetch(dl, hash, size, &name, reg.sources().to_vec());
+        }
     }
 
     /// Cancel and remove an in-progress download, deleting its `.part` files.
@@ -1570,6 +1655,32 @@ mod tests {
             e,
             EngineEvent::Progress { total, have, .. } if *total == 5000 && *have == 0
         )));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn resume_fetches_with_no_sources_leaves_the_download_resumable() {
+        // resume_fetches finds fresh sources for each resumed .part and spawns a
+        // transfer. With no server and no Kad node (nothing to find), it must be
+        // a safe no-op: the download stays registered and incomplete, so a later
+        // run (or an inbound callback) can still complete it. It must NOT drop,
+        // complete, or panic on it.
+        use crate::part_store::PartStore;
+        let dir = tmp("resume-fetch-noop");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = PartStore::create(&dir, 1, [0x11; 16], 5000, b"r.bin").unwrap();
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+        engine.downloads.lock().await.push(Download::new(store));
+
+        engine.resume_fetches().await; // no server, no kad -> no sources found
+
+        let dls = engine.downloads().await;
+        assert_eq!(dls.len(), 1, "the download is still registered");
+        assert!(
+            !dls[0].is_complete().await,
+            "still incomplete, still resumable"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
