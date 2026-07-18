@@ -47,6 +47,7 @@ ends at a differential/round-trip gate.
 | 8e | code-fix round (7 fixes from the 2026-07-18 lint) | - | **DONE (2026-07-18).** See the code-fix-round section below. |
 | 8f | GUI round (splash 7s; eMule-style top-toolbar nav; real Shared library screen) | - | **DONE (2026-07-18).** Icons Search/Transfers/Shared/Status switch one content area, inline title (never collapses); Shared screen lists the persisted library via FFI `shared_files`. |
 | 8g | 0.70b first feature slice (IP filter, search history, wire search filters) | [[emule-070b-features]] | **DONE (2026-07-18).** IP-filter blocklist (ipfilter.dat/.p2p) gating sources+inbound; persisted search recents; availability+size filters pushed onto OP_SEARCHREQUEST. All gated incl. the differential test. |
+| 8h | 0.70b second feature slice (server ratings on search rows; per-file unshare) | [[emule-070b-features]] | **DONE (2026-07-18).** Catalog parses FT_FILERATING (masked, aMule decode) -> rating pill + Fake-flag; per-file unshare drops a file from the library + known.met (keeps the file). Comments (OP_FILEDESC, post-connect) deferred. |
 | 9 | (v1.1) seedbox mode | - | not started |
 
 ## CODE-FIX ROUND (2026-07-18)

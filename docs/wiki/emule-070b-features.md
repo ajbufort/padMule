@@ -1,6 +1,6 @@
 # eMule 0.70b Feature Backlog (mined for padMule)
 
-Updated: 2026-07-18 (first slice landed)
+Updated: 2026-07-18 (slices 1-2 landed)
 
 **First slice DONE (2026-07-18):** #1 IP filter, #2 search history, #3 wire-side
 search filters (availability + size). See the code-fix-round-adjacent commits +
@@ -34,15 +34,20 @@ parsing, Kad anti-abuse hardening, and the "Automatic" search method). Ranked by
 5. **Download categories + transfer filter chips** (medium, no wire). Named
    color buckets + a state/type chip row over the flat transfer list. On-disk
    only (category index in part.met, never exchanged). Foundational for #24/#25.
-6. **Ratings/comments READ + display** (medium, medium risk). Parse
-   TAG_FILECOMMENT 0xF6 / TAG_FILERATING 0xF7 from source filename-answers, badge
-   the row red "Fake" / green "Excellent". The top pre-download quality signal;
-   dodge a bad file before spending a session on it. (Authoring = #20, Kad = #22.)
+6. **Ratings/comments READ + display** - PARTIAL (2026-07-18). The SERVER rating
+   channel is done: catalog parses FT_FILERATING 0xF7 (masked, `(v&0xF)/3`
+   aMule-style), badges search rows, and flags rating-1 as Fake. STILL TODO: the
+   richer channel - a source's COMMENT + per-source rating rides OP_FILEDESC
+   (0x61) post-connect (needs AcceptCommentVer=1 in the hello + an inbound
+   handler), badging DOWNLOAD rows; and Kad notes (#22). See the research +
+   [[decisions-and-lessons]]. (Authoring = #20.)
 7. **Per-download priority (Low/Normal/High) + Auto** (small, no wire).
    Auto self-tunes by source count; local (FT_DLPRIORITY in part.met).
-8. **Transfer-list management** (small, low risk): rename, clear-completed,
-   per-file unshare. Local; only wire edge is re-advertising a renamed shared
-   file (keep IsValidEd2kString rules).
+8. **Transfer-list management** - PARTIAL (2026-07-18). Per-file UNSHARE done
+   (swipe on the Shared screen; removes from library + known.met, keeps the
+   file). Dropped clear-completed (finished downloads already auto-remove;
+   swipe-cancel covers a stuck one); rename deferred (on-disk rename + known.met
+   rewrite; keep IsValidEd2kString rules for a re-advertised name).
 9. **Global server UDP search** (medium, medium risk). Query the whole
    serverlist, not just the connected server - the biggest widening of the result
    set. padMule already owns the UDP socket + serverlist + search expression;
