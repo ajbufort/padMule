@@ -10,6 +10,12 @@
 import Foundation
 import SwiftUI
 
+// File-scope, NOT static members: a stored-property initializer cannot reference
+// `Self.` (covariant Self), so the recents key/cap live here where the
+// `recentSearches` default can read them directly.
+private let recentsKey = "padMule.recentSearches"
+private let recentsCap = 12
+
 @MainActor
 final class EngineModel: ObservableObject {
     @Published private(set) var state: EngineStateFfi = .stopped
@@ -54,9 +60,7 @@ final class EngineModel: ObservableObject {
     /// Recent search queries, most-recent first, persisted across launches so a
     /// touch user can re-run a query without retyping on the soft keyboard.
     @Published private(set) var recentSearches: [String] =
-        UserDefaults.standard.stringArray(forKey: Self.recentsKey) ?? []
-    private static let recentsKey = "padMule.recentSearches"
-    private static let recentsCap = 12
+        UserDefaults.standard.stringArray(forKey: recentsKey) ?? []
 
     @Published private(set) var searching = false
     /// True once a search has actually run, so "no results" is only ever shown
@@ -151,15 +155,15 @@ final class EngineModel: ObservableObject {
     private func recordRecent(_ q: String) {
         var list = recentSearches.filter { $0.caseInsensitiveCompare(q) != .orderedSame }
         list.insert(q, at: 0)
-        if list.count > Self.recentsCap { list = Array(list.prefix(Self.recentsCap)) }
+        if list.count > recentsCap { list = Array(list.prefix(recentsCap)) }
         recentSearches = list
-        UserDefaults.standard.set(list, forKey: Self.recentsKey)
+        UserDefaults.standard.set(list, forKey: recentsKey)
     }
 
     /// Remove one recent query (swipe-to-delete).
     func removeRecent(_ q: String) {
         recentSearches.removeAll { $0 == q }
-        UserDefaults.standard.set(recentSearches, forKey: Self.recentsKey)
+        UserDefaults.standard.set(recentSearches, forKey: recentsKey)
     }
 
     /// Toggle uploading. Off is "Leech Mode": padMule keeps downloading but stops
