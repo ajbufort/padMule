@@ -209,6 +209,16 @@ final class EngineModel: ObservableObject {
         }
     }
 
+    /// Stop sharing one file (keeps the file on disk). refresh() pulls the
+    /// updated library right after.
+    func unshare(_ hash: String) {
+        guard let e = engine else { return }
+        work.async { [weak self] in
+            _ = e.unshareFile(hash: hash)
+            DispatchQueue.main.async { self?.refresh() }
+        }
+    }
+
     /// App backgrounded: checkpoint + release sockets. iPadOS would reclaim them
     /// anyway - doing it explicitly is what makes resume honest.
     func pause() { run { $0.pause() } }

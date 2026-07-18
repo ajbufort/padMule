@@ -357,6 +357,16 @@ impl MuleEngine {
         })
     }
 
+    /// Stop serving one shared file (keeps the file on disk). Returns false if
+    /// that hash was not being shared.
+    pub fn unshare_file(&self, hash: String) -> bool {
+        let Some(h) = parse_hash16(&hash) else {
+            return false;
+        };
+        self.rt
+            .block_on(async { self.inner.lock().await.unshare_file(h).await })
+    }
+
     /// How many IP-blocklist ranges are loaded (0 = no filter placed).
     pub fn ip_filter_ranges(&self) -> u32 {
         self.rt
