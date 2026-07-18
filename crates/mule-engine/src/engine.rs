@@ -110,6 +110,11 @@ const MAX_UPLOAD_SLOTS: usize = 8;
 /// thousands, which assumes an always-on seedbox); a queued peer holds an open
 /// connection here, so this also bounds fd/memory use.
 const UPLOAD_QUEUE_CAP: usize = 32;
+/// Total wall-clock budget for the resume-fetch pass in `start()`, and the
+/// per-download cap on source-finding within it. Small so a batch of dead
+/// downloads cannot stall startup (which holds the FFI engine lock).
+const RESUME_BUDGET: Duration = Duration::from_secs(8);
+const RESUME_PER_DL: Duration = Duration::from_secs(4);
 
 /// The next free `NNN.part` index in `dir`. aMule numbers part files this way and
 /// `resume_downloads` finds them by that name, so a new download MUST NOT reuse
@@ -204,8 +209,16 @@ fn load_shared_library(config_dir: &Path, downloads_dir: &Path) -> Vec<SharedFil
             continue;
         };
         let path = downloads_dir.join(&name);
-        if !path.exists() {
-            continue;
+        // Re-share only if the file is still there AND its size matches what we
+        // hashed. The downloads dir is the user-visible Files folder, so a file
+        // can be deleted and a DIFFERENT one saved under the same name; sharing
+        // the old hash would then serve bytes that fail the peer's hash check. A
+        // size mismatch reliably flags a replaced/truncated file (we do not
+        // re-hash a possibly-huge file on every launch to catch a same-size
+        // edit - that is aMule's date-triggered rehash, out of scope on iOS).
+        match std::fs::metadata(&path) {
+            Ok(m) if m.len() == size => {}
+            _ => continue,
         }
         out.push(SharedFile {
             hash: e.file_hash,
@@ -259,7 +272,14 @@ fn persist_shared_file(config_dir: &Path, sf: &SharedFile) {
             Tag::id(FT_FILESIZE, size_val),
         ],
     });
-    let _ = std::fs::write(&path, mule_files::write_known_met(&met));
+    // Atomic: write a temp file then rename over known.met, so a crash mid-write
+    // cannot leave a torn file that load_shared_library would read as empty and
+    // silently reset the whole library.
+    let bytes = mule_files::write_known_met(&met);
+    let tmp = path.with_extension("met.tmp");
+    if std::fs::write(&tmp, &bytes).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
 }
 
 /// Verify a finished download and move it into place.
@@ -276,6 +296,9 @@ struct FinishCtx {
     registry: Arc<Mutex<Vec<Arc<Download>>>>,
     shared: Arc<Mutex<Vec<SharedFile>>>,
     config_dir: PathBuf,
+    /// Serializes the known.met read-modify-write across concurrently-finishing
+    /// downloads (each runs in its own task) so no entry is lost to a race.
+    known_met_lock: Arc<Mutex<()>>,
     events: mpsc::UnboundedSender<EngineEvent>,
 }
 
@@ -290,6 +313,7 @@ async fn finish_download(
         registry,
         shared,
         config_dir,
+        known_met_lock,
         events,
     } = ctx;
     let name = dl.name().await;
@@ -332,7 +356,12 @@ async fn finish_download(
                 part_hashes,
                 path: dest.clone(),
             };
-            persist_shared_file(&config_dir, &sf); // re-share after a restart
+            {
+                // Serialize the known.met read-modify-write against other
+                // finishing downloads (re-share after a restart).
+                let _g = known_met_lock.lock().await;
+                persist_shared_file(&config_dir, &sf);
+            }
             shared.lock().await.push(sf);
             let _ = events.send(EngineEvent::Server(format!(
                 "Saved '{}'",
@@ -504,6 +533,8 @@ pub struct Engine {
     /// Upload slots + wait queue (see `MAX_UPLOAD_SLOTS` / `UPLOAD_QUEUE_CAP`).
     /// Shared with the listener; serve_shared grants/queues against it.
     upload_gate: Arc<UploadGate>,
+    /// Serializes known.met writes across concurrently-finishing downloads.
+    known_met_lock: Arc<Mutex<()>>,
     /// The live eD2k server link, once logged in.
     server: Option<ServerLink>,
     /// What that login yielded (server address + HighID/LowID), for the UI.
@@ -543,6 +574,7 @@ impl Engine {
                 Arc::new(Semaphore::new(MAX_UPLOAD_SLOTS)),
                 UPLOAD_QUEUE_CAP,
             )),
+            known_met_lock: Arc::new(Mutex::new(())),
             server: None,
             connection: None,
             kad: None,
@@ -713,10 +745,15 @@ impl Engine {
             self.emit(EngineEvent::Status("Connecting...".into()));
             self.connect_server().await;
             self.start_kad().await;
+            // Report Running BEFORE the (time-bounded) resume pass, so the engine
+            // is usable and the state is honest even while resume_fetches works.
+            self.set_state(EngineState::Running);
+            self.emit(EngineEvent::Status(self.online_status()));
             // Downloads resumed from disk above were registered but have no
             // transfer task yet; now that the server + Kad are up, find sources
             // and drive them (otherwise they wait passively for a callback).
             self.resume_fetches().await;
+            return;
         }
 
         self.set_state(EngineState::Running);
@@ -1131,6 +1168,7 @@ impl Engine {
             registry: Arc::clone(&self.downloads),
             shared: Arc::clone(&self.shared),
             config_dir: self.config_dir.clone(),
+            known_met_lock: Arc::clone(&self.known_met_lock),
             events: events.clone(),
         };
         let dl_task = dl;
@@ -1166,11 +1204,23 @@ impl Engine {
             }
             v
         };
+        // Bound the whole pass: start() holds the FFI engine lock for its whole
+        // duration, so a batch of dead downloads (each up to KAD_SEARCH_WAIT in
+        // find_sources) must not stall startup and delay pause(). Downloads not
+        // reached stay registered + idle (best-effort, as documented) and fetch
+        // via an inbound callback or the next start.
+        let deadline = tokio::time::Instant::now() + RESUME_BUDGET;
         for dl in pending {
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
             let hash = dl.hash().await;
             let size = dl.size().await;
             let name = dl.name().await;
-            let (reg, lowids) = self.find_sources(hash, size).await;
+            let Ok((reg, lowids)) = timeout(RESUME_PER_DL, self.find_sources(hash, size)).await
+            else {
+                continue; // source-finding overran its budget; leave it idle
+            };
             if reg.is_empty() && lowids.is_empty() {
                 continue;
             }
@@ -1487,6 +1537,59 @@ mod tests {
 
         drop(client_fs);
         srv.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_gated_peer_that_skips_startupload_gets_no_data() {
+        // A peer that names a file then jumps straight to OP_REQUESTPARTS - never
+        // asking for a slot - must NOT be served, or it would bypass the cap and
+        // the queue. It should get the filename answer and then nothing.
+        use crate::transfer::{build_request_filename_ext, build_request_parts, OP_SENDINGPART};
+        let hash = [0x3A; 16];
+        let shared = vec![SharedFile {
+            hash,
+            size: 300,
+            name: b"g.bin".to_vec(),
+            part_hashes: vec![],
+            path: PathBuf::from("/does/not/matter"),
+        }];
+        let gate = Arc::new(UploadGate::new(
+            Arc::new(Semaphore::new(MAX_UPLOAD_SLOTS)),
+            UPLOAD_QUEUE_CAP,
+        ));
+
+        let (client, server) = tokio::io::duplex(8192);
+        let mut server_fs = FramedStream::new(server);
+        let mut client_fs = FramedStream::new(client);
+
+        let gate2 = Arc::clone(&gate);
+        let srv = tokio::spawn(async move {
+            let _ = serve_shared(&mut server_fs, &shared, None, Some(&gate2)).await;
+        });
+
+        client_fs
+            .write_packet(&build_request_filename_ext(&hash))
+            .await
+            .unwrap();
+        let ans = client_fs.read_packet_unpacked().await.unwrap(); // filename answer
+        assert_ne!(ans.opcode, OP_SENDINGPART);
+        // Ask for bytes WITHOUT a slot grant.
+        client_fs
+            .write_packet(&build_request_parts(&hash, &[(0, 300)]))
+            .await
+            .unwrap();
+        // No data should come back; a short wait must time out, not yield a part.
+        let got = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            client_fs.read_packet_unpacked(),
+        )
+        .await;
+        assert!(
+            got.is_err(),
+            "an ungranted peer must receive no OP_SENDINGPART"
+        );
+        drop(client_fs);
+        let _ = srv.await;
     }
 
     #[tokio::test]
