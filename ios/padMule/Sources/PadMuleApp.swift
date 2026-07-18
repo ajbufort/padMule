@@ -11,12 +11,23 @@ import SwiftUI
 struct PadMuleApp: App {
     @StateObject private var model = EngineModel()
     @Environment(\.scenePhase) private var scenePhase
+    @State private var showSplash = true
 
     var body: some Scene {
         WindowGroup {
-            ContentView()
-                .environmentObject(model)
-                .onAppear { model.boot() }
+            ZStack {
+                ContentView()
+                    .environmentObject(model)
+                    .onAppear { model.boot() }
+                if showSplash {
+                    SplashView().transition(.opacity)
+                }
+            }
+            .task {
+                // The engine boots underneath, so these 3 seconds are not dead time.
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                withAnimation(.easeOut(duration: 0.35)) { showSplash = false }
+            }
         }
         .onChange(of: scenePhase) { phase in
             switch phase {
