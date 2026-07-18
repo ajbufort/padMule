@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use mule_engine::{AddResult, Engine, EngineEvent, EngineState, Trust};
+use mule_engine::{AddResult, Engine, EngineEvent, EngineState, HitStatus, Trust};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::Mutex;
@@ -98,6 +98,24 @@ pub struct DownloadInfo {
     pub complete: bool,
 }
 
+/// A search hit's local state (already have / fetching / new).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum HitStatusFfi {
+    New,
+    Downloading,
+    Have,
+}
+
+impl From<HitStatus> for HitStatusFfi {
+    fn from(s: HitStatus) -> Self {
+        match s {
+            HitStatus::New => HitStatusFfi::New,
+            HitStatus::Downloading => HitStatusFfi::Downloading,
+            HitStatus::Have => HitStatusFfi::Have,
+        }
+    }
+}
+
 /// One ranked, deduped search hit. `hash` is hex - the handle to pass back to
 /// [`MuleEngine::add_download`].
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -107,11 +125,24 @@ pub struct SearchHit {
     pub size: u64,
     /// Best advertised availability seen across the raw results.
     pub sources: u32,
+    /// Full-file copies advertised; 0 if none.
+    pub complete_sources: u32,
+    /// Display category (Video/Audio/Archive/Document/Image/Program/Other).
+    pub file_type: String,
+    /// Media metadata, empty/0 when the result did not carry it.
+    pub artist: String,
+    pub album: String,
+    pub title: String,
+    pub length_secs: u32,
+    pub bitrate: u32,
+    pub codec: String,
     /// False when the metadata is self-contradictory (e.g. one hash advertising
     /// two sizes). Shown, not hidden: the user decides.
     pub trusted: bool,
     /// Why it is not trusted, empty when it is.
     pub warning: String,
+    /// Whether we already have it, are fetching it, or it is new.
+    pub status: HitStatusFfi,
 }
 
 /// What [`MuleEngine::add_download`] did. "No sources" is a normal answer on a
@@ -296,28 +327,37 @@ impl MuleEngine {
     /// or genuinely no hits - all of which the UI renders the same way.
     pub fn search(&self, keyword: String) -> Vec<SearchHit> {
         self.rt.block_on(async {
-            self.inner
-                .lock()
-                .await
-                .search(&keyword)
-                .await
-                .into_iter()
-                .map(|r| {
-                    let trusted = r.is_trusted();
-                    let warning = match r.trust {
-                        Trust::Ok => String::new(),
-                        Trust::Suspect(why) => why.to_string(),
-                    };
-                    SearchHit {
-                        hash: hex::encode(r.hash),
-                        name: r.name,
-                        size: r.size,
-                        sources: r.sources,
-                        trusted,
-                        warning,
-                    }
-                })
-                .collect()
+            let mut g = self.inner.lock().await;
+            let ranked = g.search(&keyword).await;
+            let mut out = Vec::with_capacity(ranked.len());
+            for r in ranked {
+                // hit_status (&self) is called after search (&mut self) has
+                // returned its owned Vec, so the borrows do not overlap.
+                let status = g.hit_status(r.hash).await.into();
+                let trusted = r.is_trusted();
+                let warning = match r.trust {
+                    Trust::Ok => String::new(),
+                    Trust::Suspect(why) => why.to_string(),
+                };
+                out.push(SearchHit {
+                    hash: hex::encode(r.hash),
+                    name: r.name,
+                    size: r.size,
+                    sources: r.sources,
+                    complete_sources: r.complete_sources,
+                    file_type: r.file_type,
+                    artist: r.artist,
+                    album: r.album,
+                    title: r.title,
+                    length_secs: r.length_secs,
+                    bitrate: r.bitrate,
+                    codec: r.codec,
+                    trusted,
+                    warning,
+                    status,
+                });
+            }
+            out
         })
     }
 
@@ -373,6 +413,30 @@ mod tests {
             .join(format!("padmule-ffi-{tag}-{}", std::process::id()))
             .to_string_lossy()
             .into_owned()
+    }
+
+    #[test]
+    fn search_hit_has_the_rich_fields() {
+        // Compile-level guarantee that the record carries the new shape.
+        let h = SearchHit {
+            hash: "00".to_string(),
+            name: "x".to_string(),
+            size: 1,
+            sources: 2,
+            complete_sources: 1,
+            file_type: "Audio".to_string(),
+            artist: "a".to_string(),
+            album: "b".to_string(),
+            title: "c".to_string(),
+            length_secs: 10,
+            bitrate: 128,
+            codec: "mp3".to_string(),
+            trusted: true,
+            warning: String::new(),
+            status: HitStatusFfi::New,
+        };
+        assert_eq!(h.file_type, "Audio");
+        assert_eq!(h.status, HitStatusFfi::New);
     }
 
     // Not a #[tokio::test]: the facade owns its own runtime and block_on would
