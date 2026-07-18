@@ -1,8 +1,18 @@
 # padMule Design Spec
 
 Date: 2026-07-12
-Status: approved design, pre-implementation
+Status: implemented (waves 1-8d done; current state in docs/wiki/build-progress.md)
 Author: Anthony Bufort (with Claude)
+
+As-built divergences from this spec (2026-07-18 note; the spec text below is
+the unedited historical record): (1) EC was deferred entirely - the UI seam is
+in-process UniFFI (crates/mule-ffi), and there is no mule-ec crate. (2) FFI
+events are POLLED (drain_events + snapshot getters), not pushed - "the UI never
+polls" did not survive contact with the device ("an event is not state").
+(3) Search-expression encoding landed in mule-engine (search.rs), not
+mule-proto. (4) IP filter, categories, and AICH recovery did not make shipped
+v1 (open backlog - see the revised v1-scope decision in
+docs/wiki/decisions-and-lessons.md).
 
 ## 1. Goal
 

@@ -1,11 +1,12 @@
 # Mac Toolchain Setup (getting padMule onto the iPad)
 
-Updated: 2026-07-16
+Updated: 2026-07-18
 
 How to build + sign padMule's iOS app for Anthony's **iPad Pro 4th gen running
 iPadOS 26.5.2**, given the available Mac is a **2011 Mac mini (Macmini5,x, 32GB,
-non-Metal)**. The engine + [[padmule-ios-app-path]] FFI seam are done; this is the
-last piece before the SwiftUI shell (Wave 8, [[build-progress]]).
+non-Metal)**. RESOLVED: Path C (CI macOS runner -> unsigned .ipa -> Sideloadly)
+is the active, proven route - the app ships on-device with no Mac at all
+([[build-progress]] wave 8). This entry remains the toolchain reference.
 
 ## The blocker (verified 2026-07-16)
 
@@ -163,7 +164,8 @@ padMule RAN on the iPad first try: State running, Status Connected, Kad climbing
    type, and the UI polls `server_info()` as a SNAPSHOT with its own row. Lesson:
    **an event is not state** - anything the UI must keep showing has to be
    readable at any time, not announced once.
-2. **UPnP CANNOT WORK on iOS.** The "find devices on local networks" prompt was
+2. **MULTICAST SSDP cannot work on iOS** [SUPERSEDED in part - see the note at
+   the end of this item]. The "find devices on local networks" prompt was
    `upnp::discover()` firing SSDP M-SEARCH at multicast 239.255.255.250. Blocked
    twice: (a) `NSLocalNetworkUsageDescription` was missing, and without it iOS 14+
    **silently drops** every LAN packet - no error (developer.apple.com/forums/thread/661606);
@@ -175,9 +177,12 @@ padMule RAN on the iPad first try: State running, Status Connected, Kad climbing
    (NAT-PMP, unicast to gateway:5351) is already built but NOT wired into
    `map_port()`, which only tries UPnP. A unicast M-SEARCH aimed at the gateway is
    the UPnP-flavoured equivalent. Both still need the Info.plist key + user Allow.
-   NOTE for this dev box specifically: 4662/4672 forward to the WINDOWS host, not
-   the iPad, so the iPad is LowID regardless until that changes. LowID is
-   survivable - the live wav + pdf both arrived via LowID callback.
+   [SUPERSEDED 2026-07-17: the unicast M-SEARCH path was built (`upnp.rs
+   discover_unicast`; `map_port()` now falls back multicast -> unicast with
+   delete-then-add) and the iPad EARNED HIGHID with it on the BE9700 - see
+   [[net-highid-and-port-forwarding]]. NAT-PMP (`portmap.rs`) remains a codec +
+   `mule-cli natpmp` path, still not wired into `map_port()`. The old dev-box
+   forward chain this NOTE described is gone with the router swap.]
 
 Also fixed while here: `map_port()` emitted the gateway-reported **public IP** into
 a UI event, and the login event embedded the client id, which ENCODES the public IP

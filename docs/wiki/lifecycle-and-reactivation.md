@@ -1,6 +1,6 @@
 # Lifecycle Status + Clean Reactivation (hard requirement)
 
-Updated: 2026-07-13
+Updated: 2026-07-18
 
 padMule is foreground-only ([[ipados-constraints]]): iPadOS suspends the app
 ~30s after backgrounding and reclaims every TCP/UDP socket (EBADF). When focus
@@ -26,6 +26,14 @@ the UI can be honest; it cannot be inferred late.
 The engine emits state-change EVENTS (not polled) over the FFI callback
 interface. The UI renders directly from them - never a cached "Connected" that
 is actually dead.
+
+[AS BUILT (Wave 8): the opposite shape won. Events are POLLED - the UI drains
+`drain_events()` on a 1s timer - and everything the UI must KEEP showing
+(state, server info + ID type, sharing, UPnP result) is a polled SNAPSHOT,
+because "an event is not state" (an event applied and overwritten in the same
+batch hid the ID type on-device). The requirement this section states still
+holds - the UI never renders a stale "Connected" - it is just met with
+snapshots. A push callback interface remains a possible later upgrade.]
 
 ## Clean status notice (user-facing)
 
@@ -118,14 +126,17 @@ degrade gracefully back to pause-and-resume. On-device measurement needed:
 keepalive longevity on the A12Z/iPadOS 26, and whether BGContinuedProcessingTask
 is eligible there (open questions in the iPadOS research).
 
-## Where it lands
+## Where it landed (both DONE)
 
-- **Wave 3c+ (engine):** implement the state model + explicit `pause()`/
-  `resume()` + the event stream. Even the CLI harness should exercise a
-  simulated pause/resume so the logic is tested before the iPad UI exists.
-- **Wave 8 (FFI + SwiftUI):** wire ScenePhase -> `pause()`/`resume()`; render
-  the honest status indicator and per-transfer Paused badges; the calm
-  background-pause messaging.
+- **Wave 3c+ (engine):** DONE - ServerLink + Engine expose idempotent
+  `pause()`/`resume()` with the event stream; the CLI harness exercised
+  simulated pause/resume before the iPad UI existed, and `resume()` rebinds
+  the listener FIRST (the HighID ordering) then reconnects + re-bootstraps Kad.
+- **Wave 8 (FFI + SwiftUI):** DONE - `PadMuleApp` maps ScenePhase (`.active`
+  -> `resume()`, `.background` -> `pause()`, `.inactive` ignored to avoid
+  thrashing); the honest status row, Reconnecting banner, per-transfer Paused
+  badges, and calm background-pause notice all shipped ([[build-progress]]
+  wave 8).
 
 ## Related
 

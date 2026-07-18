@@ -1,9 +1,9 @@
 # Decisions and Lessons
 
-Updated: 2026-07-12
+Updated: 2026-07-18
 
 Locked decisions, rejected approaches, gotchas, measured facts. One dated
-bullet each; newest first.
+bullet each; Locked decisions newest first, Lessons in the order learned.
 
 ## Locked decisions
 
@@ -76,6 +76,10 @@ bullet each; newest first.
   source exchange, obfuscation, IP filter, UPnP, categories, EC remote
   control, and .met/.part file-format compatibility with upstream. All
   foreground-first on iPadOS (the OS suspends backgrounded P2P regardless).
+  (AS SHIPPED, 2026-07-18 revision: EC was deferred entirely - the iPad seam
+  is in-process FFI, see [[build-progress]] wave 7. AICH recovery, IP filter,
+  and categories did not make the shipped v1 either; they are open backlog,
+  recorded here so the trim is explicit rather than silent.)
 
 - 2026-07-12 **Deploy path: no Mac.** Anthony has only the iPad (plus this
   Windows/WSL2 box). Plan is engine-first on Linux; the SwiftUI shell builds

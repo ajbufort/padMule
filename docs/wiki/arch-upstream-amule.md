@@ -1,9 +1,11 @@
 # Upstream aMule 3.0.1 - Layout, Build, Port Seams
 
-Updated: 2026-07-12
+Updated: 2026-07-18
 
 Source: `amule-3.0.1/` at the repo root (extracted from the pristine zip at
-`/mnt/c/Users/ajbuf/Downloads/amule-3.0.1.zip`). GPL-2.0-or-later.
+`/mnt/c/Users/ajbuf/Downloads/amule-3.0.1.zip`). GPL-2.0-or-later. Role today:
+vendored read-only REFERENCE ORACLE for differential testing (the engine is a
+Rust rewrite - [[decisions-and-lessons]]); never linked or shipped.
 
 ## Layout
 
@@ -30,8 +32,10 @@ headless), `BUILD_REMOTEGUI` (amulegui over EC), `BUILD_AMULECMD`,
 
 - wxWidgets types (wxString, threads, events) pervade the ENGINE, not just the
   GUI - de-wx-ing the core is real work regardless of UI strategy.
-- amuled + EC is the natural seam: headless engine below EC, any UI above it
-  (this is exactly how amulegui/amuleweb/amulecmd work upstream).
+- amuled + EC is the natural seam UPSTREAM: headless engine below EC, any UI
+  above it (how amulegui/amuleweb/amulecmd work). [SUPERSEDED for padMule: the
+  decided seam is the in-process UniFFI FFI (`crates/mule-ffi`); EC was
+  deferred entirely - [[build-progress]] wave 7.]
 - Official docs confirm the modular amule/amuled/amulegui/amuleweb/amulecmd
   architecture and ARM64 support on desktop platforms ([[ref-ecosystem]]).
 

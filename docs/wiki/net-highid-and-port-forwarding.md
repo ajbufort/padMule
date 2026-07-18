@@ -1,9 +1,35 @@
 # HighID and Port Forwarding (dev box + iPad)
 
-Updated: 2026-07-14
+Updated: 2026-07-18
 
-How padMule earns a **HighID** on the eD2k network, and the exact chain that had
-to be fixed on the WSL2 dev box. **VALIDATED LIVE 2026-07-14** (see below).
+How padMule earns a **HighID** on the eD2k network. Dev-box HighID via a manual
+forward chain **VALIDATED LIVE 2026-07-14**; iPad HighID via padMule's own
+unicast-SSDP UPnP **VALIDATED ON-DEVICE 2026-07-17**.
+
+## TOPOLOGY CHANGE (2026-07-17) - read this first
+
+The network the 5-link chain below describes NO LONGER EXISTS. Because the
+Xfinity XB8's UPnP toggle is COSMETIC (it never answers SSDP by any method,
+confirmed exhaustively from WSL and native Windows), Anthony bridged the XB8
+and put a **TP-Link Archer BE9700** in front as edge router:
+
+- XB8 in bridge mode (hands off ~2 Gbps from its red 2.5G Port 4) -> BE9700 is
+  the router: gateway **192.168.0.1**, real UPnP IGD, UPnP ON.
+- Dev box is now **192.168.0.32**; iPad **192.168.0.182** (reserve it in the
+  BE9700 so its permanent mapping never goes stale).
+- Inbound now comes from **UPnP mappings**, not manual forwards: `mule-cli
+  upnp-unicast 4662` maps the dev box; the iPad maps itself in `map_port()`
+  (delete-then-add, so a stale mapping self-heals) and shows the result in the
+  "Port mapping" Status row.
+- Re-validate today with: `mule-cli upnp-unicast 4662` (expect the real public
+  IP back = no double-NAT), then `listen` + `login` as below.
+- LESSON: never trust an ISP-gateway UPnP toggle; verify with an independent
+  SSDP probe. A leftover PERMANENT test mapping (lease 0) squats the port for
+  every other device - clean up what a validation run creates.
+
+The Windows/Hyper-V firewall links (3-4) and WSL mirrored mode (5) still apply
+to the dev box unchanged; only the router links (1-2) are obsolete. Sections
+below are kept as the historical record of the old Xfinity 10.0.0.x network.
 
 ## Why HighID matters
 
@@ -21,7 +47,7 @@ So HighID is not cosmetic: it decides whether padMule is a first-class peer.
 It requires padMule to **listen** (`accept_peer`, Wave 4a) *and* for inbound
 TCP to actually reach that listener.
 
-## The chain (all five links must be open)
+## The chain (all five links must be open) [HISTORICAL - old Xfinity network]
 
 Inbound TCP 4662 (eD2k peer) and UDP 4672 (client/Kad UDP) traverse:
 
@@ -71,7 +97,7 @@ earn HighID - the listener need not complete a handshake. Our listener logs this
 as "connection reached us (forward works); handshake ended: connection closed",
 which is the expected, healthy path, not an error.
 
-## How to re-validate
+## How to re-validate [HISTORICAL recipe - on the BE9700, run upnp-unicast first]
 
 ```bash
 ./target/release/mule-cli listen 4662 &          # bind the inbound listener
@@ -83,21 +109,22 @@ so `timeout 8 bash -c "</dev/tcp/<public-ip>/4662"` succeeding from inside the
 LAN proves the forward rule + both firewalls + the listener. A hairpin *failure*
 is inconclusive on gateways that disable NAT loopback; this one does not.
 
-## iPad implications (Wave 7/8)
+## iPad HighID - ACHIEVED (2026-07-17)
 
-The dev-box forward is a **dev-box** fix - it does not carry to the iPad. On the
-same home LAN the iPad will hit the identical problem with its own address, so
-padMule on-device needs one of:
+UPnP port mapping was the right answer and it SHIPPED: iOS silently drops
+multicast SSDP without a restricted entitlement, so `upnp.rs` aims a UNICAST
+M-SEARCH at the inferred gateway (.1/.254 of our /24), then runs the normal
+IGD description/SOAP flow with delete-then-add. On the BE9700 the iPad mapped
+4662->4662 itself and earned **HighID (green)**; the router's UPnP client list
+shows `padMule 192.168.0.182`. Root cause of the earlier on-device LowID was a
+leftover permanent 4662->dev-box mapping from a validation run plus a lenient
+query that read any fault as "free" - both fixed (honest 714-vs-fault query;
+delete-then-add). See [[build-progress]] row 8c.
 
-- **UPnP / NAT-PMP port mapping** (Wave 7) - the right answer; what real clients
-  do, no user config. This is now a stronger priority given HighID's value.
-- a manual per-device forward + DHCP reservation for the iPad (works, but a bad
-  user experience and useless off the home network),
-- or accept **LowID** on foreign networks (cellular/CGNAT will force this
-  regardless - see [[ipados-constraints]]).
-
-Expect padMule to be LowID on most real-world networks. HighID must be a
-*bonus*, never an assumption; the UI should surface which one we have honestly
+Still true on foreign networks: UPnP-less routers, cellular, and CGNAT force
+**LowID** regardless ([[ipados-constraints]]). LowID is survivable (the live
+wav + pdf arrived via LowID callbacks) - HighID is a bonus, never an
+assumption, and the UI surfaces which one we have plus the "Port mapping" row
 (see [[lifecycle-and-reactivation]]).
 
 ## Related

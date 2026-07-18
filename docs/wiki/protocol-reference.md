@@ -1,6 +1,6 @@
 # aMule Protocol + Format Reference (load-bearing constants)
 
-Updated: 2026-07-12
+Updated: 2026-07-18
 
 Distilled from the full verified recon: `docs/raw/amule-upstream-reference-2026-07-12.md`
 (1746 lines, 5 subsystems, all high-confidence, adversarially checked against
@@ -53,7 +53,9 @@ subsystem.
   DER). clients.met record = 119 bytes. DH handshake: 768-bit fixed prime,
   g=2, 128-bit exponent.
 - Rust crates: `rc4` + manual 1024-byte discard (the crate does NOT drop);
-  `rsa`+`pkcs1`/`der`; `num-bigint` or `crypto-bigint` for DH modpow.
+  `rsa` (as built: on-wire pubkey is X.509 SPKI, cryptkey.dat is base64
+  PKCS#8 - PKCS#1 appears nowhere); `num-bigint` or `crypto-bigint` for DH
+  modpow.
 
 ## EC (External Connections)
 
@@ -89,14 +91,18 @@ CUInt128::SetValueBE) are CONFIRMED identical in eMule 0.50a. For wire-neutral
 POLICY (queue scoring, slot count, alpha, block batching), aMule's choices are
 fine; match aMule. Only re-check eMule when a byte layout is ambiguous.
 
-## Open questions (must resolve against source before implementing that piece)
+## Open questions - status (2026-07-18)
 
-The raw doc ends each subsystem with concrete open questions (32 total): eD2k
-ID byte-order per field, ED2Kv2 VarInt tags (implement or never negotiate?),
-AICH request/answer bodies, Kad ALPHA/search-id choices, cryptkey.dat exact DER
-layout, EC per-field CEC_*_Tag child lists + RLE part/gap status, capability
-negotiation bits, and byte-verifying every .met against a real sample. These
-are the first tasks in each implementation wave.
+The raw doc ends each subsystem with concrete open questions (32 total). Most
+were resolved during implementation: eD2k ID byte-order (one canonical
+convention, normalized in `fetch.rs`), ED2Kv2 VarInt tags (never negotiate -
+VBT never advertised), Kad ALPHA (=3, eMule's value, deliberate),
+cryptkey.dat DER (PKCS#8 wrapper; on-wire pubkey is SPKI - Wave 5c/5d),
+capability negotiation (MISCOPTIONS baselines byte-verified, Wave 3d), .met
+byte-verification (real-fixture round-trips + the amuled differential test).
+EC questions are MOOT (EC deferred entirely; the seam is FFI). STILL OPEN:
+AICH request/answer wire bodies (AICH exchange is not implemented; the tree
+itself is, row 1c) and AICH byte-validation vs a live eMule.
 
 ## Related
 

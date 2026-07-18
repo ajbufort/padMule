@@ -1,11 +1,12 @@
 # Protocol Understanding: eD2k + Kademlia (mental model)
 
-Updated: 2026-07-12
+Updated: 2026-07-18
 
 The conceptual companion to the byte-level tables in [[protocol-reference]].
 Full study (flows, state machines, the why): `docs/raw/protocol-understanding-2026-07-12.md`
-(868 lines, 5 areas, all high-confidence, adversarially verified). Read the full
-doc before implementing the engine (Wave 3) or Kad (Wave 6). This is the index.
+(869 lines, 5 areas, all high-confidence, adversarially verified). It informed
+the engine (Wave 3+) and Kad (Wave 6) builds; still the background reading for
+any wire work. This is the index.
 
 ## eD2k in one paragraph
 
