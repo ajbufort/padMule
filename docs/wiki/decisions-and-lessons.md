@@ -210,6 +210,22 @@ bullet each; Locked decisions newest first, Lessons in the order learned.
   the connection and granting in place is faithful on the wire (correct opcode +
   12-byte payload) and fits the platform. Rank is FIFO; eMule's score-ordering
   ([[build-progress]] upload_queue.rs scoring) is wire-neutral policy for later.
+- 2026-07-18 **LESSON: re-review any change that reshapes a hot path; "moved the
+  check" == "removed the check" until proven otherwise.** The same-day adversarial
+  review of the code-fix round found 8 real bugs the 383-test suite AND the amuled
+  differential test both missed - several REGRESSIONS. The worst: moving the upload
+  slot check out of connection-admission (old `serve_inbound`) into the
+  OP_STARTUPLOADREQ arm silently left the OP_REQUESTPARTS path ungated, so a peer
+  that skipped the upload request streamed full-file data past the 8-slot cap and
+  the whole queue; and the same move left idle pre-upload sessions unbounded. Both
+  are "I relocated a guard and didn't re-establish it on every path it used to
+  cover." The differential test could not catch them because it exercises the
+  DOWNLOAD direction, not serve. Rules: (1) when you move a check, enumerate every
+  code path the old placement covered and confirm the new one still does; (2) a
+  feature that reshapes a hot path (the serve loop, the fetch manager) earns an
+  adversarial review even when the test suite is green - the tests encode the paths
+  you thought of, the review hunts the ones you didn't; (3) a green oracle that only
+  drives one direction is not coverage of the other.
 - 2026-07-18 **LESSON: verify a "hardening" idea against the wire authority BEFORE
   writing it - replicate-then-improve cuts both ways.** The 2026-07-18 lint flagged
   two "candidate hardening" items (sanitize a peer's crypt bits so requires implies

@@ -93,10 +93,43 @@ three files). Wire-touching fixes were checked against eMule 0.50a first.
    too; predicates byte-identical) and sig-before-pubkey (eMule drops it too).
    Doc corrections only.
 7. **Nits:** `KadError::NotReady` (stop overloading `NotDecryptable`); collapse a
-   duplicated `verify_ready_parts` branch; saturate the u64->u32 size-filter casts
-   in `fetch-complete`; drop a redundant `Duration` alias; remove the unused
+   duplicated `verify_ready_parts` branch; the `fetch-complete` size-filter casts
+   (min saturates, max omits the 32-bit wire filter over 4 GiB so the client-side
+   u64 filter enforces it); drop a redundant `Duration` alias; remove the unused
    `mule-proto` dep from `mule-ffi`; doc-only notes on the ED2Kv2 decompress
    asymmetry, `choose_search_method`, and the iOS-16 `onChange` form.
+
+### Adversarial review round (same day)
+
+A 5-reviewer workflow (one per fix, each finding independently verified) found 8
+distinct REAL bugs - several regressions from Fixes 3 and 5 - all fixed and
+re-gated (385 tests, clippy/fmt, differential still byte-for-byte):
+
+- **Upload-cap bypass (regression):** OP_REQUESTPARTS streamed data without a
+  granted slot, so a peer skipping OP_STARTUPLOADREQ ignored the cap + queue.
+  Fixed: parts require a held permit (ungated test/differential path unaffected).
+- **Queue-counter leak:** a disconnect while queued skipped the `waiting`
+  decrement, ratcheting the count until nobody could queue. Fixed with a RAII
+  `WaitTicket` guard.
+- **Unbounded serve sessions (regression):** moving the slot check into the
+  upload arm left idle pre-upload connections holding a task+fd forever. Fixed
+  with a 60s idle-read timeout + a 120s bound on the queued wait.
+- **known.met race + torn write:** concurrent finishers lost entries and a torn
+  write reset the library. Fixed: serialize with a lock + atomic temp+rename.
+- **Stale re-share:** a file replaced at the same on-disk path was served under
+  the old hash. Fixed: `load_shared_library` verifies the on-disk size matches.
+- **Startup stall:** `resume_fetches` ran serially inline holding the FFI engine
+  lock, so dead resumed downloads could delay `pause()` past the iPadOS suspend
+  window. Fixed: report Running first, then bound the pass (8s total / 4s each).
+- **Rank vs grant order:** documented as best-effort (eMule ranks are advisory
+  too), not a code change.
+- **fetch-complete max-size filter:** see nit above (folded into Fix 7's fix).
+
+LESSON: the same-day adversarial review paid for itself - it caught cap/queue
+bypasses and a persistence race that the 383-test suite and the differential
+test (which exercises the DOWNLOAD direction, not serve) both missed. Re-review
+any change that reshapes a hot path, and treat "moved the check" as "removed the
+check until proven otherwise".
 
 ## ENGINE GOES LIVE BEHIND THE UI (2026-07-16)
 
