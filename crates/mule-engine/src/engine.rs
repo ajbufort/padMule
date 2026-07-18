@@ -675,15 +675,24 @@ impl Engine {
         self.listener = Some(handle);
     }
 
-    /// Best-effort: ask the gateway to forward our port, so a real device (which
-    /// has no hand-configured router rule) can still earn a HighID. Tries NAT-PMP
-    /// and UPnP - consumer gateways speak one or the other.
+    /// Best-effort: ask the gateway (UPnP, multicast then unicast) to forward our
+    /// port, so a real device with no hand-configured router rule can still earn a
+    /// HighID. The RESULT is emitted either way - success or the failure reason -
+    /// because on a debugger-less device this line is the only window into why the
+    /// port did or did not open. Messages are prefixed "UPnP:" so the UI can pin
+    /// them to a durable row instead of the transient notice.
     async fn map_port(&self) {
-        if crate::upnp::map_port(TCP_PORT, "padMule", 0).await.is_ok() {
-            // The external IP the gateway reports is deliberately not emitted:
-            // this event reaches the UI, and that is our public IP verbatim.
-            // "it worked" is the whole signal; HighID confirms it end to end.
-            self.emit(EngineEvent::Server(format!("UPnP mapped port {TCP_PORT}")));
+        match crate::upnp::map_port(TCP_PORT, "padMule", 0).await {
+            Ok(_ip) => {
+                // The external IP the gateway reports is deliberately NOT emitted:
+                // this reaches the UI, and that is our public IP verbatim.
+                self.emit(EngineEvent::Server(format!("UPnP: mapped port {TCP_PORT}")));
+            }
+            Err(e) => {
+                self.emit(EngineEvent::Server(format!(
+                    "UPnP: could not map port {TCP_PORT} ({e})"
+                )));
+            }
         }
     }
 

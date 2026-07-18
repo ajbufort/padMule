@@ -251,6 +251,47 @@ s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\
     )
 }
 
+/// Build the SOAP envelope for a GetSpecificPortMappingEntry action (ask the IGD
+/// what, if anything, currently holds `external_port`/`proto`).
+pub fn get_specific_mapping_body(service_type: &str, external_port: u16, proto: Proto) -> String {
+    format!(
+        "<?xml version=\"1.0\"?>\r\n\
+<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" \
+s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\
+<s:Body>\
+<u:GetSpecificPortMappingEntry xmlns:u=\"{svc}\">\
+<NewRemoteHost></NewRemoteHost>\
+<NewExternalPort>{ext}</NewExternalPort>\
+<NewProtocol>{proto}</NewProtocol>\
+</u:GetSpecificPortMappingEntry>\
+</s:Body>\
+</s:Envelope>",
+        svc = service_type,
+        ext = external_port,
+        proto = proto.as_str(),
+    )
+}
+
+/// Build the SOAP envelope for a DeletePortMapping action.
+pub fn delete_port_mapping_body(service_type: &str, external_port: u16, proto: Proto) -> String {
+    format!(
+        "<?xml version=\"1.0\"?>\r\n\
+<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" \
+s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\
+<s:Body>\
+<u:DeletePortMapping xmlns:u=\"{svc}\">\
+<NewRemoteHost></NewRemoteHost>\
+<NewExternalPort>{ext}</NewExternalPort>\
+<NewProtocol>{proto}</NewProtocol>\
+</u:DeletePortMapping>\
+</s:Body>\
+</s:Envelope>",
+        svc = service_type,
+        ext = external_port,
+        proto = proto.as_str(),
+    )
+}
+
 // ---- network (live tested via CLI) ----------------------------------------
 
 /// Our LAN IP as seen toward `gateway` - the value AddPortMapping's
@@ -459,6 +500,21 @@ pub async fn map_port_unicast(
     external_ip(&svc).await
 }
 
+/// Discover the IGD by unicast and report which internal client holds `port`
+/// (TCP), if anyone. Diagnostic: tells whether a stale/foreign mapping is holding
+/// the port that would keep another device LowID.
+pub async fn who_maps_unicast(port: u16) -> Result<Option<String>, UpnpError> {
+    let (svc, _gw) = discover_unicast(&unicast_candidates().await, Duration::from_secs(2)).await?;
+    query_specific_mapping(&svc, port, Proto::Tcp).await
+}
+
+/// Discover the IGD by unicast and delete the `port` (TCP) mapping, freeing it for
+/// another device to claim. Safe if nothing is mapped.
+pub async fn unmap_port_unicast(port: u16) -> Result<(), UpnpError> {
+    let (svc, _gw) = discover_unicast(&unicast_candidates().await, Duration::from_secs(2)).await?;
+    soap_delete_mapping(&svc, port, Proto::Tcp).await
+}
+
 /// The gateway `ip:1900` endpoints to try a unicast M-SEARCH against, inferred
 /// from our own LAN address. Empty if we cannot even determine our LAN IP.
 async fn unicast_candidates() -> Vec<SocketAddr> {
@@ -517,6 +573,57 @@ pub async fn external_ip(svc: &WanService) -> Result<Ipv4Addr, UpnpError> {
     xml_tag(&resp, "NewExternalIPAddress")
         .and_then(|s| s.trim().parse().ok())
         .ok_or(UpnpError::BadResponse)
+}
+
+/// Ask the IGD which internal client currently holds `external_port`/`proto`.
+/// `Ok(Some(ip))` if mapped, `Ok(None)` if free (error 714 NoSuchEntryInArray).
+pub async fn query_specific_mapping(
+    svc: &WanService,
+    external_port: u16,
+    proto: Proto,
+) -> Result<Option<String>, UpnpError> {
+    let body = get_specific_mapping_body(&svc.service_type, external_port, proto);
+    let (status, resp) = http_soap(
+        &svc.control_url,
+        &svc.service_type,
+        "GetSpecificPortMappingEntry",
+        &body,
+    )
+    .await?;
+    if status == 200 {
+        Ok(xml_tag(&resp, "NewInternalClient").map(|s| s.trim().to_string()))
+    } else {
+        // A SOAP fault here is almost always 714 (no such mapping) = free.
+        Ok(None)
+    }
+}
+
+/// POST a DeletePortMapping SOAP action. Deleting an entry that is not there is
+/// treated as success (the IGD returns 714), so this is safe to call blindly.
+pub async fn soap_delete_mapping(
+    svc: &WanService,
+    external_port: u16,
+    proto: Proto,
+) -> Result<(), UpnpError> {
+    let body = delete_port_mapping_body(&svc.service_type, external_port, proto);
+    let (status, resp) = http_soap(
+        &svc.control_url,
+        &svc.service_type,
+        "DeletePortMapping",
+        &body,
+    )
+    .await?;
+    if status == 200 {
+        return Ok(());
+    }
+    let code = xml_tag(&resp, "errorCode").and_then(|s| s.trim().parse::<u32>().ok());
+    if code == Some(714) {
+        Ok(()) // NoSuchEntryInArray - already gone.
+    } else {
+        Err(UpnpError::Gateway(
+            xml_tag(&resp, "errorDescription").unwrap_or_else(|| format!("HTTP {status}")),
+        ))
+    }
 }
 
 // ---- minimal HTTP/1.1 over tokio TCP ---------------------------------------
@@ -695,6 +802,22 @@ mod tests {
         assert!(body.contains("<NewProtocol>TCP</NewProtocol>"));
         assert!(body.contains("<NewInternalClient>10.0.0.33</NewInternalClient>"));
         assert!(body.contains("<NewLeaseDuration>0</NewLeaseDuration>"));
+    }
+
+    #[test]
+    fn delete_and_query_bodies_are_wellformed_soap() {
+        let svc = "urn:schemas-upnp-org:service:WANIPConnection:1";
+        let d = delete_port_mapping_body(svc, 4662, Proto::Tcp);
+        assert!(d.contains(&format!("<u:DeletePortMapping xmlns:u=\"{svc}\">")));
+        assert!(d.contains("<NewExternalPort>4662</NewExternalPort>"));
+        assert!(d.contains("<NewProtocol>TCP</NewProtocol>"));
+
+        let q = get_specific_mapping_body(svc, 4662, Proto::Tcp);
+        assert!(q.contains(&format!(
+            "<u:GetSpecificPortMappingEntry xmlns:u=\"{svc}\">"
+        )));
+        assert!(q.contains("<NewExternalPort>4662</NewExternalPort>"));
+        assert!(q.contains("<NewProtocol>TCP</NewProtocol>"));
     }
 
     #[test]

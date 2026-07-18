@@ -32,6 +32,10 @@ final class EngineModel: ObservableObject {
     @Published private(set) var adding: Set<String> = []
     /// A transient line reporting what just happened.
     @Published var notice: String?
+    /// The last port-mapping (UPnP) result - durable, so the "Connected" line
+    /// can't clobber it. This is our only window into why HighID did or didn't
+    /// happen on a device with no debugger.
+    @Published private(set) var upnpStatus: String?
     /// Whether padMule serves files to peers. Off is "Leech Mode". Polled as a
     /// SNAPSHOT, like the server login: the engine owns the truth, the UI mirrors
     /// it. Defaults to true so the switch reads correctly before the first poll.
@@ -204,11 +208,16 @@ final class EngineModel: ObservableObject {
             // The reconnect banner is a HARD lifecycle requirement.
             reconnecting = (text == "Reconnecting...")
         case .server(let text):
-            // News ("Saved 'x'", a server MOTD), NOT the connection status.
-            // Writing these to `status` would clobber the polled
-            // "Connected to <server> (HighID|LowID)" line - the same
-            // event-overwrites-state bug that hid the ID type in the first place.
-            notice = text
+            // Port-mapping results go to a DURABLE field so the connection line
+            // can't overwrite them (that "an event is not state" bug again).
+            if text.hasPrefix("UPnP:") {
+                upnpStatus = text
+            } else {
+                // News ("Saved 'x'", a server MOTD), NOT the connection status.
+                // Writing these to `status` would clobber the polled
+                // "Connected to <server> (HighID|LowID)" line.
+                notice = text
+            }
         case .kad(let contacts):
             kadContacts = contacts
         case .progress:
