@@ -21,7 +21,7 @@ const FT_MEDIA_LENGTH: u8 = 0xD3;
 const FT_MEDIA_BITRATE: u8 = 0xD4;
 const FT_MEDIA_CODEC: u8 = 0xD5;
 
-fn tag_str(tags: &[mule_proto::Tag], id: u8) -> Option<String> {
+pub(crate) fn tag_str(tags: &[mule_proto::Tag], id: u8) -> Option<String> {
     tags.iter().find_map(|t| match (&t.name, &t.value) {
         (TagName::Id(n), TagValue::Str(s)) if *n == id => {
             Some(String::from_utf8_lossy(s).into_owned())
@@ -30,7 +30,7 @@ fn tag_str(tags: &[mule_proto::Tag], id: u8) -> Option<String> {
     })
 }
 
-fn tag_u64(tags: &[mule_proto::Tag], id: u8) -> Option<u64> {
+pub(crate) fn tag_u64(tags: &[mule_proto::Tag], id: u8) -> Option<u64> {
     tags.iter().find_map(|t| match (&t.name, &t.value) {
         (TagName::Id(n), TagValue::U32(v)) if *n == id => Some(*v as u64),
         (TagName::Id(n), TagValue::U64(v)) if *n == id => Some(*v),
