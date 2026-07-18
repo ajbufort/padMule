@@ -16,6 +16,8 @@ final class EngineModel: ObservableObject {
     @Published private(set) var status: String = "Idle"
     @Published private(set) var reconnecting: Bool = false
     @Published private(set) var downloads: [DownloadInfo] = []
+    /// The files we are serving to peers (the persisted + session shared library).
+    @Published private(set) var sharedFiles: [SharedFileInfo] = []
     @Published private(set) var kadContacts: UInt32 = 0
     @Published private(set) var identity: IdentityInfo?
     @Published private(set) var bootError: String?
@@ -200,6 +202,7 @@ final class EngineModel: ObservableObject {
         work.async { [weak self] in
             let st = e.state()
             let dls = e.downloads()
+            let shf = e.sharedFiles()
             let kad = e.kadContacts()
             let srv = e.serverInfo()
             let shr = e.isSharing()
@@ -208,6 +211,7 @@ final class EngineModel: ObservableObject {
                 guard let self else { return }
                 self.state = st
                 self.downloads = dls
+                self.sharedFiles = shf
                 self.kadContacts = kad
                 self.server = srv
                 self.sharing = shr
