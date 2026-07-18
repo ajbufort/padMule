@@ -50,6 +50,38 @@ struct ContentView: View {
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
+                        if model.searched && !model.results.isEmpty {
+                            HStack {
+                                Menu {
+                                    Picker("Sort", selection: $model.sortKey) {
+                                        ForEach(SortKey.allCases) { Text($0.rawValue).tag($0) }
+                                    }
+                                    Toggle("Ascending", isOn: $model.sortAscending)
+                                } label: {
+                                    Label("Sort: \(model.sortKey.rawValue)", systemImage: "arrow.up.arrow.down")
+                                        .font(.caption)
+                                }
+                                Spacer()
+                                Menu {
+                                    Button("All types") { model.typeFilter = nil }
+                                    ForEach(["Video", "Audio", "Archive", "Document", "Image", "Program"], id: \.self) { t in
+                                        Button(t) { model.typeFilter = t }
+                                    }
+                                } label: {
+                                    Label(model.typeFilter ?? "All types", systemImage: "line.3.horizontal.decrease.circle")
+                                        .font(.caption)
+                                }
+                            }
+                            HStack {
+                                Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                                TextField("Filter these results", text: $model.nameFilter)
+                                    .textInputAutocapitalization(.never)
+                                    .disableAutocorrection(true)
+                            }
+                            .font(.caption)
+                            Toggle("Trusted only", isOn: $model.trustedOnly).font(.caption)
+                            Toggle("Hide ones I have", isOn: $model.hideHave).font(.caption)
+                        }
                         ForEach(model.presentedResults, id: \.hash) { hit in
                             resultRow(hit)
                                 .contentShape(Rectangle())
@@ -139,6 +171,9 @@ struct ContentView: View {
                 }
             }
             .navigationTitle("padMule")
+            .sheet(item: $detail) { hit in
+                SearchDetailView(hit: hit).environmentObject(model)
+            }
         }
     }
 
