@@ -280,6 +280,17 @@ pub enum AddResult {
     Failed(String),
 }
 
+/// Whether a search hit is something we already have, are fetching, or is new.
+/// Mirrors eMule's colored result states. "Have" is best-effort: it knows files
+/// finished this session (shared library) + complete downloads, not files sitting
+/// in the downloads directory from a prior run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HitStatus {
+    New,
+    Downloading,
+    Have,
+}
+
 /// A distilled Kad keyword result in the raw tagged shape the [`catalog`]
 /// expects, so server and Kad hits for one hash dedupe and rank together. The id
 /// tags mirror `catalog`'s: 0x01 filename, 0x02 filesize, 0x15 sources.
@@ -843,6 +854,24 @@ impl Engine {
         catalog(&combined)
     }
 
+    /// Classify a search hit's hash against our downloads + shared files, so the
+    /// UI can show an already-have / fetching / new indicator per result.
+    pub async fn hit_status(&self, hash: [u8; 16]) -> HitStatus {
+        for dl in self.downloads.lock().await.iter() {
+            if dl.hash().await == hash {
+                return if dl.is_complete().await {
+                    HitStatus::Have
+                } else {
+                    HitStatus::Downloading
+                };
+            }
+        }
+        if self.shared.lock().await.iter().any(|s| s.hash == hash) {
+            return HitStatus::Have;
+        }
+        HitStatus::New
+    }
+
     /// Start downloading `hash`. Asks the server who has it, creates the part
     /// file, registers the download, and spawns the transfer - returning as soon
     /// as it is registered, NOT when the file lands. Progress is observed via
@@ -1114,6 +1143,34 @@ mod tests {
         assert_eq!(cat[0].size, 1000);
         assert_eq!(cat[0].name, "clip.mp4");
         assert!(cat[0].is_trusted());
+    }
+
+    #[tokio::test]
+    async fn hit_status_reports_downloading_have_and_new() {
+        let dir = tmp("hitstatus");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (engine, _rx) = Engine::new(&dir).unwrap();
+
+        // An in-progress (incomplete) download -> Downloading.
+        let store = PartStore::create(&dir, 1, [0xAA; 16], 1000, b"a.bin").unwrap();
+        engine.downloads.lock().await.push(Download::new(store));
+        assert_eq!(engine.hit_status([0xAA; 16]).await, HitStatus::Downloading);
+
+        // A shared (finished) file -> Have.
+        engine.shared.lock().await.push(SharedFile {
+            hash: [0xBB; 16],
+            size: 10,
+            name: b"b.bin".to_vec(),
+            part_hashes: vec![],
+            path: dir.join("b.bin"),
+        });
+        assert_eq!(engine.hit_status([0xBB; 16]).await, HitStatus::Have);
+
+        // Anything else -> New.
+        assert_eq!(engine.hit_status([0xCC; 16]).await, HitStatus::New);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
