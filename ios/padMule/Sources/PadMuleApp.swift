@@ -24,8 +24,8 @@ struct PadMuleApp: App {
                 }
             }
             .task {
-                // The engine boots underneath, so these 3 seconds are not dead time.
-                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                // The engine boots underneath, so these 7 seconds are not dead time.
+                try? await Task.sleep(nanoseconds: 7_000_000_000)
                 withAnimation(.easeOut(duration: 0.35)) { showSplash = false }
             }
         }
