@@ -44,6 +44,13 @@ final class EngineModel: ObservableObject {
                 trustedOnly: trustedOnly, hideHave: hideHave)
     }
 
+    /// Recent search queries, most-recent first, persisted across launches so a
+    /// touch user can re-run a query without retyping on the soft keyboard.
+    @Published private(set) var recentSearches: [String] =
+        UserDefaults.standard.stringArray(forKey: Self.recentsKey) ?? []
+    private static let recentsKey = "padMule.recentSearches"
+    private static let recentsCap = 12
+
     @Published private(set) var searching = false
     /// True once a search has actually run, so "no results" is only ever shown
     /// about a real search - never about a box the user has not used yet.
@@ -103,6 +110,7 @@ final class EngineModel: ObservableObject {
     func search(_ keyword: String) {
         let q = keyword.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let e = engine, !q.isEmpty, !searching else { return }
+        recordRecent(q)
         searching = true
         notice = nil
         work.async { [weak self] in
@@ -123,6 +131,22 @@ final class EngineModel: ObservableObject {
         results = []
         searched = false
         notice = nil
+    }
+
+    /// Record a query at the front of the recents (case-insensitive de-dupe,
+    /// capped), and persist. Called on every real search.
+    private func recordRecent(_ q: String) {
+        var list = recentSearches.filter { $0.caseInsensitiveCompare(q) != .orderedSame }
+        list.insert(q, at: 0)
+        if list.count > Self.recentsCap { list = Array(list.prefix(Self.recentsCap)) }
+        recentSearches = list
+        UserDefaults.standard.set(list, forKey: Self.recentsKey)
+    }
+
+    /// Remove one recent query (swipe-to-delete).
+    func removeRecent(_ q: String) {
+        recentSearches.removeAll { $0 == q }
+        UserDefaults.standard.set(recentSearches, forKey: Self.recentsKey)
     }
 
     /// Toggle uploading. Off is "Leech Mode": padMule keeps downloading but stops
