@@ -141,6 +141,12 @@ where
     pub fn into_inner(self) -> S {
         self.stream
     }
+
+    /// Borrow the underlying stream (e.g. to `poll_peek` for a server drop
+    /// without consuming any framed bytes).
+    pub fn get_ref(&self) -> &S {
+        &self.stream
+    }
 }
 
 #[cfg(test)]

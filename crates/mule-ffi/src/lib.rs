@@ -50,11 +50,27 @@ impl From<EngineState> for EngineStateFfi {
 /// An observable engine event, flattened for FFI (the progress hash is hex).
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
 pub enum EngineEventFfi {
-    State { state: EngineStateFfi },
-    Status { text: String },
-    Server { text: String },
-    Kad { contacts: u32 },
-    Progress { hash: String, have: u64, total: u64 },
+    State {
+        state: EngineStateFfi,
+    },
+    Status {
+        text: String,
+    },
+    Server {
+        text: String,
+    },
+    /// The server dropped/kicked us - the UI raises a prominent dialog.
+    ServerDropped {
+        addr: String,
+    },
+    Kad {
+        contacts: u32,
+    },
+    Progress {
+        hash: String,
+        have: u64,
+        total: u64,
+    },
 }
 
 impl From<EngineEvent> for EngineEventFfi {
@@ -63,6 +79,7 @@ impl From<EngineEvent> for EngineEventFfi {
             EngineEvent::State(s) => EngineEventFfi::State { state: s.into() },
             EngineEvent::Status(text) => EngineEventFfi::Status { text },
             EngineEvent::Server(text) => EngineEventFfi::Server { text },
+            EngineEvent::ServerDropped { addr } => EngineEventFfi::ServerDropped { addr },
             EngineEvent::Kad { contacts } => EngineEventFfi::Kad {
                 contacts: contacts as u32,
             },
@@ -101,6 +118,20 @@ pub struct ServerInfoFfi {
 pub struct TransferStats {
     pub total_down: u64,
     pub total_up: u64,
+}
+
+/// One row of the Servers screen: a `server.met` entry enriched with a live UDP
+/// status probe. `users`/`files` are meaningful only when `alive`; a dead server
+/// is shown greyed out and cannot be selected.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ServerEntryFfi {
+    /// "ip:port" - the handle to pass to `connect_to_server`.
+    pub addr: String,
+    pub name: String,
+    pub users: u32,
+    pub files: u32,
+    pub alive: bool,
+    pub connected: bool,
 }
 
 /// A snapshot of one in-progress download.
@@ -404,6 +435,47 @@ impl MuleEngine {
             .block_on(async { self.inner.lock().await.kad_contacts() as u32 })
     }
 
+    /// The Servers screen: read server.met and PROBE each server's UDP status
+    /// port, returning the list with liveness + fresh user/file counts. Blocks a
+    /// few seconds while the pings resolve - run it off the UI thread. padMule
+    /// does NOT auto-connect; the user picks a live (alive) server.
+    pub fn server_list(&self) -> Vec<ServerEntryFfi> {
+        self.rt.block_on(async {
+            self.inner
+                .lock()
+                .await
+                .probe_server_list()
+                .await
+                .into_iter()
+                .map(|e| ServerEntryFfi {
+                    addr: e.addr.to_string(),
+                    name: e.name,
+                    users: e.users.unwrap_or(0),
+                    files: e.files.unwrap_or(0),
+                    alive: e.alive,
+                    connected: e.connected,
+                })
+                .collect()
+        })
+    }
+
+    /// Connect to the server at `addr` ("ip:port"). Returns false if the address
+    /// is malformed or the login was refused/timed out. Blocks up to ~12s.
+    pub fn connect_to_server(&self, addr: String) -> bool {
+        let Ok(sa) = addr.parse::<std::net::SocketAddr>() else {
+            return false;
+        };
+        self.rt
+            .block_on(async { self.inner.lock().await.connect_to_server(sa).await })
+    }
+
+    /// Disconnect from the current server at the user's request (Kad + downloads
+    /// keep running).
+    pub fn disconnect_server(&self) {
+        self.rt
+            .block_on(async { self.inner.lock().await.disconnect_server().await });
+    }
+
     /// Cumulative session transfer totals (down, up) in bytes. Polled by the UI
     /// to draw the rate history + ratio; monotonic, so sampling is race-free.
     pub fn transfer_stats(&self) -> TransferStats {
@@ -456,6 +528,9 @@ impl MuleEngine {
             // share change here, so a download that finished mid-session gets
             // re-announced to the server (OP_OFFERFILES) within about a second.
             g.maintain_shares().await;
+            // Detect a server drop/kick within ~1s and emit ServerDropped (the UI
+            // shows a dialog). Cancel-safe peek, so this never disturbs framing.
+            g.poll_server_drop().await;
             out
         })
     }

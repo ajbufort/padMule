@@ -221,6 +221,25 @@ pub fn parse_server_status(payload: &[u8]) -> Result<(u32, u32), IoError> {
     Ok((users, files))
 }
 
+/// UDP server-status ping opcodes (protocol 0xE3, sent to the server's UDP port =
+/// TCP + 4). `OP_GLOBSERVSTATREQ` is a bare `[0xE3][0x96]` datagram; a server that
+/// answers `OP_GLOBSERVSTATRES` `<users u32><files u32>` (opcodes.h:192-193) is
+/// ALIVE and reports fresh counts. Newer servers append maxusers/soft/hard/version
+/// - ignored here.
+pub const OP_GLOBSERVSTATREQ: u8 = 0x96;
+pub const OP_GLOBSERVSTATRES: u8 = 0x97;
+
+/// Parse an OP_GLOBSERVSTATRES payload into `(users, files)`, or None if it is too
+/// short. Only the leading two u32s are read; any trailing extension is ignored.
+pub fn parse_serv_stat_res(payload: &[u8]) -> Option<(u32, u32)> {
+    if payload.len() < 8 {
+        return None;
+    }
+    let users = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    let files = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+    Some((users, files))
+}
+
 /// Parse an OP_SERVERLIST payload: `u8 count` then `count * (u32 IP, u16 port)`.
 /// Peer-server gossip used to grow the local server list.
 pub fn parse_server_list(payload: &[u8]) -> Result<Vec<(u32, u16)>, IoError> {
@@ -445,6 +464,19 @@ mod tests {
         // users = 100, files = 5000
         let status = [0x64, 0x00, 0x00, 0x00, 0x88, 0x13, 0x00, 0x00];
         assert_eq!(parse_server_status(&status).unwrap(), (100, 5000));
+    }
+
+    #[test]
+    fn serv_stat_res_reads_users_and_files_ignoring_extras() {
+        // <users 4><files 4>, then a trailing extension a newer server appends.
+        let res = [
+            0x2A, 0x00, 0x00, 0x00, // users = 42
+            0x40, 0xE2, 0x01, 0x00, // files = 123456
+            0xFF, 0xFF, // trailing bytes -> ignored
+        ];
+        assert_eq!(parse_serv_stat_res(&res), Some((42, 123_456)));
+        // Too short -> None (never index past the end).
+        assert_eq!(parse_serv_stat_res(&[0x01, 0x02, 0x03]), None);
     }
 
     #[test]
