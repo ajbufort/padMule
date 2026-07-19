@@ -402,6 +402,8 @@ fn write_known_met_atomic(path: &Path, met: &mule_files::KnownMet) {
 struct FinishCtx {
     registry: Arc<Mutex<Vec<Arc<Download>>>>,
     shared: Arc<Mutex<Vec<SharedFile>>>,
+    /// Raised once the finished file joins `shared`, so the poll re-offers it.
+    shared_dirty: Arc<AtomicBool>,
     config_dir: PathBuf,
     /// Serializes the known.met read-modify-write across concurrently-finishing
     /// downloads (each runs in its own task) so no entry is lost to a race.
@@ -419,6 +421,7 @@ async fn finish_download(
     let FinishCtx {
         registry,
         shared,
+        shared_dirty,
         config_dir,
         known_met_lock,
         events,
@@ -470,6 +473,10 @@ async fn finish_download(
                 persist_shared_file(&config_dir, &sf);
             }
             shared.lock().await.push(sf);
+            // The library grew while we may be logged in: signal the poll to
+            // re-announce it (OP_OFFERFILES) so the new file is findable without
+            // waiting for a reconnect.
+            shared_dirty.store(true, Ordering::Relaxed);
             let _ = events.send(EngineEvent::Server(format!(
                 "Saved '{}'",
                 dest.file_name().unwrap_or_default().to_string_lossy()
@@ -735,6 +742,10 @@ pub struct Engine {
     /// Complete files we will serve to peers, populated as downloads finish.
     /// Shared with the listener, which serves them on request (the upload side).
     shared: Arc<Mutex<Vec<SharedFile>>>,
+    /// Set when the shared library grows mid-session (a download finishing), so
+    /// the next downloads() poll re-announces it to the server (OP_OFFERFILES).
+    /// Cloned into each download's completion task, which has no path to `server`.
+    shared_dirty: Arc<AtomicBool>,
     /// The upload switch. `false` is "Leech Mode": we still download, but serve
     /// nothing. An atomic so the listener task reads it without taking a lock.
     sharing: Arc<AtomicBool>,
@@ -780,6 +791,7 @@ impl Engine {
             routing,
             downloads: Arc::new(Mutex::new(Vec::new())),
             shared: Arc::new(Mutex::new(Vec::new())),
+            shared_dirty: Arc::new(AtomicBool::new(false)),
             sharing: Arc::new(AtomicBool::new(true)),
             upload_gate: Arc::new(UploadGate::new(
                 Arc::new(Semaphore::new(MAX_UPLOAD_SLOTS)),
@@ -1202,7 +1214,7 @@ impl Engine {
                 )));
                 // Announce our shared library so the server indexes it (findable
                 // via keyword search) and can hand us out as a source.
-                self.offer_shared_to(&mut link).await;
+                Self::offer_shared_to(&self.shared, &mut link).await;
                 self.server = Some(link);
                 return;
             }
@@ -1216,16 +1228,20 @@ impl Engine {
     /// to aMule against a compression-advertising server (every live server), and
     /// it keeps a HighID's public IP out of the server's search index (the server
     /// sources us via our login id regardless). No-op with an empty library.
-    async fn offer_shared_to(&self, link: &mut ServerLink) {
+    async fn offer_shared_to(shared: &Mutex<Vec<SharedFile>>, link: &mut ServerLink) {
         // aMule caps each OFFERFILES burst at 200 files; we cap too (v1 does not
         // republish the remainder).
         const MAX_OFFER: usize = 200;
         // Snapshot what we need, then RELEASE the lock before the network write -
         // so a concurrent share change (a download finishing) never blocks on it.
+        // Take the NEWEST 200 (finish_download appends to the tail): a just-
+        // finished file - the very reason a re-offer fires - must always be in
+        // the burst, never the one the cap drops.
         let snap: Vec<([u8; 16], String, u64)> = {
-            let shared = self.shared.lock().await;
+            let shared = shared.lock().await;
             shared
                 .iter()
+                .rev()
                 .take(MAX_OFFER)
                 .map(|s| {
                     (
@@ -1254,6 +1270,38 @@ impl Engine {
             link.offer_files(&offers, FILE_COMPLETE_ID, FILE_COMPLETE_PORT),
         )
         .await;
+    }
+
+    /// Re-announce the shared library to the server after a mid-session change.
+    /// A download finishing sets `shared_dirty`; the 1s downloads() poll calls
+    /// this, so a file that completes while we are connected becomes findable
+    /// within about a second instead of only after the next reconnect.
+    ///
+    /// Cheap: a no-op unless the library actually changed. `swap` clears the flag
+    /// up front, so a completion that lands DURING the offer re-arms it for the
+    /// next poll (no lost update). While offline nothing is lost either: a
+    /// reconnect re-offers the whole current library via `connect_server`.
+    pub async fn maintain_shares(&mut self) {
+        // Peek WITHOUT clearing: if we cannot actually offer (no server, or the
+        // link is paused/disconnected) the flag must stay raised so a later
+        // connected poll still announces the file. Clearing it here would strand
+        // the file for the session - resume()'s success fast-path does not
+        // re-offer, only a full connect_server does.
+        if !self.shared_dirty.load(Ordering::Relaxed) {
+            return;
+        }
+        // Disjoint field borrows: `server` mutably, `shared` immutably.
+        let Some(link) = self.server.as_mut() else {
+            return;
+        };
+        if !link.is_connected() {
+            return;
+        }
+        // Committed to offering. Clear now (there is no await between the load
+        // above and here, so nothing was missed); a completion that lands DURING
+        // the offer re-arms the flag for the next poll - no lost update.
+        self.shared_dirty.store(false, Ordering::Relaxed);
+        Self::offer_shared_to(&self.shared, link).await;
     }
 
     /// Bind the Kad UDP socket and bootstrap off the persisted contacts.
@@ -1539,6 +1587,7 @@ impl Engine {
         let ctx = FinishCtx {
             registry: Arc::clone(&self.downloads),
             shared: Arc::clone(&self.shared),
+            shared_dirty: Arc::clone(&self.shared_dirty),
             config_dir: self.config_dir.clone(),
             known_met_lock: Arc::clone(&self.known_met_lock),
             events: events.clone(),
@@ -2263,6 +2312,34 @@ mod tests {
             !engine.online_status().contains("HighID") && !engine.online_status().contains("LowID"),
             "must not invent an ID we were never given: {}",
             engine.online_status()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `maintain_shares` re-announces the library after a mid-session change, but
+    /// must only CONSUME the `shared_dirty` flag once it can actually offer. With
+    /// no server connected the flag has to survive - the next connected poll (or
+    /// reconnect) is what announces the file; clearing it early would strand the
+    /// file for the session, since resume()'s success path does not re-offer.
+    #[tokio::test]
+    async fn maintain_shares_keeps_the_flag_until_it_can_offer() {
+        let dir = tmp("maintshare");
+        let _ = std::fs::remove_dir_all(&dir);
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+        engine.set_offline(true);
+
+        // Nothing changed -> no work, and the flag stays clear.
+        assert!(!engine.shared_dirty.load(Ordering::Relaxed));
+        engine.maintain_shares().await;
+        assert!(!engine.shared_dirty.load(Ordering::Relaxed));
+
+        // A completion raised the flag but no server is connected: it must be
+        // KEPT, not consumed, so a later connected poll still announces the file.
+        engine.shared_dirty.store(true, Ordering::Relaxed);
+        engine.maintain_shares().await;
+        assert!(
+            engine.shared_dirty.load(Ordering::Relaxed),
+            "maintain_shares must NOT consume the dirty flag when it cannot offer"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

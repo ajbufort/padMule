@@ -368,7 +368,7 @@ impl MuleEngine {
     /// Snapshots of every in-progress download.
     pub fn downloads(&self) -> Vec<DownloadInfo> {
         self.rt.block_on(async {
-            let g = self.inner.lock().await;
+            let mut g = self.inner.lock().await;
             let mut out = Vec::new();
             for dl in g.downloads().await {
                 let size = dl.size().await;
@@ -385,6 +385,10 @@ impl MuleEngine {
                     priority: dl.priority(),
                 });
             }
+            // The 1s downloads() poll is the engine's heartbeat: drain any pending
+            // share change here, so a download that finished mid-session gets
+            // re-announced to the server (OP_OFFERFILES) within about a second.
+            g.maintain_shares().await;
             out
         })
     }
