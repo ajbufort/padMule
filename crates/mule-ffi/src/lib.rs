@@ -95,6 +95,14 @@ pub struct ServerInfoFfi {
     pub related_search: bool,
 }
 
+/// Cumulative file-data bytes moved this session. The UI samples these monotonic
+/// totals each poll to derive the transfer-rate history and the up:down ratio.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct TransferStats {
+    pub total_down: u64,
+    pub total_up: u64,
+}
+
 /// A snapshot of one in-progress download.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct DownloadInfo {
@@ -388,6 +396,18 @@ impl MuleEngine {
     pub fn kad_contacts(&self) -> u32 {
         self.rt
             .block_on(async { self.inner.lock().await.kad_contacts() as u32 })
+    }
+
+    /// Cumulative session transfer totals (down, up) in bytes. Polled by the UI
+    /// to draw the rate history + ratio; monotonic, so sampling is race-free.
+    pub fn transfer_stats(&self) -> TransferStats {
+        self.rt.block_on(async {
+            let (total_down, total_up) = self.inner.lock().await.transfer_totals();
+            TransferStats {
+                total_down,
+                total_up,
+            }
+        })
     }
 
     /// Whether padMule serves the files it has to other peers. `false` is

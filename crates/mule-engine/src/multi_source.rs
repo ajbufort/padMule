@@ -576,6 +576,7 @@ where
             }
             for w in rx.accept(pkt.opcode, &pkt.payload)? {
                 delivered += w.data.len() as u64;
+                crate::stats::add_downloaded(w.data.len() as u64);
                 dl.commit(w.offset, &w.data)
                     .await
                     .map_err(TransferError::Io)?;

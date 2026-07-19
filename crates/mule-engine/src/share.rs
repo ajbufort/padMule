@@ -303,6 +303,7 @@ where
                         let data = read_range(&f.path, s, e).map_err(FrameError::Io)?;
                         fs.write_packet(&build_sending_part(&f.hash, s, e, &data))
                             .await?;
+                        crate::stats::add_uploaded(data.len() as u64);
                     }
                 }
             }

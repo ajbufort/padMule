@@ -861,6 +861,13 @@ impl Engine {
         self.routing.len()
     }
 
+    /// Total file-data bytes moved this session as `(downloaded, uploaded)`. The
+    /// UI samples these monotonic totals to draw the rate history + up:down ratio
+    /// (see [`crate::stats`]). Process-global, so they survive a pause/resume.
+    pub fn transfer_totals(&self) -> (u64, u64) {
+        (crate::stats::downloaded(), crate::stats::uploaded())
+    }
+
     /// The in-progress downloads. Cheap: clones `Arc`s, not files.
     pub async fn downloads(&self) -> Vec<Arc<Download>> {
         self.downloads.lock().await.clone()
