@@ -62,6 +62,13 @@ final class EngineModel: ObservableObject {
     @Published private(set) var recentSearches: [String] =
         UserDefaults.standard.stringArray(forKey: recentsKey) ?? []
 
+    // Categories: a client-side organization layer over the transfer list
+    // (definitions + a hash -> category-id map, both in UserDefaults).
+    @Published private(set) var categories: [Category] = CategoryStore.loadCategories()
+    @Published private(set) var categoryOf: [String: String] = CategoryStore.loadAssignment()
+    /// The active category filter on the Transfers screen; nil = show all.
+    @Published var categoryFilter: String?
+
     @Published private(set) var searching = false
     /// True once a search has actually run, so "no results" is only ever shown
     /// about a real search - never about a box the user has not used yet.
@@ -211,6 +218,46 @@ final class EngineModel: ObservableObject {
             _ = e.cancelDownload(hash: hash)
             DispatchQueue.main.async { self?.refresh() }
         }
+    }
+
+    // MARK: - Categories
+
+    /// Downloads in the currently-selected category (all when no filter).
+    var filteredDownloads: [DownloadInfo] {
+        guard let f = categoryFilter else { return downloads }
+        return downloads.filter { categoryOf[$0.hash] == f }
+    }
+
+    /// The category assigned to a hash, if any.
+    func category(for hash: String) -> Category? {
+        guard let id = categoryOf[hash] else { return nil }
+        return categories.first { $0.id == id }
+    }
+
+    /// Add a category with the next palette color. No-op on a blank/dupe name.
+    func addCategory(_ name: String) {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              !categories.contains(where: { $0.name.caseInsensitiveCompare(trimmed) == .orderedSame })
+        else { return }
+        let cat = Category(id: UUID().uuidString, name: trimmed, colorIndex: categories.count)
+        categories.append(cat)
+        CategoryStore.saveCategories(categories)
+    }
+
+    /// Delete a category and clear it from any downloads assigned to it.
+    func removeCategory(_ id: String) {
+        categories.removeAll { $0.id == id }
+        categoryOf = categoryOf.filter { $0.value != id }
+        if categoryFilter == id { categoryFilter = nil }
+        CategoryStore.saveCategories(categories)
+        CategoryStore.saveAssignment(categoryOf)
+    }
+
+    /// Assign (or clear, with nil) a hash's category.
+    func assignCategory(_ id: String?, to hash: String) {
+        if let id { categoryOf[hash] = id } else { categoryOf.removeValue(forKey: hash) }
+        CategoryStore.saveAssignment(categoryOf)
     }
 
     /// Stop sharing one file (keeps the file on disk). refresh() pulls the
