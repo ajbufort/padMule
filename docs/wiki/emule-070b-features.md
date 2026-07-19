@@ -121,13 +121,14 @@ parsing, Kad anti-abuse hardening, and the "Automatic" search method). Ranked by
 - **34 Time-of-day scheduler:** a suspended app can't fire rules; the premise
   (unattended overnight) is gutted. Only "while running" remains, ~= static caps.
 
-## Recommended first slice
+## Recommended first slice (ALL LANDED 2026-07-19)
 
 The Tier-1 items that are safe AND make padMule feel complete on day one:
 **IP filter (#1)**, **search history (#2)**, **wire-side search filters (#3)**,
 and the **verified badge (#4)** - all small, three of four wire-neutral or
-low-risk, no format changes. Ratings-read (#6) and categories (#5) are the next
-step up in value once those land.
+low-risk, no format changes. Ratings-read (#6) and categories (#5) were the next
+step up in value. ALL of these have since shipped (this was the plan; kept for the
+rationale). Remaining Tier-1: #9 (global UDP search), #10 (related search).
 
 ## Related
 

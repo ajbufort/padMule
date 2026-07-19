@@ -1,6 +1,6 @@
 # Decisions and Lessons
 
-Updated: 2026-07-18
+Updated: 2026-07-19
 
 Locked decisions, rejected approaches, gotchas, measured facts. One dated
 bullet each; Locked decisions newest first, Lessons in the order learned.
@@ -241,6 +241,26 @@ bullet each; Locked decisions newest first, Lessons in the order learned.
   and "interoperable" are not the same, and diverging silently breaks interop the
   way the SX/extended-requests bugs did, just in the other direction. Same spirit as
   the "agent-derived constants are a hypothesis" lesson above.
+- 2026-07-19 **LESSON: never ship an interop feature validated only by a mock that
+  plays the WRONG role - a false-positive test is worse than no test.** The
+  "verified-identity" secure-ident feature shipped GREEN (its unit test passed) and
+  was REVERTED the next commit after an adversarial review found a HIGH deadlock.
+  Root cause: padMule ran secure-ident as a post-transfer INITIATOR while advertising
+  sec_ident=0, so a real uploader never initiated and padMule hung the full 8s
+  timeout on EVERY delivering source (never verifying, delaying completion). The unit
+  test passed only because BOTH mock ends called `run_secure_ident` as initiators - a
+  synthetic exchange no real serve peer performs. The original instinct to DEFER (it
+  could not be integration-tested) was correct and was overridden by a
+  green-but-synthetic test. Redone correctly (advertise sec_ident so the uploader
+  initiates; RESPOND inline; never wait - #4/#32) and validated the RIGHT way: a mock
+  uploader that INITIATES, plus the amuled differential proving "verified: true"
+  against real aMule. Rules: (1) test an interop feature against a FAITHFUL
+  other-side - the real peer (the amuled/eMule/eserver oracles) or a mock that plays
+  the peer's ACTUAL role, NEVER both-ends-same-role; (2) if no faithful test is
+  possible, DEFER and say so - do not ship on a false positive; (3) the reverted
+  commit is far cheaper than the shipped bug. Cross-session memory:
+  interop-test-fidelity. Enabled by the [[build-progress]] oracle set (amuled peer,
+  real eMule peer [[emule-peer-oracle]], real eserver server [[ed2k-server-oracle]]).
 
 ## Related
 

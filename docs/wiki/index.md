@@ -26,16 +26,16 @@ the Ingest / Query / Lint workflows.
 
 ## Process
 - [[decisions-and-lessons]] - locked decisions, rejected approaches, gotchas.
-- [[build-progress]] - wave-by-wave build status. Engine complete through Kad + multi-source fetch; padMule RUNS on the iPad and does the full search->download->verify->save loop on-device; on-device feature round (uploads + Leech toggle, cancel, Kad-in-search, unicast-SSDP HighID) DONE 2026-07-17; search-panel eMule parity + splash + app icon (8d) MERGED 2026-07-18. Repo has LICENSE (GPL v2) + NOTICE + README.
+- [[build-progress]] - wave-by-wave build status. Engine complete through Kad + multi-source fetch; padMule RUNS on the iPad and does the full search->download->verify->save loop on-device; on-device feature round + search-panel parity + splash/icon DONE by 2026-07-18. Since then (2026-07-19): the 0.70b Tier-1 slices (IP filter, search history, wire filters, categories, ratings/comments read+author, per-source sheet, per-download priority, per-file unshare) and the verified-identity badge (secure-ident redo) landed, plus a real-peer/real-server ORACLE SET ([[emule-peer-oracle]], [[ed2k-server-oracle]]). Repo has LICENSE (GPL v2) + NOTICE + README.
 
 ## Backlog / feature ideas
 - [[feature-server-hunter]] - discover + verify live eD2k servers (auto-update, health-check, server-graph crawl); NOT literal whole-net scanning. Future work.
-- [[emule-070b-features]] - ranked backlog of eMule 0.70b features to adopt (34 items; Tier 1 do-soon = IP filter, search history, wire-side search filters, verified badge, categories, ratings-read); first-slice recommendation. From the 2026-07-18 dive.
+- [[emule-070b-features]] - ranked backlog of eMule 0.70b features to adopt (34 items). From the 2026-07-18 dive; Tier 1 is now largely DONE (#1-8 landed, some partial). Remaining Tier-1: #9 global server UDP search (next, testable vs [[ed2k-server-oracle]]) + #10 related search.
 
 ## Strategy
 (All the big forks are LOCKED and executed - Rust engine rewrite, no-Mac
 CI+Sideloadly deploy path, foreground-only v1 - see [[decisions-and-lessons]];
-the app is shipped and on-device. Current direction: GUI + functionality
-enhancements toward eMule-community-release (0.70b) functional parity, plus a
-code-fix round from the 2026-07-18 lint pass. Wave 9 seedbox mode is the open
-v1.1 item.)
+the app is shipped and on-device. Current direction: eMule 0.70b functional
+parity - Tier-1 largely landed (see [[emule-070b-features]]); next up is #9
+global server UDP search, now testable against a real local server
+([[ed2k-server-oracle]]). Wave 9 seedbox mode is the open v1.1 item.)
