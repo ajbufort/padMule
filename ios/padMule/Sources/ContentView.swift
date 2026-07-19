@@ -122,27 +122,34 @@ struct ContentView: View {
     private var categoryChips: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
-                chip("All", color: .secondary, selected: model.categoryFilter == nil) {
-                    model.categoryFilter = nil
-                }
-                ForEach(model.categories) { cat in
-                    chip(cat.name, color: cat.color, selected: model.categoryFilter == cat.id) {
-                        model.categoryFilter = cat.id
+                // "All" + the category chips only make sense once a category
+                // exists; the "+" is ALWAYS shown so the very first category can
+                // be created (otherwise the whole feature is unreachable).
+                if !model.categories.isEmpty {
+                    chip("All", color: .secondary, selected: model.categoryFilter == nil) {
+                        model.categoryFilter = nil
                     }
-                    .contextMenu {
-                        Button(role: .destructive) {
-                            model.removeCategory(cat.id)
-                        } label: {
-                            Label("Delete \"\(cat.name)\"", systemImage: "trash")
+                    ForEach(model.categories) { cat in
+                        chip(cat.name, color: cat.color, selected: model.categoryFilter == cat.id) {
+                            model.categoryFilter = cat.id
+                        }
+                        .contextMenu {
+                            Button(role: .destructive) {
+                                model.removeCategory(cat.id)
+                            } label: {
+                                Label("Delete \"\(cat.name)\"", systemImage: "trash")
+                            }
                         }
                     }
                 }
                 Button {
                     showAddCategory = true
                 } label: {
-                    Image(systemName: "plus.circle")
+                    Label("Add category", systemImage: "plus.circle")
+                        .labelStyle(.iconOnly)
                 }
                 .buttonStyle(.borderless)
+                .accessibilityLabel("Add category")
             }
             .padding(.vertical, 2)
         }
@@ -253,6 +260,7 @@ struct ContentView: View {
                         } label: {
                             Image(systemName: "xmark.circle.fill")
                                 .foregroundStyle(.secondary)
+                                .accessibilityLabel("Clear search")
                         }
                         .buttonStyle(.plain)
                     }
@@ -313,10 +321,18 @@ struct ContentView: View {
                         .contentShape(Rectangle())
                         .onTapGesture { detail = hit }
                 }
-                if model.searched, model.results.isEmpty, !model.searching {
-                    Text("No results.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                if model.searched, !model.searching {
+                    if model.results.isEmpty {
+                        Text("No results.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else if model.presentedResults.isEmpty {
+                        // Hits came back but the client-side filters hid them all -
+                        // say so, instead of leaving a blank gap under the filters.
+                        Text("No matches for these filters.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 }
             }
 
@@ -349,9 +365,9 @@ struct ContentView: View {
 
     private var transfersScreen: some View {
         List {
-            if !model.categories.isEmpty {
-                categoryChips
-            }
+            // Always shown: with no categories yet it is just the "+" so the
+            // first one can be created (the add button used to be hidden here).
+            categoryChips
             Section("Transfers") {
                 let shown = model.filteredDownloads
                 if shown.isEmpty {
@@ -547,8 +563,18 @@ struct ContentView: View {
             if model.adding.contains(hit.hash) {
                 ProgressView()
             } else {
-                Button("Get") { model.download(hit) }
-                    .buttonStyle(.borderless)
+                // Only offer Get for a NEW hit; a file already downloading or
+                // owned shows that state instead of a live button that does
+                // nothing useful (it contradicts the status dot otherwise).
+                switch hit.status {
+                case .have:
+                    Text("Have").foregroundStyle(.green)
+                case .downloading:
+                    Text("Downloading").foregroundStyle(.orange)
+                case .new:
+                    Button("Get") { model.download(hit) }
+                        .buttonStyle(.borderless)
+                }
             }
         }
     }

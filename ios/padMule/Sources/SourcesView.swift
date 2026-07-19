@@ -26,8 +26,14 @@ struct SourcesView: View {
             .navigationTitle("Sources")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Refresh") { reload() }
+                // Refresh is an action, not a cancel/dismiss - keep it out of the
+                // leading .cancellationAction slot (that role reads as "Cancel").
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button {
+                        reload()
+                    } label: {
+                        Label("Refresh", systemImage: "arrow.clockwise")
+                    }
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") { dismiss() }
