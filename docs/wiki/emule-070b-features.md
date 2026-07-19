@@ -1,11 +1,13 @@
 # eMule 0.70b Feature Backlog (mined for padMule)
 
-Updated: 2026-07-19 (slices 1-3 landed)
+Updated: 2026-07-19 (slices 1-3 landed; #4 identity-checkmark reverted to PARTIAL)
 
 **DONE so far:** #1 IP filter, #2 search history, #3 wire-side search filters,
 #5 categories, #6 ratings/comments (server rating + OP_FILEDESC comment), #21
-per-source detail sheet, #8 (partial: per-file unshare). #4 verified badge (both the encryption lock and the identity checkmark now
-live - secure-ident runs on delivering sources). See [[build-progress]].
+per-source detail sheet, #8 (partial: per-file unshare). #4 verified badge is
+PARTIAL: the encryption LOCK (per-source obfuscation) is live; the identity
+CHECKMARK is NOT (the secure-ident-in-fetch attempt was reverted - it deadlocked
+against real sources; see #4 below). See [[build-progress]].
 
 A ranked proposal of features padMule could adopt from eMule 0.70b, from a
 4-surveyor + synthesis dive over `refs/emule-0.70b`. Scope: GUI/feature-level
@@ -28,15 +30,27 @@ parsing, Kad anti-abuse hardening, and the "Automatic" search method). Ranked by
    min_sources -> FT_SOURCES `> N-1` (universal op); size min/max on the wire
    (max > 4 GiB omitted, enforced client-side). FFI SearchFilters +
    "Complete sources only" toggle + size preset menus. Type stays client-side.
-4. **Verified-identity badge + obfuscation glyph** - DONE (2026-07-19). The
-   encryption LOCK (per-source `obfuscated`) and the identity CHECKMARK both
-   ship. `fetch_one` now runs mutual secure-ident with a source AFTER it delivers
-   bytes (on the warm connection), gated on the peer ADVERTISING sec_ident (so a
-   non-supporting source never costs the sweep a timeout) and best-effort with an
-   8s cap; success -> `note_source_verified`. Does NOT touch the differential
-   path (peer-download uses `download_from_peer`, not `fetch_one`). Proven by a
-   unit test with a mock secure-ident peer (dive premise "padMule already runs
-   secure-ident" was wrong - it only ran in tests until now).
+4. **Verified-identity badge + obfuscation glyph** - PARTIAL (2026-07-19). The
+   encryption LOCK (per-source `obfuscated`) ships and is real. The identity
+   CHECKMARK is NOT live: an attempt to run mutual secure-ident from `fetch_one`
+   AFTER a source delivered bytes (commit d401ec6) was REVERTED (dbfecad) after
+   an adversarial review confirmed a HIGH deadlock. Root cause: padMule's fetch
+   HELLO advertises MISCOPTIONS1 `sec_ident=0` (`HelloInfo::baseline` ->
+   `baseline_misc_options1(0)`), so a real aMule/eMule uploader's
+   `m_bySupportSecIdent` reads 0 and it NEVER issues its own OP_SECIDENTSTATE;
+   padMule-as-initiator then waits forever for the peer's state packet -> the
+   exchange deadlocks and burns the full 8s timeout on EVERY real delivering
+   source (delaying the download's "Saved" event by ~8s), and verified never
+   fires. The unit test passed only because it had BOTH ends call
+   `run_secure_ident` as initiators (synthetic - no real serve peer behaves that
+   way). CORRECT approach for a future pass: padMule must ADVERTISE sec_ident in
+   its fetch HELLO so the uploader initiates, and RESPOND to the uploader's
+   OP_SECIDENTSTATE right after the hello (not post-transfer as initiator) - and
+   it needs a real integration test with a mock uploader that initiates
+   secure-ident, since the differential harness drives `download_from_peer`, not
+   `fetch_one`, and no test serve side speaks secure-ident. `note_source_verified`
+   exists but has no live caller again; the seal is guarded by `if s.verified`
+   (always false) so no dead UI renders.
 5. **Download categories + transfer filter chips** - DONE (2026-07-18). Color
    buckets + a filter-chip row + a per-download context menu. CLIENT-SIDE
    (definitions + hash->category in UserDefaults, NOT part.met - zero wire risk;
