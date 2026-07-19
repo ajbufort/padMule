@@ -44,6 +44,7 @@ struct ContentView: View {
     @State private var detail: SearchHit?
     @State private var showAddCategory = false
     @State private var newCategoryName = ""
+    @State private var sourcesFor: DownloadInfo?
 
     var body: some View {
         NavigationStack {
@@ -95,6 +96,9 @@ struct ContentView: View {
                     newCategoryName = ""
                 }
                 Button("Cancel", role: .cancel) { newCategoryName = "" }
+            }
+            .sheet(item: $sourcesFor) { dl in
+                SourcesView(download: dl).environmentObject(model)
             }
         }
     }
@@ -305,7 +309,15 @@ struct ContentView: View {
                                     Label("Remove", systemImage: "trash")
                                 }
                             }
-                            .contextMenu { categoryMenu(for: dl.hash) }
+                            .contextMenu {
+                                Button {
+                                    sourcesFor = dl
+                                } label: {
+                                    Label("View sources", systemImage: "person.2")
+                                }
+                                Divider()
+                                categoryMenu(for: dl.hash)
+                            }
                     }
                 }
             }
@@ -521,6 +533,12 @@ struct ContentView: View {
                 }
                 Text(dl.name.isEmpty ? String(dl.hash.prefix(16)) : dl.name)
                     .lineLimit(1)
+                ratingBadge(dl.rating)
+                if dl.hasComment {
+                    Image(systemName: "text.bubble")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
                 Spacer()
                 if dl.complete {
                     Text("Done").font(.caption).foregroundStyle(.green)
