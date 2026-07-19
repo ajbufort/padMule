@@ -260,6 +260,16 @@ final class EngineModel: ObservableObject {
         CategoryStore.saveAssignment(categoryOf)
     }
 
+    /// Fetch the connected sources for one download (a snapshot; the FFI call
+    /// blocks, so it runs off the main thread and hands the result back on it).
+    func sources(for hash: String, completion: @escaping ([SourceInfoFfi]) -> Void) {
+        guard let e = engine else { completion([]); return }
+        work.async {
+            let s = e.downloadSources(hash: hash)
+            DispatchQueue.main.async { completion(s) }
+        }
+    }
+
     /// Stop sharing one file (keeps the file on disk). refresh() pulls the
     /// updated library right after.
     func unshare(_ hash: String) {
