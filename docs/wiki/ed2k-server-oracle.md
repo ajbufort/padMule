@@ -60,12 +60,24 @@ and `wsl --shutdown`; not needed - i686 works.)
 - DONE: #9 global server UDP search - `mule-cli global-search 127.0.0.1:4661
   <kw>` sends OP_GLOBSEARCHREQ to the UDP port (TCP+4 = 4665) and parses
   OP_GLOBSEARCHRES; eserver accepts it.
-- DONE: OP_OFFERFILES - `mule-cli offer-hold 127.0.0.1 4661 "<name>"` logs in +
-  announces a file; eserver INDEXES it ("1 files, 1 complete, 2 keyw" in its `g`
-  stats). This makes eserver a DETERMINISTIC SEARCH oracle. Caveat: eserver
-  self-filters a client's OWN files, so `offer-search` (offer + search from the
-  same 127.0.0.1) shows the file indexed but not returned; a full offer->find
-  needs the searcher on a different IP than the offerer (both are loopback here).
+- DONE: OP_OFFERFILES - `mule-cli offer-hold 127.0.0.1 4661 "<name[|name...]>"`
+  logs in + announces one or more files ('|'-separated = one shared library in a
+  single OP_OFFERFILES); eserver INDEXES them ("N files, N complete, M keyw" in
+  its `g` stats). This makes eserver a DETERMINISTIC SEARCH oracle. The self-filter
+  is by USER HASH, not IP: `offer-search` (offer + search from ONE client, same
+  demo hash) shows the file indexed but not returned, BUT a full offer->find works
+  fine on the same loopback IP when the offerer and searcher have DIFFERENT user
+  hashes - no separate IP needed.
+- DONE (2026-07-19): full offer->FIND search oracle, via `scripts/simulate.sh`.
+  It launches ONE background `offer-hold` seeder (demo hash) holding a 3-file
+  library named with the keyword, then runs the FFI `simulate` engine (a distinct
+  user hash) which PROBES + connects + searches. Live: the status probe reports
+  users=1 files=3 alive=true (the OP_GLOBSERVSTATREQ challenge fix, commit
+  05fbe5a) and SEARCH returns the 3 real typed sourced results. Boolean `NOT` and
+  UDP global search return 0 from THIS server - padMule's boolean encoding is
+  byte-identical to eMule 0.50a (ops 00 00 / 00 01 / 00 02, string 01, prefix
+  order), so those are Lugdunum server-side evaluation quirks, not padMule bugs.
+  `KEEP_LOG=1 scripts/simulate.sh` persists the eserver log out of the namespace.
 - DONE: #10 related-files search - `mule-cli related-search 127.0.0.1 4661
   <hash>` logs in and sends `related::<UPPERHEX>` (a normal OP_SEARCHREQUEST).
   PROVEN: the real eserver ADVERTISES SRV_TCPFLG_RELATEDSEARCH (0x40) - padMule
