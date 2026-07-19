@@ -42,8 +42,7 @@ struct SearchDetailView: View {
                         dismiss()
                     } label: { Label("Download", systemImage: "arrow.down.circle") }
                     Button {
-                        let base = (hit.name as NSString).deletingPathExtension
-                        model.search(base)
+                        model.relatedSearch(hit)
                         dismiss()
                     } label: { Label("Search related", systemImage: "magnifyingglass") }
                 }

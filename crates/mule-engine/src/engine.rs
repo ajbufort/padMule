@@ -32,8 +32,8 @@ use crate::part_store::PartStore;
 use crate::peer::HelloInfo;
 use crate::peer_conn::peer_handshake_inbound;
 use crate::search::{
-    build_global_search_udp, parse_global_search_res, SearchParams, SearchResultFile,
-    OP_GLOBSEARCHRES,
+    build_global_search_udp, parse_global_search_res, related_keyword, SearchParams,
+    SearchResultFile, OP_GLOBSEARCHRES,
 };
 use crate::server_messages::{
     LoginRequest, OfferedFile, DEFAULT_SERVER_FLAGS, FILE_COMPLETE_ID, FILE_COMPLETE_PORT,
@@ -705,6 +705,10 @@ pub struct ServerInfo {
     pub addr: String,
     /// True when the server handed us a LowID (no reachable inbound port).
     pub low_id: bool,
+    /// True when this server answers related-files searches (advertised
+    /// SRV_TCPFLG_RELATEDSEARCH), so the UI can offer the true `related::`
+    /// query instead of the filename-keyword fallback.
+    pub related_search: bool,
 }
 
 /// Optional pre-search filters pushed onto the server query (and re-applied to
@@ -1198,8 +1202,11 @@ impl Engine {
         for srv in met.servers.iter().take(10) {
             let addr = SocketAddr::new(IpAddr::V4(ip_from_met_u32(srv.ip)), srv.port);
             let mut link = ServerLink::new(addr, login.clone(), tx.clone());
-            if let Ok(Ok(ServerState::Connected { low_id, .. })) =
-                timeout(Duration::from_secs(12), link.connect()).await
+            if let Ok(Ok(ServerState::Connected {
+                low_id,
+                related_search,
+                ..
+            })) = timeout(Duration::from_secs(12), link.connect()).await
             {
                 // The client id is deliberately NOT recorded here: a HighID id
                 // encodes our public IP and this text reaches the screen. (The
@@ -1207,6 +1214,7 @@ impl Engine {
                 self.connection = Some(ServerInfo {
                     addr: addr.to_string(),
                     low_id,
+                    related_search,
                 });
                 self.emit(EngineEvent::Server(format!(
                     "Connected to {addr} ({})",
@@ -1430,6 +1438,37 @@ impl Engine {
                 && filters.max_size.is_none_or(|m| r.size <= m)
         });
         ranked
+    }
+
+    /// Related-files search: ask the connected server for the files its index
+    /// associates with `hash` - the ones clients who share this file also share
+    /// (eMule's `related::` feature). SERVER-ONLY: Kad has no related index, and
+    /// only a server advertising SRV_TCPFLG_RELATEDSEARCH answers it (else it
+    /// would treat `related::<hash>` as a literal keyword and return nothing), so
+    /// this returns empty when the server does not support it - the UI offers a
+    /// filename keyword search instead (see `ServerInfo::related_search`). Ranked
+    /// through the same [`catalog`] pass as a normal search, so results render
+    /// identically.
+    pub async fn related_search(&mut self, hash: [u8; 16]) -> Vec<RankedFile> {
+        if self.offline {
+            return Vec::new();
+        }
+        let Some(link) = self.server.as_mut() else {
+            return Vec::new();
+        };
+        if !link.related_search_supported() {
+            return Vec::new();
+        }
+        let params = SearchParams {
+            keyword: related_keyword(&hash),
+            file_type: None,
+            min_size: None,
+            max_size: None,
+            min_sources: None,
+            extension: None,
+        };
+        let files = link.search(&params, SEARCH_WAIT).await.unwrap_or_default();
+        catalog(&files)
     }
 
     /// Classify a search hit's hash against our downloads + shared files, so the
@@ -1805,11 +1844,18 @@ impl Engine {
             // change, which is the whole point on a mobile device.
             let resumed = match &mut self.server {
                 Some(s) => match timeout(Duration::from_secs(12), s.resume()).await {
-                    Ok(Ok(ServerState::Connected { low_id, .. })) => {
+                    Ok(Ok(ServerState::Connected {
+                        low_id,
+                        related_search,
+                        ..
+                    })) => {
                         // Re-record: the ID can flip across an IP change, which
-                        // is exactly what resume() exists to survive.
+                        // is exactly what resume() exists to survive. The server's
+                        // related-search capability comes back on the fresh
+                        // IDCHANGE too.
                         if let Some(c) = &mut self.connection {
                             c.low_id = low_id;
+                            c.related_search = related_search;
                         }
                         true
                     }
@@ -2357,6 +2403,7 @@ mod tests {
         engine.connection = Some(ServerInfo {
             addr: "192.0.2.1:4242".to_string(),
             low_id: true,
+            related_search: false,
         });
         // Still not online -> still no claim, remembered or not.
         assert_eq!(engine.server_info(), None, "is_online gates the claim");

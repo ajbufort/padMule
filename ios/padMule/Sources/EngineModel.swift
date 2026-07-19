@@ -155,6 +155,36 @@ final class EngineModel: ObservableObject {
         }
     }
 
+    /// True eD2k "related files" search: ask the connected server for the files
+    /// its index associates with this hit's hash. Only servers advertising
+    /// related-search support answer it, so when the server lacks support we fall
+    /// back to a filename keyword search - the action still does something useful
+    /// (eMule just greys the button out; padMule degrades gracefully instead).
+    func relatedSearch(_ hit: SearchHit) {
+        guard let e = engine, !searching else { return }
+        guard server?.relatedSearch == true else {
+            // Fallback: keyword search on the base filename.
+            search((hit.name as NSString).deletingPathExtension)
+            return
+        }
+        searching = true
+        notice = nil
+        let hash = hit.hash
+        let name = hit.name
+        work.async { [weak self] in
+            let hits = e.relatedSearch(hash: hash)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.searching = false
+                self.results = hits
+                self.searched = true
+                if hits.isEmpty {
+                    self.notice = "No files related to \"\(name)\"."
+                }
+            }
+        }
+    }
+
     func clearSearch() {
         results = []
         searched = false

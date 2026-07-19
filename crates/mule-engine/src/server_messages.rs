@@ -18,6 +18,12 @@ pub const OP_SERVERIDENT: u8 = 0x41;
 /// can hand us out as a source.
 pub const OP_OFFERFILES: u8 = 0x15;
 
+/// Server TCP-capability bit (in the OP_IDCHANGE flags word) meaning the server
+/// answers "related files" searches - a keyword query whose string is
+/// `related::<HEXHASH>`. eMule `server.h:39` SRV_TCPFLG_RELATEDSEARCH; gates
+/// `CSearchResultsWnd::CanSearchRelatedFiles`.
+pub const SRV_TCPFLG_RELATEDSEARCH: u32 = 0x0000_0040;
+
 // File-tag ids for an offered file (opcodes.h:322,324,328).
 const FT_FILENAME: u8 = 0x01;
 const FT_FILESIZE: u8 = 0x02;

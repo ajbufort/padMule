@@ -15,7 +15,7 @@ use std::time::Duration;
 use mule_engine::peer::HelloInfo;
 use mule_engine::search::{
     build_global_search_udp, build_search_request, parse_global_search_res, parse_search_result,
-    SearchParams, OP_GLOBSEARCHRES,
+    related_keyword, SearchParams, OP_GLOBSEARCHRES,
 };
 use mule_engine::server_messages::{LoginRequest, DEFAULT_SERVER_FLAGS};
 use mule_engine::sources::{build_callback_request, build_get_sources, parse_found_sources};
@@ -237,6 +237,66 @@ async fn cmd_global_search(target: &str, keyword: &str) {
 /// a keyword from it - proving OP_OFFERFILES makes our shares findable (the
 /// deterministic local-eserver oracle loop). The TCP login is held open across
 /// the UDP search so the server keeps the file indexed.
+/// related-search <host> <port> <hash>: log in, report whether the server
+/// advertises SRV_TCPFLG_RELATEDSEARCH, then send the true `related::<hash>`
+/// query over TCP and print the hits. This is what padMule's app does when the
+/// server supports it; the Lugdunum eserver oracle is how to prove it live.
+async fn cmd_related_search(host: &str, port: u16, hash: [u8; 16]) {
+    let Some(addr) = format!("{host}:{port}")
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut i| i.next())
+    else {
+        eprintln!("cannot resolve {host}:{port}");
+        return;
+    };
+    let (tx, rx) = mpsc::channel(64);
+    let printer = spawn_event_printer(rx);
+    let mut link = ServerLink::new(addr, demo_login(), tx);
+    let (id, low_id) = match link.connect().await {
+        Ok(ServerState::Connected { id, low_id, .. }) => (id, low_id),
+        other => {
+            eprintln!("login failed: {other:?}");
+            return;
+        }
+    };
+    println!("logged in (id={id:#x}, low_id={low_id})");
+    println!(
+        "server related-search support: {}",
+        link.related_search_supported()
+    );
+
+    let keyword = related_keyword(&hash);
+    println!("-> OP_SEARCHREQUEST '{keyword}'");
+    let params = SearchParams {
+        keyword,
+        ..Default::default()
+    };
+    match link.search(&params, Duration::from_secs(5)).await {
+        Ok(files) if !files.is_empty() => {
+            println!("{} related file(s):", files.len());
+            for f in &files {
+                let nm = f
+                    .tags
+                    .iter()
+                    .find_map(|t| match (&t.name, &t.value) {
+                        (mule_proto::TagName::Id(0x01), mule_proto::TagValue::Str(s)) => {
+                            Some(String::from_utf8_lossy(s).into_owned())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                println!("  <- {nm}  hash={}", hex16(&f.hash));
+            }
+        }
+        Ok(_) => println!("no related files returned (server may not support it, or none indexed)"),
+        Err(e) => eprintln!("search failed: {e}"),
+    }
+    link.disconnect().await;
+    drop(link);
+    let _ = printer.await;
+}
+
 async fn cmd_offer_search(host: &str, port: u16, name: &str) {
     use mule_engine::server_messages::{OfferedFile, FILE_COMPLETE_ID, FILE_COMPLETE_PORT};
     use tokio::net::UdpSocket;
@@ -253,7 +313,7 @@ async fn cmd_offer_search(host: &str, port: u16, name: &str) {
     let printer = spawn_event_printer(rx);
     let mut link = ServerLink::new(addr, demo_login(), tx);
     let (id, low_id) = match link.connect().await {
-        Ok(ServerState::Connected { id, low_id }) => (id, low_id),
+        Ok(ServerState::Connected { id, low_id, .. }) => (id, low_id),
         other => {
             eprintln!("login failed: {other:?}");
             return;
@@ -416,7 +476,7 @@ async fn cmd_login_any(met_path: &str) {
         let printer = spawn_event_printer(rx);
         let mut link = ServerLink::new(addr, demo_login(), tx);
         match timeout(Duration::from_secs(8), link.connect()).await {
-            Ok(Ok(ServerState::Connected { id, low_id })) => {
+            Ok(Ok(ServerState::Connected { id, low_id, .. })) => {
                 println!("CONNECTED (id={id:#x}, low_id={low_id})");
                 link.disconnect().await;
                 drop(link);
@@ -2105,6 +2165,13 @@ async fn main() {
             Ok(port) => cmd_offer_search(&args[2], port, &args[4]).await,
             Err(_) => eprintln!("bad port: {}", args[3]),
         },
+        Some("related-search") if args.len() == 5 => {
+            match (args[3].parse::<u16>(), parse_hex16(&args[4])) {
+                (Ok(port), Some(hash)) => cmd_related_search(&args[2], port, hash).await,
+                (Err(_), _) => eprintln!("bad port: {}", args[3]),
+                (_, None) => eprintln!("bad hash (need 32 hex chars): {}", args[4]),
+            }
+        }
         Some("offer-hold") if args.len() == 5 || args.len() == 6 => {
             let secs = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(15);
             match args[3].parse::<u16>() {
