@@ -80,8 +80,11 @@ fn write_term(w: &mut Writer, t: &Term) {
     }
 }
 
-/// Build an OP_SEARCHREQUEST packet for `p` (ANDed-terms form).
-pub fn build_search_request(p: &SearchParams) -> Packet {
+/// Write the ANDed search-expression tree for `p` into `w`. This is the SAME
+/// payload for both the TCP OP_SEARCHREQUEST and the UDP global-search opcodes
+/// (eMule reuses the identical packet body, only changing the opcode -
+/// SearchResultsWnd.cpp:1320-1341), so both callers share this encoder.
+fn write_search_tree(w: &mut Writer, p: &SearchParams) {
     let mut terms: Vec<Term> = vec![Term::Keyword(&p.keyword)];
     if let Some(ft) = &p.file_type {
         terms.push(Term::StringMeta(FT_FILETYPE, ft));
@@ -106,15 +109,20 @@ pub fn build_search_request(p: &SearchParams) -> Packet {
         terms.push(Term::StringMeta(FT_FILEFORMAT, ext));
     }
 
-    let mut w = Writer::new();
     let n = terms.len();
     for (i, t) in terms.iter().enumerate() {
         // aMule writes an AND before every parameter except the last.
         if i + 1 < n {
-            write_and(&mut w);
+            write_and(w);
         }
-        write_term(&mut w, t);
+        write_term(w, t);
     }
+}
+
+/// Build an OP_SEARCHREQUEST packet for `p` (ANDed-terms form).
+pub fn build_search_request(p: &SearchParams) -> Packet {
+    let mut w = Writer::new();
+    write_search_tree(&mut w, p);
     Packet::new(PROT_EDONKEY, OP_SEARCHREQUEST, w.into_inner())
 }
 
@@ -133,6 +141,26 @@ fn read_hash16(r: &mut Reader) -> Result<[u8; 16], IoError> {
     Ok(h)
 }
 
+/// Read one result record `<hash 16><id 4><port 2><tagcount 4><tag>*` from `r`.
+/// Shared by the TCP array parser and the UDP chained parser (they carry the
+/// identical per-file record; only the framing around it differs).
+fn read_one_result_file(r: &mut Reader) -> Result<SearchResultFile, IoError> {
+    let hash = read_hash16(r)?;
+    let id = r.read_u32()?;
+    let port = r.read_u16()?;
+    let tagcount = r.read_u32()?;
+    let mut tags = Vec::new();
+    for _ in 0..tagcount {
+        tags.push(read_tag(r)?);
+    }
+    Ok(SearchResultFile {
+        hash,
+        id,
+        port,
+        tags,
+    })
+}
+
 /// Parse an OP_SEARCHRESULT payload into its result files.
 pub fn parse_search_result(payload: &[u8]) -> Result<Vec<SearchResultFile>, IoError> {
     let mut r = Reader::new(payload);
@@ -140,20 +168,60 @@ pub fn parse_search_result(payload: &[u8]) -> Result<Vec<SearchResultFile>, IoEr
     // Do NOT pre-allocate from the untrusted count; grow as we read.
     let mut out = Vec::new();
     for _ in 0..count {
-        let hash = read_hash16(&mut r)?;
-        let id = r.read_u32()?;
-        let port = r.read_u16()?;
-        let tagcount = r.read_u32()?;
-        let mut tags = Vec::new();
-        for _ in 0..tagcount {
-            tags.push(read_tag(&mut r)?);
+        out.push(read_one_result_file(&mut r)?);
+    }
+    Ok(out)
+}
+
+// -------------------------------------------------- global server UDP search
+
+/// Global-search request opcodes (all PROT_EDONKEY, sent as raw UDP datagrams to
+/// a server's UDP port = its TCP port + 4). 0x98 is the UNIVERSAL fallback every
+/// server understands; 0x92/0x90 are opcode-only optimizations for
+/// EXT_GETFILES/large-file-UDP servers (deferred - padMule's u32-size searches
+/// never need the large-file path). See opcodes.h:190-195, SearchResultsWnd.cpp.
+pub const OP_GLOBSEARCHREQ: u8 = 0x98;
+/// Global-search response opcode (one `<hash><id><port><tags>` record per
+/// segment; multiple records are chained, each behind its own `[0xE3][0x99]`).
+pub const OP_GLOBSEARCHRES: u8 = 0x99;
+
+/// Build a global-search UDP datagram body for `p`: the SAME search tree as the
+/// TCP request, wrapped as OP_GLOBSEARCHREQ (the universal 0x98 form). The
+/// returned `Packet`'s UDP header is `[PROT_EDONKEY][OP_GLOBSEARCHREQ]` (2 bytes,
+/// no length field - the datagram boundary is the framing).
+pub fn build_global_search_udp(p: &SearchParams) -> Packet {
+    let mut w = Writer::new();
+    write_search_tree(&mut w, p);
+    Packet::new(PROT_EDONKEY, OP_GLOBSEARCHREQ, w.into_inner())
+}
+
+/// Parse an OP_GLOBSEARCHRES datagram payload (the bytes AFTER the leading
+/// `[0xE3][0x99]` header the caller already stripped). Unlike TCP, there is NO
+/// count field: it is one result record, optionally followed by more records
+/// each prefixed by another `[0xE3][0x99]` sub-header (UDPSocket.cpp:237-279).
+/// Stops at the first non-`[0xE3][0x99]` continuation or a short/garbled record,
+/// returning whatever parsed cleanly (a truncated trailing record is not fatal).
+pub fn parse_global_search_res(payload: &[u8]) -> Result<Vec<SearchResultFile>, IoError> {
+    let mut r = Reader::new(payload);
+    let mut out = Vec::new();
+    loop {
+        match read_one_result_file(&mut r) {
+            Ok(f) => out.push(f),
+            // A malformed FIRST record is a real error; a malformed later one just
+            // ends the chain with what we have.
+            Err(e) if out.is_empty() => return Err(e),
+            Err(_) => break,
         }
-        out.push(SearchResultFile {
-            hash,
-            id,
-            port,
-            tags,
-        });
+        // Another record only follows if the next two bytes are a fresh
+        // [0xE3][0x99] sub-header; anything else (or end of datagram) ends it.
+        if r.remaining() < 2 {
+            break;
+        }
+        let prot = r.read_u8()?;
+        let op = r.read_u8()?;
+        if prot != PROT_EDONKEY || op != OP_GLOBSEARCHRES {
+            break;
+        }
     }
     Ok(out)
 }
@@ -355,5 +423,60 @@ mod tests {
             parse_search_result(&[0x01, 0x00, 0x00, 0x00]),
             Err(IoError::UnexpectedEof)
         );
+    }
+
+    // One result record on the wire: <hash 16><id 4 LE><port 2 LE><tagcount 4 LE=0>.
+    fn record(hash: u8, id: u32, port: u16) -> Vec<u8> {
+        let mut v = vec![hash; 16];
+        v.extend_from_slice(&id.to_le_bytes());
+        v.extend_from_slice(&port.to_le_bytes());
+        v.extend_from_slice(&0u32.to_le_bytes()); // tagcount 0
+        v
+    }
+
+    #[test]
+    fn global_search_udp_reuses_the_tcp_tree_only_the_opcode_differs() {
+        let p = SearchParams {
+            keyword: "linux".into(),
+            min_size: Some(1000),
+            ..Default::default()
+        };
+        let tcp = build_search_request(&p);
+        let udp = build_global_search_udp(&p);
+        // Same PROT_EDONKEY body, but the global-search opcode 0x98.
+        assert_eq!(udp.protocol, PROT_EDONKEY);
+        assert_eq!(udp.opcode, OP_GLOBSEARCHREQ);
+        assert_eq!(udp.opcode, 0x98);
+        assert_eq!(tcp.opcode, OP_SEARCHREQUEST);
+        // The search-expression tree is byte-identical (eMule reuses the packet).
+        assert_eq!(udp.payload, tcp.payload);
+    }
+
+    #[test]
+    fn parse_global_search_res_chains_records_by_the_0xe3_0x99_subheader() {
+        // One record, then [0xE3][0x99] + a second record, then trailing junk that
+        // is NOT a fresh sub-header (so the chain ends cleanly, junk ignored).
+        let mut buf = record(0xAA, 0x0A00_0001, 4662);
+        buf.push(PROT_EDONKEY);
+        buf.push(OP_GLOBSEARCHRES);
+        buf.extend_from_slice(&record(0xBB, 0x0A00_0002, 4663));
+        buf.extend_from_slice(&[0x11, 0x22]); // not [0xE3][0x99] -> stop
+
+        let files = parse_global_search_res(&buf).unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].hash, [0xAA; 16]);
+        assert_eq!(files[0].port, 4662);
+        assert_eq!(files[1].hash, [0xBB; 16]);
+        assert_eq!(files[1].id, 0x0A00_0002);
+    }
+
+    #[test]
+    fn parse_global_search_res_single_record_and_empty_are_handled() {
+        // A single record with no continuation.
+        let one = parse_global_search_res(&record(0xCC, 7, 99)).unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].id, 7);
+        // A truncated FIRST record is a real error (nothing parsed).
+        assert!(parse_global_search_res(&[0x00; 4]).is_err());
     }
 }
