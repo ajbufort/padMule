@@ -175,10 +175,20 @@ async fn fetch_one(
             None => connect_peer(src.addr, me).await,
         }
     };
-    let (_peer, mut fs) = match timeout(per_peer, connect).await {
+    let (peer, mut fs) = match timeout(per_peer, connect).await {
         Ok(Ok(v)) => v,
         _ => return Err(()),
     };
+    // Record what we learned about this source (software, obfuscation, LowID)
+    // for the per-source UI. Obfuscated iff we knew its userhash and dialed obf.
+    let low_id = peer.client_id < 0x0100_0000;
+    dl.note_source(
+        peer.client_software(),
+        src.addr,
+        src.user_hash.is_some(),
+        low_id,
+    )
+    .await;
     // Multi-source manager: bail the instant this peer queues us and try another
     // source rather than burning `per_peer` in its queue.
     match timeout(per_peer, download_from_peer(&mut fs, dl, true)).await {

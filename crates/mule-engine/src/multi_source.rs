@@ -15,6 +15,7 @@
 //!   with no visible error.
 
 use std::io;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -33,9 +34,31 @@ use crate::transfer::{
 use crate::transfer_session::TransferError;
 use mule_proto::PARTSIZE;
 
+/// What we learned about one source we connected to, for the per-source UI.
+#[derive(Debug, Clone)]
+pub struct SourceInfo {
+    pub addr: SocketAddr,
+    /// Client software display string (from the HELLO CT_EMULE_VERSION tag).
+    pub software: String,
+    /// Whether our connection to it was obfuscated (RC4).
+    pub obfuscated: bool,
+    /// Whether the peer reported a LowID (id < 0x0100_0000).
+    pub low_id: bool,
+    /// Whether we cryptographically verified its identity (secure-ident).
+    pub verified: bool,
+    /// Its rating for this file (0-5, from OP_FILEDESC); 0 = unrated.
+    pub rating: u8,
+    /// Its comment on this file (from OP_FILEDESC); empty if none.
+    pub comment: String,
+}
+
 /// One file being pulled from many peers.
 pub struct Download {
     inner: Mutex<Inner>,
+    /// Metadata about each source we have connected to, keyed by address. A
+    /// SEPARATE lock from `inner`, so recording a source never contends the
+    /// hot transfer lock.
+    sources: Mutex<Vec<SourceInfo>>,
     /// Set when the user cancels. The fetch workers check it and stop; a
     /// lock-free atomic so cancelling never has to wait on the transfer lock.
     cancelled: AtomicBool,
@@ -65,8 +88,60 @@ impl Download {
                 reserved: Vec::new(),
                 availability: vec![0u32; parts],
             }),
+            sources: Mutex::new(Vec::new()),
             cancelled: AtomicBool::new(false),
         })
+    }
+
+    /// Record (or refresh) the base facts about a source we connected to:
+    /// software, obfuscation, and LowID. Keyed by address; a reconnect updates
+    /// those fields but preserves any rating/comment/verified already learned.
+    pub async fn note_source(
+        &self,
+        software: String,
+        addr: SocketAddr,
+        obfuscated: bool,
+        low_id: bool,
+    ) {
+        let mut g = self.sources.lock().await;
+        if let Some(s) = g.iter_mut().find(|s| s.addr == addr) {
+            s.software = software;
+            s.obfuscated = obfuscated;
+            s.low_id = low_id;
+        } else {
+            g.push(SourceInfo {
+                addr,
+                software,
+                obfuscated,
+                low_id,
+                verified: false,
+                rating: 0,
+                comment: String::new(),
+            });
+        }
+    }
+
+    /// Attach a source's rating + comment (from OP_FILEDESC). No-op if we have no
+    /// record of that address yet (the base note comes first on connect).
+    pub async fn note_source_comment(&self, addr: SocketAddr, rating: u8, comment: String) {
+        let mut g = self.sources.lock().await;
+        if let Some(s) = g.iter_mut().find(|s| s.addr == addr) {
+            s.rating = rating.min(5);
+            s.comment = comment;
+        }
+    }
+
+    /// Mark a source as identity-verified (secure-ident succeeded).
+    pub async fn note_source_verified(&self, addr: SocketAddr) {
+        let mut g = self.sources.lock().await;
+        if let Some(s) = g.iter_mut().find(|s| s.addr == addr) {
+            s.verified = true;
+        }
+    }
+
+    /// Snapshot of every source we have connected to (for the per-source UI).
+    pub async fn sources(&self) -> Vec<SourceInfo> {
+        self.sources.lock().await.clone()
     }
 
     /// Mark this download cancelled. The fetch workers notice within a block and
@@ -374,6 +449,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[tokio::test]
+    async fn note_source_upserts_and_preserves_learned_fields() {
+        let dir = tmpdir("srcinfo");
+        let store = PartStore::create(&dir, 1, [0x11; 16], 400_000, b"s.bin").unwrap();
+        let dl = Download::new(store);
+        let a: SocketAddr = "1.2.3.4:4662".parse().unwrap();
+        let b: SocketAddr = "5.6.7.8:4662".parse().unwrap();
+
+        dl.note_source("aMule 3.0.1".into(), a, true, false).await;
+        dl.note_source("eMule 0.50a".into(), b, false, true).await;
+        // A comment + a verification land on source a.
+        dl.note_source_comment(a, 5, "great".into()).await;
+        dl.note_source_verified(a).await;
+        // A reconnect to a refreshes the base fields but keeps rating/comment/verified.
+        dl.note_source("aMule 3.0.1".into(), a, true, false).await;
+
+        let mut srcs = dl.sources().await;
+        assert_eq!(srcs.len(), 2, "one entry per address");
+        srcs.sort_by_key(|s| s.addr);
+        let sa = srcs.iter().find(|s| s.addr == a).unwrap();
+        assert_eq!(sa.software, "aMule 3.0.1");
+        assert!(sa.obfuscated && !sa.low_id);
+        assert_eq!(sa.rating, 5);
+        assert_eq!(sa.comment, "great");
+        assert!(sa.verified, "verification survives a base re-note");
+        let sb = srcs.iter().find(|s| s.addr == b).unwrap();
+        assert!(!sb.obfuscated && sb.low_id && sb.rating == 0 && !sb.verified);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
