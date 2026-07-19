@@ -31,7 +31,10 @@ use crate::multi_source::{download_from_peer, resume_downloads, Download};
 use crate::part_store::PartStore;
 use crate::peer::HelloInfo;
 use crate::peer_conn::peer_handshake_inbound;
-use crate::search::{SearchParams, SearchResultFile};
+use crate::search::{
+    build_global_search_udp, parse_global_search_res, SearchParams, SearchResultFile,
+    OP_GLOBSEARCHRES,
+};
 use crate::server_messages::{LoginRequest, DEFAULT_SERVER_FLAGS};
 use crate::share::{head_hash, is_upload_request, serve_shared, SharedFile, UploadGate};
 use crate::transfer::build_file_req_ans_no_fil;
@@ -48,7 +51,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
@@ -550,6 +553,86 @@ fn kad_to_search(f: &mule_kad::FileResult) -> SearchResultFile {
     }
 }
 
+/// Global server UDP search (#9): send OP_GLOBSEARCHREQ to every server in
+/// `server.met`'s UDP port (TCP port + 4), skipping `connected` (already queried
+/// over TCP), and collect OP_GLOBSEARCHRES replies for `budget`. Best-effort:
+/// honors only replies from IPs we asked (anti-spoof), dedupes by hash, and
+/// returns `[]` on any setup failure. Bounded to the first `MAX_GLOBAL_SERVERS`.
+async fn global_udp_search(
+    config_dir: &Path,
+    params: &SearchParams,
+    connected: Option<SocketAddr>,
+    budget: Duration,
+) -> Vec<SearchResultFile> {
+    const MAX_GLOBAL_SERVERS: usize = 40;
+    let Some(met) = std::fs::read(config_dir.join("server.met"))
+        .ok()
+        .and_then(|b| read_server_met(&b).ok())
+    else {
+        return Vec::new();
+    };
+    let Ok(sock) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0u16)).await else {
+        return Vec::new();
+    };
+    let sock = Arc::new(sock);
+    let pkt = build_global_search_udp(params);
+    let mut req = vec![pkt.protocol, pkt.opcode];
+    req.extend_from_slice(&pkt.payload);
+
+    let asked: Arc<Mutex<std::collections::HashSet<Ipv4Addr>>> =
+        Arc::new(Mutex::new(std::collections::HashSet::new()));
+    let hits: Arc<Mutex<Vec<SearchResultFile>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let (rsock, rasked, rhits) = (Arc::clone(&sock), Arc::clone(&asked), Arc::clone(&hits));
+    let recv = tokio::spawn(async move {
+        let mut buf = [0u8; 16 * 1024];
+        while let Ok((n, src)) = rsock.recv_from(&mut buf).await {
+            if n < 2 {
+                continue;
+            }
+            let IpAddr::V4(sip) = src.ip() else { continue };
+            if !rasked.lock().await.contains(&sip) {
+                continue; // anti-spoof: only a server we asked this search
+            }
+            if buf[0] == mule_proto::PROT_EDONKEY && buf[1] == OP_GLOBSEARCHRES {
+                let files = parse_global_search_res(&buf[2..n]).unwrap_or_default();
+                let mut h = rhits.lock().await;
+                for f in files {
+                    if !h.iter().any(|x| x.hash == f.hash) {
+                        h.push(f);
+                    }
+                }
+            }
+        }
+    });
+
+    let deadline = tokio::time::Instant::now() + budget;
+    for srv in met.servers.iter().take(MAX_GLOBAL_SERVERS) {
+        if srv.ip == 0 || srv.port == 0 {
+            continue;
+        }
+        let Some(udp_port) = srv.port.checked_add(4) else {
+            continue;
+        };
+        let ip = ip_from_met_u32(srv.ip);
+        if connected == Some(SocketAddr::new(IpAddr::V4(ip), srv.port)) {
+            continue; // already queried over TCP
+        }
+        asked.lock().await.insert(ip);
+        let _ = sock
+            .send_to(&req, SocketAddr::new(IpAddr::V4(ip), udp_port))
+            .await;
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    tokio::time::sleep(deadline.saturating_duration_since(tokio::time::Instant::now())).await;
+    recv.abort();
+    let h = hits.lock().await;
+    h.clone()
+}
+
 /// Flatten a server-link event into the UI's event stream.
 fn map_server_event(e: ServerEvent) -> EngineEvent {
     match e {
@@ -618,6 +701,9 @@ pub struct SearchFilters {
     /// Minimum / maximum file size in BYTES.
     pub min_size: Option<u64>,
     pub max_size: Option<u64>,
+    /// Also query the whole serverlist over UDP (global search), not just the
+    /// connected server. Off by default (more traffic + noisier results).
+    pub global: bool,
 }
 
 /// The padMule engine. Create with [`Engine::new`], drive with the lifecycle
@@ -1185,11 +1271,16 @@ impl Engine {
             // for a ".pdf" when asked for "pdf").
             extension: None,
         };
+        // Global UDP search (#9) reads server.met + the connected server's addr
+        // (to skip it) before the &mut borrows below; it runs concurrently.
+        let config_dir = self.config_dir.clone();
+        let connected = self.server.as_ref().map(|l| l.addr());
+        let do_global = filters.global;
         // The server link and the Kad node are separate fields, so both can be
         // borrowed and driven at once.
         let server = self.server.as_mut();
         let kad = self.kad.as_mut();
-        let (server_files, kad_files) = tokio::join!(
+        let (server_files, kad_files, global_files) = tokio::join!(
             async {
                 match server {
                     Some(link) => link.search(&params, SEARCH_WAIT).await.unwrap_or_default(),
@@ -1211,11 +1302,19 @@ impl Engine {
                     None => Vec::new(),
                 }
             },
+            async {
+                if do_global {
+                    global_udp_search(&config_dir, &params, connected, SEARCH_WAIT).await
+                } else {
+                    Vec::new()
+                }
+            },
         );
-        // Fold the Kad hits (already distilled) into the same shape the server
-        // hits arrive in, so a single catalog pass dedupes across both by hash.
+        // Fold the Kad + global-UDP hits into the same shape the server hits
+        // arrive in, so a single catalog pass dedupes across all three by hash.
         let mut combined = server_files;
         combined.extend(kad_files.iter().map(kad_to_search));
+        combined.extend(global_files);
         let mut ranked = catalog(&combined);
         // Apply the same bounds to the merged set, so Kad hits (not filtered on
         // the wire) and any server slack obey the user's filters too.

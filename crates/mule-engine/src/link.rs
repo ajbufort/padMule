@@ -52,6 +52,12 @@ impl ServerLink {
         &self.state
     }
 
+    /// The server address this link is for (used to skip it in a global UDP
+    /// fan-out - it was already queried over TCP).
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
     /// True when logged in.
     pub fn is_connected(&self) -> bool {
         matches!(self.state, ServerState::Connected { .. })

@@ -260,6 +260,8 @@ struct ContentView: View {
                 // so the capped result set fills with matches instead of junk.
                 Toggle("Complete sources only", isOn: $model.wireCompleteOnly)
                     .font(.caption)
+                Toggle("Search all servers (global)", isOn: $model.wireGlobal)
+                    .font(.caption)
                 HStack {
                     Text("Size").font(.caption).foregroundStyle(.secondary)
                     Spacer()
