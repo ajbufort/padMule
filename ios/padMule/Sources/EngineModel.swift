@@ -291,6 +291,16 @@ final class EngineModel: ObservableObject {
         }
     }
 
+    /// Set a download's priority: 0 = Low, 1 = Normal, 2 = High. Persisted to
+    /// part.met and honored by the running fetch. refresh() pulls the update.
+    func setPriority(_ hash: String, priority: UInt8) {
+        guard let e = engine else { return }
+        work.async { [weak self] in
+            _ = e.setDownloadPriority(hash: hash, priority: priority)
+            DispatchQueue.main.async { self?.refresh() }
+        }
+    }
+
     /// App backgrounded: checkpoint + release sockets. iPadOS would reclaim them
     /// anyway - doing it explicitly is what makes resume honest.
     func pause() { run { $0.pause() } }

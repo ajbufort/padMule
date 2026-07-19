@@ -104,6 +104,9 @@ pub struct DownloadInfo {
     pub rating: u8,
     /// True if any source left a comment (view them in the per-source sheet).
     pub has_comment: bool,
+    /// Download priority: 0 = Low, 1 = Normal, 2 = High. Biases how many sources
+    /// this download contacts at once.
+    pub priority: u8,
 }
 
 /// One complete file we are serving to peers (the shared library).
@@ -375,6 +378,7 @@ impl MuleEngine {
                     complete: dl.is_complete().await,
                     rating,
                     has_comment,
+                    priority: dl.priority(),
                 });
             }
             out
@@ -455,6 +459,22 @@ impl MuleEngine {
                 .lock()
                 .await
                 .set_file_rating(h, rating, comment)
+                .await
+        })
+    }
+
+    /// Set a download's priority: 0 = Low, 1 = Normal, 2 = High (an unknown
+    /// value clamps to Normal). Persisted and honored by the running fetch.
+    /// Returns false if that hash is not an active download.
+    pub fn set_download_priority(&self, hash: String, priority: u8) -> bool {
+        let Some(h) = parse_hash16(&hash) else {
+            return false;
+        };
+        self.rt.block_on(async {
+            self.inner
+                .lock()
+                .await
+                .set_download_priority(h, priority)
                 .await
         })
     }

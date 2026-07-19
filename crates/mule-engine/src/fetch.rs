@@ -269,12 +269,11 @@ pub async fn fetch_from_sources(
     out
 }
 
-/// How the download manager runs.
+/// How the download manager runs. The concurrent-peer COUNT is NOT here: it is
+/// read live from the `Download`'s priority every round (see [`download_file`]),
+/// so a mid-session priority change biases the ongoing sweep.
 #[derive(Debug, Clone, Copy)]
 pub struct ManagerConfig {
-    /// Peers to download from concurrently. A `Download` reserves distinct block
-    /// ranges per peer, so parallel peers split the work safely.
-    pub parallel: usize,
     /// Timeout for one peer session (connect + a burst of blocks).
     pub per_peer: Duration,
     /// How many times to sweep the source set. eD2k peers ration upload slots -
@@ -286,10 +285,40 @@ pub struct ManagerConfig {
 impl Default for ManagerConfig {
     fn default() -> Self {
         ManagerConfig {
-            parallel: 4,
             per_peer: Duration::from_secs(45),
             rounds: 8,
         }
+    }
+}
+
+impl ManagerConfig {
+    /// The sweep budget for a download at `priority` (PR_LOW/PR_NORMAL/PR_HIGH):
+    /// a higher priority sweeps the source set more times before giving up.
+    pub fn for_priority(priority: u8) -> Self {
+        ManagerConfig {
+            per_peer: Duration::from_secs(45),
+            rounds: rounds_for_priority(priority),
+        }
+    }
+}
+
+/// Concurrent peers to pull from for a download at `priority`. More peers = more
+/// simultaneous upload-slot requests = faster byte accumulation; honest network
+/// effort (contacting more of the known sources at once), not a bandwidth grab.
+/// PR_NORMAL keeps the historical default of 4, so Normal downloads are unchanged.
+pub fn parallel_for_priority(priority: u8) -> usize {
+    match priority {
+        crate::part_store::PR_LOW => 2,
+        crate::part_store::PR_HIGH => 6,
+        _ => 4,
+    }
+}
+
+fn rounds_for_priority(priority: u8) -> usize {
+    match priority {
+        crate::part_store::PR_LOW => 6,
+        crate::part_store::PR_HIGH => 12,
+        _ => 8,
     }
 }
 
@@ -304,13 +333,15 @@ pub async fn download_file(
     config: ManagerConfig,
 ) -> FetchOutcome {
     let mut out = FetchOutcome::default();
-    let parallel = config.parallel.max(1);
     // Learned across rounds: which sources actually delivered.
     let scoreboard = Arc::new(Mutex::new(PeerScoreboard::new()));
     for _round in 0..config.rounds.max(1) {
         if dl.is_complete().await || dl.is_cancelled() || sources.is_empty() {
             break;
         }
+        // Read priority live each round, so a mid-session change to a running
+        // download's priority widens or narrows the very next round's peer count.
+        let parallel = parallel_for_priority(dl.priority()).max(1);
         // Order the sweep best-first by what each source delivered in prior
         // rounds (proven deliverers, then untried, then proven failures).
         let mut ordered: Vec<PeerSource> = sources.to_vec();

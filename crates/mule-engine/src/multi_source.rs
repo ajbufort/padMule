@@ -16,7 +16,7 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -62,6 +62,10 @@ pub struct Download {
     /// Set when the user cancels. The fetch workers check it and stop; a
     /// lock-free atomic so cancelling never has to wait on the transfer lock.
     cancelled: AtomicBool,
+    /// The user's download priority (PR_LOW/PR_NORMAL/PR_HIGH). A lock-free
+    /// atomic so the fetch manager can read it every round without touching the
+    /// transfer lock; the canonical copy is persisted in the PartStore.
+    priority: AtomicU8,
 }
 
 struct Inner {
@@ -82,6 +86,7 @@ const ENDGAME_LIMIT: u64 = 4 * crate::transfer::EMBLOCKSIZE;
 impl Download {
     pub fn new(store: PartStore) -> Arc<Self> {
         let parts = data_part_count(store.pf.size) as usize;
+        let priority = AtomicU8::new(store.priority);
         Arc::new(Download {
             inner: Mutex::new(Inner {
                 store,
@@ -90,6 +95,7 @@ impl Download {
             }),
             sources: Mutex::new(Vec::new()),
             cancelled: AtomicBool::new(false),
+            priority,
         })
     }
 
@@ -166,6 +172,23 @@ impl Download {
     /// Whether cancellation has been requested.
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Relaxed)
+    }
+
+    /// The current download priority (PR_LOW/PR_NORMAL/PR_HIGH). Read lock-free
+    /// by the fetch manager every round, so a live change biases the ongoing
+    /// sweep, not just the next spawn.
+    pub fn priority(&self) -> u8 {
+        self.priority.load(Ordering::Relaxed)
+    }
+
+    /// Set the download priority and persist it to part.met so it survives a
+    /// restart. Best-effort persistence: a failed met write leaves the live
+    /// atomic updated (the sweep still honors it this session).
+    pub async fn set_priority(&self, priority: u8) {
+        self.priority.store(priority, Ordering::Relaxed);
+        let mut g = self.inner.lock().await;
+        g.store.priority = priority;
+        let _ = g.store.save_met();
     }
 
     /// Delete the backing `.part` and `.part.met`. Best effort: an open file
