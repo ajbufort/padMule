@@ -34,6 +34,19 @@ final class EngineModel: ObservableObject {
     /// event-derived ID is overwritten in the same frame it arrives.
     @Published private(set) var server: ServerInfoFfi?
     @Published private(set) var results: [SearchHit] = []
+
+    // Session transfer stats. `totalDown`/`totalUp` are the engine's monotonic
+    // byte totals; `rateHistory` is a rolling 60s window of per-second deltas the
+    // stats screen charts. All derived on the main thread from the 1s poll.
+    @Published private(set) var totalDown: UInt64 = 0
+    @Published private(set) var totalUp: UInt64 = 0
+    @Published private(set) var rateHistory: [RatePoint] = []
+    private var lastSampleDown: UInt64 = 0
+    private var lastSampleUp: UInt64 = 0
+    private var lastSampleTime = Date()
+    private var sampleIndex = 0
+    private var statsPrimed = false
+    private let rateHistoryCap = 60
     // Pre-search WIRE filters (sent to the server so it pre-filters the capped
     // result set), distinct from the client-side sort/filter chips below which
     // refine what came back. `mb` values are megabytes; 0 = no bound.
@@ -372,6 +385,7 @@ final class EngineModel: ObservableObject {
             let ipf = e.ipFilterRanges()
             let srv = e.serverInfo()
             let shr = e.isSharing()
+            let stats = e.transferStats()
             let evs = e.drainEvents()
             DispatchQueue.main.async {
                 guard let self else { return }
@@ -382,9 +396,48 @@ final class EngineModel: ObservableObject {
                 self.ipFilterRanges = ipf
                 self.server = srv
                 self.sharing = shr
+                self.sampleStats(stats)
                 for ev in evs { self.apply(ev) }
             }
         }
+    }
+
+    /// Fold one poll's transfer totals into the published stats. Main-thread only.
+    ///
+    /// The engine's byte totals are monotonic, so `delta / elapsed` is the rate.
+    /// This must NOT assume a 1s cadence: refresh() (which calls this) fires not
+    /// only from the 1s timer but on command completions and pause/resume too. So
+    /// the totals are updated every time, but a rate POINT is folded only once
+    /// ~1s of real time has passed, dividing the byte delta by the ACTUAL elapsed
+    /// seconds - an off-cadence refresh never injects a false sub-second dip, and
+    /// the rolling window stays a true ~60 seconds. The first sample only primes
+    /// the baseline (no spike from bytes moved before the view opened).
+    private func sampleStats(_ stats: TransferStats) {
+        totalDown = stats.totalDown
+        totalUp = stats.totalUp
+
+        let now = Date()
+        guard statsPrimed else {
+            statsPrimed = true
+            lastSampleDown = stats.totalDown
+            lastSampleUp = stats.totalUp
+            lastSampleTime = now
+            return
+        }
+        let elapsed = now.timeIntervalSince(lastSampleTime)
+        guard elapsed >= 0.9 else { return }
+
+        let dDown = stats.totalDown >= lastSampleDown ? stats.totalDown - lastSampleDown : 0
+        let dUp = stats.totalUp >= lastSampleUp ? stats.totalUp - lastSampleUp : 0
+        sampleIndex += 1
+        rateHistory.append(
+            RatePoint(id: sampleIndex, down: Double(dDown) / elapsed, up: Double(dUp) / elapsed))
+        if rateHistory.count > rateHistoryCap {
+            rateHistory.removeFirst(rateHistory.count - rateHistoryCap)
+        }
+        lastSampleDown = stats.totalDown
+        lastSampleUp = stats.totalUp
+        lastSampleTime = now
     }
 
     private func apply(_ event: EngineEventFfi) {

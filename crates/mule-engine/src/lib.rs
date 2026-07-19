@@ -27,6 +27,7 @@ pub mod secure_ident;
 pub mod server_messages;
 pub mod share;
 pub mod sources;
+pub mod stats;
 pub mod transfer;
 pub mod transfer_session;
 pub mod upload_queue;

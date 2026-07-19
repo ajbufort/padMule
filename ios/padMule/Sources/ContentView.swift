@@ -12,7 +12,7 @@ import SwiftUI
 
 /// The top-toolbar destinations. Each is one eD2k function, one icon.
 enum Screen: String, CaseIterable, Identifiable {
-    case search, transfers, shared, status
+    case search, transfers, shared, stats, status
     var id: String { rawValue }
 
     var title: String {
@@ -20,6 +20,7 @@ enum Screen: String, CaseIterable, Identifiable {
         case .search: return "Search"
         case .transfers: return "Transfers"
         case .shared: return "Shared"
+        case .stats: return "Statistics"
         case .status: return "Status"
         }
     }
@@ -32,6 +33,7 @@ enum Screen: String, CaseIterable, Identifiable {
         case .search: return "magnifyingglass"
         case .transfers: return selected ? "arrow.down.circle.fill" : "arrow.down.circle"
         case .shared: return selected ? "folder.fill" : "folder"
+        case .stats: return selected ? "chart.xyaxis.line" : "chart.xyaxis.line"
         case .status: return "gauge"
         }
     }
@@ -66,6 +68,7 @@ struct ContentView: View {
                 case .search: searchScreen
                 case .transfers: transfersScreen
                 case .shared: sharedScreen
+                case .stats: StatsView().environmentObject(model)
                 case .status: statusScreen
                 }
             }
