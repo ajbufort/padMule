@@ -1516,11 +1516,18 @@ impl Engine {
         if self.offline {
             return AddResult::NoServer;
         }
-        if self.server.is_none() {
-            return AddResult::NoServer;
-        }
+        // No server gate: find_sources queries the connected server AND Kad, so a
+        // SERVERLESS client still downloads from HighID Kad sources (a LowID Kad
+        // source needs a server callback, so it is simply skipped without one).
+        // A hands-on simulation caught the old gate: with every server down but
+        // Kad up, search returned real hits yet every download was refused
+        // "NoServer" - even though Kad had the sources.
         let (reg, lowids) = self.find_sources(hash, size).await;
-        if reg.is_empty() && lowids.is_empty() {
+        // A LowID source can only reach us via a SERVER callback, so without a
+        // server only directly-connectable (HighID) sources are usable - otherwise
+        // a Kad-only client would register a download that can never progress.
+        let has_usable_source = !reg.is_empty() || (self.server.is_some() && !lowids.is_empty());
+        if !has_usable_source {
             return AddResult::NoSources;
         }
 
@@ -2359,6 +2366,26 @@ mod tests {
             engine.downloads().await.is_empty(),
             "nothing was registered"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With NO server (but not `offline`), a download must fall through to Kad
+    /// source-finding, not be refused outright. Here neither a server nor a Kad
+    /// node exists, so find_sources touches no network and reports NoSources - the
+    /// old code returned NoServer before ever trying Kad, so a Kad-only client
+    /// (all servers down, Kad up) could search but never download. Caught by the
+    /// hands-on FFI simulation.
+    #[tokio::test]
+    async fn add_download_without_a_server_still_tries_kad() {
+        let dir = tmp("kadonly");
+        let _ = std::fs::remove_dir_all(&dir);
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+        // Deliberately NOT set_offline: server is None, kad is None.
+        assert_eq!(
+            engine.add_download([2; 16], 1000, "x.bin").await,
+            AddResult::NoSources
+        );
+        assert!(engine.downloads().await.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
