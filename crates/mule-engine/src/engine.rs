@@ -1186,11 +1186,12 @@ impl Engine {
         for srv in met.servers.iter().take(10) {
             let addr = SocketAddr::new(IpAddr::V4(ip_from_met_u32(srv.ip)), srv.port);
             let mut link = ServerLink::new(addr, login.clone(), tx.clone());
-            if let Ok(Ok(ServerState::Connected { id, low_id })) =
+            if let Ok(Ok(ServerState::Connected { low_id, .. })) =
                 timeout(Duration::from_secs(12), link.connect()).await
             {
-                // `id` is used LOCALLY for the OP_OFFERFILES record but never
-                // stored or emitted: a HighID id encodes our public IP.
+                // The client id is deliberately NOT recorded here: a HighID id
+                // encodes our public IP and this text reaches the screen. (The
+                // OP_OFFERFILES record uses FILE_COMPLETE markers, not the id.)
                 self.connection = Some(ServerInfo {
                     addr: addr.to_string(),
                     low_id,
@@ -1201,7 +1202,7 @@ impl Engine {
                 )));
                 // Announce our shared library so the server indexes it (findable
                 // via keyword search) and can hand us out as a source.
-                self.offer_shared_to(&mut link, id, low_id).await;
+                self.offer_shared_to(&mut link).await;
                 self.server = Some(link);
                 return;
             }
@@ -1209,35 +1210,50 @@ impl Engine {
         self.emit(EngineEvent::Server("no server accepted a login".into()));
     }
 
-    /// Announce our whole shared library to `link` via OP_OFFERFILES, so the
-    /// server indexes it (findable by keyword search) and can source us. A HighID
-    /// client offers its real `id` + TCP port; a LowID one the complete-file
-    /// markers (all our shares are complete). No-op with an empty library.
-    async fn offer_shared_to(&self, link: &mut ServerLink, id: u32, low_id: bool) {
-        let shared = self.shared.lock().await;
-        if shared.is_empty() {
+    /// Announce our shared library to `link` via OP_OFFERFILES, so the server
+    /// indexes it (findable by keyword search) and can source us. All our shares
+    /// are COMPLETE, so each carries the FILE_COMPLETE_ID/PORT marker - faithful
+    /// to aMule against a compression-advertising server (every live server), and
+    /// it keeps a HighID's public IP out of the server's search index (the server
+    /// sources us via our login id regardless). No-op with an empty library.
+    async fn offer_shared_to(&self, link: &mut ServerLink) {
+        // aMule caps each OFFERFILES burst at 200 files; we cap too (v1 does not
+        // republish the remainder).
+        const MAX_OFFER: usize = 200;
+        // Snapshot what we need, then RELEASE the lock before the network write -
+        // so a concurrent share change (a download finishing) never blocks on it.
+        let snap: Vec<([u8; 16], String, u64)> = {
+            let shared = self.shared.lock().await;
+            shared
+                .iter()
+                .take(MAX_OFFER)
+                .map(|s| {
+                    (
+                        s.hash,
+                        String::from_utf8_lossy(&s.name).into_owned(),
+                        s.size,
+                    )
+                })
+                .collect()
+        };
+        if snap.is_empty() {
             return;
         }
-        // Own the names first so the OfferedFile borrows outlive the call.
-        let names: Vec<String> = shared
+        let offers: Vec<OfferedFile> = snap
             .iter()
-            .map(|s| String::from_utf8_lossy(&s.name).into_owned())
-            .collect();
-        let offers: Vec<OfferedFile> = shared
-            .iter()
-            .zip(&names)
-            .map(|(s, n)| OfferedFile {
-                hash: s.hash,
+            .map(|(h, n, sz)| OfferedFile {
+                hash: *h,
                 name: n,
-                size: s.size,
+                size: *sz,
             })
             .collect();
-        let (cid, cport) = if low_id {
-            (FILE_COMPLETE_ID, FILE_COMPLETE_PORT)
-        } else {
-            (id, TCP_PORT)
-        };
-        let _ = link.offer_files(&offers, cid, cport).await;
+        // Bounded + best-effort: a stalled write must NOT hang connect/resume
+        // (the lifecycle hard requirement), and a rejected offer is not fatal.
+        let _ = timeout(
+            Duration::from_secs(10),
+            link.offer_files(&offers, FILE_COMPLETE_ID, FILE_COMPLETE_PORT),
+        )
+        .await;
     }
 
     /// Bind the Kad UDP socket and bootstrap off the persisted contacts.

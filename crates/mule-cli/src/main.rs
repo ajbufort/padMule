@@ -269,11 +269,9 @@ async fn cmd_offer_search(host: &str, port: u16, name: &str) {
     };
     // A HighID client offers its real id+port; a LowID one uses the complete-file
     // markers (all our shares are complete).
-    let (cid, cport) = if low_id {
-        (FILE_COMPLETE_ID, FILE_COMPLETE_PORT)
-    } else {
-        (id, 4662)
-    };
+    // All our shares are complete: use the marker id/port (faithful to aMule
+    // against a compression-advertising server; no public-IP leak).
+    let (cid, cport) = (FILE_COMPLETE_ID, FILE_COMPLETE_PORT);
     if let Err(e) = link.offer_files(&[file], cid, cport).await {
         eprintln!("offer failed: {e}");
         return;
@@ -360,19 +358,17 @@ async fn cmd_offer_hold(host: &str, port: u16, name: &str, seconds: u64) {
     let (tx, rx) = mpsc::channel(64);
     let printer = spawn_event_printer(rx);
     let mut link = ServerLink::new(addr, demo_login(), tx);
-    let (id, low_id) = match link.connect().await {
-        Ok(ServerState::Connected { id, low_id }) => (id, low_id),
+    match link.connect().await {
+        Ok(ServerState::Connected { .. }) => {}
         other => {
             eprintln!("login failed: {other:?}");
             return;
         }
-    };
+    }
     let hash = ed2k_hash(name.as_bytes());
-    let (cid, cport) = if low_id {
-        (FILE_COMPLETE_ID, FILE_COMPLETE_PORT)
-    } else {
-        (id, 4662)
-    };
+    // All our shares are complete: use the marker id/port (faithful to aMule
+    // against a compression-advertising server; no public-IP leak).
+    let (cid, cport) = (FILE_COMPLETE_ID, FILE_COMPLETE_PORT);
     if let Err(e) = link
         .offer_files(
             &[OfferedFile {
