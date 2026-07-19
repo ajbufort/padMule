@@ -706,6 +706,17 @@ impl Engine {
         self.downloads.lock().await.clone()
     }
 
+    /// The sources we have connected to for one download (for the per-source UI).
+    /// Empty if no download with that hash is active.
+    pub async fn download_sources(&self, hash: [u8; 16]) -> Vec<crate::multi_source::SourceInfo> {
+        for dl in self.downloads.lock().await.iter() {
+            if dl.hash().await == hash {
+                return dl.sources().await;
+            }
+        }
+        Vec::new()
+    }
+
     /// How many IP-blocklist ranges are loaded (0 = no filter). For the UI.
     pub fn ip_filter_ranges(&self) -> usize {
         self.ip_filter.as_ref().map_or(0, |f| f.len())

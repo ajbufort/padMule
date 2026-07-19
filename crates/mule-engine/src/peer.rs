@@ -235,6 +235,35 @@ impl ParsedHello {
         })
     }
 
+    /// The peer's client software as a display string ("padMule", "aMule 3.0.1",
+    /// "eMule 0.50a", "eDonkey", ...), decoded from the CT_EMULE_VERSION tag
+    /// (BaseClient.cpp:573-579): high byte = compatible-client id, low 24 bits
+    /// pack version as `(v>>17).(v>>10).(v>>7)&7`. A peer with no eMule extension
+    /// tag is a plain eDonkey client.
+    pub fn client_software(&self) -> String {
+        if self.padmule().is_some() {
+            return "padMule".to_string();
+        }
+        let Some(v) = self.tag_u32(CT_EMULE_VERSION) else {
+            return "eDonkey".to_string();
+        };
+        let name = match v >> 24 {
+            0 => "eMule",
+            1 => "cDonkey",
+            2 => "xMule",
+            3 => "aMule",
+            4 => "Shareaza",
+            10 => "MLDonkey",
+            20 => "lphant",
+            _ => "eMule-compatible",
+        };
+        let ver = v & 0x00FF_FFFF;
+        let major = (ver >> 17) & 0x7F;
+        let minor = (ver >> 10) & 0x7F;
+        let patch = (ver >> 7) & 0x07;
+        format!("{name} {major}.{minor}.{patch}")
+    }
+
     /// Decode the peer's capabilities from its MISCOPTIONS1/2 tags, if present.
     pub fn capabilities(&self) -> Option<Capabilities> {
         let m1 = self.tag_u32(CT_EMULE_MISCOPTIONS1)?;
@@ -433,6 +462,38 @@ mod tests {
         assert!(
             matches!(marker.value, TagValue::U32(_)),
             "marker must be a standard UINT32, never a custom type"
+        );
+    }
+
+    #[test]
+    fn client_software_decodes_the_version_tag() {
+        let hello = |tags: Vec<Tag>| ParsedHello {
+            user_hash: [0; 16],
+            client_id: 0,
+            tcp_port: 0,
+            tags,
+            server_ip: 0,
+            server_port: 0,
+        };
+        // Our own tag (aMule 3.0.1 -> 0x03060080).
+        assert_eq!(
+            hello(vec![Tag::id(CT_EMULE_VERSION, TagValue::U32(0x0306_0080))]).client_software(),
+            "aMule 3.0.1"
+        );
+        // Compatible-client id 0 = eMule.
+        let emule = 0x0032_0100; // id 0, decodes to some eMule x.y.z
+        assert!(hello(vec![Tag::id(CT_EMULE_VERSION, TagValue::U32(emule))])
+            .client_software()
+            .starts_with("eMule "));
+        // No eMule extension tag at all -> plain eDonkey.
+        assert_eq!(
+            hello(vec![Tag::id(CT_NAME, TagValue::Str(b"x".to_vec()))]).client_software(),
+            "eDonkey"
+        );
+        // The padMule marker wins over any version tag.
+        assert_eq!(
+            hello(vec![padmule_marker_tag(0x0000_0001)]).client_software(),
+            "padMule"
         );
     }
 

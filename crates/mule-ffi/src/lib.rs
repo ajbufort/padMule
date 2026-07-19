@@ -110,6 +110,19 @@ pub struct SharedFileInfo {
     pub size: u64,
 }
 
+/// One source we have connected to for a download (the per-source detail view).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct SourceInfoFfi {
+    pub addr: String,
+    pub software: String,
+    pub obfuscated: bool,
+    pub low_id: bool,
+    pub verified: bool,
+    /// 0 = unrated, else 1-5 (1 = Fake .. 5 = Excellent).
+    pub rating: u8,
+    pub comment: String,
+}
+
 /// Pre-search filters pushed onto the server query. A `0` field means "unset".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
 pub struct SearchFilters {
@@ -354,6 +367,32 @@ impl MuleEngine {
                 });
             }
             out
+        })
+    }
+
+    /// The sources connected for one download (per-source detail). Empty for an
+    /// unknown/finished hash.
+    pub fn download_sources(&self, hash: String) -> Vec<SourceInfoFfi> {
+        let Some(h) = parse_hash16(&hash) else {
+            return Vec::new();
+        };
+        self.rt.block_on(async {
+            self.inner
+                .lock()
+                .await
+                .download_sources(h)
+                .await
+                .into_iter()
+                .map(|s| SourceInfoFfi {
+                    addr: s.addr.to_string(),
+                    software: s.software,
+                    obfuscated: s.obfuscated,
+                    low_id: s.low_id,
+                    verified: s.verified,
+                    rating: s.rating,
+                    comment: s.comment,
+                })
+                .collect()
         })
     }
 
