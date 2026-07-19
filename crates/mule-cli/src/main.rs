@@ -455,8 +455,9 @@ async fn cmd_offer_search(host: &str, port: u16, name: &str) {
     let _ = printer.await;
 }
 
-/// offer-hold <host> <port> <name> [seconds]: log in, OFFER a synthetic complete
-/// file named <name>, and HOLD the connection so the server keeps it indexed
+/// offer-hold <host> <port> <name[|name...]> [seconds]: log in, OFFER one or more
+/// synthetic complete files (a '|'-separated <name> list is one shared library on
+/// a single connection), and HOLD the connection so the server keeps them indexed
 /// (for inspecting the server's share count, or searching from another client).
 async fn cmd_offer_hold(host: &str, port: u16, name: &str, seconds: u64) {
     use mule_engine::server_messages::{OfferedFile, FILE_COMPLETE_ID, FILE_COMPLETE_PORT};
@@ -478,29 +479,33 @@ async fn cmd_offer_hold(host: &str, port: u16, name: &str, seconds: u64) {
             return;
         }
     }
-    let hash = ed2k_hash(name.as_bytes());
+    // `name` may be a '|'-separated list, so ONE client can offer a small shared
+    // library (multiple files in a single OP_OFFERFILES) - the demo user hash is
+    // fixed, so several separate seeders would collide as one client on the server.
+    let offers: Vec<OfferedFile> = name
+        .split('|')
+        .filter(|s| !s.is_empty())
+        .map(|n| OfferedFile {
+            hash: ed2k_hash(n.as_bytes()),
+            name: n,
+            size: 1_234_567,
+        })
+        .collect();
+    if offers.is_empty() {
+        eprintln!("no file names given");
+        return;
+    }
     // All our shares are complete: use the marker id/port (faithful to aMule
     // against a compression-advertising server; no public-IP leak).
     let (cid, cport) = (FILE_COMPLETE_ID, FILE_COMPLETE_PORT);
-    if let Err(e) = link
-        .offer_files(
-            &[OfferedFile {
-                hash,
-                name,
-                size: 1_234_567,
-            }],
-            cid,
-            cport,
-        )
-        .await
-    {
+    if let Err(e) = link.offer_files(&offers, cid, cport).await {
         eprintln!("offer failed: {e}");
         return;
     }
-    println!(
-        "offered '{name}' (hash {}); holding {seconds}s",
-        hex16(&hash)
-    );
+    for o in &offers {
+        println!("offered '{}' (hash {})", o.name, hex16(&o.hash));
+    }
+    println!("holding {seconds}s");
     tokio::time::sleep(Duration::from_secs(seconds)).await;
     link.disconnect().await;
     drop(link);
