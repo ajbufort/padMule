@@ -42,6 +42,8 @@ struct ContentView: View {
     @State private var screen: Screen = .search
     @State private var query = ""
     @State private var detail: SearchHit?
+    @State private var showAddCategory = false
+    @State private var newCategoryName = ""
 
     var body: some View {
         NavigationStack {
@@ -85,6 +87,88 @@ struct ContentView: View {
             }
             .sheet(item: $detail) { hit in
                 SearchDetailView(hit: hit).environmentObject(model)
+            }
+            .alert("New Category", isPresented: $showAddCategory) {
+                TextField("Name", text: $newCategoryName)
+                Button("Add") {
+                    model.addCategory(newCategoryName)
+                    newCategoryName = ""
+                }
+                Button("Cancel", role: .cancel) { newCategoryName = "" }
+            }
+        }
+    }
+
+    // MARK: - Categories
+
+    /// The filter-chip row: All, each category (colored, long-press to delete),
+    /// and a "+" to add one. Selecting a chip filters the transfer list.
+    private var categoryChips: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                chip("All", color: .secondary, selected: model.categoryFilter == nil) {
+                    model.categoryFilter = nil
+                }
+                ForEach(model.categories) { cat in
+                    chip(cat.name, color: cat.color, selected: model.categoryFilter == cat.id) {
+                        model.categoryFilter = cat.id
+                    }
+                    .contextMenu {
+                        Button(role: .destructive) {
+                            model.removeCategory(cat.id)
+                        } label: {
+                            Label("Delete \"\(cat.name)\"", systemImage: "trash")
+                        }
+                    }
+                }
+                Button {
+                    showAddCategory = true
+                } label: {
+                    Image(systemName: "plus.circle")
+                }
+                .buttonStyle(.borderless)
+            }
+            .padding(.vertical, 2)
+        }
+        .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16))
+    }
+
+    private func chip(_ label: String, color: Color, selected: Bool, tap: @escaping () -> Void) -> some View {
+        Button(action: tap) {
+            Text(label)
+                .font(.caption)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 4)
+                .background((selected ? color : color.opacity(0.15)))
+                .foregroundStyle(selected ? .white : color)
+                .clipShape(Capsule())
+        }
+        .buttonStyle(.borderless)
+    }
+
+    /// A context-menu picker to move a download into a category (or clear it).
+    /// The current choice gets a checkmark.
+    @ViewBuilder
+    private func categoryMenu(for hash: String) -> some View {
+        let current = model.category(for: hash)?.id
+        Button {
+            model.assignCategory(nil, to: hash)
+        } label: {
+            if current == nil {
+                Label("No category", systemImage: "checkmark")
+            } else {
+                Text("No category")
+            }
+        }
+        ForEach(model.categories) { cat in
+            Button {
+                model.assignCategory(cat.id, to: hash)
+            } label: {
+                if current == cat.id {
+                    Label(cat.name, systemImage: "checkmark")
+                } else {
+                    Text(cat.name)
+                }
             }
         }
     }
@@ -203,11 +287,16 @@ struct ContentView: View {
 
     private var transfersScreen: some View {
         List {
+            if !model.categories.isEmpty {
+                categoryChips
+            }
             Section("Transfers") {
-                if model.downloads.isEmpty {
-                    Text("No transfers").foregroundStyle(.secondary)
+                let shown = model.filteredDownloads
+                if shown.isEmpty {
+                    Text(model.categoryFilter == nil ? "No transfers" : "None in this category")
+                        .foregroundStyle(.secondary)
                 } else {
-                    ForEach(model.downloads, id: \.hash) { dl in
+                    ForEach(shown, id: \.hash) { dl in
                         transferRow(dl)
                             .swipeActions(edge: .trailing) {
                                 Button(role: .destructive) {
@@ -216,6 +305,7 @@ struct ContentView: View {
                                     Label("Remove", systemImage: "trash")
                                 }
                             }
+                            .contextMenu { categoryMenu(for: dl.hash) }
                     }
                 }
             }
@@ -426,6 +516,9 @@ struct ContentView: View {
     private func transferRow(_ dl: DownloadInfo) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack {
+                if let cat = model.category(for: dl.hash) {
+                    Circle().fill(cat.color).frame(width: 8, height: 8)
+                }
                 Text(dl.name.isEmpty ? String(dl.hash.prefix(16)) : dl.name)
                     .lineLimit(1)
                 Spacer()
