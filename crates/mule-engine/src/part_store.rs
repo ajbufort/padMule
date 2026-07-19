@@ -44,12 +44,15 @@ pub const FT_CORRUPTEDPARTS: u8 = 0x24;
 pub const FT_DLPRIORITY: u8 = 0x18;
 pub const FT_OLDDLPRIORITY: u8 = 0x13;
 
-/// Priority levels (eMule `Constants.h`): the three padMule honors. PR_AUTO(5)
-/// and the others are read-tolerantly (any unknown value -> Normal), matching
-/// aMule's own clamp (PartFile.cpp:512-515); Auto is not implemented yet.
+/// Priority levels (eMule `Constants.h`): the three padMule honors, plus the
+/// AUTO sentinel it maps in. padMule does not implement Auto tuning, so on read
+/// it collapses AUTO to HIGH exactly as aMule does when it cannot auto-tune
+/// (PartFile.cpp:506-509); genuinely unknown values (PR_VERYHIGH 3, PR_VERY_LOW
+/// 4, PR_POWERSHARE 6) clamp to Normal like aMule's later branch (:512-515).
 pub const PR_LOW: u8 = 0;
 pub const PR_NORMAL: u8 = 1;
 pub const PR_HIGH: u8 = 2;
+pub const PR_AUTO: u8 = 5;
 
 /// A download backed by a real `.part` file.
 pub struct PartStore {
@@ -136,9 +139,8 @@ impl PartStore {
 
         // Priority: prefer the modern tag, fall back to the legacy one. Read as
         // any int width (mule-proto preserves the on-disk width; an old eMule may
-        // have written it narrow). Only Low/Normal/High are honored - anything
-        // else (incl. PR_AUTO 5, which padMule does not implement) reads as
-        // Normal, matching aMule's own unknown-value clamp.
+        // have written it narrow). AUTO collapses to HIGH (aMule's own AUTO->HIGH,
+        // since padMule has no Auto tuning); other unknown values clamp to Normal.
         let priority = met
             .tags
             .iter()
@@ -154,7 +156,7 @@ impl PartStore {
             })
             .map(|v| match v as u8 {
                 PR_LOW => PR_LOW,
-                PR_HIGH => PR_HIGH,
+                PR_HIGH | PR_AUTO => PR_HIGH,
                 _ => PR_NORMAL,
             })
             .unwrap_or(PR_NORMAL);
@@ -413,15 +415,18 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_priority_value_reads_as_normal() {
-        // aMule may write PR_AUTO(5) or PR_VERYHIGH(3); padMule honors only
-        // Low/Normal/High and clamps the rest to Normal (like aMule's own clamp).
+    fn auto_reads_as_high_and_other_unknowns_read_as_normal() {
+        // aMule collapses PR_AUTO(5) -> HIGH; padMule mirrors that (no Auto tuning).
         let dir = tmpdir("priority-auto");
         let mut s = PartStore::create(&dir, 1, [0x11; 16], 500, b"a.bin").unwrap();
-        s.priority = 5; // PR_AUTO - not one of the three we honor
+        s.priority = PR_AUTO;
         s.save_met().unwrap();
-        let reopened = PartStore::open(&dir, 1).unwrap();
-        assert_eq!(reopened.priority, PR_NORMAL);
+        assert_eq!(PartStore::open(&dir, 1).unwrap().priority, PR_HIGH);
+
+        // A genuinely-unknown value (PR_VERYHIGH 3) clamps to Normal, like aMule.
+        s.priority = 3;
+        s.save_met().unwrap();
+        assert_eq!(PartStore::open(&dir, 1).unwrap().priority, PR_NORMAL);
         fs::remove_dir_all(&dir).ok();
     }
 
