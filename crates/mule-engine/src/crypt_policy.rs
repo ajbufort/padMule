@@ -70,6 +70,7 @@ mod tests {
             sec_ident: 0,
             source_exchange: 3,
             ext_requests: 2,
+            accept_comment: 1,
             large_files: true,
             ext_multipacket: false,
             supports_crypt: supports,

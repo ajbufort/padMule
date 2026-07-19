@@ -112,6 +112,10 @@ pub struct SharedFileInfo {
     pub hash: String,
     pub name: String,
     pub size: u64,
+    /// The local user's own rating, 0 = unrated, else 1-5 (1 = Fake .. 5 =
+    /// Excellent). Served to downloaders (with the comment) via OP_FILEDESC.
+    pub rating: u8,
+    pub comment: String,
 }
 
 /// One source we have connected to for a download (the per-source detail view).
@@ -428,12 +432,30 @@ impl MuleEngine {
                 .shared_files()
                 .await
                 .into_iter()
-                .map(|(hash, name, size)| SharedFileInfo {
+                .map(|(hash, name, size, rating, comment)| SharedFileInfo {
                     hash: hex::encode(hash),
                     name,
                     size,
+                    rating,
+                    comment,
                 })
                 .collect()
+        })
+    }
+
+    /// Set the local user's own rating (0-5, 0 = clear) and comment on a shared
+    /// file, persisted and served to downloaders via OP_FILEDESC. Returns false
+    /// if that hash is not in the shared library.
+    pub fn set_file_rating(&self, hash: String, rating: u8, comment: String) -> bool {
+        let Some(h) = parse_hash16(&hash) else {
+            return false;
+        };
+        self.rt.block_on(async {
+            self.inner
+                .lock()
+                .await
+                .set_file_rating(h, rating, comment)
+                .await
         })
     }
 

@@ -40,7 +40,7 @@ use mule_files::{
     DEFAULT_IPFILTER_LEVEL,
 };
 use mule_kad::RoutingTable;
-use mule_proto::{Kad128, Packet, Tag, TagValue};
+use mule_proto::{Kad128, Packet, Tag, TagName, TagValue};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -192,6 +192,8 @@ fn unique_dest(dest: PathBuf) -> PathBuf {
 const KNOWN_MET: &str = "known.met";
 const FT_FILENAME: u8 = 0x01;
 const FT_FILESIZE: u8 = 0x02;
+const FT_FILERATING: u8 = 0xF7;
+const FT_FILECOMMENT: u8 = 0xF6;
 
 /// Load the IP blocklist from the config dir if present. Reads `ipfilter.dat`
 /// then `.p2p`/`guarding.p2p` (both text line-forms parse the same), at the
@@ -256,6 +258,10 @@ fn load_shared_library(config_dir: &Path, downloads_dir: &Path) -> Vec<SharedFil
             name: name.into_bytes(),
             part_hashes: e.part_hashes,
             path,
+            // Our own rating/comment for this file, if we set one (persisted in
+            // the known.met entry). Served to leechers via OP_FILEDESC.
+            rating: tag_u64(&e.tags, FT_FILERATING).unwrap_or(0).min(5) as u8,
+            comment: tag_str(&e.tags, FT_FILECOMMENT).unwrap_or_default(),
         });
     }
     out
@@ -293,14 +299,25 @@ fn persist_shared_file(config_dir: &Path, sf: &SharedFile) {
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs() as u32)
         .unwrap_or(0);
+    let mut tags = vec![
+        Tag::id(FT_FILENAME, TagValue::Str(sf.name.clone())),
+        Tag::id(FT_FILESIZE, size_val),
+    ];
+    // Persist our own rating/comment so it survives a restart and re-serves.
+    if sf.rating != 0 {
+        tags.push(Tag::id(FT_FILERATING, TagValue::U8(sf.rating)));
+    }
+    if !sf.comment.is_empty() {
+        tags.push(Tag::id(
+            FT_FILECOMMENT,
+            TagValue::Str(sf.comment.clone().into_bytes()),
+        ));
+    }
     met.entries.push(mule_files::KnownFileEntry {
         date,
         file_hash: sf.hash,
         part_hashes: sf.part_hashes.clone(),
-        tags: vec![
-            Tag::id(FT_FILENAME, TagValue::Str(sf.name.clone())),
-            Tag::id(FT_FILESIZE, size_val),
-        ],
+        tags,
     });
     // Atomic: write a temp file then rename over known.met, so a crash mid-write
     // cannot leave a torn file that load_shared_library would read as empty and
@@ -323,6 +340,38 @@ fn forget_shared_file(config_dir: &Path, hash: [u8; 16]) {
     if met.entries.len() != before {
         write_known_met_atomic(&path, &met);
     }
+}
+
+/// Update the rating/comment tags on an existing `known.met` entry, so the
+/// local user's own rating survives a restart and re-serves via OP_FILEDESC.
+/// Caller must hold the known.met lock. A no-op if the file is absent. Passing
+/// rating 0 / an empty comment clears that field.
+fn update_shared_file_meta(config_dir: &Path, hash: [u8; 16], rating: u8, comment: &str) {
+    let path = config_dir.join(KNOWN_MET);
+    let Some(mut met) = std::fs::read(&path)
+        .ok()
+        .and_then(|b| mule_files::read_known_met(&b).ok())
+    else {
+        return;
+    };
+    let Some(entry) = met.entries.iter_mut().find(|e| e.file_hash == hash) else {
+        return;
+    };
+    entry.tags.retain(
+        |t| !matches!(&t.name, TagName::Id(id) if *id == FT_FILERATING || *id == FT_FILECOMMENT),
+    );
+    if rating != 0 {
+        entry
+            .tags
+            .push(Tag::id(FT_FILERATING, TagValue::U8(rating)));
+    }
+    if !comment.is_empty() {
+        entry.tags.push(Tag::id(
+            FT_FILECOMMENT,
+            TagValue::Str(comment.as_bytes().to_vec()),
+        ));
+    }
+    write_known_met_atomic(&path, &met);
 }
 
 /// Write `met` to `path` atomically (temp file + rename), so a crash mid-write
@@ -408,6 +457,8 @@ async fn finish_download(
                 name: on_disk_name.into_bytes(),
                 part_hashes,
                 path: dest.clone(),
+                rating: 0, // the user can rate it later
+                comment: String::new(),
             };
             {
                 // Serialize the known.met read-modify-write against other
@@ -441,6 +492,7 @@ async fn serve_inbound<S>(
     sharing: &Arc<AtomicBool>,
     gate: &Arc<UploadGate>,
     first: Packet,
+    peer_accept_comment: u8,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -452,7 +504,7 @@ async fn serve_inbound<S>(
         return;
     }
     let library = shared.lock().await.clone();
-    let _ = serve_shared(fs, &library, Some(first), Some(gate)).await;
+    let _ = serve_shared(fs, &library, Some(first), Some(gate), peer_accept_comment).await;
 }
 
 /// What [`Engine::add_download`] did. Not an Error type: "no sources yet" is a
@@ -725,7 +777,7 @@ impl Engine {
     /// The complete files we are currently serving to peers, as (hash, name,
     /// size). Reflects the persisted library plus anything finished this session;
     /// empty in Leech Mode is still what we HOLD, not what we serve.
-    pub async fn shared_files(&self) -> Vec<([u8; 16], String, u64)> {
+    pub async fn shared_files(&self) -> Vec<([u8; 16], String, u64, u8, String)> {
         self.shared
             .lock()
             .await
@@ -735,6 +787,8 @@ impl Engine {
                     s.hash,
                     String::from_utf8_lossy(&s.name).into_owned(),
                     s.size,
+                    s.rating,
+                    s.comment.clone(),
                 )
             })
             .collect()
@@ -913,13 +967,15 @@ impl Engine {
                 let ip_filter = ip_filter.clone();
                 tokio::spawn(async move {
                     let mut fs = FramedStream::new(stream);
-                    // A bare connect+close (the server's HighID probe) ends here.
-                    if timeout(Duration::from_secs(8), peer_handshake_inbound(&mut fs, &me))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
+                    // A bare connect+close (the server's HighID probe) ends here:
+                    // it never sends OP_HELLO, so the handshake errors and we bail.
+                    let peer_accept_comment =
+                        match timeout(Duration::from_secs(8), peer_handshake_inbound(&mut fs, &me))
+                            .await
+                        {
+                            Ok(Ok(h)) => h.capabilities().map(|c| c.accept_comment).unwrap_or(0),
+                            _ => return,
+                        };
                     // Drop a blocklisted PEER now (after the handshake, so the
                     // server's bare-connect HighID probe - which never completes a
                     // handshake and already returned above - is never filtered and
@@ -934,7 +990,15 @@ impl Engine {
                     // path below reads cleanly (see framed::read_packet).
                     match timeout(SERVE_PEEK, fs.read_packet_unpacked()).await {
                         Ok(Ok(pkt)) if is_upload_request(pkt.opcode) => {
-                            serve_inbound(&mut fs, &shared, &sharing, &gate, pkt).await;
+                            serve_inbound(
+                                &mut fs,
+                                &shared,
+                                &sharing,
+                                &gate,
+                                pkt,
+                                peer_accept_comment,
+                            )
+                            .await;
                         }
                         // Spoke, but not an upload request, or the link errored:
                         // nothing we can do with it.
@@ -1421,6 +1485,37 @@ impl Engine {
         removed
     }
 
+    /// Set the local user's own rating (0-5, 0 = none) and comment on a file we
+    /// share. Updates the live library AND `known.met`, so it survives a restart
+    /// and is served to downloaders via OP_FILEDESC (when they accept comments).
+    /// Rating is clamped to 5 and the comment to MAX_FILE_COMMENT_LEN chars, so
+    /// what we store is exactly what goes on the wire. Returns false if we do not
+    /// share that hash.
+    pub async fn set_file_rating(&mut self, hash: [u8; 16], rating: u8, comment: String) -> bool {
+        let rating = rating.min(5);
+        let comment: String = comment
+            .chars()
+            .take(crate::transfer::MAX_FILE_COMMENT_LEN)
+            .collect();
+        let updated = {
+            let mut guard = self.shared.lock().await;
+            match guard.iter_mut().find(|s| s.hash == hash) {
+                Some(sf) => {
+                    sf.rating = rating;
+                    sf.comment = comment.clone();
+                    true
+                }
+                None => false,
+            }
+        };
+        if updated {
+            let _g = self.known_met_lock.lock().await;
+            update_shared_file_meta(&self.config_dir, hash, rating, &comment);
+            self.emit(EngineEvent::Server("Updated a file rating".into()));
+        }
+        updated
+    }
+
     /// App backgrounded: checkpoint to disk and release sockets. Idempotent - a
     /// no-op unless currently `Running`. `Running` -> `Paused`.
     pub async fn pause(&mut self) {
@@ -1600,6 +1695,8 @@ mod tests {
             name: b"b.bin".to_vec(),
             part_hashes: vec![],
             path: dir.join("b.bin"),
+            rating: 0,
+            comment: String::new(),
         });
         assert_eq!(engine.hit_status([0xBB; 16]).await, HitStatus::Have);
 
@@ -1621,6 +1718,8 @@ mod tests {
             name: b"held.bin".to_vec(),
             part_hashes: vec![],
             path: PathBuf::from("/does/not/matter"),
+            rating: 0,
+            comment: String::new(),
         }]));
         let sharing = Arc::new(AtomicBool::new(false)); // Leech Mode
         let gate = Arc::new(UploadGate::new(
@@ -1634,7 +1733,7 @@ mod tests {
 
         let first = build_request_filename_ext(&hash);
         let srv = tokio::spawn(async move {
-            serve_inbound(&mut server_fs, &shared, &sharing, &gate, first).await
+            serve_inbound(&mut server_fs, &shared, &sharing, &gate, first, 0).await
         });
 
         let reply = client_fs.read_packet_unpacked().await.unwrap();
@@ -1664,6 +1763,8 @@ mod tests {
             name: b"q.bin".to_vec(),
             part_hashes: vec![],
             path: PathBuf::from("/does/not/matter"),
+            rating: 0,
+            comment: String::new(),
         }];
 
         let (client, server) = tokio::io::duplex(8192);
@@ -1672,7 +1773,7 @@ mod tests {
 
         let gate2 = Arc::clone(&gate);
         let srv = tokio::spawn(async move {
-            let _ = serve_shared(&mut server_fs, &shared, None, Some(&gate2)).await;
+            let _ = serve_shared(&mut server_fs, &shared, None, Some(&gate2), 0).await;
         });
 
         // Name the file, then ask to upload - the slot is taken, so we are queued.
@@ -1719,6 +1820,8 @@ mod tests {
             name: b"g.bin".to_vec(),
             part_hashes: vec![],
             path: PathBuf::from("/does/not/matter"),
+            rating: 0,
+            comment: String::new(),
         }];
         let gate = Arc::new(UploadGate::new(
             Arc::new(Semaphore::new(MAX_UPLOAD_SLOTS)),
@@ -1731,7 +1834,7 @@ mod tests {
 
         let gate2 = Arc::clone(&gate);
         let srv = tokio::spawn(async move {
-            let _ = serve_shared(&mut server_fs, &shared, None, Some(&gate2)).await;
+            let _ = serve_shared(&mut server_fs, &shared, None, Some(&gate2), 0).await;
         });
 
         client_fs
@@ -1776,6 +1879,8 @@ mod tests {
             name: b"f.bin".to_vec(),
             part_hashes: vec![],
             path,
+            rating: 0,
+            comment: String::new(),
         }]));
         let sharing = Arc::new(AtomicBool::new(true));
         let gate = Arc::new(UploadGate::new(
@@ -1790,7 +1895,7 @@ mod tests {
         let srv = tokio::spawn(async move {
             // The listener peeks the first packet before deciding; do the same.
             let first = server_fs.read_packet_unpacked().await.unwrap();
-            serve_inbound(&mut server_fs, &shared, &sharing, &gate, first).await;
+            serve_inbound(&mut server_fs, &shared, &sharing, &gate, first, 0).await;
         });
 
         let got = crate::transfer_session::download_file(&mut client_fs, &hash, data.len() as u64)
@@ -2131,6 +2236,8 @@ mod tests {
             name: b"kept.bin".to_vec(),
             part_hashes: vec![],
             path: downloads.join("kept.bin"),
+            rating: 0,
+            comment: String::new(),
         };
         let gone = SharedFile {
             hash: [0x22; 16],
@@ -2138,6 +2245,8 @@ mod tests {
             name: b"gone.bin".to_vec(),
             part_hashes: vec![[0xAB; 16], [0xCD; 16]],
             path: downloads.join("gone.bin"), // never written to disk
+            rating: 0,
+            comment: String::new(),
         };
         persist_shared_file(&dir, &kept);
         persist_shared_file(&dir, &gone);
@@ -2200,6 +2309,8 @@ mod tests {
             name: b"keep.bin".to_vec(),
             part_hashes: vec![],
             path: downloads.join("keep.bin"),
+            rating: 0,
+            comment: String::new(),
         };
         let drop = SharedFile {
             hash: [0xBB; 16],
@@ -2207,6 +2318,8 @@ mod tests {
             name: b"drop.bin".to_vec(),
             part_hashes: vec![],
             path: downloads.join("drop.bin"),
+            rating: 0,
+            comment: String::new(),
         };
         persist_shared_file(&dir, &keep);
         persist_shared_file(&dir, &drop);
@@ -2233,6 +2346,61 @@ mod tests {
             downloads.join("drop.bin").exists(),
             "the file itself is kept"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn set_file_rating_updates_the_library_and_survives_a_reload() {
+        let dir = tmp("set-rating");
+        let _ = std::fs::remove_dir_all(&dir);
+        let downloads = dir.join("downloads");
+        std::fs::create_dir_all(&downloads).unwrap();
+        std::fs::write(downloads.join("rate.bin"), b"hello").unwrap();
+        let sf = SharedFile {
+            hash: [0xAA; 16],
+            size: 5,
+            name: b"rate.bin".to_vec(),
+            part_hashes: vec![],
+            path: downloads.join("rate.bin"),
+            rating: 0,
+            comment: String::new(),
+        };
+        persist_shared_file(&dir, &sf);
+
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+        engine.set_offline(true);
+        engine.shared.lock().await.push(sf);
+
+        assert!(
+            engine
+                .set_file_rating([0xAA; 16], 4, "solid rip".to_string())
+                .await,
+            "known hash is rated"
+        );
+        assert!(
+            !engine
+                .set_file_rating([0xCC; 16], 5, "nope".to_string())
+                .await,
+            "an unknown hash returns false"
+        );
+        // Live library reflects it.
+        {
+            let lib = engine.shared.lock().await;
+            assert_eq!(lib[0].rating, 4);
+            assert_eq!(lib[0].comment, "solid rip");
+        }
+        // And it survived to known.met: a reload reads it back (the entry was
+        // UPDATED in place, not duplicated - persist_shared_file skips by hash).
+        let lib = load_shared_library(&dir, &downloads);
+        assert_eq!(lib.len(), 1, "still exactly one entry");
+        assert_eq!(lib[0].rating, 4);
+        assert_eq!(lib[0].comment, "solid rip");
+
+        // Clearing the rating removes the tags again.
+        assert!(engine.set_file_rating([0xAA; 16], 0, String::new()).await);
+        let lib = load_shared_library(&dir, &downloads);
+        assert_eq!(lib[0].rating, 0);
+        assert!(lib[0].comment.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
