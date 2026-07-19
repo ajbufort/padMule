@@ -118,6 +118,12 @@ pub struct DownloadInfo {
     /// Download priority: 0 = Low, 1 = Normal, 2 = High. Biases how many sources
     /// this download contacts at once.
     pub priority: u8,
+    /// True when preview mode is on (block selection biased to grow the file
+    /// contiguously from the start so it can be played incomplete).
+    pub preview: bool,
+    /// Bytes available CONTIGUOUSLY from offset 0 - how much of the file a media
+    /// player can read right now (see `preview_snapshot`).
+    pub contiguous_prefix: u64,
 }
 
 /// One complete file we are serving to peers (the shared library).
@@ -442,6 +448,8 @@ impl MuleEngine {
                     rating,
                     has_comment,
                     priority: dl.priority(),
+                    preview: dl.is_preview(),
+                    contiguous_prefix: dl.contiguous_prefix().await,
                 });
             }
             // The 1s downloads() poll is the engine's heartbeat: drain any pending
@@ -543,6 +551,40 @@ impl MuleEngine {
                 .await
                 .set_download_priority(h, priority)
                 .await
+        })
+    }
+
+    /// Turn preview mode on/off for a download - biases block selection so the
+    /// file grows contiguously from the start (playable while incomplete).
+    /// Returns false if that hash is not an active download.
+    pub fn set_preview(&self, hash: String, on: bool) -> bool {
+        let Some(h) = parse_hash16(&hash) else {
+            return false;
+        };
+        self.rt
+            .block_on(async { self.inner.lock().await.set_preview(h, on).await })
+    }
+
+    /// Copy the contiguous-from-start prefix of a download to `dest_path` (a file
+    /// the UI hands to a media player), returning the bytes written. 0 if the hash
+    /// is unknown, nothing contiguous is available yet, or the copy failed. The
+    /// engine lock is held ONLY to resolve the source path + length; the copy runs
+    /// on a blocking thread with NO lock held, so snapshotting a large prefix never
+    /// stalls the download or the 1s heartbeat.
+    pub fn preview_snapshot(&self, hash: String, dest_path: String) -> u64 {
+        let Some(h) = parse_hash16(&hash) else {
+            return 0;
+        };
+        self.rt.block_on(async {
+            let Some((src, len)) = self.inner.lock().await.preview_target(h).await else {
+                return 0;
+            };
+            let dest = std::path::PathBuf::from(dest_path);
+            tokio::task::spawn_blocking(move || {
+                mule_engine::copy_file_prefix(&src, &dest, len).unwrap_or(0)
+            })
+            .await
+            .unwrap_or(0)
         })
     }
 

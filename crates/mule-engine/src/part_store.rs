@@ -207,6 +207,12 @@ impl PartStore {
         Ok(buf)
     }
 
+    /// The backing `.part` data file's path, so a preview snapshot can open its
+    /// OWN read handle and copy without holding the download lock.
+    pub fn part_path(&self) -> &Path {
+        &self.part_path
+    }
+
     /// Verify a completed part against the hashset, re-opening it if it is bad.
     ///
     /// Returns `Some(true)` if it verified, `Some(false)` if it was corrupt (and
@@ -318,6 +324,34 @@ fn paths(dir: &Path, index: u32) -> (PathBuf, PathBuf) {
         dir.join(format!("{index:03}.part")),
         dir.join(format!("{index:03}.part.met")),
     )
+}
+
+/// Copy the first `len` bytes of the `.part` at `src` to `dest`, so the UI can
+/// hand a contiguous media prefix to a player. Opens its OWN read handle (NOT the
+/// download's), so the caller can run it WITHOUT holding the download lock - safe
+/// because `[0, len)` is completed contiguous data the block writer never rewrites
+/// (writes only fill gaps at or past `len`). Chunked (a large video is never held
+/// in memory); returns the bytes written (short if the file ends early). 0 for an
+/// empty prefix, leaving no stray file behind.
+pub fn copy_file_prefix(src: &Path, dest: &Path, len: u64) -> io::Result<u64> {
+    if len == 0 {
+        return Ok(0);
+    }
+    let mut input = File::open(src)?;
+    let mut out = File::create(dest)?;
+    let mut remaining = len;
+    let mut buf = vec![0u8; 256 * 1024];
+    while remaining > 0 {
+        let want = remaining.min(buf.len() as u64) as usize;
+        let n = input.read(&mut buf[..want])?;
+        if n == 0 {
+            break;
+        }
+        out.write_all(&buf[..n])?;
+        remaining -= n as u64;
+    }
+    out.sync_data()?;
+    Ok(len - remaining)
 }
 
 fn format_corrupted(parts: &[u64]) -> Vec<u8> {
@@ -439,6 +473,32 @@ mod tests {
         s.save_met().unwrap();
         assert_eq!(PartStore::open(&dir, 1).unwrap().priority, PR_NORMAL);
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn copy_prefix_snapshots_the_contiguous_leading_bytes() {
+        let dir = tmpdir("prefix");
+        let data: Vec<u8> = (0..5000u32).map(|i| i as u8).collect();
+        let mut s =
+            PartStore::create(&dir, 1, ed2k_hash(&data), data.len() as u64, b"m.bin").unwrap();
+        // A leading run [0, 3000) plus a DISCONNECTED island [4000, 5000).
+        s.write_block(0, &data[0..3000]).unwrap();
+        s.write_block(4000, &data[4000..5000]).unwrap();
+        assert_eq!(
+            s.pf.contiguous_prefix(),
+            3000,
+            "only the leading run counts, not the island"
+        );
+        let dest = dir.join("snapshot.bin");
+        let prefix = s.pf.contiguous_prefix();
+        let n = copy_file_prefix(s.part_path(), &dest, prefix).unwrap();
+        assert_eq!(n, 3000);
+        assert_eq!(
+            fs::read(&dest).unwrap(),
+            data[0..3000],
+            "the snapshot is exactly the leading bytes"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

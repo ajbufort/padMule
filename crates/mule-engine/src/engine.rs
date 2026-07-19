@@ -1781,6 +1781,38 @@ impl Engine {
         }
     }
 
+    /// Find an active download by hash (clones the Arc).
+    async fn find_download(&self, hash: [u8; 16]) -> Option<Arc<Download>> {
+        let guard = self.downloads.lock().await;
+        for d in guard.iter() {
+            if d.hash().await == hash {
+                return Some(Arc::clone(d));
+            }
+        }
+        None
+    }
+
+    /// Turn preview mode on/off for the download with `hash`: first+last-then-
+    /// sequential block bias, so the file grows contiguously from the start and
+    /// can be played while still incomplete. False if no active download matches.
+    pub async fn set_preview(&mut self, hash: [u8; 16], on: bool) -> bool {
+        match self.find_download(hash).await {
+            Some(d) => {
+                d.set_preview(on);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The `(part_path, contiguous_prefix)` a preview snapshot needs for `hash`, or
+    /// None if there is no such active download or nothing contiguous is available
+    /// yet. The caller copies the prefix OUTSIDE the engine lock (see the FFI), so
+    /// a large copy never stalls the 1s heartbeat or the download.
+    pub async fn preview_target(&self, hash: [u8; 16]) -> Option<(std::path::PathBuf, u64)> {
+        self.find_download(hash).await?.preview_target().await
+    }
+
     /// Set the local user's own rating (0-5, 0 = none) and comment on a file we
     /// share. Updates the live library AND `known.met`, so it survives a restart
     /// and is served to downloaders via OP_FILEDESC (when they accept comments).

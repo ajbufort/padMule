@@ -35,6 +35,10 @@ final class EngineModel: ObservableObject {
     @Published private(set) var server: ServerInfoFfi?
     @Published private(set) var results: [SearchHit] = []
 
+    // The incomplete-file preview currently open (drives the AVPlayer sheet).
+    // Settable so the sheet can clear it on dismiss.
+    @Published var preview: PreviewItem?
+
     // Session transfer stats. `totalDown`/`totalUp` are the engine's monotonic
     // byte totals; `rateHistory` is a rolling 60s window of per-second deltas the
     // stats screen charts. All derived on the main thread from the 1s poll.
@@ -202,6 +206,50 @@ final class EngineModel: ObservableObject {
         results = []
         searched = false
         notice = nil
+    }
+
+    /// AVPlayer-friendly media containers, so we only offer Preview for files it
+    /// can actually open (avi/mkv/wmv are not natively supported - skip those).
+    private static let previewableExtensions: Set<String> = [
+        "mp4", "m4v", "mov", "m4a", "mp3", "aac", "wav", "caf", "aif", "aiff",
+    ]
+
+    func isPreviewable(_ name: String) -> Bool {
+        Self.previewableExtensions.contains((name as NSString).pathExtension.lowercased())
+    }
+
+    /// Preview an incomplete download: switch it to preview block-bias (so the
+    /// file grows contiguously from the start), snapshot the contiguous prefix to
+    /// a temp file, and play it. A too-small prefix just turns preview mode on and
+    /// asks the user to try again shortly - the bias makes the head arrive first.
+    func startPreview(_ dl: DownloadInfo) {
+        guard let e = engine else { return }
+        let hash = dl.hash
+        let name = dl.name
+        let ext = (name as NSString).pathExtension
+        let dest = FileManager.default.temporaryDirectory
+            .appendingPathComponent("preview-\(hash).\(ext.isEmpty ? "mp4" : ext)")
+        work.async { [weak self] in
+            _ = e.setPreview(hash: hash, on: true)
+            let n = e.previewSnapshot(hash: hash, destPath: dest.path)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if n > 0 {
+                    self.preview = PreviewItem(url: dest, name: name, hash: hash)
+                } else {
+                    self.notice = "Not enough of \"\(name)\" yet - preview mode is on, "
+                        + "try again shortly."
+                }
+            }
+        }
+    }
+
+    /// Turn preview mode back off (reverting to rarest-first). Called when the
+    /// preview sheet is dismissed, so previewing once does not latch off
+    /// rarest-first block selection for the rest of the session.
+    func stopPreview(_ hash: String) {
+        guard let e = engine else { return }
+        work.async { _ = e.setPreview(hash: hash, on: false) }
     }
 
     /// Record a query at the front of the recents (case-insensitive de-dupe,

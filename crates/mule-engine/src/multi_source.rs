@@ -77,6 +77,10 @@ pub struct Download {
     /// atomic so the fetch manager can read it every round without touching the
     /// transfer lock; the canonical copy is persisted in the PartStore.
     priority: AtomicU8,
+    /// Preview mode: when set, block selection is forward-SEQUENTIAL instead of
+    /// rarest-first, so the file grows contiguously from offset 0 and the user can
+    /// play its leading run while it is still downloading. Transient, not persisted.
+    preview: AtomicBool,
 }
 
 struct Inner {
@@ -107,6 +111,7 @@ impl Download {
             sources: Mutex::new(Vec::new()),
             cancelled: AtomicBool::new(false),
             priority,
+            preview: AtomicBool::new(false),
         })
     }
 
@@ -202,6 +207,37 @@ impl Download {
         let _ = g.store.save_met();
     }
 
+    /// Whether preview mode is on (first+last-then-sequential block bias).
+    pub fn is_preview(&self) -> bool {
+        self.preview.load(Ordering::Relaxed)
+    }
+
+    /// Turn preview mode on/off. Read lock-free by the fetch manager every round,
+    /// so it re-biases the ongoing sweep, not just the next spawn. Not persisted -
+    /// it is a transient viewing intent.
+    pub fn set_preview(&self, on: bool) {
+        self.preview.store(on, Ordering::Relaxed);
+    }
+
+    /// Bytes available CONTIGUOUSLY from offset 0 - the leading prefix a player
+    /// can read from the raw `.part` (see `PartFile::contiguous_prefix`).
+    pub async fn contiguous_prefix(&self) -> u64 {
+        self.inner.lock().await.store.pf.contiguous_prefix()
+    }
+
+    /// The `(part_path, contiguous_prefix)` a preview snapshot needs, or None when
+    /// nothing contiguous is available yet. Holds the lock ONLY to read the path +
+    /// length; the caller then copies `[0, prefix)` from its own read handle
+    /// (outside the lock), so copying a large prefix never stalls the download.
+    pub async fn preview_target(&self) -> Option<(std::path::PathBuf, u64)> {
+        let g = self.inner.lock().await;
+        let len = g.store.pf.contiguous_prefix();
+        if len == 0 {
+            return None;
+        }
+        Some((g.store.part_path().to_path_buf(), len))
+    }
+
     /// Delete the backing `.part` and `.part.met`. Best effort: an open file
     /// handle a worker still holds keeps the bytes readable until it drops, but
     /// the files are gone from disk at once so a restart will not resume them.
@@ -276,6 +312,7 @@ impl Download {
         if self.is_cancelled() {
             return Vec::new();
         }
+        let preview = self.preview.load(Ordering::Relaxed);
         let mut g = self.inner.lock().await;
         let reserved = g.reserved.clone();
         let avail = g.availability.clone();
@@ -283,9 +320,15 @@ impl Download {
         let rarity = |p: u64| avail.get(p as usize).copied().unwrap_or(0);
         let has = |p: u64| status.has_part(p as usize);
 
-        let mut blocks = g.store.pf.next_blocks(&has, &reserved, max, &rarity, false);
+        let mut blocks = g
+            .store
+            .pf
+            .next_blocks(&has, &reserved, max, &rarity, false, preview);
         if blocks.is_empty() && missing > 0 && missing <= ENDGAME_LIMIT {
-            blocks = g.store.pf.next_blocks(&has, &reserved, max, &rarity, true);
+            blocks = g
+                .store
+                .pf
+                .next_blocks(&has, &reserved, max, &rarity, true, preview);
         }
         g.reserved.extend_from_slice(&blocks);
         blocks
