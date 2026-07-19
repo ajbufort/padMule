@@ -267,8 +267,6 @@ async fn cmd_offer_search(host: &str, port: u16, name: &str) {
         name,
         size: 1_234_567,
     };
-    // A HighID client offers its real id+port; a LowID one uses the complete-file
-    // markers (all our shares are complete).
     // All our shares are complete: use the marker id/port (faithful to aMule
     // against a compression-advertising server; no public-IP leak).
     let (cid, cport) = (FILE_COMPLETE_ID, FILE_COMPLETE_PORT);
