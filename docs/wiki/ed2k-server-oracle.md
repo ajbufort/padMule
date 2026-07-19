@@ -66,6 +66,15 @@ and `wsl --shutdown`; not needed - i686 works.)
   self-filters a client's OWN files, so `offer-search` (offer + search from the
   same 127.0.0.1) shows the file indexed but not returned; a full offer->find
   needs the searcher on a different IP than the offerer (both are loopback here).
+- DONE: #10 related-files search - `mule-cli related-search 127.0.0.1 4661
+  <hash>` logs in and sends `related::<UPPERHEX>` (a normal OP_SEARCHREQUEST).
+  PROVEN: the real eserver ADVERTISES SRV_TCPFLG_RELATEDSEARCH (0x40) - padMule
+  read `related_search: true` straight off the live server - AND accepted the
+  `related::` query without error. (No hits: an empty single-client server has
+  no co-occurrence index, and the self-filter caveat above applies - a returned
+  related hit needs the searcher on a different IP than the offerer.) So the flag
+  read + query acceptance are live-validated; a populated related result is not
+  reproducible in the single-IP isolated setup.
 - HighID would need a routable IP + callback; the isolated loopback setup gives
   LowID, which is a complete protocol exchange regardless.
 
