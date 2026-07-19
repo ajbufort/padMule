@@ -76,10 +76,11 @@ To watch the raw packet sequence - including whether eMule sends OP_SECIDENTSTAT
 target/release/mule-cli peer-probe 127.0.0.1 4663 <HASH>
 ```
 
-NOTE: today `peer-probe` (and the fetch HELLO) advertise `sec_ident=0`, so eMule
-will NOT initiate secure-ident yet. Making padMule advertise sec_ident so eMule
-DOES initiate - then responding correctly - is exactly task #32; this probe is
-how to confirm it live once that lands.
+NOTE: as of #32 (2026-07-19), the fetch path AND `peer-download` advertise
+SecureIdent v1 and run the exchange, so `scripts/emule-oracle.sh` prints
+"source identity verified (secure-ident): true/false" - the live confirmation
+against real eMule. (`peer-probe` still uses the sec_ident=0 baseline, so it is
+only a plain-handshake tracer; use the oracle script for the secure-ident check.)
 
 ## Troubleshooting
 
