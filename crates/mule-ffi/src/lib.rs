@@ -696,6 +696,54 @@ mod tests {
         assert_eq!(h.status, HitStatusFfi::New);
     }
 
+    /// The "Share uploads" / Leech-Mode setting round-trips through the facade.
+    #[test]
+    fn sharing_setting_round_trips_via_the_facade() {
+        let dir = tmp("sharing");
+        let _ = std::fs::remove_dir_all(&dir);
+        let eng = MuleEngine::new(dir.clone(), format!("{dir}-dl")).unwrap();
+        assert!(eng.is_sharing(), "sharing defaults ON");
+        eng.set_sharing(false);
+        assert!(!eng.is_sharing(), "Leech Mode: sharing OFF");
+        eng.set_sharing(true);
+        assert!(eng.is_sharing(), "back ON");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every search wire-filter setting maps to the engine query as designed:
+    /// "complete only" -> min_sources >= 1, the size bounds appear only when set,
+    /// and the global toggle passes through.
+    #[test]
+    fn search_filter_settings_map_to_the_wire() {
+        let off: EngineSearchFilters = SearchFilters {
+            complete_only: false,
+            min_size: 0,
+            max_size: 0,
+            global: false,
+        }
+        .into();
+        assert_eq!(off.min_sources, None);
+        assert_eq!(off.min_size, None);
+        assert_eq!(off.max_size, None);
+        assert!(!off.global);
+
+        let on: EngineSearchFilters = SearchFilters {
+            complete_only: true,
+            min_size: 1024,
+            max_size: 4096,
+            global: true,
+        }
+        .into();
+        assert_eq!(
+            on.min_sources,
+            Some(1),
+            "complete-only -> at least one source"
+        );
+        assert_eq!(on.min_size, Some(1024));
+        assert_eq!(on.max_size, Some(4096));
+        assert!(on.global);
+    }
+
     // Not a #[tokio::test]: the facade owns its own runtime and block_on would
     // panic inside an ambient one.
     #[test]
