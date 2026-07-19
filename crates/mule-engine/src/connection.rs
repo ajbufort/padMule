@@ -8,7 +8,7 @@ use crate::framed::{FrameError, FramedStream};
 use crate::server_messages::{
     build_login_request, parse_id_change, parse_server_list, parse_server_message,
     parse_server_status, LoginRequest, OP_IDCHANGE, OP_SERVERLIST, OP_SERVERMESSAGE,
-    OP_SERVERSTATUS,
+    OP_SERVERSTATUS, SRV_TCPFLG_RELATEDSEARCH,
 };
 use mule_proto::{decompress, Packet, MAX_PACKET_SIZE, PROT_PACKED};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -20,10 +20,12 @@ pub enum ServerState {
     Disconnected,
     Connecting,
     /// Logged in. `low_id` distinguishes a server-local LowID from a directly
-    /// reachable HighID.
+    /// reachable HighID. `related_search` is true when the server advertised
+    /// SRV_TCPFLG_RELATEDSEARCH (it answers `related::<hash>` queries).
     Connected {
         id: u32,
         low_id: bool,
+        related_search: bool,
     },
     /// Paused because the app is backgrounded (iPadOS lifecycle).
     PausedForBackground,
@@ -99,6 +101,12 @@ where
                     ServerState::Connected {
                         id: ic.new_id,
                         low_id: ic.is_low_id(),
+                        // The IDCHANGE flags word (absent on older servers) carries
+                        // the server's TCP capabilities; the RELATEDSEARCH bit says
+                        // it answers `related::<hash>` queries.
+                        related_search: ic
+                            .tcp_flags
+                            .is_some_and(|f| f & SRV_TCPFLG_RELATEDSEARCH != 0),
                     }
                 };
                 let _ = tx.send(ServerEvent::State(state.clone())).await;
@@ -192,7 +200,8 @@ mod tests {
             state,
             ServerState::Connected {
                 id: 0x0A00_0001,
-                low_id: false
+                low_id: false,
+                related_search: false,
             }
         );
 
@@ -210,9 +219,39 @@ mod tests {
                 },
                 ServerEvent::State(ServerState::Connected {
                     id: 0x0A00_0001,
-                    low_id: false
+                    low_id: false,
+                    related_search: false,
                 }),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn handshake_reads_related_search_support_from_the_flags_word() {
+        let (client, server) = tokio::io::duplex(4096);
+        let server_task = tokio::spawn(async move {
+            let mut sfs = FramedStream::new(server);
+            let _ = sfs.read_packet().await.unwrap();
+            // IDCHANGE: HighID + a flags word with the RELATEDSEARCH bit set.
+            let mut payload = 0x0A00_0001u32.to_le_bytes().to_vec();
+            payload.extend_from_slice(&SRV_TCPFLG_RELATEDSEARCH.to_le_bytes());
+            sfs.write_packet(&Packet::new(PROT_EDONKEY, OP_IDCHANGE, payload))
+                .await
+                .unwrap();
+        });
+        let mut cfs = FramedStream::new(client);
+        let (tx, _rx) = mpsc::channel(16);
+        let state = login_handshake(&mut cfs, &sample_login(), &tx)
+            .await
+            .unwrap();
+        server_task.await.unwrap();
+        assert_eq!(
+            state,
+            ServerState::Connected {
+                id: 0x0A00_0001,
+                low_id: false,
+                related_search: true,
+            }
         );
     }
 
@@ -271,7 +310,8 @@ mod tests {
             state,
             ServerState::Connected {
                 id: 100,
-                low_id: true
+                low_id: true,
+                related_search: false,
             }
         );
         // The packed message was decompressed and delivered.

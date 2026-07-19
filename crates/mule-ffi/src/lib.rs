@@ -12,8 +12,8 @@
 use std::sync::Arc;
 
 use mule_engine::{
-    AddResult, Engine, EngineEvent, EngineState, HitStatus, SearchFilters as EngineSearchFilters,
-    Trust,
+    AddResult, Engine, EngineEvent, EngineState, HitStatus, RankedFile,
+    SearchFilters as EngineSearchFilters, Trust,
 };
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -90,6 +90,9 @@ pub struct IdentityInfo {
 pub struct ServerInfoFfi {
     pub addr: String,
     pub low_id: bool,
+    /// True when this server answers related-files searches, so the UI can offer
+    /// the true `related::` query instead of a filename-keyword search.
+    pub related_search: bool,
 }
 
 /// A snapshot of one in-progress download.
@@ -250,6 +253,41 @@ impl std::fmt::Display for FfiError {
 
 impl std::error::Error for FfiError {}
 
+/// Map engine `RankedFile`s to FFI `SearchHit`s, tagging each with its
+/// have/fetching/new status. Shared by `search` and `related_search`. `g` is
+/// borrowed immutably, so call it AFTER the `&mut self` search has returned its
+/// owned Vec - the borrows never overlap.
+async fn ranked_to_hits(g: &Engine, ranked: Vec<RankedFile>) -> Vec<SearchHit> {
+    let mut out = Vec::with_capacity(ranked.len());
+    for r in ranked {
+        let status = g.hit_status(r.hash).await.into();
+        let trusted = r.is_trusted();
+        let warning = match r.trust {
+            Trust::Ok => String::new(),
+            Trust::Suspect(why) => why.to_string(),
+        };
+        out.push(SearchHit {
+            hash: hex::encode(r.hash),
+            name: r.name,
+            size: r.size,
+            sources: r.sources,
+            complete_sources: r.complete_sources,
+            file_type: r.file_type,
+            artist: r.artist,
+            album: r.album,
+            title: r.title,
+            length_secs: r.length_secs,
+            bitrate: r.bitrate,
+            codec: r.codec,
+            rating: r.rating,
+            trusted,
+            warning,
+            status,
+        });
+    }
+    out
+}
+
 /// The single object the native UI holds. Thread-safe; drive it with the
 /// lifecycle methods and poll [`MuleEngine::drain_events`].
 #[derive(uniffi::Object)]
@@ -341,6 +379,7 @@ impl MuleEngine {
                 .map(|s| ServerInfoFfi {
                     addr: s.addr,
                     low_id: s.low_id,
+                    related_search: s.related_search,
                 })
         })
     }
@@ -494,36 +533,24 @@ impl MuleEngine {
         self.rt.block_on(async {
             let mut g = self.inner.lock().await;
             let ranked = g.search(&keyword, filters.into()).await;
-            let mut out = Vec::with_capacity(ranked.len());
-            for r in ranked {
-                // hit_status (&self) is called after search (&mut self) has
-                // returned its owned Vec, so the borrows do not overlap.
-                let status = g.hit_status(r.hash).await.into();
-                let trusted = r.is_trusted();
-                let warning = match r.trust {
-                    Trust::Ok => String::new(),
-                    Trust::Suspect(why) => why.to_string(),
-                };
-                out.push(SearchHit {
-                    hash: hex::encode(r.hash),
-                    name: r.name,
-                    size: r.size,
-                    sources: r.sources,
-                    complete_sources: r.complete_sources,
-                    file_type: r.file_type,
-                    artist: r.artist,
-                    album: r.album,
-                    title: r.title,
-                    length_secs: r.length_secs,
-                    bitrate: r.bitrate,
-                    codec: r.codec,
-                    rating: r.rating,
-                    trusted,
-                    warning,
-                    status,
-                });
-            }
-            out
+            ranked_to_hits(&g, ranked).await
+        })
+    }
+
+    /// Related-files search: find the files a server's index associates with this
+    /// hash (eMule's `related::` feature). Returns empty when the hash is
+    /// malformed or the connected server does not advertise related-search
+    /// support - the UI checks `ServerInfoFfi::related_search` and falls back to a
+    /// filename keyword search in that case. Results have the same shape as
+    /// `search`, so the UI renders them through the same list.
+    pub fn related_search(&self, hash: String) -> Vec<SearchHit> {
+        let Some(h) = parse_hash16(&hash) else {
+            return Vec::new();
+        };
+        self.rt.block_on(async {
+            let mut g = self.inner.lock().await;
+            let ranked = g.related_search(h).await;
+            ranked_to_hits(&g, ranked).await
         })
     }
 

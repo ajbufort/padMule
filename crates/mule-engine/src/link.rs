@@ -63,6 +63,19 @@ impl ServerLink {
         matches!(self.state, ServerState::Connected { .. })
     }
 
+    /// True when the connected server advertised related-search support (it
+    /// answers `related::<hash>` queries). False when disconnected or on a
+    /// server that did not set the flag.
+    pub fn related_search_supported(&self) -> bool {
+        matches!(
+            self.state,
+            ServerState::Connected {
+                related_search: true,
+                ..
+            }
+        )
+    }
+
     async fn set_state(&mut self, s: ServerState) {
         self.state = s.clone();
         let _ = self.events.send(ServerEvent::State(s)).await;
@@ -273,10 +286,15 @@ mod tests {
         let connected = ServerState::Connected {
             id: 0x0A00_0001,
             low_id: false,
+            related_search: false,
         };
 
         assert_eq!(link.connect().await.unwrap(), connected);
         assert!(link.is_connected());
+        assert!(
+            !link.related_search_supported(),
+            "the mock advertises no flags"
+        );
 
         link.pause().await;
         assert_eq!(*link.state(), ServerState::PausedForBackground);

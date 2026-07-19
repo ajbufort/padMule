@@ -126,6 +126,32 @@ pub fn build_search_request(p: &SearchParams) -> Packet {
     Packet::new(PROT_EDONKEY, OP_SEARCHREQUEST, w.into_inner())
 }
 
+/// The keyword that asks a server for files "related" to `hash` - the ones its
+/// index says clients who share this file also share. It is an ORDINARY keyword
+/// search whose string is `related::<HEXHASH>`; the server special-cases the
+/// `related::` prefix (eMule `CSearchResultsWnd::SearchRelatedFiles`, a shortcut
+/// for a user typing that string into the search box). The hash is UPPERCASE hex
+/// with no separators, matching eMule's `md4str`. Only servers advertising
+/// SRV_TCPFLG_RELATEDSEARCH answer it; others treat it as a literal keyword.
+pub fn related_keyword(hash: &[u8; 16]) -> String {
+    let mut s = String::with_capacity("related::".len() + 32);
+    s.push_str("related::");
+    for b in hash {
+        // Uppercase nibble hex, as eMule md4str emits (otherfunctions.cpp:1231).
+        s.push(
+            char::from_digit((b >> 4) as u32, 16)
+                .unwrap()
+                .to_ascii_uppercase(),
+        );
+        s.push(
+            char::from_digit((b & 0x0f) as u32, 16)
+                .unwrap()
+                .to_ascii_uppercase(),
+        );
+    }
+    s
+}
+
 /// One file in a search result.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchResultFile {
@@ -268,6 +294,34 @@ mod tests {
         );
         assert_eq!(choose_search_method(false, true), Some(SearchMethod::Kad));
         assert_eq!(choose_search_method(false, false), None);
+    }
+
+    #[test]
+    fn related_keyword_is_the_related_prefix_plus_uppercase_hex() {
+        // Distinct nibbles so a swapped-nibble or lowercase bug would show.
+        let hash = [
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0xFE, 0xDC, 0xBA, 0x98, 0x76, 0x54,
+            0x32, 0x10,
+        ];
+        assert_eq!(
+            related_keyword(&hash),
+            "related::0123456789ABCDEFFEDCBA9876543210"
+        );
+        // A search built from it carries the whole string as ONE keyword leaf
+        // (no split on the colons), exactly as if typed into the search box.
+        let p = SearchParams {
+            keyword: related_keyword(&hash),
+            file_type: None,
+            min_size: None,
+            max_size: None,
+            min_sources: None,
+            extension: None,
+        };
+        let pkt = build_search_request(&p);
+        // 0x01 = string parameter, then a u16 length of 41 ("related::" + 32 hex).
+        assert_eq!(pkt.payload[0], 0x01);
+        let len = u16::from_le_bytes([pkt.payload[1], pkt.payload[2]]);
+        assert_eq!(len as usize, "related::".len() + 32);
     }
 
     #[test]
