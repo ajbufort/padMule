@@ -37,7 +37,7 @@ use crate::search::{
 };
 use crate::server_messages::{
     parse_serv_stat_res, LoginRequest, OfferedFile, DEFAULT_SERVER_FLAGS, FILE_COMPLETE_ID,
-    FILE_COMPLETE_PORT, OP_GLOBSERVSTATREQ, OP_GLOBSERVSTATRES,
+    FILE_COMPLETE_PORT, OP_GLOBSERVSTATREQ, OP_GLOBSERVSTATRES, SERV_STAT_CHALLENGE,
 };
 use crate::share::{head_hash, is_upload_request, serve_shared, SharedFile, UploadGate};
 use crate::transfer::build_file_req_ans_no_fil;
@@ -870,7 +870,9 @@ impl Engine {
         } else if self.offline {
             "Offline (network disabled)".to_string()
         } else {
-            "Offline - no server accepted a login".to_string()
+            // We do NOT auto-connect (eMule behavior), so "no server accepted a
+            // login" would be a lie - we simply have not been told to connect yet.
+            "Not connected - pick a server".to_string()
         }
     }
 
@@ -1297,7 +1299,10 @@ impl Engine {
         let Ok(sock) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0u16)).await else {
             return servers;
         };
-        let req = [PROT_EDONKEY, OP_GLOBSERVSTATREQ];
+        // The request MUST carry a 4-byte challenge (a modern server ignores a
+        // challenge-less ping); the server echoes it as the response's first u32.
+        let ch = SERV_STAT_CHALLENGE.to_le_bytes();
+        let req = [PROT_EDONKEY, OP_GLOBSERVSTATREQ, ch[0], ch[1], ch[2], ch[3]];
         for e in &servers {
             if let Some(udp) = e.addr.port().checked_add(4) {
                 let _ = sock.send_to(&req, SocketAddr::new(e.addr.ip(), udp)).await;
@@ -1315,14 +1320,17 @@ impl Engine {
                 Ok(Ok((n, src)))
                     if n >= 2 && buf[0] == PROT_EDONKEY && buf[1] == OP_GLOBSERVSTATRES =>
                 {
-                    if let Some((users, files)) = parse_serv_stat_res(&buf[2..n]) {
-                        if let Some(e) = servers.iter_mut().find(|e| {
-                            e.addr.ip() == src.ip()
-                                && e.addr.port().checked_add(4) == Some(src.port())
-                        }) {
-                            e.alive = true;
-                            e.users = Some(users);
-                            e.files = Some(files);
+                    // Verify the echoed challenge (anti-spoof) as well as the src.
+                    if let Some((challenge, users, files)) = parse_serv_stat_res(&buf[2..n]) {
+                        if challenge == SERV_STAT_CHALLENGE {
+                            if let Some(e) = servers.iter_mut().find(|e| {
+                                e.addr.ip() == src.ip()
+                                    && e.addr.port().checked_add(4) == Some(src.port())
+                            }) {
+                                e.alive = true;
+                                e.users = Some(users);
+                                e.files = Some(files);
+                            }
                         }
                     }
                 }
@@ -1333,13 +1341,14 @@ impl Engine {
         servers
     }
 
-    /// Detect a server drop/kick between requests. Cancel-safe: a socket peek
-    /// never removes framed bytes, so this is safe to call from the 1s heartbeat.
-    /// On EOF it clears the link + connection and emits `ServerDropped` (the UI
-    /// raises a prominent dialog), returning the lost server's address.
+    /// Drain buffered server packets (kick message / MOTD -> events) and detect a
+    /// drop/kick between requests. Cancel-safe (FramedStream buffers), so this is
+    /// safe to call from the 1s heartbeat. On EOF it clears the link + connection
+    /// and emits `ServerDropped` (the UI raises a prominent dialog), returning the
+    /// lost server's address.
     pub async fn poll_server_drop(&mut self) -> Option<String> {
-        let dropped = match self.server.as_ref() {
-            Some(l) => l.peek_dropped().await,
+        let dropped = match self.server.as_mut() {
+            Some(l) => l.poll_incoming().await,
             None => return None,
         };
         if !dropped {

@@ -156,13 +156,42 @@ fn main() {
     println!("kad id:   {}", id.kad_id);
     println!("config:   {config}");
 
-    screen("START + CONNECT (poll like the 1s timer)");
+    screen("START (no auto-connect - eMule behavior)");
     engine.start();
-    for tick in 1..=6 {
+    for tick in 1..=4 {
         sleep(Duration::from_secs(1));
-        println!("-- tick {tick} --");
         drain(&engine);
+        if tick == 4 {
+            render_status(&engine);
+        }
+    }
+
+    screen("SERVERS (probe server.met, then user-picks a live one)");
+    let servers = engine.server_list();
+    println!("{} server(s):", servers.len());
+    for s in servers.iter().take(8) {
+        println!(
+            "  {}  users={} files={} alive={} connected={}",
+            if s.name.is_empty() {
+                s.addr.clone()
+            } else {
+                s.name.clone()
+            },
+            s.users,
+            s.files,
+            s.alive,
+            s.connected
+        );
+    }
+    if let Some(live) = servers.iter().find(|s| s.alive) {
+        println!("-> connecting to the live server {} ...", live.addr);
+        let ok = engine.connect_to_server(live.addr.clone());
+        sleep(Duration::from_secs(1));
+        drain(&engine);
+        println!("connect_to_server={ok}");
         render_status(&engine);
+    } else {
+        println!("(no live server answered the probe)");
     }
 
     let filters = || SearchFilters {

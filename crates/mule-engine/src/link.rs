@@ -126,21 +126,42 @@ impl ServerLink {
         self.set_state(ServerState::Disconnected).await;
     }
 
-    /// True if the server has CLOSED its side of the connection (a clean kick or a
-    /// drop). Cancel-safe: `peek` never removes bytes from the socket, so calling
-    /// this between requests loses nothing and cannot corrupt framing. `Ok(0)` from
-    /// a peek is the EOF signal; a short timeout means "no data, still connected".
-    pub async fn peek_dropped(&self) -> bool {
-        let Some(fs) = self.conn.as_ref() else {
-            return false;
-        };
-        let mut buf = [0u8; 1];
-        match timeout(Duration::from_millis(5), fs.get_ref().peek(&mut buf)).await {
-            Ok(Ok(0)) => true,  // EOF: the server closed the connection
-            Ok(Ok(_)) => false, // data waiting (peeked, not consumed): still up
-            Ok(Err(_)) => true, // socket error: treat as dropped
-            Err(_) => false,    // no data within the peek window: still connected
+    /// Drain any buffered server packets (unsolicited MOTD / status / a kick
+    /// message -> the event stream) and detect a drop, without blocking. Returns
+    /// true if the server CLOSED the connection (a clean kick or a drop), having
+    /// set the state to Disconnected. Call from the 1s heartbeat.
+    ///
+    /// Cancel-safe: FramedStream buffers and tokio's read consumes nothing on a
+    /// timed-out read, so this cannot corrupt framing. Draining (rather than a bare
+    /// peek) is what catches a kick that arrives as a MESSAGE FOLLOWED BY a close -
+    /// a peek would only see the buffered message and wrongly report "still up".
+    pub async fn poll_incoming(&mut self) -> bool {
+        // Bound the burst so a chatty server cannot spin the heartbeat.
+        for _ in 0..64 {
+            if self.conn.is_none() {
+                return false;
+            }
+            let result = {
+                let fs = self.conn.as_mut().unwrap();
+                timeout(Duration::from_millis(5), fs.read_packet_unpacked()).await
+            };
+            match result {
+                Ok(Ok(pkt)) => {
+                    if let Some(ev) = crate::connection::classify_server_packet(&pkt) {
+                        let _ = self.events.send(ev).await;
+                    }
+                }
+                // EOF or a read error -> the server dropped us.
+                Ok(Err(_)) => {
+                    self.conn = None;
+                    self.set_state(ServerState::Disconnected).await;
+                    return true;
+                }
+                // No COMPLETE packet ready within the window -> still connected.
+                Err(_) => return false,
+            }
         }
+        false
     }
 
     /// Send `pkt`, then read until a `want` packet arrives or `wait` elapses.
