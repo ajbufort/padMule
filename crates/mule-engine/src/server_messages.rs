@@ -18,11 +18,19 @@ pub const OP_SERVERIDENT: u8 = 0x41;
 /// can hand us out as a source.
 pub const OP_OFFERFILES: u8 = 0x15;
 
-// File-tag ids for an offered file (opcodes.h:322,324).
+// File-tag ids for an offered file (opcodes.h:322,324,328).
 const FT_FILENAME: u8 = 0x01;
 const FT_FILESIZE: u8 = 0x02;
-/// The special client-id/port an offered COMPLETE file carries when we are LowID
-/// (aMule `KnownFile.cpp:1173-1174`); a HighID client uses its real id + port.
+/// High 32 bits of a 64-bit file size, TO A SERVER (opcodes.h FT_FILESIZE_HI).
+/// A server offer for a large file uses FT_FILESIZE (low) + FT_FILESIZE_HI (high)
+/// as TWO 32-bit tags, NOT one 64-bit FT_FILESIZE (KnownFile.cpp:1222-1223).
+const FT_FILESIZE_HI: u8 = 0x3A;
+/// The marker client-id/port an offered COMPLETE file carries (aMule
+/// `KnownFile.cpp:1173-1174`). aMule sends it for a complete file whenever the
+/// server advertises compression (`KnownFile.cpp:1172`) - i.e. every live server;
+/// padMule uses it for ALL its (complete) shares, which is faithful for that
+/// common case and keeps a HighID's public IP out of the server's search index
+/// (the server still sources us via our login id).
 pub const FILE_COMPLETE_ID: u32 = 0xFBFB_FBFB;
 pub const FILE_COMPLETE_PORT: u16 = 0xFBFB;
 
@@ -113,10 +121,10 @@ pub struct OfferedFile<'a> {
 }
 
 /// Build an OP_OFFERFILES packet announcing `files` to the server. `client_id` /
-/// `client_port` are our real ID + TCP port when HighID; pass FILE_COMPLETE_ID /
-/// FILE_COMPLETE_PORT when LowID (all our shares are complete files). Each record
-/// carries FT_FILENAME + FT_FILESIZE - enough for the server to index the keyword
-/// and know the size. Faithful to aMule `CKnownFile::CreateOfferedFilePacket`.
+/// `client_port` identify the source (padMule passes FILE_COMPLETE_ID/PORT for
+/// its complete shares). Each record carries FT_FILENAME + FT_FILESIZE (plus
+/// FT_FILESIZE_HI for a >4-GiB file - the TWO-32-bit-tag SERVER form, not a
+/// single 64-bit tag). Faithful to aMule `CKnownFile::CreateOfferedFilePacket`.
 pub fn build_offer_files(files: &[OfferedFile], client_id: u32, client_port: u16) -> Packet {
     let mut w = Writer::new();
     w.write_u32(files.len() as u32);
@@ -124,19 +132,21 @@ pub fn build_offer_files(files: &[OfferedFile], client_id: u32, client_port: u16
         w.write_bytes(&f.hash);
         w.write_u32(client_id);
         w.write_u16(client_port);
-        w.write_u32(2); // tag count: name + size
+        let large = f.size > mule_proto::OLD_MAX_FILE_SIZE;
+        w.write_u32(if large { 3 } else { 2 }); // name + size (+ size-hi if large)
         write_tag(
             &mut w,
             &Tag::id(FT_FILENAME, TagValue::Str(f.name.as_bytes().to_vec())),
         );
-        // A file past the 32-bit boundary needs the u64 size tag; else the 32-bit
-        // form (what aMule writes for a sub-4-GiB file).
-        let size_tag = if f.size > mule_proto::OLD_MAX_FILE_SIZE {
-            TagValue::U64(f.size)
-        } else {
-            TagValue::U32(f.size as u32)
-        };
-        write_tag(&mut w, &Tag::id(FT_FILESIZE, size_tag));
+        // To a SERVER, a large file is FT_FILESIZE(low 32) + FT_FILESIZE_HI(high
+        // 32) - NOT a single u64 tag (KnownFile.cpp:1222-1223).
+        write_tag(&mut w, &Tag::id(FT_FILESIZE, TagValue::U32(f.size as u32)));
+        if large {
+            write_tag(
+                &mut w,
+                &Tag::id(FT_FILESIZE_HI, TagValue::U32((f.size >> 32) as u32)),
+            );
+        }
     }
     Packet::new(PROT_EDONKEY, OP_OFFERFILES, w.into_inner())
 }
@@ -283,6 +293,39 @@ mod tests {
                 _ => None,
             });
         assert_eq!(name.as_deref(), Some("linux mint.iso"));
+    }
+
+    #[test]
+    fn offer_files_large_file_uses_split_32bit_size_tags() {
+        // A SERVER offer for a >4-GiB file carries FT_FILESIZE(low) +
+        // FT_FILESIZE_HI(high) as two 32-bit tags, not a single u64.
+        let size: u64 = 5_000_000_000; // > OLD_MAX_FILE_SIZE (~4.29 GiB)
+        let files = vec![OfferedFile {
+            hash: [0xBB; 16],
+            name: "big.iso",
+            size,
+        }];
+        let pkt = build_offer_files(&files, FILE_COMPLETE_ID, FILE_COMPLETE_PORT);
+        let parsed = crate::search::parse_search_result(&pkt.payload).unwrap();
+        assert_eq!(parsed.len(), 1);
+        let lo = parsed[0]
+            .tags
+            .iter()
+            .find_map(|t| match (&t.name, &t.value) {
+                (mule_proto::TagName::Id(FT_FILESIZE), TagValue::U32(v)) => Some(*v),
+                _ => None,
+            });
+        let hi = parsed[0]
+            .tags
+            .iter()
+            .find_map(|t| match (&t.name, &t.value) {
+                (mule_proto::TagName::Id(FT_FILESIZE_HI), TagValue::U32(v)) => Some(*v),
+                _ => None,
+            });
+        assert_eq!(lo, Some(size as u32));
+        assert_eq!(hi, Some((size >> 32) as u32));
+        // The two halves reconstruct the true u64 size.
+        assert_eq!(((hi.unwrap() as u64) << 32) | lo.unwrap() as u64, size);
     }
 
     fn sample_login() -> LoginRequest {
