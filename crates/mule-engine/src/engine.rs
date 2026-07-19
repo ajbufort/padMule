@@ -1313,8 +1313,6 @@ impl Engine {
         let me = HelloInfo::baseline(self.identity.userhash, 0, TCP_PORT, KAD_UDP_PORT, "padMule");
         let dest = self.downloads_dir.join(safe_filename(name));
         let events = self.events.clone();
-        // Our RSA identity, so a delivering source's identity can be verified.
-        let identity = Arc::new(self.identity.rsa.clone());
         let ctx = FinishCtx {
             registry: Arc::clone(&self.downloads),
             shared: Arc::clone(&self.shared),
@@ -1324,14 +1322,7 @@ impl Engine {
         };
         let dl_task = dl;
         tokio::spawn(async move {
-            download_file(
-                &dl_task,
-                &sources,
-                &me,
-                ManagerConfig::default(),
-                Some(identity),
-            )
-            .await;
+            download_file(&dl_task, &sources, &me, ManagerConfig::default()).await;
             // Cancelled while in flight: the engine already removed it and deleted
             // the .part. Do NOT finish or emit - there is nothing to save.
             if dl_task.is_cancelled() {

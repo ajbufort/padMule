@@ -11,38 +11,16 @@
 //!   - Server / peer-exchange sources use the eD2k convention: the first octet
 //!     is the LOW byte (`Ipv4Addr::new(ip, ip>>8, ip>>16, ip>>24)`).
 
-use crate::framed::FramedStream;
 use crate::multi_source::{download_from_peer_at, Download};
 use crate::peer::HelloInfo;
 use crate::peer_conn::{connect_peer, connect_peer_obf};
-use crate::secure_ident::{run_secure_ident, Identity};
 use crate::sources::FoundSource;
 use std::collections::VecDeque;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Mutex;
 use tokio::time::timeout;
-
-/// How long to give a post-transfer secure-ident exchange before giving up. A
-/// peer that does not support it (or a padMule serve peer, which does not answer
-/// secure-ident) simply times out and the source stays unverified - no harm, the
-/// file already arrived.
-const SECIDENT_TIMEOUT: Duration = Duration::from_secs(8);
-
-/// Best-effort mutual secure identification with a source we just downloaded
-/// from, on the same open connection. On success (the peer's RSA signature
-/// verifies) the source is marked verified for the per-source UI. Never fails
-/// the caller: a timeout or a non-participating peer just leaves it unverified.
-async fn verify_source<S>(fs: &mut FramedStream<S>, dl: &Download, addr: SocketAddr, id: &Identity)
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    if let Ok(Ok(true)) = timeout(SECIDENT_TIMEOUT, run_secure_ident(fs, id)).await {
-        dl.note_source_verified(addr).await;
-    }
-}
 
 /// Which discovery backend surfaced a source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,7 +168,6 @@ async fn fetch_one(
     src: &PeerSource,
     me: &HelloInfo,
     per_peer: Duration,
-    identity: Option<&Arc<Identity>>,
 ) -> Result<u64, ()> {
     let connect = async {
         match src.user_hash {
@@ -212,31 +189,18 @@ async fn fetch_one(
         low_id,
     )
     .await;
-    // Only peers that ADVERTISE secure-ident are worth (and able) to verify;
-    // this is what keeps a non-supporting source from costing us a timeout.
-    let supports_secident = peer.capabilities().is_some_and(|c| c.sec_ident != 0);
     // Multi-source manager: bail the instant this peer queues us and try another
     // source rather than burning `per_peer` in its queue. Pass the addr so a
     // rating/comment (OP_FILEDESC) the source sends is recorded against it.
-    let bytes = match timeout(
+    match timeout(
         per_peer,
         download_from_peer_at(&mut fs, dl, true, Some(src.addr)),
     )
     .await
     {
-        Ok(Ok(bytes)) => bytes,
-        _ => return Ok(0), // connected but delivered nothing (queued / dropped)
-    };
-    // The source delivered real bytes and the connection is warm: verify its
-    // identity now (bounded, best-effort) so the per-source UI can show a seal.
-    // Gated on it delivering AND advertising secure-ident, so the completion
-    // sweep is never slowed by a round-trip a source could not answer anyway.
-    if bytes > 0 && supports_secident {
-        if let Some(id) = identity {
-            verify_source(&mut fs, dl, src.addr, id).await;
-        }
+        Ok(Ok(bytes)) => Ok(bytes),
+        _ => Ok(0), // connected but delivered nothing (queued / dropped)
     }
-    Ok(bytes)
 }
 
 /// Per-source delivery history, so the manager tries proven-good sources first.
@@ -296,9 +260,7 @@ pub async fn fetch_from_sources(
             break;
         }
         out.sources_tried += 1;
-        // This sequential variant is CLI/test-only; identity verification is
-        // wired only on the parallel manager path used by the app.
-        if fetch_one(dl, src, me, per_peer, None).await.is_ok() {
+        if fetch_one(dl, src, me, per_peer).await.is_ok() {
             out.peers_connected += 1;
         }
     }
@@ -340,7 +302,6 @@ pub async fn download_file(
     sources: &[PeerSource],
     me: &HelloInfo,
     config: ManagerConfig,
-    identity: Option<Arc<Identity>>,
 ) -> FetchOutcome {
     let mut out = FetchOutcome::default();
     let parallel = config.parallel.max(1);
@@ -365,7 +326,6 @@ pub async fn download_file(
             let queue = Arc::clone(&queue);
             let scoreboard = Arc::clone(&scoreboard);
             let per = config.per_peer;
-            let identity = identity.clone();
             handles.push(tokio::spawn(async move {
                 // (sources_tried, peers_connected) for this worker.
                 let mut tried = 0usize;
@@ -378,7 +338,7 @@ pub async fn download_file(
                         break;
                     };
                     tried += 1;
-                    match fetch_one(&dl, &src, &me, per, identity.as_ref()).await {
+                    match fetch_one(&dl, &src, &me, per).await {
                         Ok(bytes) => {
                             connected += 1;
                             scoreboard.lock().await.record(src.addr, bytes);
@@ -406,77 +366,6 @@ mod tests {
     use super::*;
     use mule_kad::Source;
     use mule_proto::Kad128;
-
-    #[tokio::test]
-    async fn verify_source_marks_a_secure_ident_peer_verified() {
-        // verify_source runs mutual secure-ident with the peer on the (warm)
-        // connection; if the peer's RSA signature checks out, the source is
-        // flagged verified for the per-source UI.
-        use crate::part_store::PartStore;
-        use crate::secure_ident::Identity;
-
-        let dir = std::env::temp_dir().join(format!("padmule-vfy-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let store = PartStore::create(&dir, 1, [0x33; 16], 1000, b"v.bin").unwrap();
-        let dl = Download::new(store);
-        let addr: SocketAddr = "7.7.7.7:4662".parse().unwrap();
-        dl.note_source("aMule 3.0.1".into(), addr, true, false)
-            .await;
-
-        let (client, server) = tokio::io::duplex(8192);
-        let mut client_fs = FramedStream::new(client);
-        let mut server_fs = FramedStream::new(server);
-
-        // The peer runs the counterpart exchange (mutual).
-        let peer = tokio::spawn(async move {
-            let peer_id = Identity::generate();
-            run_secure_ident(&mut server_fs, &peer_id).await.unwrap()
-        });
-
-        let our_id = Identity::generate();
-        verify_source(&mut client_fs, &dl, addr, &our_id).await;
-
-        assert!(peer.await.unwrap(), "the peer verified us too (mutual)");
-        let srcs = dl.sources().await;
-        assert!(
-            srcs.iter().find(|s| s.addr == addr).unwrap().verified,
-            "a secure-ident peer is marked verified"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn verify_source_leaves_a_silent_peer_unverified() {
-        // A peer that does not answer secure-ident (times out) stays unverified,
-        // and verify_source never fails the caller.
-        use crate::part_store::PartStore;
-        use crate::secure_ident::Identity;
-
-        let dir = std::env::temp_dir().join(format!("padmule-vfy-none-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let store = PartStore::create(&dir, 1, [0x44; 16], 1000, b"n.bin").unwrap();
-        let dl = Download::new(store);
-        let addr: SocketAddr = "8.8.8.8:4662".parse().unwrap();
-        dl.note_source("eDonkey".into(), addr, false, false).await;
-
-        // A duplex whose far end we just hold open and never answer on.
-        let (client, _server) = tokio::io::duplex(8192);
-        let mut client_fs = FramedStream::new(client);
-        let our_id = Identity::generate();
-        // Use a short local timeout rather than the 8s default so the test is fast.
-        let quick = tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            run_secure_ident(&mut client_fs, &our_id),
-        )
-        .await;
-        assert!(quick.is_err(), "a silent peer times out");
-        // verify_source would leave it unverified in exactly this case.
-        let srcs = dl.sources().await;
-        assert!(!srcs.iter().find(|s| s.addr == addr).unwrap().verified);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 
     #[test]
     fn kad_highid_source_uses_the_big_endian_ip_view() {
