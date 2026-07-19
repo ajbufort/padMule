@@ -565,6 +565,9 @@ async fn global_udp_search(
     budget: Duration,
 ) -> Vec<SearchResultFile> {
     const MAX_GLOBAL_SERVERS: usize = 40;
+    // Cap collected hits so a flooding/malicious server cannot grow this
+    // unbounded during the window (eMule caps a search at MAX_RESULTS too).
+    const MAX_GLOBAL_HITS: usize = 300;
     let Some(met) = std::fs::read(config_dir.join("server.met"))
         .ok()
         .and_then(|b| read_server_met(&b).ok())
@@ -598,6 +601,9 @@ async fn global_udp_search(
                 let files = parse_global_search_res(&buf[2..n]).unwrap_or_default();
                 let mut h = rhits.lock().await;
                 for f in files {
+                    if h.len() >= MAX_GLOBAL_HITS {
+                        break;
+                    }
                     if !h.iter().any(|x| x.hash == f.hash) {
                         h.push(f);
                     }
@@ -2580,6 +2586,23 @@ mod tests {
         let lib = load_shared_library(&dir, &downloads);
         assert_eq!(lib[0].rating, 0);
         assert!(lib[0].comment.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn global_udp_search_with_no_server_met_returns_empty() {
+        // No server.met in the config dir -> the global fan-out is a graceful
+        // no-op (empty, no hang, no panic), so a global search on a fresh install
+        // just contributes nothing.
+        let dir = tmp("global-no-met");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let params = SearchParams {
+            keyword: "x".into(),
+            ..Default::default()
+        };
+        let out = global_udp_search(&dir, &params, None, Duration::from_millis(200)).await;
+        assert!(out.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
