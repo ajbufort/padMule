@@ -112,7 +112,7 @@ async fn download_manager_completes_from_multiple_parallel_peers() {
         per_peer: Duration::from_secs(20),
         rounds: 4,
     };
-    let outcome = download_file(&dl, &sources, &me, cfg).await;
+    let outcome = download_file(&dl, &sources, &me, cfg, None).await;
 
     assert!(outcome.completed, "the manager must complete the file");
     assert_eq!(outcome.bytes_present, data.len() as u64);

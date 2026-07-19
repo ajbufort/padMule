@@ -54,6 +54,7 @@ pub const SIGNATURE_LEN: usize = 48;
 
 /// Our RSA identity: the private key plus its cached public-key DER (the bytes
 /// we put on the wire).
+#[derive(Clone)]
 pub struct Identity {
     key: RsaPrivateKey,
     pub_der: Vec<u8>,
