@@ -11,7 +11,7 @@
 //!   - Server / peer-exchange sources use the eD2k convention: the first octet
 //!     is the LOW byte (`Ipv4Addr::new(ip, ip>>8, ip>>16, ip>>24)`).
 
-use crate::multi_source::{download_from_peer, Download};
+use crate::multi_source::{download_from_peer_at, Download};
 use crate::peer::HelloInfo;
 use crate::peer_conn::{connect_peer, connect_peer_obf};
 use crate::sources::FoundSource;
@@ -190,8 +190,14 @@ async fn fetch_one(
     )
     .await;
     // Multi-source manager: bail the instant this peer queues us and try another
-    // source rather than burning `per_peer` in its queue.
-    match timeout(per_peer, download_from_peer(&mut fs, dl, true)).await {
+    // source rather than burning `per_peer` in its queue. Pass the addr so a
+    // rating/comment (OP_FILEDESC) the source sends is recorded against it.
+    match timeout(
+        per_peer,
+        download_from_peer_at(&mut fs, dl, true, Some(src.addr)),
+    )
+    .await
+    {
         Ok(Ok(bytes)) => Ok(bytes),
         _ => Ok(0), // connected but delivered nothing (queued / dropped)
     }

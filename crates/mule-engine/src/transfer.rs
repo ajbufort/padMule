@@ -22,6 +22,39 @@ pub const OP_OUTOFPARTREQS: u8 = 0x57; // E3
 pub const OP_REQUESTFILENAME: u8 = 0x58; // E3
 pub const OP_REQFILENAMEANSWER: u8 = 0x59; // E3
 pub const OP_QUEUERANKING: u8 = 0x60; // C5 (eMule ext)
+pub const OP_FILEDESC: u8 = 0x61; // C5 (eMule ext) - a source's rating + comment
+
+/// eMule MAXFILECOMMENTLEN (Constants.h:54): comments are capped at 50 chars.
+pub const MAX_FILE_COMMENT_LEN: usize = 50;
+
+/// Build OP_FILEDESC: `<rating u8><comment u32-len string>` (SendCommentInfo,
+/// UploadClient.cpp:613-616). Comment truncated to MAX_FILE_COMMENT_LEN chars.
+pub fn build_file_desc(rating: u8, comment: &str) -> Packet {
+    let text: String = comment.chars().take(MAX_FILE_COMMENT_LEN).collect();
+    let mut w = Writer::new();
+    w.write_u8(rating.min(5));
+    let bytes = text.as_bytes();
+    w.write_u32(bytes.len() as u32);
+    w.write_bytes(bytes);
+    Packet::new(PROT_EMULE, OP_FILEDESC, w.into_inner())
+}
+
+/// Parse OP_FILEDESC: `<rating u8><comment u32-len string>`. Faithful to
+/// eMule ProcessMuleCommentPacket (BaseClient.cpp:1185-1197): a rating > 5 is
+/// treated as 0 (unrated), and the comment is truncated to
+/// MAX_FILE_COMMENT_LEN chars (lossy UTF-8, safe against a lying length).
+pub fn parse_file_desc(payload: &[u8]) -> Result<(u8, String), IoError> {
+    let mut r = Reader::new(payload);
+    let rating = r.read_u8()?;
+    let rating = if rating > 5 { 0 } else { rating };
+    let len = r.read_u32()? as usize;
+    let bytes = r.read_bytes(len)?;
+    let comment: String = String::from_utf8_lossy(&bytes)
+        .chars()
+        .take(MAX_FILE_COMMENT_LEN)
+        .collect();
+    Ok((rating, comment))
+}
 pub const OP_COMPRESSEDPART: u8 = 0x40; // C5
 pub const OP_COMPRESSEDPART_I64: u8 = 0xA1; // C5
 pub const OP_SENDINGPART_I64: u8 = 0xA2; // C5
@@ -564,6 +597,25 @@ impl BlockReceiver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_desc_round_trips_and_clamps() {
+        // Normal.
+        let (r, c) = parse_file_desc(&build_file_desc(4, "solid rip").payload).unwrap();
+        assert_eq!((r, c.as_str()), (4, "solid rip"));
+        // A rating > 5 is clamped to 5 on build; a hostile raw > 5 reads as 0.
+        let (r, _) = parse_file_desc(&build_file_desc(9, "x").payload).unwrap();
+        assert_eq!(r, 5);
+        let hostile = Packet::new(PROT_EMULE, OP_FILEDESC, vec![0x2A, 0x00, 0x00, 0x00, 0x00]);
+        assert_eq!(
+            parse_file_desc(&hostile.payload).unwrap(),
+            (0, String::new())
+        );
+        // Comment truncated to 50 chars.
+        let long = "a".repeat(100);
+        let (_, c) = parse_file_desc(&build_file_desc(3, &long).payload).unwrap();
+        assert_eq!(c.chars().count(), MAX_FILE_COMMENT_LEN);
+    }
 
     const H: [u8; 16] = [
         0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
