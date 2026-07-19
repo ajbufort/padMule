@@ -1,11 +1,12 @@
 # eMule 0.70b Feature Backlog (mined for padMule)
 
-Updated: 2026-07-18 (slices 1-2 landed)
+Updated: 2026-07-19 (slices 1-3 landed)
 
-**First slice DONE (2026-07-18):** #1 IP filter, #2 search history, #3 wire-side
-search filters (availability + size). See the code-fix-round-adjacent commits +
-[[build-progress]]. #4 verified-identity badge is deferred - it needs a
-per-source detail sheet (#21) to render on, which does not exist yet.
+**DONE so far:** #1 IP filter, #2 search history, #3 wire-side search filters,
+#5 categories, #6 ratings/comments (server rating + OP_FILEDESC comment), #21
+per-source detail sheet, #8 (partial: per-file unshare). #4 verified badge is
+PARTIAL (the encryption lock ships; the identity checkmark is wired but needs
+secure-ident run inline in the fetch path). See [[build-progress]].
 
 A ranked proposal of features padMule could adopt from eMule 0.70b, from a
 4-surveyor + synthesis dive over `refs/emule-0.70b`. Scope: GUI/feature-level
@@ -28,19 +29,22 @@ parsing, Kad anti-abuse hardening, and the "Automatic" search method). Ranked by
    min_sources -> FT_SOURCES `> N-1` (universal op); size min/max on the wire
    (max > 4 GiB omitted, enforced client-side). FFI SearchFilters +
    "Complete sources only" toggle + size preset menus. Type stays client-side.
-4. **Verified-identity badge + obfuscation glyph** (small, no wire). padMule
-   already runs secure-ident (`credits`/`identity.rs`) but shows no badge; a
-   verified checkmark + a lock glyph are pure presentation of held state.
-5. **Download categories + transfer filter chips** (medium, no wire). Named
-   color buckets + a state/type chip row over the flat transfer list. On-disk
-   only (category index in part.met, never exchanged). Foundational for #24/#25.
-6. **Ratings/comments READ + display** - PARTIAL (2026-07-18). The SERVER rating
-   channel is done: catalog parses FT_FILERATING 0xF7 (masked, `(v&0xF)/3`
-   aMule-style), badges search rows, and flags rating-1 as Fake. STILL TODO: the
-   richer channel - a source's COMMENT + per-source rating rides OP_FILEDESC
-   (0x61) post-connect (needs AcceptCommentVer=1 in the hello + an inbound
-   handler), badging DOWNLOAD rows; and Kad notes (#22). See the research +
-   [[decisions-and-lessons]]. (Authoring = #20.)
+4. **Verified-identity badge + obfuscation glyph** - PARTIAL (2026-07-19). The
+   encryption LOCK ships (per-source `obfuscated`, real today). The identity
+   CHECKMARK is wired to `note_source_verified` and rendered in the per-source
+   sheet, but stays off until secure-ident runs INLINE in the fetch path -
+   a delicate, differential-tested hot-path change deferred to its own pass.
+5. **Download categories + transfer filter chips** - DONE (2026-07-18). Color
+   buckets + a filter-chip row + a per-download context menu. CLIENT-SIDE
+   (definitions + hash->category in UserDefaults, NOT part.met - zero wire risk;
+   a deliberate simplification since padMule does not sync part files).
+6. **Ratings/comments READ + display** - DONE (2026-07-19). BOTH channels:
+   (a) the SERVER rating (FT_FILERATING 0xF7, masked `(v&0xF)/3`, aMule-averaged)
+   badges search rows + flags rating-1 Fake; (b) a source's COMMENT + per-source
+   rating (OP_FILEDESC 0x61, post-connect - padMule already advertised
+   AcceptCommentVer=1) is recorded per source, averaged onto the download row,
+   and shown in the per-source sheet (#21). Still TODO: Kad notes (#22) +
+   authoring your own (#20).
 7. **Per-download priority (Low/Normal/High) + Auto** (small, no wire).
    Auto self-tunes by source count; local (FT_DLPRIORITY in part.met).
 8. **Transfer-list management** - PARTIAL (2026-07-18). Per-file UNSHARE done
@@ -72,7 +76,7 @@ parsing, Kad anti-abuse hardening, and the "Automatic" search method). Ranked by
 | 18 | Server manager (priority, pin, prune, auto-update from URL) | med | low |
 | 19 | Live server status ping (OP_GLOBSERVSTATREQ) | med | medium |
 | 20 | Author your own rating/comment + serve it back | med | medium |
-| 21 | Per-peer / per-source detail sheet | small | none |
+| 21 | Per-peer / per-source detail sheet - DONE 2026-07-19 (SourcesView) | small | none |
 | 22 | Kad notes search (ratings by hash, no connected source needed) | large | high |
 | 23 | Friend list + grant friend-slot + browse shares | med | low |
 | 24 | One-at-a-time download manager | small | none |
