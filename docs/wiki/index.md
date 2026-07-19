@@ -21,6 +21,7 @@ the Ingest / Query / Lint workflows.
 ## Reference
 - [[ref-ecosystem]] - eMule AI fork, eMule-Board dev forums, official aMule docs site.
 - [[ref-source-trees]] - the reference source oracles under refs/ (eMule 0.50a/0.70b, aMule master); protocol authority + findings.
+- [[emule-peer-oracle]] - a SECOND live peer oracle: real eMule on the Windows host (mirrored-mode 127.0.0.1:4663), driven by scripts/emule-oracle.sh; complements the headless amuled differential test and is the faithful other-side for secure-ident (#32). Manual (Anthony launches eMule).
 
 ## Process
 - [[decisions-and-lessons]] - locked decisions, rejected approaches, gotchas.
