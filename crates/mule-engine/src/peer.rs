@@ -275,6 +275,7 @@ impl ParsedHello {
             sec_ident: ((m1 >> 16) & 0xF) as u8,
             source_exchange: ((m1 >> 12) & 0xF) as u8,
             ext_requests: ((m1 >> 8) & 0xF) as u8,
+            accept_comment: ((m1 >> 4) & 0xF) as u8,
             large_files: (m2 >> 4) & 1 == 1,
             ext_multipacket: (m2 >> 5) & 1 == 1,
             supports_crypt: (m2 >> 7) & 1 == 1,
@@ -324,6 +325,9 @@ pub struct Capabilities {
     pub sec_ident: u8,
     pub source_exchange: u8,
     pub ext_requests: u8,
+    /// Comment/rating version the peer accepts (MISCOPTIONS1 bits 4-7); >= 1 means
+    /// we may push it an OP_FILEDESC with our rating/comment for a served file.
+    pub accept_comment: u8,
     pub large_files: bool,
     pub ext_multipacket: bool,
     pub supports_crypt: bool,

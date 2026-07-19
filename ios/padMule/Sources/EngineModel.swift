@@ -280,6 +280,17 @@ final class EngineModel: ObservableObject {
         }
     }
 
+    /// Set the local user's own rating (0-5, 0 = none) and comment on a shared
+    /// file. Persisted and served to downloaders via OP_FILEDESC. refresh() pulls
+    /// the updated library right after.
+    func setFileRating(_ hash: String, rating: UInt8, comment: String) {
+        guard let e = engine else { return }
+        work.async { [weak self] in
+            _ = e.setFileRating(hash: hash, rating: rating, comment: comment)
+            DispatchQueue.main.async { self?.refresh() }
+        }
+    }
+
     /// App backgrounded: checkpoint + release sockets. iPadOS would reclaim them
     /// anyway - doing it explicitly is what makes resume honest.
     func pause() { run { $0.pause() } }

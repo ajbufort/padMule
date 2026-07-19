@@ -45,6 +45,7 @@ struct ContentView: View {
     @State private var showAddCategory = false
     @State private var newCategoryName = ""
     @State private var sourcesFor: DownloadInfo?
+    @State private var ratingFor: SharedFileInfo?
 
     var body: some View {
         NavigationStack {
@@ -99,6 +100,11 @@ struct ContentView: View {
             }
             .sheet(item: $sourcesFor) { dl in
                 SourcesView(download: dl).environmentObject(model)
+            }
+            .sheet(item: $ratingFor) { f in
+                RatingEditorView(hash: f.hash, name: f.name, rating: f.rating, comment: f.comment) { rating, comment in
+                    model.setFileRating(f.hash, rating: rating, comment: comment)
+                }
             }
         }
     }
@@ -367,15 +373,36 @@ struct ContentView: View {
                         .foregroundStyle(.secondary)
                 } else {
                     ForEach(model.sharedFiles, id: \.hash) { f in
-                        HStack {
-                            Image(systemName: "doc")
-                                .foregroundStyle(.secondary)
-                            Text(f.name.isEmpty ? String(f.hash.prefix(16)) : f.name)
-                                .lineLimit(1)
-                            Spacer()
-                            Text(bytes(f.size))
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                        VStack(alignment: .leading, spacing: 3) {
+                            HStack {
+                                Image(systemName: "doc")
+                                    .foregroundStyle(.secondary)
+                                Text(f.name.isEmpty ? String(f.hash.prefix(16)) : f.name)
+                                    .lineLimit(1)
+                                if f.rating > 0 { sharedRatingPill(f.rating) }
+                                Spacer()
+                                Text(bytes(f.size))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            if !f.comment.isEmpty {
+                                Text("\u{201C}\(f.comment)\u{201D}")
+                                    .font(.caption)
+                                    .italic()
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(2)
+                            }
+                        }
+                        .contentShape(Rectangle())
+                        .onTapGesture { ratingFor = f }
+                        .swipeActions(edge: .leading) {
+                            // Rate / comment this file; served to downloaders.
+                            Button {
+                                ratingFor = f
+                            } label: {
+                                Label("Rate", systemImage: "star")
+                            }
+                            .tint(.blue)
                         }
                         .swipeActions(edge: .trailing) {
                             // Stop serving this file; the file stays in your Files.
@@ -565,6 +592,24 @@ struct ContentView: View {
 
     private func bytes(_ n: UInt64) -> String {
         ByteCountFormatter.string(fromByteCount: Int64(n), countStyle: .file)
+    }
+
+    /// The eMule rating scale (1 Fake .. 5 Excellent) as a small colored pill.
+    private func sharedRatingPill(_ rating: UInt8) -> some View {
+        let (label, color): (String, Color) = {
+            switch rating {
+            case 1: return ("Fake", .red)
+            case 2: return ("Poor", .orange)
+            case 3: return ("Fair", .yellow)
+            case 4: return ("Good", .green)
+            default: return ("Excellent", .green)
+            }
+        }()
+        return Text(label)
+            .font(.caption2)
+            .padding(.horizontal, 5).padding(.vertical, 1)
+            .background(color.opacity(0.2)).foregroundStyle(color)
+            .clipShape(Capsule())
     }
 
     private func row(_ k: String, _ v: String) -> some View {

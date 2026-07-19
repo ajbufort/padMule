@@ -56,7 +56,7 @@ impl Drop for WaitTicket<'_> {
 
 use crate::framed::{FrameError, FramedStream};
 use crate::transfer::{
-    build_accept_upload, build_file_req_ans_no_fil, build_file_status_complete,
+    build_accept_upload, build_file_desc, build_file_req_ans_no_fil, build_file_status_complete,
     build_hashset_answer, build_queue_ranking, build_req_filename_answer, build_sending_part,
     parse_request_parts, OP_HASHSETREQUEST, OP_REQUESTFILENAME, OP_REQUESTPARTS,
     OP_REQUESTPARTS_I64, OP_SETREQFILEID, OP_STARTUPLOADREQ,
@@ -111,6 +111,10 @@ pub struct SharedFile {
     pub part_hashes: Vec<[u8; 16]>,
     /// The finished file on disk, read block-by-block on demand.
     pub path: PathBuf,
+    /// Our rating for this file (0 = none, 1 = Fake .. 5 = Excellent) and comment,
+    /// pushed to a leecher (OP_FILEDESC) that accepts comments.
+    pub rating: u8,
+    pub comment: String,
 }
 
 /// True if `op` is a packet a peer sends when it wants to download FROM us. The
@@ -154,6 +158,7 @@ pub async fn serve_shared<S>(
     library: &[SharedFile],
     first: Option<Packet>,
     gate: Option<&UploadGate>,
+    peer_accept_comment: u8,
 ) -> Result<(), FrameError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -187,7 +192,14 @@ where
                 match &file {
                     Some(f) => {
                         fs.write_packet(&build_req_filename_answer(&f.hash, &f.name))
-                            .await?
+                            .await?;
+                        // Push our rating/comment right after the name, exactly as
+                        // eMule does (SendCommentInfo) - but only if we have one and
+                        // the peer advertised it accepts comments.
+                        if peer_accept_comment >= 1 && (f.rating != 0 || !f.comment.is_empty()) {
+                            fs.write_packet(&build_file_desc(f.rating, &f.comment))
+                                .await?;
+                        }
                     }
                     None => {
                         if let Some(h) = head_hash(&pkt.payload) {
@@ -351,6 +363,8 @@ mod tests {
             name: b"movie.bin".to_vec(),
             part_hashes: vec![],
             path,
+            rating: 0,
+            comment: String::new(),
         }];
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -358,7 +372,7 @@ mod tests {
         let up = tokio::spawn(async move {
             let me = HelloInfo::baseline([0xBB; 16], 0, 4662, 4672, "seed");
             if let Ok((_p, mut fs)) = accept_peer(&listener, &me).await {
-                let _ = serve_shared(&mut fs, &shared, None, None).await;
+                let _ = serve_shared(&mut fs, &shared, None, None, 0).await;
             }
         });
 
@@ -377,6 +391,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn we_serve_our_rating_and_comment_when_the_peer_accepts() {
+        use crate::transfer::{
+            build_request_filename_ext, parse_file_desc, OP_FILEDESC, OP_REQFILENAMEANSWER,
+        };
+        let hash = [0x77; 16];
+        let shared = vec![SharedFile {
+            hash,
+            size: 100,
+            name: b"rated.bin".to_vec(),
+            part_hashes: vec![],
+            path: PathBuf::from("/does/not/matter"),
+            rating: 4,
+            comment: "great little file".to_string(),
+        }];
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let up = tokio::spawn(async move {
+            let me = HelloInfo::baseline([0xBB; 16], 0, 4662, 4672, "seed");
+            if let Ok((_p, mut fs)) = accept_peer(&listener, &me).await {
+                // The peer advertised AcceptCommentVer=1.
+                let _ = serve_shared(&mut fs, &shared, None, None, 1).await;
+            }
+        });
+
+        let me = HelloInfo::baseline([0xAA; 16], 0x0A00_0001, 4663, 4673, "dl");
+        let (_p, mut fs) = connect_peer(addr, &me).await.unwrap();
+        fs.write_packet(&build_request_filename_ext(&hash))
+            .await
+            .unwrap();
+        // First the filename answer, then - because we have a rating/comment and
+        // the peer accepts comments - OP_FILEDESC right behind it (SendCommentInfo).
+        let ans = fs.read_packet().await.unwrap();
+        assert_eq!(ans.opcode, OP_REQFILENAMEANSWER);
+        let desc = fs.read_packet().await.unwrap();
+        assert_eq!(desc.opcode, OP_FILEDESC);
+        let (rating, comment) = parse_file_desc(&desc.payload).unwrap();
+        assert_eq!(rating, 4);
+        assert_eq!(comment, "great little file");
+
+        drop(fs);
+        up.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn we_withhold_the_comment_when_the_peer_does_not_accept() {
+        use crate::transfer::{build_request_filename_ext, OP_REQFILENAMEANSWER};
+        let hash = [0x78; 16];
+        let shared = vec![SharedFile {
+            hash,
+            size: 100,
+            name: b"rated.bin".to_vec(),
+            part_hashes: vec![],
+            path: PathBuf::from("/does/not/matter"),
+            rating: 4,
+            comment: "hidden".to_string(),
+        }];
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let up = tokio::spawn(async move {
+            let me = HelloInfo::baseline([0xBB; 16], 0, 4662, 4672, "seed");
+            if let Ok((_p, mut fs)) = accept_peer(&listener, &me).await {
+                // The peer did NOT advertise AcceptCommentVer.
+                let _ = serve_shared(&mut fs, &shared, None, None, 0).await;
+            }
+        });
+
+        let me = HelloInfo::baseline([0xAA; 16], 0x0A00_0001, 4663, 4673, "dl");
+        let (_p, mut fs) = connect_peer(addr, &me).await.unwrap();
+        fs.write_packet(&build_request_filename_ext(&hash))
+            .await
+            .unwrap();
+        let ans = fs.read_packet().await.unwrap();
+        assert_eq!(ans.opcode, OP_REQFILENAMEANSWER);
+        // No OP_FILEDESC follows: the server is now idle-waiting for the next
+        // request, so a short read on our side elapses instead of returning a desc.
+        let next =
+            tokio::time::timeout(std::time::Duration::from_millis(300), fs.read_packet()).await;
+        assert!(
+            next.is_err(),
+            "must not send OP_FILEDESC when the peer does not accept comments"
+        );
+
+        drop(fs);
+        up.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn a_hash_we_do_not_hold_is_refused_not_hung() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -384,7 +487,7 @@ mod tests {
         let up = tokio::spawn(async move {
             let me = HelloInfo::baseline([0xBB; 16], 0, 4662, 4672, "seed");
             if let Ok((_p, mut fs)) = accept_peer(&listener, &me).await {
-                let _ = serve_shared(&mut fs, &[], None, None).await;
+                let _ = serve_shared(&mut fs, &[], None, None, 0).await;
             }
         });
 
@@ -421,6 +524,8 @@ mod tests {
             name: b"big.bin".to_vec(),
             part_hashes: ph.clone(),
             path,
+            rating: 0,
+            comment: String::new(),
         }];
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -428,7 +533,7 @@ mod tests {
         let up = tokio::spawn(async move {
             let me = HelloInfo::baseline([0xBB; 16], 0, 4662, 4672, "seed");
             if let Ok((_p, mut fs)) = accept_peer(&listener, &me).await {
-                let _ = serve_shared(&mut fs, &shared, None, None).await;
+                let _ = serve_shared(&mut fs, &shared, None, None, 0).await;
             }
         });
 
