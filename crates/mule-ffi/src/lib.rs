@@ -100,6 +100,10 @@ pub struct DownloadInfo {
     pub size: u64,
     pub have: u64,
     pub complete: bool,
+    /// Average rating across rated sources (0 = none; 1 = Fake .. 5 = Excellent).
+    pub rating: u8,
+    /// True if any source left a comment (view them in the per-source sheet).
+    pub has_comment: bool,
 }
 
 /// One complete file we are serving to peers (the shared library).
@@ -358,12 +362,15 @@ impl MuleEngine {
             for dl in g.downloads().await {
                 let size = dl.size().await;
                 let have = size - dl.missing().await;
+                let (rating, has_comment) = dl.rating_summary().await;
                 out.push(DownloadInfo {
                     hash: hex::encode(dl.hash().await),
                     name: dl.name().await,
                     size,
                     have,
                     complete: dl.is_complete().await,
+                    rating,
+                    has_comment,
                 });
             }
             out

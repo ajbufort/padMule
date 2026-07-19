@@ -27,12 +27,12 @@ use crate::part_file::data_part_count;
 use crate::part_store::PartStore;
 use crate::transfer::{
     build_hashset_request, build_request_filename_ext, build_request_parts, build_set_req_file_id,
-    build_start_upload_req, parse_file_status, parse_hashset_answer, BlockReceiver, FileStatus,
-    OP_ACCEPTUPLOADREQ, OP_FILEREQANSNOFIL, OP_FILESTATUS, OP_HASHSETANSWER, OP_QUEUERANKING,
-    STANDARD_BLOCKS_REQUEST,
+    build_start_upload_req, parse_file_desc, parse_file_status, parse_hashset_answer,
+    BlockReceiver, FileStatus, OP_ACCEPTUPLOADREQ, OP_FILEDESC, OP_FILEREQANSNOFIL, OP_FILESTATUS,
+    OP_HASHSETANSWER, OP_QUEUERANKING, STANDARD_BLOCKS_REQUEST,
 };
 use crate::transfer_session::TransferError;
-use mule_proto::PARTSIZE;
+use mule_proto::{Packet, PARTSIZE};
 
 /// What we learned about one source we connected to, for the per-source UI.
 #[derive(Debug, Clone)]
@@ -142,6 +142,19 @@ impl Download {
     /// Snapshot of every source we have connected to (for the per-source UI).
     pub async fn sources(&self) -> Vec<SourceInfo> {
         self.sources.lock().await.clone()
+    }
+
+    /// A download-row summary of what sources said: the average rating over rated
+    /// sources (0 = none rated), and whether any source left a comment.
+    pub async fn rating_summary(&self) -> (u8, bool) {
+        let g = self.sources.lock().await;
+        let (sum, count) = g
+            .iter()
+            .filter(|s| s.rating > 0)
+            .fold((0u32, 0u32), |acc, s| (acc.0 + s.rating as u32, acc.1 + 1));
+        let avg = sum.checked_div(count).unwrap_or(0) as u8;
+        let has_comment = g.iter().any(|s| !s.comment.is_empty());
+        (avg, has_comment)
     }
 
     /// Mark this download cancelled. The fetch workers notice within a block and
@@ -342,11 +355,37 @@ pub async fn download_from_peer<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    download_from_peer_at(fs, dl, bail_on_queue, None).await
+}
+
+/// As [`download_from_peer`], but `peer` names the source address so a rating +
+/// comment it sends (OP_FILEDESC) can be recorded against it for the UI.
+pub async fn download_from_peer_at<S>(
+    fs: &mut FramedStream<S>,
+    dl: &Download,
+    bail_on_queue: bool,
+    peer: Option<SocketAddr>,
+) -> Result<u64, TransferError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let mut held: Vec<(u64, u64)> = Vec::new();
-    let r = run_peer(fs, dl, &mut held, bail_on_queue).await;
+    let r = run_peer(fs, dl, &mut held, bail_on_queue, peer).await;
     // Whatever happened, do not strand blocks nobody else will be offered.
     dl.release(&held).await;
     r
+}
+
+/// If `pkt` is a source's OP_FILEDESC, record its rating + comment against
+/// `peer` (when known). Unsolicited and one-shot; safe to call from any loop.
+async fn note_comment_if_desc(pkt: &Packet, dl: &Download, peer: Option<SocketAddr>) {
+    if pkt.opcode == OP_FILEDESC {
+        if let Some(addr) = peer {
+            if let Ok((rating, comment)) = parse_file_desc(&pkt.payload) {
+                dl.note_source_comment(addr, rating, comment).await;
+            }
+        }
+    }
 }
 
 async fn run_peer<S>(
@@ -354,6 +393,7 @@ async fn run_peer<S>(
     dl: &Download,
     held: &mut Vec<(u64, u64)>,
     bail_on_queue: bool,
+    peer: Option<SocketAddr>,
 ) -> Result<u64, TransferError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -368,7 +408,9 @@ where
         match pkt.opcode {
             OP_FILEREQANSNOFIL => return Err(TransferError::NoFile),
             OP_FILESTATUS => break parse_file_status(&pkt.payload)?,
-            _ => {}
+            // A source sends its rating/comment (OP_FILEDESC) unsolicited right
+            // after the filename answer, so it lands here.
+            _ => note_comment_if_desc(&pkt, dl, peer).await,
         }
     };
     // Record what this peer holds so block selection knows which parts are rare.
@@ -398,7 +440,7 @@ where
         match pkt.opcode {
             OP_ACCEPTUPLOADREQ => break,
             OP_QUEUERANKING if bail_on_queue => return Err(TransferError::Queued),
-            _ => {}
+            _ => note_comment_if_desc(&pkt, dl, peer).await,
         }
     }
 
@@ -449,6 +491,53 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[tokio::test]
+    async fn a_sources_comment_is_recorded_during_the_session() {
+        use crate::transfer::{build_file_desc, build_file_req_ans_no_fil, OP_SETREQFILEID};
+        let dir = tmpdir("filedesc");
+        let hash = [0x77; 16];
+        let store = PartStore::create(&dir, 1, hash, 400_000, b"c.bin").unwrap();
+        let dl = Download::new(store);
+        let addr: SocketAddr = "9.9.9.9:4662".parse().unwrap();
+        // fetch_one records the base source before driving the session.
+        dl.note_source("aMule 3.0.1".into(), addr, true, false)
+            .await;
+
+        let (client, server) = tokio::io::duplex(8192);
+        let mut client_fs = FramedStream::new(client);
+        let mut server_fs = FramedStream::new(server);
+        // The "source": after the file request it pushes an unsolicited comment,
+        // then declines the file (so the session ends quickly but the comment was
+        // already recorded).
+        let src = tokio::spawn(async move {
+            // Consume the two request packets (REQUESTFILENAME, SETREQFILEID).
+            loop {
+                let pkt = server_fs.read_packet_unpacked().await.unwrap();
+                if pkt.opcode == OP_SETREQFILEID {
+                    break;
+                }
+            }
+            server_fs
+                .write_packet(&build_file_desc(5, "verified good rip"))
+                .await
+                .unwrap();
+            server_fs
+                .write_packet(&build_file_req_ans_no_fil(&hash))
+                .await
+                .unwrap();
+        });
+
+        let r = download_from_peer_at(&mut client_fs, &dl, false, Some(addr)).await;
+        assert!(matches!(r, Err(TransferError::NoFile)));
+        let _ = src.await;
+
+        let srcs = dl.sources().await;
+        let s = srcs.iter().find(|s| s.addr == addr).unwrap();
+        assert_eq!(s.rating, 5);
+        assert_eq!(s.comment, "verified good rip");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
