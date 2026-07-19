@@ -107,4 +107,31 @@ mod tests {
     fn empty_and_oversize_are_none() {
         assert!(aich_master_hash(&[]).is_none());
     }
+
+    /// Byte-validation against the REAL amuled AICH, not a self-consistent
+    /// reconstruction (the [[interop-test-fidelity]] lesson: a reference that is
+    /// wrong the SAME way gives false confidence). A deterministic 10 MB file -
+    /// over PARTSIZE (9,728,000), so the MULTI-PART tree branch is exercised, and
+    /// exactly ceil(10_000_000 / 184320) = 55 AICH blocks - hashed by amuled 3.0.1
+    /// yields this master root, read from its `known2_64.met` AICH hashset backup
+    /// (`version(1) | root(20) | count(u32) | count*hash(20)`). Regenerate with
+    /// `scripts/aich-golden.sh`. The file bytes follow a fixed LCG so we rebuild
+    /// them here byte-for-byte (i < 2^34, so the product never overflows u64).
+    #[test]
+    fn aich_master_matches_real_amuled_for_a_multipart_file() {
+        let n = 10_000_000usize;
+        let mut data = vec![0u8; n];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = ((i as u64).wrapping_mul(1_103_515_245).wrapping_add(12_345) >> 16) as u8;
+        }
+        let golden: [u8; 20] = [
+            0xbc, 0x30, 0x1c, 0x26, 0xff, 0x3c, 0xc6, 0xd9, 0x8e, 0x80, 0x49, 0x01, 0x60, 0x3a,
+            0x0a, 0x32, 0x88, 0x35, 0x11, 0x00,
+        ];
+        assert_eq!(
+            aich_master_hash(&data).unwrap(),
+            golden,
+            "padMule AICH master must match real amuled"
+        );
+    }
 }
