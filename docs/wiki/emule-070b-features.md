@@ -4,9 +4,8 @@ Updated: 2026-07-19 (slices 1-3 landed)
 
 **DONE so far:** #1 IP filter, #2 search history, #3 wire-side search filters,
 #5 categories, #6 ratings/comments (server rating + OP_FILEDESC comment), #21
-per-source detail sheet, #8 (partial: per-file unshare). #4 verified badge is
-PARTIAL (the encryption lock ships; the identity checkmark is wired but needs
-secure-ident run inline in the fetch path). See [[build-progress]].
+per-source detail sheet, #8 (partial: per-file unshare). #4 verified badge (both the encryption lock and the identity checkmark now
+live - secure-ident runs on delivering sources). See [[build-progress]].
 
 A ranked proposal of features padMule could adopt from eMule 0.70b, from a
 4-surveyor + synthesis dive over `refs/emule-0.70b`. Scope: GUI/feature-level
@@ -29,11 +28,15 @@ parsing, Kad anti-abuse hardening, and the "Automatic" search method). Ranked by
    min_sources -> FT_SOURCES `> N-1` (universal op); size min/max on the wire
    (max > 4 GiB omitted, enforced client-side). FFI SearchFilters +
    "Complete sources only" toggle + size preset menus. Type stays client-side.
-4. **Verified-identity badge + obfuscation glyph** - PARTIAL (2026-07-19). The
-   encryption LOCK ships (per-source `obfuscated`, real today). The identity
-   CHECKMARK is wired to `note_source_verified` and rendered in the per-source
-   sheet, but stays off until secure-ident runs INLINE in the fetch path -
-   a delicate, differential-tested hot-path change deferred to its own pass.
+4. **Verified-identity badge + obfuscation glyph** - DONE (2026-07-19). The
+   encryption LOCK (per-source `obfuscated`) and the identity CHECKMARK both
+   ship. `fetch_one` now runs mutual secure-ident with a source AFTER it delivers
+   bytes (on the warm connection), gated on the peer ADVERTISING sec_ident (so a
+   non-supporting source never costs the sweep a timeout) and best-effort with an
+   8s cap; success -> `note_source_verified`. Does NOT touch the differential
+   path (peer-download uses `download_from_peer`, not `fetch_one`). Proven by a
+   unit test with a mock secure-ident peer (dive premise "padMule already runs
+   secure-ident" was wrong - it only ran in tests until now).
 5. **Download categories + transfer filter chips** - DONE (2026-07-18). Color
    buckets + a filter-chip row + a per-download context menu. CLIENT-SIDE
    (definitions + hash->category in UserDefaults, NOT part.met - zero wire risk;
