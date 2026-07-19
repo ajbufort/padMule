@@ -101,7 +101,7 @@ parsing, Kad anti-abuse hardening, and the "Automatic" search method). Ranked by
 | 14 | Statistics tab (Swift Charts: rate history, totals, ratios) - DONE 2026-07-19 (commit 81a58c6; engine keeps 2 global monotonic byte counters, UI samples + charts them; rate = delta/elapsed after a review found off-cadence sampling) | med | none |
 | 15 | Learning spam filter over results (heuristics + mark-as-spam) | med | none |
 | 16 | Static up/down speed caps + anti-leech ratio guard | small | none |
-| 17 | Preview / open incomplete files (AVPlayer; first+last chunk bias) | med | low |
+| 17 | Preview / open incomplete files (AVPlayer) - DONE 2026-07-19 (commit 39c59fe; per-download SEQUENTIAL block bias, snapshot the contiguous prefix, AVKit VideoPlayer; review-hardened: lock-free copy, revert-on-dismiss, honest moov-at-end message. NB: we do SEQUENTIAL not "first+last" - the snapshot only uses the contiguous head, so a tail island would not help it) | med | low |
 | 18 | Server manager (priority, pin, prune, auto-update from URL) | med | low |
 | 19 | Live server status ping (OP_GLOBSERVSTATREQ) | med | medium |
 | 20 | Author your own rating/comment + serve it back - DONE 2026-07-19 (Shared-screen editor -> known.met -> OP_FILEDESC, byte-faithful to aMule SendCommentInfo) | med | medium |
