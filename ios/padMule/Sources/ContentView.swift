@@ -104,6 +104,9 @@ struct ContentView: View {
             .sheet(item: $sourcesFor) { dl in
                 SourcesView(download: dl).environmentObject(model)
             }
+            .sheet(item: $model.preview) { item in
+                PreviewPlayerView(item: item).environmentObject(model)
+            }
             .sheet(item: $ratingFor) { f in
                 RatingEditorView(hash: f.hash, name: f.name, rating: f.rating, comment: f.comment) { rating, comment in
                     model.setFileRating(f.hash, rating: rating, comment: comment)
@@ -369,6 +372,13 @@ struct ContentView: View {
                                     sourcesFor = dl
                                 } label: {
                                     Label("View sources", systemImage: "person.2")
+                                }
+                                if !dl.complete && model.isPreviewable(dl.name) {
+                                    Button {
+                                        model.startPreview(dl)
+                                    } label: {
+                                        Label("Preview", systemImage: "play.rectangle")
+                                    }
                                 }
                                 Divider()
                                 priorityMenu(for: dl)

@@ -51,7 +51,7 @@ pub use link::ServerLink;
 pub use multi_source::{download_from_peer, download_from_peer_at, Download, SecIdentCtx};
 pub use obf_handshake::{obf_accept, obf_initiate, ObfDetect};
 pub use part_file::{data_part_count, part_size, PartFile};
-pub use part_store::PartStore;
+pub use part_store::{copy_file_prefix, PartStore};
 pub use peer::{
     build_hello, build_hello_answer, parse_hello, Capabilities, HelloInfo, PadMuleInfo,
     ParsedHello, PADMULE_CHANNEL_VERSION,

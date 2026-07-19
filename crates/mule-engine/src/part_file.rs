@@ -108,6 +108,14 @@ impl PartFile {
         self.gaps.iter().map(|g| g.end - g.start).sum()
     }
 
+    /// Bytes available CONTIGUOUSLY from offset 0 (up to the first gap). This is
+    /// the leading prefix a media player can read straight off the raw `.part`:
+    /// 0 when byte 0 is still missing, the full `size` when complete. `gaps` is
+    /// kept sorted by start, so the first gap's start is the prefix length.
+    pub fn contiguous_prefix(&self) -> u64 {
+        self.gaps.first().map(|g| g.start).unwrap_or(self.size)
+    }
+
     /// Every byte has arrived. (Verification is separate - see `verify_part`.)
     pub fn is_complete(&self) -> bool {
         self.gaps.is_empty()
@@ -266,6 +274,7 @@ impl PartFile {
         max: usize,
         rarity: &dyn Fn(u64) -> u32,
         endgame: bool,
+        preview: bool,
     ) -> Vec<(u64, u64)> {
         let mut out: Vec<(u64, u64)> = Vec::new();
         let mut taken: Vec<(u64, u64)> = if endgame {
@@ -275,9 +284,21 @@ impl PartFile {
         };
 
         // `wanted_parts()` is already ordered by (missing, part); a stable sort
-        // by rarity puts the rarest first while preserving that tie-break.
+        // preserves that tie-break under the chosen ordering.
         let mut parts = self.wanted_parts();
-        parts.sort_by_key(|&p| rarity(p));
+        if preview {
+            // Preview bias: strictly forward-sequential (part 0, 1, 2, ...), so the
+            // file grows CONTIGUOUSLY from offset 0 and a player can read/play the
+            // leading run straight off the raw `.part`. We do NOT fetch the last
+            // part early: the snapshot the player gets is only the contiguous head,
+            // so a disconnected tail island would not help it - a moov-at-end
+            // (non-faststart) file simply is not previewable until near-complete
+            // (a future AVAssetResourceLoader serving ranges would lift that).
+            parts.sort_by_key(|&p| p);
+        } else {
+            // Rarest-first: the least-available data enters our copy soonest.
+            parts.sort_by_key(|&p| rarity(p));
+        }
 
         for part in parts {
             if !available(part) {
@@ -454,7 +475,7 @@ mod tests {
     #[test]
     fn next_blocks_hands_out_three_distinct_blocks() {
         let pf = PartFile::new(H, 400_000);
-        let blocks = pf.next_blocks(&|_| true, &[], 3, &|_| 0, false);
+        let blocks = pf.next_blocks(&|_| true, &[], 3, &|_| 0, false, false);
         assert_eq!(blocks.len(), 3);
         assert_eq!(blocks[0], (0, EMBLOCKSIZE));
         assert_eq!(blocks[1], (EMBLOCKSIZE, 2 * EMBLOCKSIZE));
@@ -464,16 +485,66 @@ mod tests {
     }
 
     #[test]
+    fn contiguous_prefix_stops_at_the_first_gap() {
+        let mut pf = PartFile::new(H, 1_000_000);
+        assert_eq!(pf.contiguous_prefix(), 0, "byte 0 is still missing");
+        pf.fill_gap(0, 300_000);
+        assert_eq!(
+            pf.contiguous_prefix(),
+            300_000,
+            "prefix reaches the first gap"
+        );
+        // A disconnected island does NOT extend the contiguous-from-0 prefix.
+        pf.fill_gap(500_000, 600_000);
+        assert_eq!(pf.contiguous_prefix(), 300_000);
+        pf.fill_gap(300_000, 500_000);
+        assert_eq!(pf.contiguous_prefix(), 600_000, "the island now joins on");
+        pf.fill_gap(0, 1_000_000);
+        assert_eq!(pf.contiguous_prefix(), 1_000_000, "complete -> whole file");
+    }
+
+    #[test]
+    fn preview_is_sequential_ignoring_rarity() {
+        // 3 parts, with the LAST part made the rarest so rarest-first would start
+        // there. Preview must ignore rarity and go strictly front-to-back.
+        let pf = PartFile::new(H, 3 * PARTSIZE);
+        let rarity = |p: u64| if p == 2 { 0 } else { 9 }; // part 2 is rarest
+
+        // Non-preview: rarest-first starts in the rarest part (2).
+        let rare = pf.next_blocks(&|_| true, &[], 1, &rarity, false, false);
+        assert!(
+            rare[0].0 >= 2 * PARTSIZE,
+            "rarest-first starts in the rarest part"
+        );
+
+        // Preview: sequential from part 0, and it continues to part 1 (NOT the rare
+        // last part), so the contiguous-from-start prefix grows.
+        let prev = pf.next_blocks(&|_| true, &[], 10_000, &rarity, false, true);
+        assert_eq!(
+            prev[0],
+            (0, EMBLOCKSIZE),
+            "preview starts at the first block"
+        );
+        let after_part0 = prev.iter().take_while(|(s, _)| *s < PARTSIZE).count();
+        assert_eq!(
+            prev[after_part0].0, PARTSIZE,
+            "preview continues to part 1, in order"
+        );
+    }
+
+    #[test]
     fn we_never_request_a_part_the_source_lacks() {
         let pf = PartFile::new(H, 3 * PARTSIZE);
         // Source has ONLY part 2.
-        let blocks = pf.next_blocks(&|p| p == 2, &[], 3, &|_| 0, false);
+        let blocks = pf.next_blocks(&|p| p == 2, &[], 3, &|_| 0, false, false);
         assert!(!blocks.is_empty());
         for (s, _) in blocks {
             assert!(s >= 2 * PARTSIZE, "requested outside part 2: {s}");
         }
         // A source with nothing gives us nothing.
-        assert!(pf.next_blocks(&|_| false, &[], 3, &|_| 0, false).is_empty());
+        assert!(pf
+            .next_blocks(&|_| false, &[], 3, &|_| 0, false, false)
+            .is_empty());
     }
 
     #[test]
@@ -481,7 +552,9 @@ mod tests {
         let mut pf = PartFile::new(H, 400_000);
         pf.fill_gap(0, 400_000);
         assert!(pf.is_complete());
-        assert!(pf.next_blocks(&|_| true, &[], 3, &|_| 0, false).is_empty());
+        assert!(pf
+            .next_blocks(&|_| true, &[], 3, &|_| 0, false, false)
+            .is_empty());
         assert!(pf.next_block_in_part(0, &[]).is_none());
     }
 
@@ -633,7 +706,7 @@ mod tests {
         // it to the front.
         let pf = PartFile::new(H, 3 * PARTSIZE);
         let rarity = |p: u64| if p == 2 { 0 } else { 9 };
-        let blocks = pf.next_blocks(&|_| true, &[], 1, &rarity, false);
+        let blocks = pf.next_blocks(&|_| true, &[], 1, &rarity, false, false);
         assert_eq!(blocks.len(), 1);
         assert!(
             blocks[0].0 >= 2 * PARTSIZE,
@@ -641,7 +714,7 @@ mod tests {
             blocks[0]
         );
         // With uniform rarity, order falls back to the part index (part 0).
-        let flat = pf.next_blocks(&|_| true, &[], 1, &|_| 0, false);
+        let flat = pf.next_blocks(&|_| true, &[], 1, &|_| 0, false, false);
         assert!(flat[0].0 < PARTSIZE, "uniform rarity -> part 0 first");
     }
 
@@ -650,8 +723,13 @@ mod tests {
         // A one-block file. Normally a reserved block is skipped; in endgame it
         // is re-offered so several peers can race the final block.
         let pf = PartFile::new(H, 100_000); // < EMBLOCKSIZE -> one block
-        let b = pf.next_blocks(&|_| true, &[], 1, &|_| 0, false)[0];
-        assert!(pf.next_blocks(&|_| true, &[b], 1, &|_| 0, false).is_empty());
-        assert_eq!(pf.next_blocks(&|_| true, &[b], 1, &|_| 0, true), vec![b]);
+        let b = pf.next_blocks(&|_| true, &[], 1, &|_| 0, false, false)[0];
+        assert!(pf
+            .next_blocks(&|_| true, &[b], 1, &|_| 0, false, false)
+            .is_empty());
+        assert_eq!(
+            pf.next_blocks(&|_| true, &[b], 1, &|_| 0, true, false),
+            vec![b]
+        );
     }
 }
