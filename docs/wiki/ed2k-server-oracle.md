@@ -57,12 +57,17 @@ and `wsl --shutdown`; not needed - i686 works.)
 
 - DONE: server connect - login, ID assignment (LowID here), server messages,
   pause/resume reconnect - all against real eserver.
-- NEXT: #9 global server UDP search - eserver listens UDP on 4661/4665/4669
-  (confirmed via `ss`), so padMule's OP_GLOBSEARCHREQ/RES codec can be exercised
-  against it. A meaningful search test also needs a client (amuled/padMule)
-  connected to eserver and SHARING a file, so the server has something to index.
-- HighID here would need a routable IP + callback; the isolated loopback setup
-  gives LowID, which is a complete protocol exchange regardless.
+- DONE: #9 global server UDP search - `mule-cli global-search 127.0.0.1:4661
+  <kw>` sends OP_GLOBSEARCHREQ to the UDP port (TCP+4 = 4665) and parses
+  OP_GLOBSEARCHRES; eserver accepts it.
+- DONE: OP_OFFERFILES - `mule-cli offer-hold 127.0.0.1 4661 "<name>"` logs in +
+  announces a file; eserver INDEXES it ("1 files, 1 complete, 2 keyw" in its `g`
+  stats). This makes eserver a DETERMINISTIC SEARCH oracle. Caveat: eserver
+  self-filters a client's OWN files, so `offer-search` (offer + search from the
+  same 127.0.0.1) shows the file indexed but not returned; a full offer->find
+  needs the searcher on a different IP than the offerer (both are loopback here).
+- HighID would need a routable IP + callback; the isolated loopback setup gives
+  LowID, which is a complete protocol exchange regardless.
 
 ## Related
 
