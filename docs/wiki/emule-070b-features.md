@@ -1,9 +1,10 @@
 # eMule 0.70b Feature Backlog (mined for padMule)
 
-Updated: 2026-07-19 (slices 1-3 landed; #4 identity-checkmark reverted to PARTIAL)
+Updated: 2026-07-19 (slices 1-3 + #20 authoring landed; #4 identity-checkmark reverted to PARTIAL)
 
 **DONE so far:** #1 IP filter, #2 search history, #3 wire-side search filters,
-#5 categories, #6 ratings/comments (server rating + OP_FILEDESC comment), #21
+#5 categories, #6 ratings/comments (server rating + OP_FILEDESC comment READ),
+#20 authoring your OWN rating/comment + serving it (OP_FILEDESC write), #21
 per-source detail sheet, #8 (partial: per-file unshare). #4 verified badge is
 PARTIAL: the encryption LOCK (per-source obfuscation) is live; the identity
 CHECKMARK is NOT (the secure-ident-in-fetch attempt was reverted - it deadlocked
@@ -60,8 +61,8 @@ parsing, Kad anti-abuse hardening, and the "Automatic" search method). Ranked by
    badges search rows + flags rating-1 Fake; (b) a source's COMMENT + per-source
    rating (OP_FILEDESC 0x61, post-connect - padMule already advertised
    AcceptCommentVer=1) is recorded per source, averaged onto the download row,
-   and shown in the per-source sheet (#21). Still TODO: Kad notes (#22) +
-   authoring your own (#20).
+   and shown in the per-source sheet (#21). Authoring your own (#20) is now DONE
+   (see the Tier-2 row). Still TODO: Kad notes (#22).
 7. **Per-download priority (Low/Normal/High) + Auto** (small, no wire).
    Auto self-tunes by source count; local (FT_DLPRIORITY in part.met).
 8. **Transfer-list management** - PARTIAL (2026-07-18). Per-file UNSHARE done
@@ -92,7 +93,7 @@ parsing, Kad anti-abuse hardening, and the "Automatic" search method). Ranked by
 | 17 | Preview / open incomplete files (AVPlayer; first+last chunk bias) | med | low |
 | 18 | Server manager (priority, pin, prune, auto-update from URL) | med | low |
 | 19 | Live server status ping (OP_GLOBSERVSTATREQ) | med | medium |
-| 20 | Author your own rating/comment + serve it back | med | medium |
+| 20 | Author your own rating/comment + serve it back - DONE 2026-07-19 (Shared-screen editor -> known.met -> OP_FILEDESC, byte-faithful to aMule SendCommentInfo) | med | medium |
 | 21 | Per-peer / per-source detail sheet - DONE 2026-07-19 (SourcesView) | small | none |
 | 22 | Kad notes search (ratings by hash, no connected source needed) | large | high |
 | 23 | Friend list + grant friend-slot + browse shares | med | low |
