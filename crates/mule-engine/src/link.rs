@@ -194,6 +194,27 @@ impl ServerLink {
         };
         fs.write_packet(&build_callback_request(client_id)).await
     }
+
+    /// Announce our shared files to the server (OP_OFFERFILES) so it indexes them
+    /// for keyword search and can hand us out as a source. Fire-and-forget (no
+    /// reply). `client_id`/`client_port` are our real ID + port when HighID, else
+    /// the FILE_COMPLETE_ID/PORT markers (all our shares are complete).
+    pub async fn offer_files(
+        &mut self,
+        files: &[crate::server_messages::OfferedFile<'_>],
+        client_id: u32,
+        client_port: u16,
+    ) -> Result<(), FrameError> {
+        let Some(fs) = self.conn.as_mut() else {
+            return Err(not_connected());
+        };
+        fs.write_packet(&crate::server_messages::build_offer_files(
+            files,
+            client_id,
+            client_port,
+        ))
+        .await
+    }
 }
 
 #[cfg(test)]
