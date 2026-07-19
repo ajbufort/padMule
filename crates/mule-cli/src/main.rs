@@ -13,7 +13,10 @@ use std::path::Path;
 use std::time::Duration;
 
 use mule_engine::peer::HelloInfo;
-use mule_engine::search::{build_search_request, parse_search_result, SearchParams};
+use mule_engine::search::{
+    build_global_search_udp, build_search_request, parse_global_search_res, parse_search_result,
+    SearchParams, OP_GLOBSEARCHRES,
+};
 use mule_engine::server_messages::{LoginRequest, DEFAULT_SERVER_FLAGS};
 use mule_engine::sources::{build_callback_request, build_get_sources, parse_found_sources};
 use mule_engine::{
@@ -100,6 +103,134 @@ async fn cmd_login(addr: SocketAddr) {
     }
     drop(link);
     let _ = printer.await;
+}
+
+/// global-search <server.met|host:port> <keyword>: fan a GLOBAL server UDP
+/// search across the serverlist (or one server, for testing). Each server's UDP
+/// port is its TCP port + 4 (the eD2k landmine); the request is OP_GLOBSEARCHREQ
+/// carrying the normal search tree, and OP_GLOBSEARCHRES replies (one chained
+/// record set each) are collected - honoring only IPs we actually asked
+/// (anti-spoof), deduped by hash.
+async fn cmd_global_search(target: &str, keyword: &str) {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use tokio::net::UdpSocket;
+    use tokio::sync::Mutex;
+
+    // A `host:port` targets one server (its TCP port); otherwise it is a server.met.
+    let servers: Vec<(Ipv4Addr, u16)> = if let Ok(SocketAddr::V4(sa)) = target.parse() {
+        vec![(*sa.ip(), sa.port())]
+    } else {
+        match std::fs::read(target)
+            .ok()
+            .and_then(|b| read_server_met(&b).ok())
+        {
+            Some(m) => m
+                .servers
+                .iter()
+                .filter(|s| s.ip != 0 && s.port != 0)
+                .map(|s| (ip_from_met_u32(s.ip), s.port))
+                .collect(),
+            None => {
+                eprintln!("cannot read a server.met or a host:port from: {target}");
+                return;
+            }
+        }
+    };
+    let params = SearchParams {
+        keyword: keyword.to_string(),
+        ..Default::default()
+    };
+    let pkt = build_global_search_udp(&params);
+    // UDP wire = [protocol][opcode][payload] (2-byte header, no length field).
+    let mut req = vec![pkt.protocol, pkt.opcode];
+    req.extend_from_slice(&pkt.payload);
+
+    let sock = match UdpSocket::bind(("0.0.0.0", 0u16)).await {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            eprintln!("udp bind failed: {e}");
+            return;
+        }
+    };
+    let asked: Arc<Mutex<HashSet<Ipv4Addr>>> = Arc::new(Mutex::new(HashSet::new()));
+    let hits: Arc<Mutex<Vec<(Ipv4Addr, mule_engine::search::SearchResultFile)>>> =
+        Arc::new(Mutex::new(Vec::new()));
+
+    let (rsock, rasked, rhits) = (Arc::clone(&sock), Arc::clone(&asked), Arc::clone(&hits));
+    let recv = tokio::spawn(async move {
+        let mut buf = [0u8; 16 * 1024];
+        loop {
+            let (n, src) = match rsock.recv_from(&mut buf).await {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            if n < 2 {
+                continue;
+            }
+            let IpAddr::V4(sip) = src.ip() else { continue };
+            // Anti-spoof: only accept a reply from a server we sent a request to.
+            if !rasked.lock().await.contains(&sip) {
+                continue;
+            }
+            let (prot, op, payload) = (buf[0], buf[1], &buf[2..n]);
+            let files = if prot == mule_proto::PROT_EDONKEY && op == OP_GLOBSEARCHRES {
+                parse_global_search_res(payload).unwrap_or_default()
+            } else if prot == mule_proto::PROT_PACKED {
+                // A large result set may arrive zlib-packed.
+                match mule_proto::decompress(
+                    &mule_proto::Packet::new(prot, op, payload.to_vec()),
+                    1 << 20,
+                ) {
+                    Ok(inner) if inner.opcode == OP_GLOBSEARCHRES => {
+                        parse_global_search_res(&inner.payload).unwrap_or_default()
+                    }
+                    _ => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            };
+            let mut h = rhits.lock().await;
+            for f in files {
+                if !h.iter().any(|(_, x)| x.hash == f.hash) {
+                    h.push((sip, f));
+                }
+            }
+        }
+    });
+
+    let mut sent = 0usize;
+    for (ip, tcp_port) in &servers {
+        asked.lock().await.insert(*ip);
+        let dst = SocketAddr::new(IpAddr::V4(*ip), tcp_port + 4); // +4: the UDP-port landmine
+        match sock.send_to(&req, dst).await {
+            Ok(_) => {
+                println!("-> OP_GLOBSEARCHREQ to {dst} (server {ip}:{tcp_port})");
+                sent += 1;
+            }
+            Err(e) => eprintln!("   send to {dst} failed: {e}"),
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    println!("sent {sent} request(s); collecting replies ...");
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    recv.abort();
+
+    let h = hits.lock().await;
+    println!("=== {} unique file(s) via global UDP search ===", h.len());
+    for (src, f) in h.iter() {
+        let name = f
+            .tags
+            .iter()
+            .find_map(|t| match (&t.name, &t.value) {
+                (mule_proto::TagName::Id(0x01), mule_proto::TagValue::Str(s)) => {
+                    Some(String::from_utf8_lossy(s).into_owned())
+                }
+                _ => None,
+            })
+            .unwrap_or_default();
+        println!("  {name}  hash={} (from server {src})", hex16(&f.hash));
+    }
 }
 
 async fn cmd_login_any(met_path: &str) {
@@ -1810,6 +1941,7 @@ async fn main() {
             }
         }
         Some("login-any") if args.len() == 3 => cmd_login_any(&args[2]).await,
+        Some("global-search") if args.len() == 4 => cmd_global_search(&args[2], &args[3]).await,
         Some("listen") => {
             let port: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(4662);
             cmd_listen(port).await;
