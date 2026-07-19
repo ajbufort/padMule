@@ -1,11 +1,12 @@
 # eMule 0.70b Feature Backlog (mined for padMule)
 
-Updated: 2026-07-19 (slices 1-3 + #20 authoring landed; #4 identity-checkmark reverted to PARTIAL)
+Updated: 2026-07-19 (slices 1-3 + #20 authoring + #7 priority landed; #4 identity-checkmark reverted to PARTIAL)
 
 **DONE so far:** #1 IP filter, #2 search history, #3 wire-side search filters,
 #5 categories, #6 ratings/comments (server rating + OP_FILEDESC comment READ),
-#20 authoring your OWN rating/comment + serving it (OP_FILEDESC write), #21
-per-source detail sheet, #8 (partial: per-file unshare). #4 verified badge is
+#7 per-download priority (Low/Normal/High; Auto deferred), #20 authoring your OWN
+rating/comment + serving it (OP_FILEDESC write), #21 per-source detail sheet, #8
+(partial: per-file unshare). #4 verified badge is
 PARTIAL: the encryption LOCK (per-source obfuscation) is live; the identity
 CHECKMARK is NOT (the secure-ident-in-fetch attempt was reverted - it deadlocked
 against real sources; see #4 below). See [[build-progress]].
@@ -63,8 +64,16 @@ parsing, Kad anti-abuse hardening, and the "Automatic" search method). Ranked by
    AcceptCommentVer=1) is recorded per source, averaged onto the download row,
    and shown in the per-source sheet (#21). Authoring your own (#20) is now DONE
    (see the Tier-2 row). Still TODO: Kad notes (#22).
-7. **Per-download priority (Low/Normal/High) + Auto** (small, no wire).
-   Auto self-tunes by source count; local (FT_DLPRIORITY in part.met).
+7. **Per-download priority (Low/Normal/High)** - DONE (2026-07-19). Set from the
+   transfer-row context menu (a Priority submenu + an up/down row glyph).
+   HONESTLY honored, not cosmetic: the fetch manager reads priority live every
+   round, so High contacts more sources at once (Low 2 / Normal 4 / High 6
+   concurrent peers) and sweeps more rounds (6/8/12); resume_fetches finds
+   sources for high-priority parts first. Persisted byte-faithfully to part.met
+   (both FT_DLPRIORITY 0x18 + legacy FT_OLDDLPRIORITY 0x13 as UINT32, same value,
+   as aMule writes them PartFile.cpp:928-933; unknown/PR_AUTO clamps to Normal).
+   AUTO deferred: it needs a periodic source-count recompute loop the engine does
+   not have (source-finding is one-shot per download today).
 8. **Transfer-list management** - PARTIAL (2026-07-18). Per-file UNSHARE done
    (swipe on the Shared screen; removes from library + known.met, keeps the
    file). Dropped clear-completed (finished downloads already auto-remove;
