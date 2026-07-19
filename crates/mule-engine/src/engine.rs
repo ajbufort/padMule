@@ -35,7 +35,9 @@ use crate::search::{
     build_global_search_udp, parse_global_search_res, SearchParams, SearchResultFile,
     OP_GLOBSEARCHRES,
 };
-use crate::server_messages::{LoginRequest, DEFAULT_SERVER_FLAGS};
+use crate::server_messages::{
+    LoginRequest, OfferedFile, DEFAULT_SERVER_FLAGS, FILE_COMPLETE_ID, FILE_COMPLETE_PORT,
+};
 use crate::share::{head_hash, is_upload_request, serve_shared, SharedFile, UploadGate};
 use crate::transfer::build_file_req_ans_no_fil;
 use mule_files::{
@@ -1184,11 +1186,11 @@ impl Engine {
         for srv in met.servers.iter().take(10) {
             let addr = SocketAddr::new(IpAddr::V4(ip_from_met_u32(srv.ip)), srv.port);
             let mut link = ServerLink::new(addr, login.clone(), tx.clone());
-            if let Ok(Ok(ServerState::Connected { low_id, .. })) =
+            if let Ok(Ok(ServerState::Connected { id, low_id })) =
                 timeout(Duration::from_secs(12), link.connect()).await
             {
-                // The client id is deliberately NOT recorded here: a HighID id
-                // encodes our public IP and this text reaches the screen.
+                // `id` is used LOCALLY for the OP_OFFERFILES record but never
+                // stored or emitted: a HighID id encodes our public IP.
                 self.connection = Some(ServerInfo {
                     addr: addr.to_string(),
                     low_id,
@@ -1197,11 +1199,45 @@ impl Engine {
                     "Connected to {addr} ({})",
                     if low_id { "LowID" } else { "HighID" }
                 )));
+                // Announce our shared library so the server indexes it (findable
+                // via keyword search) and can hand us out as a source.
+                self.offer_shared_to(&mut link, id, low_id).await;
                 self.server = Some(link);
                 return;
             }
         }
         self.emit(EngineEvent::Server("no server accepted a login".into()));
+    }
+
+    /// Announce our whole shared library to `link` via OP_OFFERFILES, so the
+    /// server indexes it (findable by keyword search) and can source us. A HighID
+    /// client offers its real `id` + TCP port; a LowID one the complete-file
+    /// markers (all our shares are complete). No-op with an empty library.
+    async fn offer_shared_to(&self, link: &mut ServerLink, id: u32, low_id: bool) {
+        let shared = self.shared.lock().await;
+        if shared.is_empty() {
+            return;
+        }
+        // Own the names first so the OfferedFile borrows outlive the call.
+        let names: Vec<String> = shared
+            .iter()
+            .map(|s| String::from_utf8_lossy(&s.name).into_owned())
+            .collect();
+        let offers: Vec<OfferedFile> = shared
+            .iter()
+            .zip(&names)
+            .map(|(s, n)| OfferedFile {
+                hash: s.hash,
+                name: n,
+                size: s.size,
+            })
+            .collect();
+        let (cid, cport) = if low_id {
+            (FILE_COMPLETE_ID, FILE_COMPLETE_PORT)
+        } else {
+            (id, TCP_PORT)
+        };
+        let _ = link.offer_files(&offers, cid, cport).await;
     }
 
     /// Bind the Kad UDP socket and bootstrap off the persisted contacts.

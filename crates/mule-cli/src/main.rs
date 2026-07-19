@@ -232,6 +232,172 @@ async fn cmd_global_search(target: &str, keyword: &str) {
     }
 }
 
+/// offer-search <host> <port> <name>: log into a server, OFFER a synthetic
+/// complete file named <name> (OP_OFFERFILES), then GLOBAL-SEARCH the server for
+/// a keyword from it - proving OP_OFFERFILES makes our shares findable (the
+/// deterministic local-eserver oracle loop). The TCP login is held open across
+/// the UDP search so the server keeps the file indexed.
+async fn cmd_offer_search(host: &str, port: u16, name: &str) {
+    use mule_engine::server_messages::{OfferedFile, FILE_COMPLETE_ID, FILE_COMPLETE_PORT};
+    use tokio::net::UdpSocket;
+
+    let Some(addr) = format!("{host}:{port}")
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut i| i.next())
+    else {
+        eprintln!("cannot resolve {host}:{port}");
+        return;
+    };
+    let (tx, rx) = mpsc::channel(64);
+    let printer = spawn_event_printer(rx);
+    let mut link = ServerLink::new(addr, demo_login(), tx);
+    let (id, low_id) = match link.connect().await {
+        Ok(ServerState::Connected { id, low_id }) => (id, low_id),
+        other => {
+            eprintln!("login failed: {other:?}");
+            return;
+        }
+    };
+    println!("logged in (id={id:#x}, low_id={low_id})");
+
+    let hash = ed2k_hash(name.as_bytes()); // deterministic, recognizable
+    let file = OfferedFile {
+        hash,
+        name,
+        size: 1_234_567,
+    };
+    // A HighID client offers its real id+port; a LowID one uses the complete-file
+    // markers (all our shares are complete).
+    let (cid, cport) = if low_id {
+        (FILE_COMPLETE_ID, FILE_COMPLETE_PORT)
+    } else {
+        (id, 4662)
+    };
+    if let Err(e) = link.offer_files(&[file], cid, cport).await {
+        eprintln!("offer failed: {e}");
+        return;
+    }
+    println!("offered '{name}' (hash {}) to the server", hex16(&hash));
+    tokio::time::sleep(Duration::from_millis(500)).await; // let the server index it
+
+    // Global UDP search the same server (port+4) for the first keyword of <name>.
+    let keyword = name.split_whitespace().next().unwrap_or(name);
+    let params = SearchParams {
+        keyword: keyword.to_string(),
+        ..Default::default()
+    };
+    let pkt = build_global_search_udp(&params);
+    let mut req = vec![pkt.protocol, pkt.opcode];
+    req.extend_from_slice(&pkt.payload);
+    let Ok(sock) = UdpSocket::bind(("0.0.0.0", 0u16)).await else {
+        eprintln!("udp bind failed");
+        return;
+    };
+    let Some(udp_port) = port.checked_add(4) else {
+        return;
+    };
+    let dst = SocketAddr::new(addr.ip(), udp_port);
+    let _ = sock.send_to(&req, dst).await;
+    println!("-> OP_GLOBSEARCHREQ '{keyword}' to {dst}");
+
+    let mut found = false;
+    let mut buf = [0u8; 16 * 1024];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match timeout(remaining, sock.recv_from(&mut buf)).await {
+            Ok(Ok((n, src))) if n >= 2 && src.ip() == addr.ip() => {
+                if buf[0] == mule_proto::PROT_EDONKEY && buf[1] == OP_GLOBSEARCHRES {
+                    for f in parse_global_search_res(&buf[2..n]).unwrap_or_default() {
+                        let nm = f
+                            .tags
+                            .iter()
+                            .find_map(|t| match (&t.name, &t.value) {
+                                (mule_proto::TagName::Id(0x01), mule_proto::TagValue::Str(s)) => {
+                                    Some(String::from_utf8_lossy(s).into_owned())
+                                }
+                                _ => None,
+                            })
+                            .unwrap_or_default();
+                        println!("  <- {nm}  hash={}", hex16(&f.hash));
+                        if f.hash == hash {
+                            found = true;
+                        }
+                    }
+                }
+            }
+            Ok(Ok(_)) => {}
+            _ => break,
+        }
+    }
+    if found {
+        println!("PASS: the offered file came back via global UDP search (OP_OFFERFILES works).");
+    } else {
+        println!("NOT FOUND: the offered file did not come back (see the search output above).");
+    }
+    link.disconnect().await;
+    drop(link);
+    let _ = printer.await;
+}
+
+/// offer-hold <host> <port> <name> [seconds]: log in, OFFER a synthetic complete
+/// file named <name>, and HOLD the connection so the server keeps it indexed
+/// (for inspecting the server's share count, or searching from another client).
+async fn cmd_offer_hold(host: &str, port: u16, name: &str, seconds: u64) {
+    use mule_engine::server_messages::{OfferedFile, FILE_COMPLETE_ID, FILE_COMPLETE_PORT};
+    let Some(addr) = format!("{host}:{port}")
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut i| i.next())
+    else {
+        eprintln!("cannot resolve {host}:{port}");
+        return;
+    };
+    let (tx, rx) = mpsc::channel(64);
+    let printer = spawn_event_printer(rx);
+    let mut link = ServerLink::new(addr, demo_login(), tx);
+    let (id, low_id) = match link.connect().await {
+        Ok(ServerState::Connected { id, low_id }) => (id, low_id),
+        other => {
+            eprintln!("login failed: {other:?}");
+            return;
+        }
+    };
+    let hash = ed2k_hash(name.as_bytes());
+    let (cid, cport) = if low_id {
+        (FILE_COMPLETE_ID, FILE_COMPLETE_PORT)
+    } else {
+        (id, 4662)
+    };
+    if let Err(e) = link
+        .offer_files(
+            &[OfferedFile {
+                hash,
+                name,
+                size: 1_234_567,
+            }],
+            cid,
+            cport,
+        )
+        .await
+    {
+        eprintln!("offer failed: {e}");
+        return;
+    }
+    println!(
+        "offered '{name}' (hash {}); holding {seconds}s",
+        hex16(&hash)
+    );
+    tokio::time::sleep(Duration::from_secs(seconds)).await;
+    link.disconnect().await;
+    drop(link);
+    let _ = printer.await;
+}
+
 async fn cmd_login_any(met_path: &str) {
     let bytes = match std::fs::read(met_path) {
         Ok(b) => b,
@@ -1941,6 +2107,17 @@ async fn main() {
         }
         Some("login-any") if args.len() == 3 => cmd_login_any(&args[2]).await,
         Some("global-search") if args.len() == 4 => cmd_global_search(&args[2], &args[3]).await,
+        Some("offer-search") if args.len() == 5 => match args[3].parse::<u16>() {
+            Ok(port) => cmd_offer_search(&args[2], port, &args[4]).await,
+            Err(_) => eprintln!("bad port: {}", args[3]),
+        },
+        Some("offer-hold") if args.len() == 5 || args.len() == 6 => {
+            let secs = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(15);
+            match args[3].parse::<u16>() {
+                Ok(port) => cmd_offer_hold(&args[2], port, &args[4], secs).await,
+                Err(_) => eprintln!("bad port: {}", args[3]),
+            }
+        }
         Some("listen") => {
             let port: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(4662);
             cmd_listen(port).await;

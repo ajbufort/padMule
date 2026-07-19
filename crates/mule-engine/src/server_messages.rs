@@ -13,6 +13,18 @@ pub const OP_SERVERSTATUS: u8 = 0x34;
 pub const OP_SERVERMESSAGE: u8 = 0x38;
 pub const OP_IDCHANGE: u8 = 0x40;
 pub const OP_SERVERIDENT: u8 = 0x41;
+/// Announce our shared files to the server (`<count 4>(<HASH 16><ID 4><PORT 2>
+/// <tagset>)[count]`, opcodes.h:161) so it indexes them for keyword search and
+/// can hand us out as a source.
+pub const OP_OFFERFILES: u8 = 0x15;
+
+// File-tag ids for an offered file (opcodes.h:322,324).
+const FT_FILENAME: u8 = 0x01;
+const FT_FILESIZE: u8 = 0x02;
+/// The special client-id/port an offered COMPLETE file carries when we are LowID
+/// (aMule `KnownFile.cpp:1173-1174`); a HighID client uses its real id + port.
+pub const FILE_COMPLETE_ID: u32 = 0xFBFB_FBFB;
+pub const FILE_COMPLETE_PORT: u16 = 0xFBFB;
 
 // Login tag ids (ClientTags.h).
 const CT_NAME: u8 = 0x01;
@@ -91,6 +103,42 @@ pub fn build_login_request(req: &LoginRequest) -> Packet {
         &Tag::id(CT_EMULE_VERSION, TagValue::U32(EMULE_VERSION_TAG)),
     );
     Packet::new(PROT_EDONKEY, OP_LOGINREQUEST, w.into_inner())
+}
+
+/// One shared file to announce via OP_OFFERFILES.
+pub struct OfferedFile<'a> {
+    pub hash: [u8; 16],
+    pub name: &'a str,
+    pub size: u64,
+}
+
+/// Build an OP_OFFERFILES packet announcing `files` to the server. `client_id` /
+/// `client_port` are our real ID + TCP port when HighID; pass FILE_COMPLETE_ID /
+/// FILE_COMPLETE_PORT when LowID (all our shares are complete files). Each record
+/// carries FT_FILENAME + FT_FILESIZE - enough for the server to index the keyword
+/// and know the size. Faithful to aMule `CKnownFile::CreateOfferedFilePacket`.
+pub fn build_offer_files(files: &[OfferedFile], client_id: u32, client_port: u16) -> Packet {
+    let mut w = Writer::new();
+    w.write_u32(files.len() as u32);
+    for f in files {
+        w.write_bytes(&f.hash);
+        w.write_u32(client_id);
+        w.write_u16(client_port);
+        w.write_u32(2); // tag count: name + size
+        write_tag(
+            &mut w,
+            &Tag::id(FT_FILENAME, TagValue::Str(f.name.as_bytes().to_vec())),
+        );
+        // A file past the 32-bit boundary needs the u64 size tag; else the 32-bit
+        // form (what aMule writes for a sub-4-GiB file).
+        let size_tag = if f.size > mule_proto::OLD_MAX_FILE_SIZE {
+            TagValue::U64(f.size)
+        } else {
+            TagValue::U32(f.size as u32)
+        };
+        write_tag(&mut w, &Tag::id(FT_FILESIZE, size_tag));
+    }
+    Packet::new(PROT_EDONKEY, OP_OFFERFILES, w.into_inner())
 }
 
 /// The server's login answer: our assigned ID plus optional session details.
@@ -205,6 +253,37 @@ pub fn parse_server_ident(payload: &[u8]) -> Result<ServerIdent, IoError> {
 mod tests {
     use super::*;
     use mule_proto::{read_packet, write_packet};
+
+    #[test]
+    fn offer_files_round_trips_via_the_shared_result_record() {
+        // OP_OFFERFILES carries the SAME <count>(<hash><id><port><tagset>)[count]
+        // record as a search result, so parse it back with parse_search_result to
+        // prove the record format is byte-correct.
+        let files = vec![OfferedFile {
+            hash: [0xAA; 16],
+            name: "linux mint.iso",
+            size: 2_000_000,
+        }];
+        let pkt = build_offer_files(&files, FILE_COMPLETE_ID, FILE_COMPLETE_PORT);
+        assert_eq!(pkt.protocol, PROT_EDONKEY);
+        assert_eq!(pkt.opcode, OP_OFFERFILES);
+
+        let parsed = crate::search::parse_search_result(&pkt.payload).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].hash, [0xAA; 16]);
+        assert_eq!(parsed[0].id, FILE_COMPLETE_ID); // LowID complete-file marker
+        assert_eq!(parsed[0].port, FILE_COMPLETE_PORT);
+        let name = parsed[0]
+            .tags
+            .iter()
+            .find_map(|t| match (&t.name, &t.value) {
+                (mule_proto::TagName::Id(FT_FILENAME), TagValue::Str(s)) => {
+                    Some(String::from_utf8_lossy(s).into_owned())
+                }
+                _ => None,
+            });
+        assert_eq!(name.as_deref(), Some("linux mint.iso"));
+    }
 
     fn sample_login() -> LoginRequest {
         LoginRequest {
