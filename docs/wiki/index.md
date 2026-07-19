@@ -16,6 +16,7 @@ the Ingest / Query / Lint workflows.
 - [[ipados-constraints]] - iPadOS/Rust-on-iOS constraints; foreground-only engine, sockets OK, free-team sideload limits, storage plan (verified 2026).
 - [[lifecycle-and-reactivation]] - HARD requirement: honest status notice + clean pause/resume across focus loss; shapes the engine state model from Wave 3c.
 - [[mac-toolchain-setup]] - getting padMule onto the iPad (iPadOS 26.5.2). VERIFIED blocker: iPadOS 26 needs Xcode 26 needs macOS Tahoe 26.2, and OCLP has no Tahoe support -> the 2011 mini cannot run it. Escape hatch: padMule is sideload-only (the Xcode-26 mandate is App-Store-only), so CI builds with an older Xcode and Sideloadly installs it (AltStore died on -22411). Path C is the active, proven route.
+- [[on-device-test-checklist]] - the human on-glass pass after a Sideloadly install; the engine side of every item is coverable by the hands-on FFI simulation (scripts/simulate.sh).
 - [[net-highid-and-port-forwarding]] - HighID validated on the dev box (2026-07-14, 5-link manual chain) AND on the iPad via unicast-SSDP UPnP (2026-07-17); topology since 2026-07-17 is XB8-bridged -> TP-Link BE9700 (real UPnP IGD), which replaced the manual chain.
 
 ## Reference
