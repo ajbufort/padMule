@@ -107,7 +107,8 @@ async fn download_manager_completes_from_multiple_parallel_peers() {
     let dl = Download::new(store);
     let me = HelloInfo::baseline(user_hash(), 0, 4662, 4672, "padMule");
 
-    let cfg = ManagerConfig {
+    let cfg = ManagerConfig::Fixed {
+        parallel: 3,
         per_peer: Duration::from_secs(20),
         rounds: 4,
     };

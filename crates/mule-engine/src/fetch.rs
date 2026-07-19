@@ -269,35 +269,48 @@ pub async fn fetch_from_sources(
     out
 }
 
-/// How the download manager runs. The concurrent-peer COUNT is NOT here: it is
-/// read live from the `Download`'s priority every round (see [`download_file`]),
-/// so a mid-session priority change biases the ongoing sweep.
+/// How the download manager runs. Two shapes, on purpose:
+/// - `Fixed`: an exact peer count + sweep budget, for the CLI/test harnesses that
+///   deliberately tune those (they do not carry a user priority).
+/// - `ByPriority`: BOTH the concurrent-peer count AND the sweep-round budget are
+///   read LIVE from the `Download`'s priority every round (see [`download_file`]),
+///   so a mid-session priority change on an actively-fetching download biases the
+///   ongoing sweep in both dimensions. This is what the engine uses.
 #[derive(Debug, Clone, Copy)]
-pub struct ManagerConfig {
-    /// Timeout for one peer session (connect + a burst of blocks).
-    pub per_peer: Duration,
-    /// How many times to sweep the source set. eD2k peers ration upload slots -
-    /// they serve a burst then queue/drop you - so retrying accumulates the file
-    /// across reconnects (the `.part` persists progress between sweeps).
-    pub rounds: usize,
-}
-
-impl Default for ManagerConfig {
-    fn default() -> Self {
-        ManagerConfig {
-            per_peer: Duration::from_secs(45),
-            rounds: 8,
-        }
-    }
+pub enum ManagerConfig {
+    Fixed {
+        /// Peers to download from concurrently.
+        parallel: usize,
+        /// Timeout for one peer session (connect + a burst of blocks).
+        per_peer: Duration,
+        /// How many times to sweep the source set (see the per-round note below).
+        rounds: usize,
+    },
+    ByPriority {
+        per_peer: Duration,
+    },
 }
 
 impl ManagerConfig {
-    /// The sweep budget for a download at `priority` (PR_LOW/PR_NORMAL/PR_HIGH):
-    /// a higher priority sweeps the source set more times before giving up.
-    pub fn for_priority(priority: u8) -> Self {
-        ManagerConfig {
-            per_peer: Duration::from_secs(45),
-            rounds: rounds_for_priority(priority),
+    /// Concurrent peers for the current round, given the download's live priority.
+    fn parallel(&self, priority: u8) -> usize {
+        match self {
+            ManagerConfig::Fixed { parallel, .. } => *parallel,
+            ManagerConfig::ByPriority { .. } => parallel_for_priority(priority),
+        }
+    }
+    /// Sweep-round budget, given the download's live priority.
+    fn rounds(&self, priority: u8) -> usize {
+        match self {
+            ManagerConfig::Fixed { rounds, .. } => *rounds,
+            ManagerConfig::ByPriority { .. } => rounds_for_priority(priority),
+        }
+    }
+    fn per_peer(&self) -> Duration {
+        match self {
+            ManagerConfig::Fixed { per_peer, .. } | ManagerConfig::ByPriority { per_peer } => {
+                *per_peer
+            }
         }
     }
 }
@@ -314,7 +327,9 @@ pub fn parallel_for_priority(priority: u8) -> usize {
     }
 }
 
-fn rounds_for_priority(priority: u8) -> usize {
+/// Sweep rounds for a download at `priority`: a higher priority re-sweeps the
+/// source set more times before giving up. PR_NORMAL keeps the historical 8.
+pub fn rounds_for_priority(priority: u8) -> usize {
     match priority {
         crate::part_store::PR_LOW => 6,
         crate::part_store::PR_HIGH => 12,
@@ -322,8 +337,11 @@ fn rounds_for_priority(priority: u8) -> usize {
     }
 }
 
-/// The download manager: pull `dl` to completion from `sources`, `parallel` peers
-/// at a time, sweeping the set up to `rounds` times. Stops early once complete.
+/// The download manager: pull `dl` to completion from `sources`, sweeping the set
+/// up to a round budget with several peers at a time. Stops early once complete.
+/// Both the peer count and the round budget come from `config` and, for
+/// `ByPriority`, are re-read from the download's LIVE priority every round - so
+/// raising an actively-fetching download to High immediately widens both.
 /// Source discovery/refresh is the caller's job (re-issue get-sources / a Kad
 /// search between calls and pass a wider set).
 pub async fn download_file(
@@ -335,13 +353,19 @@ pub async fn download_file(
     let mut out = FetchOutcome::default();
     // Learned across rounds: which sources actually delivered.
     let scoreboard = Arc::new(Mutex::new(PeerScoreboard::new()));
-    for _round in 0..config.rounds.max(1) {
+    let mut round = 0usize;
+    loop {
+        // Both bounds are read live each round from the download's priority (for
+        // ByPriority), so a mid-session priority change biases the ongoing sweep
+        // in BOTH dimensions - the round budget and the concurrent-peer count.
+        if round >= config.rounds(dl.priority()).max(1) {
+            break;
+        }
         if dl.is_complete().await || dl.is_cancelled() || sources.is_empty() {
             break;
         }
-        // Read priority live each round, so a mid-session change to a running
-        // download's priority widens or narrows the very next round's peer count.
-        let parallel = parallel_for_priority(dl.priority()).max(1);
+        round += 1;
+        let parallel = config.parallel(dl.priority()).max(1);
         // Order the sweep best-first by what each source delivered in prior
         // rounds (proven deliverers, then untried, then proven failures).
         let mut ordered: Vec<PeerSource> = sources.to_vec();
@@ -356,7 +380,7 @@ pub async fn download_file(
             let me = me.clone();
             let queue = Arc::clone(&queue);
             let scoreboard = Arc::clone(&scoreboard);
-            let per = config.per_peer;
+            let per = config.per_peer();
             handles.push(tokio::spawn(async move {
                 // (sources_tried, peers_connected) for this worker.
                 let mut tried = 0usize;

@@ -1386,7 +1386,11 @@ impl Engine {
         };
         let dl_task = dl;
         tokio::spawn(async move {
-            let cfg = ManagerConfig::for_priority(dl_task.priority());
+            // ByPriority: the sweep reads dl.priority() live each round, so a
+            // priority change on this download while it is fetching takes effect.
+            let cfg = ManagerConfig::ByPriority {
+                per_peer: Duration::from_secs(45),
+            };
             download_file(&dl_task, &sources, &me, cfg).await;
             // Cancelled while in flight: the engine already removed it and deleted
             // the .part. Do NOT finish or emit - there is nothing to save.
@@ -1510,10 +1514,15 @@ impl Engine {
             found
         };
         match dl {
-            Some(d) => {
+            // A complete download is a no-op: its priority is moot, and skipping
+            // the persist keeps set_priority's blocking save_met from racing
+            // finish_download's Arc::try_unwrap (which would strand the finished
+            // file until the next start).
+            Some(d) if !d.is_complete().await => {
                 d.set_priority(priority).await;
                 true
             }
+            Some(_) => true,
             None => false,
         }
     }
