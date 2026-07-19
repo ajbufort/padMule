@@ -173,20 +173,13 @@ async fn cmd_global_search(target: &str, keyword: &str) {
             if !rasked.lock().await.contains(&sip) {
                 continue;
             }
+            // eMule/aMule drop any UDP datagram whose protocol byte is not 0xE3
+            // before dispatch (UDPSocket.cpp:181; ServerUDPSocket.cpp:92) - server
+            // UDP is never zlib-packed (that is a TCP-only path), so only a plain
+            // OP_GLOBSEARCHRES is a valid reply.
             let (prot, op, payload) = (buf[0], buf[1], &buf[2..n]);
             let files = if prot == mule_proto::PROT_EDONKEY && op == OP_GLOBSEARCHRES {
                 parse_global_search_res(payload).unwrap_or_default()
-            } else if prot == mule_proto::PROT_PACKED {
-                // A large result set may arrive zlib-packed.
-                match mule_proto::decompress(
-                    &mule_proto::Packet::new(prot, op, payload.to_vec()),
-                    1 << 20,
-                ) {
-                    Ok(inner) if inner.opcode == OP_GLOBSEARCHRES => {
-                        parse_global_search_res(&inner.payload).unwrap_or_default()
-                    }
-                    _ => Vec::new(),
-                }
             } else {
                 Vec::new()
             };
@@ -201,8 +194,14 @@ async fn cmd_global_search(target: &str, keyword: &str) {
 
     let mut sent = 0usize;
     for (ip, tcp_port) in &servers {
+        // UDP port = TCP port + 4 (the landmine); guard the u16 add so a corrupt
+        // server.met entry near 65535 skips instead of overflowing.
+        let Some(udp_port) = tcp_port.checked_add(4) else {
+            eprintln!("   skipping {ip}:{tcp_port}: no valid +4 UDP port");
+            continue;
+        };
         asked.lock().await.insert(*ip);
-        let dst = SocketAddr::new(IpAddr::V4(*ip), tcp_port + 4); // +4: the UDP-port landmine
+        let dst = SocketAddr::new(IpAddr::V4(*ip), udp_port);
         match sock.send_to(&req, dst).await {
             Ok(_) => {
                 println!("-> OP_GLOBSEARCHREQ to {dst} (server {ip}:{tcp_port})");
