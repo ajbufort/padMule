@@ -1372,7 +1372,11 @@ impl Engine {
         name: &str,
         sources: Vec<PeerSource>,
     ) {
-        let me = HelloInfo::baseline(self.identity.userhash, 0, TCP_PORT, KAD_UDP_PORT, "padMule");
+        // Advertise SecureIdent v1 in the fetch HELLO so a source will initiate
+        // the exchange toward us; pass our RSA identity so we can respond + verify.
+        let me = HelloInfo::baseline(self.identity.userhash, 0, TCP_PORT, KAD_UDP_PORT, "padMule")
+            .with_secident();
+        let identity = Arc::clone(&self.identity.rsa);
         let dest = self.downloads_dir.join(safe_filename(name));
         let events = self.events.clone();
         let ctx = FinishCtx {
@@ -1389,7 +1393,7 @@ impl Engine {
             let cfg = ManagerConfig::ByPriority {
                 per_peer: Duration::from_secs(45),
             };
-            download_file(&dl_task, &sources, &me, cfg).await;
+            download_file(&dl_task, &sources, &me, cfg, Some(identity)).await;
             // Cancelled while in flight: the engine already removed it and deleted
             // the .part. Do NOT finish or emit - there is nothing to save.
             if dl_task.is_cancelled() {

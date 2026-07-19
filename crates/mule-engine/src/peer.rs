@@ -147,6 +147,16 @@ impl HelloInfo {
             server_port: 0,
         }
     }
+
+    /// Advertise SecureIdent v1 in MISCOPTIONS1 (bit 16 of the sec_ident nibble),
+    /// so a peer we connect to as a DOWNLOADER will initiate the secure-ident
+    /// exchange toward us (eMule gates SendSecIdentStatePacket on the peer's
+    /// advertised support, BaseClient.cpp:2251-2261). v1 only (value 1, not 3):
+    /// padMule does not implement the v2 challenge-IP variant.
+    pub fn with_secident(mut self) -> Self {
+        self.misc_options1 = baseline_misc_options1(1);
+        self
+    }
 }
 
 /// Build the padMule enhancement-channel marker tag (Layer 1 detection). `caps`
