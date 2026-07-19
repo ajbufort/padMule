@@ -142,6 +142,9 @@ pub struct SearchFilters {
     /// Minimum / maximum size in BYTES; 0 = no bound.
     pub min_size: u64,
     pub max_size: u64,
+    /// True = also query the whole serverlist over UDP (global search), not just
+    /// the connected server. Slower + noisier, so it is opt-in.
+    pub global: bool,
 }
 
 impl From<SearchFilters> for EngineSearchFilters {
@@ -150,6 +153,7 @@ impl From<SearchFilters> for EngineSearchFilters {
             min_sources: if f.complete_only { Some(1) } else { None },
             min_size: (f.min_size > 0).then_some(f.min_size),
             max_size: (f.max_size > 0).then_some(f.max_size),
+            global: f.global,
         }
     }
 }

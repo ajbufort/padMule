@@ -40,6 +40,9 @@ final class EngineModel: ObservableObject {
     @Published var wireCompleteOnly = false
     @Published var wireMinSizeMb: UInt64 = 0
     @Published var wireMaxSizeMb: UInt64 = 0
+    /// Query the whole serverlist over UDP (global search), not just the
+    /// connected server. Off by default (slower + noisier).
+    @Published var wireGlobal = false
 
     // Sort / filter inputs (UI-owned; applied client-side over `results`).
     @Published var sortKey: SortKey = .sources
@@ -135,7 +138,8 @@ final class EngineModel: ObservableObject {
         let filters = SearchFilters(
             completeOnly: wireCompleteOnly,
             minSize: wireMinSizeMb * mb,
-            maxSize: wireMaxSizeMb * mb
+            maxSize: wireMaxSizeMb * mb,
+            global: wireGlobal
         )
         work.async { [weak self] in
             let hits = e.search(keyword: q, filters: filters)
