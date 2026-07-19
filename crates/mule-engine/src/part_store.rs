@@ -293,6 +293,17 @@ impl PartStore {
         Ok(())
     }
 
+    /// Move the finished `.part` into place WITHOUT consuming the store, so the
+    /// caller need not be the sole owner of the enclosing `Arc<Download>`. Unix
+    /// (iPadOS + Linux, the only targets) renames an open file fine; the still-open
+    /// handle keeps pointing at the moved inode until the Download is dropped. The
+    /// `.part`/`.met` paths are now stale, so this must be the store's last write.
+    pub fn finish_in_place(&mut self, dest: &Path) -> io::Result<()> {
+        fs::rename(&self.part_path, dest)?;
+        let _ = fs::remove_file(&self.met_path);
+        Ok(())
+    }
+
     /// Delete the backing `.part` and `.part.met` (best effort). Used when a
     /// download is cancelled. Any open handle keeps the bytes readable until it
     /// drops, but the paths leave disk at once so a restart will not resume them.

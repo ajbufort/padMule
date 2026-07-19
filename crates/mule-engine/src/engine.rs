@@ -426,22 +426,20 @@ async fn finish_download(
         )));
         return;
     }
-    // Capture the hashset BEFORE into_store consumes the store: a finished file
-    // becomes a shared source, and answering OP_HASHSETREQUEST needs these.
+    // A finished file becomes a shared source, and answering OP_HASHSETREQUEST
+    // needs these.
     let part_hashes = dl.part_hashes().await;
-    // Drop our registry handle so the store can be taken back out of the Arc.
+    // The download is complete: it leaves the active registry and (below) joins
+    // the shared library.
     registry.lock().await.retain(|d| !Arc::ptr_eq(d, &dl));
-    let Some(store) = dl.into_store().await else {
-        let _ = events.send(EngineEvent::Server(format!(
-            "'{name}' verified but is still in use - it will be saved on the next start"
-        )));
-        return;
-    };
     if let Some(parent) = dest.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     let dest = unique_dest(dest);
-    match store.finish(&dest) {
+    // finish_to moves the file THROUGH the download's lock (not via Arc::try_unwrap),
+    // so a concurrent Arc holder - the 1s downloads() poll, cancel, or
+    // set_download_priority - can no longer strand a byte-complete .part.
+    match dl.finish_to(&dest).await {
         Ok(()) => {
             // Seed it: a verified, complete file is a full source other peers can
             // pull. The listener only serves it while sharing is on. Use the

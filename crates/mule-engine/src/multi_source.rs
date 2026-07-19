@@ -332,6 +332,15 @@ impl Download {
             .ok()
             .map(|d| d.inner.into_inner().store)
     }
+
+    /// Move the finished file into `dest` through the lock, WITHOUT needing sole
+    /// ownership of the Arc. Unlike `into_store`, this never fails just because a
+    /// concurrent holder (the 1s downloads() poll, cancel, set_download_priority)
+    /// happens to hold an Arc clone at the same instant - which would otherwise
+    /// leave a byte-complete `.part` stranded.
+    pub async fn finish_to(&self, dest: &std::path::Path) -> std::io::Result<()> {
+        self.inner.lock().await.store.finish_in_place(dest)
+    }
 }
 
 /// Resume every in-progress download in `dir` by opening each `NNN.part` from
@@ -514,6 +523,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[tokio::test]
+    async fn finish_to_moves_the_file_even_with_a_concurrent_arc_holder() {
+        // The old into_store path used Arc::try_unwrap, which failed - and
+        // stranded the byte-complete .part - if ANY other Arc<Download> clone
+        // existed at that instant (the 1s downloads() poll, cancel, set_priority).
+        // finish_to goes through the lock instead, so a live clone can't strand it.
+        let dir = tmpdir("finish-concurrent");
+        let store = PartStore::create(&dir, 1, [0x33; 16], 500, b"done.bin").unwrap();
+        let part_path = dir.join("001.part");
+        let met_path = dir.join("001.part.met");
+        assert!(part_path.exists());
+        let dl = Download::new(store);
+
+        // Simulate a concurrent holder (e.g. the downloads() poll) keeping a clone.
+        let holder = Arc::clone(&dl);
+
+        let dest = dir.join("done.bin");
+        dl.finish_to(&dest).await.unwrap();
+
+        assert!(dest.exists(), "the file must be moved into place");
+        assert!(!part_path.exists(), "the .part is renamed away");
+        assert!(!met_path.exists(), "the .part.met is removed");
+        // The clone is still alive throughout - it did not block the finish.
+        assert_eq!(Arc::strong_count(&holder), 2);
+        drop(holder);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
