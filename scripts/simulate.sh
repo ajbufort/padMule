@@ -14,14 +14,16 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$REPO/build-oracle/eserver/eserver"
 SIM="$REPO/target/release/examples/simulate"
+CLI="$REPO/target/release/mule-cli"
 PORT=4661
 KEYWORD="${1:-test}"
 
 if [ "${SIM_IN_NS:-}" != "1" ]; then
   [ -x "$BIN" ] || { echo "run scripts/eserver-oracle.sh once first (eserver not obtained)"; exit 1; }
-  ( cd "$REPO" && cargo build --release -p mule-ffi --example simulate >/dev/null 2>&1 ) \
-    || { echo "failed to build the simulate example"; exit 1; }
-  export SIM_IN_NS=1 REPO BIN SIM PORT KEYWORD
+  # Build the simulate example AND mule-cli (the index seeder, below).
+  ( cd "$REPO" && cargo build --release -p mule-ffi --example simulate -p mule-cli >/dev/null 2>&1 ) \
+    || { echo "failed to build the simulate example / mule-cli"; exit 1; }
+  export SIM_IN_NS=1 REPO BIN SIM CLI PORT KEYWORD
   exec unshare -rn bash "$0"
 fi
 
@@ -54,9 +56,23 @@ data = bytes([0xE0]) + struct.pack('<I', 1) \
 open(path, 'wb').write(data)
 PY
 
-echo "== eserver up on 127.0.0.1:$PORT (isolated) - running the app simulation =="
+# Seed the eserver's index: ONE client offers a small shared library (files named
+# with the search keyword) and HOLDS the connection, so the files stay searchable
+# while the simulation runs. This is how a real eD2k server gets a searchable index
+# - from clients that offer - so the SEARCH screen returns real, sourced results
+# instead of an empty set. The seeder is a distinct user from the simulate engine,
+# so the searcher sees them as another peer's files. Synthetic names only, no
+# content (validates SEARCH + result color-coding, not the byte transfer, which the
+# amuled differential test already covers).
+SEED_LIB="$KEYWORD sample video.avi|$KEYWORD music track.mp3|$KEYWORD readme notes.txt"
+"$CLI" offer-hold 127.0.0.1 "$PORT" "$SEED_LIB" 120 &
+SEED_PID=$!
+sleep 2 # let the seeder log in + offer before the search runs
+echo "== seeded the eserver index (keyword '$KEYWORD'); running the app simulation =="
 "$SIM" "$CFG" "$DL" "$KEYWORD"
 
+kill "$SEED_PID" 2>/dev/null || true
+[ -n "${KEEP_LOG:-}" ] && cp "$ORACLE/eserver.log" "$REPO/build-oracle/eserver-sim.log" 2>/dev/null || true
 exec 9>&-
 wait "$ESRV" 2>/dev/null || true
 rm -rf "$WORK"
