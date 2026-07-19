@@ -25,6 +25,9 @@ use tokio::sync::Mutex;
 use crate::framed::FramedStream;
 use crate::part_file::data_part_count;
 use crate::part_store::PartStore;
+use crate::secure_ident::{
+    Identity, SecureIdentSession, OP_PUBLICKEY, OP_SECIDENTSTATE, OP_SIGNATURE,
+};
 use crate::transfer::{
     build_hashset_request, build_request_filename_ext, build_request_parts, build_set_req_file_id,
     build_start_upload_req, parse_file_desc, parse_file_status, parse_hashset_answer,
@@ -33,6 +36,14 @@ use crate::transfer::{
 };
 use crate::transfer_session::TransferError;
 use mule_proto::{Packet, PARTSIZE};
+
+/// Inputs the download-side secure-ident exchange needs: our RSA identity, and
+/// whether the peer advertised secure-ident support in its HELLO (so we know to
+/// proactively ask it to prove itself, matching a real eMule downloader).
+pub struct SecIdentCtx {
+    pub identity: Arc<Identity>,
+    pub peer_supports: bool,
+}
 
 /// What we learned about one source we connected to, for the per-source UI.
 #[derive(Debug, Clone)]
@@ -387,22 +398,26 @@ pub async fn download_from_peer<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    download_from_peer_at(fs, dl, bail_on_queue, None).await
+    download_from_peer_at(fs, dl, bail_on_queue, None, None).await
 }
 
-/// As [`download_from_peer`], but `peer` names the source address so a rating +
-/// comment it sends (OP_FILEDESC) can be recorded against it for the UI.
+/// As [`download_from_peer`], but `peer` names the source address (so a rating +
+/// comment it sends via OP_FILEDESC, and an identity verification, can be recorded
+/// against it) and `sec` carries the secure-ident context (our RSA identity +
+/// whether the peer advertised support), enabling mutual secure-identification
+/// inline with the transfer. `sec = None` disables it (plain download).
 pub async fn download_from_peer_at<S>(
     fs: &mut FramedStream<S>,
     dl: &Download,
     bail_on_queue: bool,
     peer: Option<SocketAddr>,
+    sec: Option<SecIdentCtx>,
 ) -> Result<u64, TransferError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut held: Vec<(u64, u64)> = Vec::new();
-    let r = run_peer(fs, dl, &mut held, bail_on_queue, peer).await;
+    let r = run_peer(fs, dl, &mut held, bail_on_queue, peer, sec).await;
     // Whatever happened, do not strand blocks nobody else will be offered.
     dl.release(&held).await;
     r
@@ -420,17 +435,71 @@ async fn note_comment_if_desc(pkt: &Packet, dl: &Download, peer: Option<SocketAd
     }
 }
 
+/// Handle a packet that is NOT the one a read loop is waiting for: a source's
+/// rating/comment (OP_FILEDESC), and the secure-ident exchange (OP_SECIDENTSTATE
+/// / OP_PUBLICKEY / OP_SIGNATURE). Secure-ident is best-effort and NEVER blocks
+/// the transfer - it just answers packets the loop was going to read anyway: we
+/// reply so the peer can verify us, mark the source verified once its signature
+/// checks out, and drop a malformed packet silently. Nothing here awaits new data.
+async fn handle_aux_packet<S>(
+    pkt: &Packet,
+    sec: &mut Option<(SecureIdentSession, Arc<Identity>)>,
+    fs: &mut FramedStream<S>,
+    dl: &Download,
+    peer: Option<SocketAddr>,
+) -> Result<(), TransferError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    note_comment_if_desc(pkt, dl, peer).await;
+    if matches!(pkt.opcode, OP_SECIDENTSTATE | OP_PUBLICKEY | OP_SIGNATURE) {
+        if let Some((session, id)) = sec.as_mut() {
+            // A malformed secure-ident packet is dropped (Err ignored), never
+            // fatal to the download.
+            if let Ok(replies) = session.on_packet(id, pkt.opcode, &pkt.payload) {
+                for reply in replies {
+                    fs.write_packet(&reply).await?;
+                }
+                if session.peer_verified() {
+                    if let Some(addr) = peer {
+                        dl.note_source_verified(addr).await;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn run_peer<S>(
     fs: &mut FramedStream<S>,
     dl: &Download,
     held: &mut Vec<(u64, u64)>,
     bail_on_queue: bool,
     peer: Option<SocketAddr>,
+    sec: Option<SecIdentCtx>,
 ) -> Result<u64, TransferError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let hash = dl.hash().await;
+
+    // Secure-ident, when enabled: build our session and - if the peer advertised
+    // support - proactively ask it to prove it owns its userhash, exactly as a
+    // real eMule downloader does right after the hello. Fire-and-forget: the
+    // exchange rides along on packets the transfer loops read anyway, and we NEVER
+    // wait on it, so a peer that does not answer just stays unverified.
+    let mut sec: Option<(SecureIdentSession, Arc<Identity>)> = match sec {
+        Some(ctx) => {
+            let session = SecureIdentSession::new(&ctx.identity);
+            if ctx.peer_supports {
+                let start = session.start();
+                fs.write_packet(&start).await?;
+            }
+            Some((session, ctx.identity))
+        }
+        None => None,
+    };
 
     // Ask what this peer has.
     fs.write_packet(&build_request_filename_ext(&hash)).await?;
@@ -440,9 +509,9 @@ where
         match pkt.opcode {
             OP_FILEREQANSNOFIL => return Err(TransferError::NoFile),
             OP_FILESTATUS => break parse_file_status(&pkt.payload)?,
-            // A source sends its rating/comment (OP_FILEDESC) unsolicited right
-            // after the filename answer, so it lands here.
-            _ => note_comment_if_desc(&pkt, dl, peer).await,
+            // A source's OP_FILEDESC (rating/comment) or a secure-ident packet
+            // can arrive here; neither is what we are waiting for.
+            _ => handle_aux_packet(&pkt, &mut sec, fs, dl, peer).await?,
         }
     };
     // Record what this peer holds so block selection knows which parts are rare.
@@ -458,6 +527,7 @@ where
                 dl.set_hashset(hashes).await;
                 break;
             }
+            handle_aux_packet(&pkt, &mut sec, fs, dl, peer).await?;
         }
     }
 
@@ -472,7 +542,7 @@ where
         match pkt.opcode {
             OP_ACCEPTUPLOADREQ => break,
             OP_QUEUERANKING if bail_on_queue => return Err(TransferError::Queued),
-            _ => note_comment_if_desc(&pkt, dl, peer).await,
+            _ => handle_aux_packet(&pkt, &mut sec, fs, dl, peer).await?,
         }
     }
 
@@ -494,6 +564,16 @@ where
         let mut rx = BlockReceiver::new(hash, size, &blocks);
         while !rx.is_done() {
             let pkt = fs.read_packet_unpacked().await?;
+            // A secure-ident packet (or a late OP_FILEDESC) can interleave with
+            // block data on the same connection; handle it and keep waiting for
+            // the blocks we asked for.
+            if matches!(
+                pkt.opcode,
+                OP_SECIDENTSTATE | OP_PUBLICKEY | OP_SIGNATURE | OP_FILEDESC
+            ) {
+                handle_aux_packet(&pkt, &mut sec, fs, dl, peer).await?;
+                continue;
+            }
             for w in rx.accept(pkt.opcode, &pkt.payload)? {
                 delivered += w.data.len() as u64;
                 dl.commit(w.offset, &w.data)
@@ -589,7 +669,7 @@ mod tests {
                 .unwrap();
         });
 
-        let r = download_from_peer_at(&mut client_fs, &dl, false, Some(addr)).await;
+        let r = download_from_peer_at(&mut client_fs, &dl, false, Some(addr), None).await;
         assert!(matches!(r, Err(TransferError::NoFile)));
         let _ = src.await;
 
@@ -693,6 +773,92 @@ mod tests {
             }
         });
         addr
+    }
+
+    #[tokio::test]
+    async fn secure_ident_verifies_a_source_inline_with_the_download() {
+        use crate::transfer::{
+            build_accept_upload, build_file_status_complete, build_sending_part,
+            parse_request_parts, OP_REQUESTFILENAME, OP_REQUESTPARTS, OP_STARTUPLOADREQ,
+        };
+        let dir = tmpdir("secident-verify");
+        let data: Vec<u8> = (0..5000u32).map(|i| (i.wrapping_mul(7)) as u8).collect();
+        let hash = ed2k_hash(&data);
+
+        // A mock UPLOADER that advertises secure-ident, INITIATES it toward the
+        // downloader (as a real eMule does right after the hello), responds to the
+        // downloader's own request, and serves the file - all interleaved on one
+        // connection. This is the FAITHFUL other-side the reverted attempt lacked.
+        let server_data = data.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let me = HelloInfo::baseline([0xBB; 16], 0, 4662, 4672, "server").with_secident();
+            let (_p, mut fs) = accept_peer(&listener, &me).await.unwrap();
+            let server_id = Identity::generate();
+            let mut sess = SecureIdentSession::new(&server_id);
+            // Initiate: ask the downloader to prove it owns its userhash.
+            fs.write_packet(&sess.start()).await.unwrap();
+            while let Ok(pkt) = fs.read_packet_unpacked().await {
+                match pkt.opcode {
+                    OP_SECIDENTSTATE | OP_PUBLICKEY | OP_SIGNATURE => {
+                        if let Ok(replies) = sess.on_packet(&server_id, pkt.opcode, &pkt.payload) {
+                            for r in replies {
+                                let _ = fs.write_packet(&r).await;
+                            }
+                        }
+                    }
+                    OP_REQUESTFILENAME => {
+                        let _ = fs.write_packet(&build_file_status_complete(&hash)).await;
+                    }
+                    OP_STARTUPLOADREQ => {
+                        let _ = fs.write_packet(&build_accept_upload()).await;
+                    }
+                    OP_REQUESTPARTS => {
+                        if let Ok((_h, blocks)) = parse_request_parts(&pkt.payload, false) {
+                            for (s, e) in blocks {
+                                if s <= e && (e as usize) <= server_data.len() {
+                                    let _ = fs
+                                        .write_packet(&build_sending_part(
+                                            &hash,
+                                            s,
+                                            e,
+                                            &server_data[s as usize..e as usize],
+                                        ))
+                                        .await;
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let store = PartStore::create(&dir, 1, hash, data.len() as u64, b"s.bin").unwrap();
+        let dl = Download::new(store);
+        let me = HelloInfo::baseline([0xAA; 16], 0x0A00_0001, 4663, 4673, "dl").with_secident();
+        let (_p, mut fs) = connect_peer(addr, &me).await.unwrap();
+        // Register the source so a verification is recorded against it.
+        dl.note_source("server".into(), addr, false, false).await;
+        let sec = Some(SecIdentCtx {
+            identity: Arc::new(Identity::generate()),
+            peer_supports: true,
+        });
+        let got = download_from_peer_at(&mut fs, &dl, false, Some(addr), sec)
+            .await
+            .unwrap();
+
+        assert_eq!(got, data.len() as u64, "the whole file transferred");
+        assert!(dl.is_complete().await, "download completed");
+        assert!(
+            dl.sources().await.iter().any(|s| s.verified),
+            "the source must be cryptographically verified via secure-ident"
+        );
+
+        drop(fs);
+        let _ = server.await;
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

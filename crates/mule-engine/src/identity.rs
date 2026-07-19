@@ -15,6 +15,7 @@ use mule_files::{
 use mule_proto::Kad128;
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
 
 /// The node's full, persistent identity.
 pub struct NodeIdentity {
@@ -24,8 +25,9 @@ pub struct NodeIdentity {
     pub kad_id: Kad128,
     /// Per-install Kad UDP anti-spoof key (feeds `udp_verify_key`).
     pub kad_udp_key: u32,
-    /// RSA secure-identification key.
-    pub rsa: RsaIdentity,
+    /// RSA secure-identification key. `Arc` so the parallel fetch workers can
+    /// each hold a cheap handle to it for the download-path secure-ident exchange.
+    pub rsa: Arc<RsaIdentity>,
 }
 
 fn generate_userhash() -> [u8; 16] {
@@ -51,7 +53,7 @@ impl NodeIdentity {
             userhash: generate_userhash(),
             kad_id: generate_kad_id(),
             kad_udp_key: rand::random(),
-            rsa: RsaIdentity::generate(),
+            rsa: Arc::new(RsaIdentity::generate()),
         }
     }
 
@@ -74,10 +76,12 @@ impl NodeIdentity {
             .filter(|b| b.len() >= 4)
             .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .unwrap_or_else(rand::random);
-        let rsa = std::fs::read(dir.join("cryptkey.dat"))
-            .ok()
-            .and_then(|b| RsaIdentity::from_cryptkey_dat(&b).ok())
-            .unwrap_or_else(RsaIdentity::generate);
+        let rsa = Arc::new(
+            std::fs::read(dir.join("cryptkey.dat"))
+                .ok()
+                .and_then(|b| RsaIdentity::from_cryptkey_dat(&b).ok())
+                .unwrap_or_else(RsaIdentity::generate),
+        );
 
         let id = NodeIdentity {
             userhash,

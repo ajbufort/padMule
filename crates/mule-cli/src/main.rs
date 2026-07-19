@@ -18,9 +18,9 @@ use mule_engine::server_messages::{LoginRequest, DEFAULT_SERVER_FLAGS};
 use mule_engine::sources::{build_callback_request, build_get_sources, parse_found_sources};
 use mule_engine::{
     catalog, connect_peer, connect_peer_obf, connect_server, download_file, download_from_peer,
-    fetch_from_sources, login_handshake, obf_accept, peer_handshake_inbound, serve, Download,
-    FramedStream, KadNode, ManagerConfig, ObfDetect, PartStore, ServedFile, ServerEvent,
-    ServerLink, ServerState, SourceRegistry,
+    download_from_peer_at, fetch_from_sources, login_handshake, obf_accept, peer_handshake_inbound,
+    serve, Download, FramedStream, Identity, KadNode, ManagerConfig, ObfDetect, PartStore,
+    SecIdentCtx, ServedFile, ServerEvent, ServerLink, ServerState, SourceRegistry,
 };
 use mule_files::{read_nodes_dat, read_server_met};
 use mule_proto::{ed2k_hash, Kad128};
@@ -508,8 +508,10 @@ async fn cmd_peer_download(
     );
     // Advertise client id 0 (LowID/unregistered): we have no server-assigned
     // HighID, and a non-LowID id that does not match our real source IP trips
-    // aMule's ParanoidFilter (ClientTCPSocket.cpp:300).
-    let me = HelloInfo::baseline(demo_user_hash(), 0, 4662, 4672, "padMule");
+    // aMule's ParanoidFilter (ClientTCPSocket.cpp:300). Advertise SecureIdent so
+    // the peer initiates secure-ident toward us - this makes the differential
+    // test exercise the real exchange against a live aMule/eMule.
+    let me = HelloInfo::baseline(demo_user_hash(), 0, 4662, 4672, "padMule").with_secident();
     let connect = async {
         match obf_target {
             Some(th) => connect_peer_obf(addr, &me, &th).await,
@@ -548,9 +550,27 @@ async fn cmd_peer_download(
     };
     let dl = Download::new(store);
 
+    // Register the source so a secure-ident verification (and any rating/comment)
+    // is recorded against it - the engine's fetch_one does this; the CLI must too.
+    let low_id = peer.client_id < 0x0100_0000;
+    dl.note_source(peer.client_software(), addr, obf_target.is_some(), low_id)
+        .await;
+
+    // Secure-ident: carry a fresh RSA identity and run the exchange inline. The
+    // peer initiates because we advertised support; we also proactively verify it.
+    let identity = std::sync::Arc::new(Identity::generate());
+    let peer_supports = peer
+        .capabilities()
+        .map(|c| c.sec_ident != 0)
+        .unwrap_or(false);
+    let sec = Some(SecIdentCtx {
+        identity,
+        peer_supports,
+    });
+
     match timeout(
         Duration::from_secs(120),
-        download_from_peer(&mut fs, &dl, false),
+        download_from_peer_at(&mut fs, &dl, false, Some(addr), sec),
     )
     .await
     {
@@ -564,6 +584,10 @@ async fn cmd_peer_download(
             return;
         }
     }
+
+    // Report whether we cryptographically verified the source's identity.
+    let verified = dl.sources().await.iter().any(|s| s.verified);
+    println!("source identity verified (secure-ident): {verified}");
 
     if !dl.is_complete().await {
         eprintln!(
@@ -882,7 +906,7 @@ async fn cmd_kad_fetch(nodes_path: &str, hash: [u8; 16], size: u64, out: &str) {
     let me = HelloInfo::baseline(demo_user_hash(), 0, 4662, 4672, "padMule");
 
     println!("downloading from {} connectable source(s)...", reg.len());
-    let fetched = fetch_from_sources(&dl, reg.sources(), &me, Duration::from_secs(60)).await;
+    let fetched = fetch_from_sources(&dl, reg.sources(), &me, Duration::from_secs(60), None).await;
     println!(
         "connected to {}/{} sources; {} / {size} bytes present; complete={}",
         fetched.peers_connected, fetched.sources_tried, fetched.bytes_present, fetched.completed
@@ -1146,7 +1170,7 @@ async fn cmd_search_download(met_path: &str, keyword: &str, out: &str) {
             per_peer: Duration::from_secs(45),
             rounds: 3,
         };
-        let out = download_file(&dl, reg.sources(), &me, cfg).await;
+        let out = download_file(&dl, reg.sources(), &me, cfg, None).await;
         println!(
             "  {} / {size} bytes; complete={}",
             out.bytes_present, out.completed
@@ -1429,7 +1453,7 @@ async fn cmd_link(link: &str, out: Option<&str>) {
                 per_peer: Duration::from_secs(60),
                 rounds: 6,
             };
-            let o = download_file(&dl, &sources, &me, cfg).await;
+            let o = download_file(&dl, &sources, &me, cfg, None).await;
             println!(
                 "{} / {} bytes; complete={}",
                 o.bytes_present, f.size, o.completed
@@ -1706,7 +1730,7 @@ async fn cmd_fetch_complete(
         };
         // Direct HighID sources (each bails in ~2s if it queues us rather than
         // granting a slot, so this whole call is fast when nobody is free)...
-        download_file(&dl, reg.sources(), &me, cfg).await;
+        download_file(&dl, reg.sources(), &me, cfg, None).await;
         // ...then, if we asked LowID sources to call back, wait WHILE they keep
         // delivering. A callback can take many seconds to connect and then streams
         // the whole file, so a fixed short wait would abandon an in-flight

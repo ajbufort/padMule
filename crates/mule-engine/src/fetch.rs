@@ -11,9 +11,10 @@
 //!   - Server / peer-exchange sources use the eD2k convention: the first octet
 //!     is the LOW byte (`Ipv4Addr::new(ip, ip>>8, ip>>16, ip>>24)`).
 
-use crate::multi_source::{download_from_peer_at, Download};
+use crate::multi_source::{download_from_peer_at, Download, SecIdentCtx};
 use crate::peer::HelloInfo;
 use crate::peer_conn::{connect_peer, connect_peer_obf};
+use crate::secure_ident::Identity;
 use crate::sources::FoundSource;
 use std::collections::VecDeque;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -168,6 +169,7 @@ async fn fetch_one(
     src: &PeerSource,
     me: &HelloInfo,
     per_peer: Duration,
+    identity: Option<&Arc<Identity>>,
 ) -> Result<u64, ()> {
     let connect = async {
         match src.user_hash {
@@ -189,12 +191,26 @@ async fn fetch_one(
         low_id,
     )
     .await;
+    // Secure-ident: run it inline with the transfer when we have an identity.
+    // `peer_supports` (from the peer's advertised MISCOPTIONS1) tells us whether
+    // to proactively ask it to prove itself. Verifying it marks the source's blue
+    // seal; it never gates or delays the download.
+    let sec = identity.map(|id| {
+        let peer_supports = peer
+            .capabilities()
+            .map(|c| c.sec_ident != 0)
+            .unwrap_or(false);
+        SecIdentCtx {
+            identity: Arc::clone(id),
+            peer_supports,
+        }
+    });
     // Multi-source manager: bail the instant this peer queues us and try another
     // source rather than burning `per_peer` in its queue. Pass the addr so a
     // rating/comment (OP_FILEDESC) the source sends is recorded against it.
     match timeout(
         per_peer,
-        download_from_peer_at(&mut fs, dl, true, Some(src.addr)),
+        download_from_peer_at(&mut fs, dl, true, Some(src.addr), sec),
     )
     .await
     {
@@ -253,6 +269,7 @@ pub async fn fetch_from_sources(
     sources: &[PeerSource],
     me: &HelloInfo,
     per_peer: Duration,
+    identity: Option<&Arc<Identity>>,
 ) -> FetchOutcome {
     let mut out = FetchOutcome::default();
     for src in sources {
@@ -260,7 +277,7 @@ pub async fn fetch_from_sources(
             break;
         }
         out.sources_tried += 1;
-        if fetch_one(dl, src, me, per_peer).await.is_ok() {
+        if fetch_one(dl, src, me, per_peer, identity).await.is_ok() {
             out.peers_connected += 1;
         }
     }
@@ -349,6 +366,7 @@ pub async fn download_file(
     sources: &[PeerSource],
     me: &HelloInfo,
     config: ManagerConfig,
+    identity: Option<Arc<Identity>>,
 ) -> FetchOutcome {
     let mut out = FetchOutcome::default();
     // Learned across rounds: which sources actually delivered.
@@ -381,6 +399,7 @@ pub async fn download_file(
             let queue = Arc::clone(&queue);
             let scoreboard = Arc::clone(&scoreboard);
             let per = config.per_peer();
+            let identity = identity.clone();
             handles.push(tokio::spawn(async move {
                 // (sources_tried, peers_connected) for this worker.
                 let mut tried = 0usize;
@@ -393,7 +412,7 @@ pub async fn download_file(
                         break;
                     };
                     tried += 1;
-                    match fetch_one(&dl, &src, &me, per).await {
+                    match fetch_one(&dl, &src, &me, per, identity.as_ref()).await {
                         Ok(bytes) => {
                             connected += 1;
                             scoreboard.lock().await.record(src.addr, bytes);

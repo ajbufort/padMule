@@ -62,7 +62,7 @@ async fn fetch_downloads_a_file_from_a_discovered_source() {
     }];
     let me = HelloInfo::baseline(user_hash(), 0, 4662, 4672, "padMule");
 
-    let outcome = fetch_from_sources(&dl, &sources, &me, Duration::from_secs(20)).await;
+    let outcome = fetch_from_sources(&dl, &sources, &me, Duration::from_secs(20), None).await;
 
     assert_eq!(outcome.sources_tried, 1);
     assert_eq!(outcome.peers_connected, 1);
@@ -112,7 +112,7 @@ async fn download_manager_completes_from_multiple_parallel_peers() {
         per_peer: Duration::from_secs(20),
         rounds: 4,
     };
-    let outcome = download_file(&dl, &sources, &me, cfg).await;
+    let outcome = download_file(&dl, &sources, &me, cfg, None).await;
 
     assert!(outcome.completed, "the manager must complete the file");
     assert_eq!(outcome.bytes_present, data.len() as u64);
@@ -146,7 +146,7 @@ async fn fetch_skips_a_dead_source_and_reports_no_completion() {
         origin: SourceOrigin::Server,
     }];
     let me = HelloInfo::baseline(user_hash(), 0, 4662, 4672, "padMule");
-    let outcome = fetch_from_sources(&dl, &sources, &me, Duration::from_millis(800)).await;
+    let outcome = fetch_from_sources(&dl, &sources, &me, Duration::from_millis(800), None).await;
 
     assert_eq!(outcome.sources_tried, 1);
     assert_eq!(outcome.peers_connected, 0);
