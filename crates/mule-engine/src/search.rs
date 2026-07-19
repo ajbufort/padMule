@@ -2,10 +2,10 @@
 //! SearchList.cpp:156-257 (CSearchExprTarget), :714-830 (CreateSearchData), and
 //! docs/wiki/protocol-understanding.md Part 1.
 //!
-//! Only the common ANDed-terms form is built (a keyword plus size/type/extension
-//! filters, all ANDed) - aMule's optimized path for searches without OR/NOT.
-//! The full boolean tree (OR/NOT, parenthesized) and global UDP search are
-//! deferred.
+//! The keyword field is parsed as a full boolean expression (implicit-AND
+//! between words, explicit AND/OR/NOT, parentheses, "quoted phrases") into a
+//! binary tree, then ANDed with the size/type/extension filters. Global UDP
+//! search reuses this exact encoder (see `build_global_search_udp`).
 
 use mule_proto::{read_tag, IoError, Packet, Reader, Tag, Writer, PROT_EDONKEY};
 
@@ -45,6 +45,16 @@ fn write_and(w: &mut Writer) {
     w.write_u8(0x00); // AND
 }
 
+fn write_or(w: &mut Writer) {
+    w.write_u8(0x00); // boolean operator parameter type
+    w.write_u8(0x01); // OR
+}
+
+fn write_not(w: &mut Writer) {
+    w.write_u8(0x00); // boolean operator parameter type
+    w.write_u8(0x02); // NOT (binary: left AND-NOT right)
+}
+
 fn write_keyword(w: &mut Writer, s: &str) {
     w.write_u8(0x01); // string parameter type
     w.write_string_u16(s.as_bytes());
@@ -67,38 +77,271 @@ fn write_numeric_meta(w: &mut Writer, tag_id: u8, op: u8, value: u32) {
 
 /// One term of a search expression, in aMule's parameter order.
 enum Term<'a> {
-    Keyword(&'a str),
     StringMeta(u8, &'a str),
     NumericMeta(u8, u8, u32),
 }
 
 fn write_term(w: &mut Writer, t: &Term) {
     match *t {
-        Term::Keyword(s) => write_keyword(w, s),
         Term::StringMeta(id, s) => write_string_meta(w, id, s),
         Term::NumericMeta(id, op, v) => write_numeric_meta(w, id, op, v),
     }
 }
 
-/// Write the ANDed search-expression tree for `p` into `w`. This is the SAME
-/// payload for both the TCP OP_SEARCHREQUEST and the UDP global-search opcodes
-/// (eMule reuses the identical packet body, only changing the opcode -
+/// A parsed boolean keyword expression. The eD2k wire ops are all BINARY: a NOT
+/// node means "left AND-NOT right" (eMule `CSearchExprTarget::WriteBooleanNOT`).
+/// Adjacent words are implicitly ANDed, matching how eMule tokenizes a query.
+enum QueryExpr {
+    Word(String),
+    And(Box<QueryExpr>, Box<QueryExpr>),
+    Or(Box<QueryExpr>, Box<QueryExpr>),
+    Not(Box<QueryExpr>, Box<QueryExpr>),
+}
+
+fn write_query_expr(w: &mut Writer, e: &QueryExpr) {
+    match e {
+        QueryExpr::Word(s) => write_keyword(w, s),
+        QueryExpr::And(l, r) => {
+            write_and(w);
+            write_query_expr(w, l);
+            write_query_expr(w, r);
+        }
+        QueryExpr::Or(l, r) => {
+            write_or(w);
+            write_query_expr(w, l);
+            write_query_expr(w, r);
+        }
+        QueryExpr::Not(l, r) => {
+            write_not(w);
+            write_query_expr(w, l);
+            write_query_expr(w, r);
+        }
+    }
+}
+
+enum Tok {
+    Word(String),
+    And,
+    Or,
+    Not,
+    LParen,
+    RParen,
+}
+
+/// Split a query into tokens. Whitespace separates; `"quoted phrases"` are one
+/// literal word (even if the text is AND/OR/NOT); parentheses are their own
+/// tokens; a bare `AND`/`OR`/`NOT` (uppercase, as eMule requires) is an operator,
+/// anything else is a word. `:` and other punctuation stay inside a word, so a
+/// `related::<hash>` query survives as a single leaf.
+fn tokenize(s: &str) -> Vec<Tok> {
+    fn flush(cur: &mut String, toks: &mut Vec<Tok>) {
+        if cur.is_empty() {
+            return;
+        }
+        let tok = match cur.as_str() {
+            "AND" => Tok::And,
+            "OR" => Tok::Or,
+            "NOT" => Tok::Not,
+            _ => Tok::Word(cur.clone()),
+        };
+        cur.clear();
+        toks.push(tok);
+    }
+
+    let mut toks = Vec::new();
+    let mut cur = String::new();
+    let mut chars = s.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        match c {
+            '"' => {
+                flush(&mut cur, &mut toks);
+                chars.next();
+                let mut phrase = String::new();
+                for pc in chars.by_ref() {
+                    if pc == '"' {
+                        break;
+                    }
+                    phrase.push(pc);
+                }
+                if !phrase.is_empty() {
+                    toks.push(Tok::Word(phrase));
+                }
+            }
+            '(' => {
+                flush(&mut cur, &mut toks);
+                chars.next();
+                toks.push(Tok::LParen);
+            }
+            ')' => {
+                flush(&mut cur, &mut toks);
+                chars.next();
+                toks.push(Tok::RParen);
+            }
+            c if c.is_whitespace() => {
+                flush(&mut cur, &mut toks);
+                chars.next();
+            }
+            _ => {
+                cur.push(c);
+                chars.next();
+            }
+        }
+    }
+    flush(&mut cur, &mut toks);
+    toks
+}
+
+/// Cap on parenthesis-nesting recursion. A real query nests a handful of levels;
+/// past this we bail to the fallback leaf rather than overflow the stack (a Rust
+/// stack overflow aborts uncatchably, and an iOS thread stack is only ~512 KB).
+const MAX_DEPTH: u32 = 64;
+
+/// Recursive-descent parser over the token stream. Precedence, lowest first:
+/// AND (also implicit adjacency), then OR, then NOT (highest), all
+/// left-associative - matching eMule `parser.y:52-54` (`%left TOK_AND` declared
+/// first is the *lowest*, so `a b OR c d` == `a AND b OR c AND d`). Tolerant of
+/// malformed input (a dangling or leading operator, an unmatched paren) so a
+/// stray character never sinks the whole search.
+struct Parser<'a> {
+    toks: &'a [Tok],
+    pos: usize,
+    depth: u32,
+}
+
+impl<'a> Parser<'a> {
+    fn peek(&self) -> Option<&'a Tok> {
+        self.toks.get(self.pos)
+    }
+    fn bump(&mut self) -> Option<&'a Tok> {
+        let t = self.toks.get(self.pos);
+        if t.is_some() {
+            self.pos += 1;
+        }
+        t
+    }
+
+    /// AND level (lowest precedence): explicit `AND` and implicit adjacency.
+    fn parse_and(&mut self) -> Option<QueryExpr> {
+        let mut left = self.parse_or()?;
+        loop {
+            match self.peek() {
+                Some(Tok::And) => {
+                    self.bump();
+                }
+                // Adjacent word/group is an implicit AND (do NOT consume it).
+                Some(Tok::Word(_)) | Some(Tok::LParen) => {}
+                _ => break, // OR / NOT bind tighter; RParen / end
+            }
+            match self.parse_or() {
+                Some(right) => left = QueryExpr::And(Box::new(left), Box::new(right)),
+                None => break,
+            }
+        }
+        Some(left)
+    }
+
+    /// OR level (middle precedence).
+    fn parse_or(&mut self) -> Option<QueryExpr> {
+        let mut left = self.parse_not()?;
+        while matches!(self.peek(), Some(Tok::Or)) {
+            self.bump();
+            match self.parse_not() {
+                Some(right) => left = QueryExpr::Or(Box::new(left), Box::new(right)),
+                None => break, // trailing OR: drop it
+            }
+        }
+        Some(left)
+    }
+
+    /// NOT level (highest precedence). Binary: `a NOT b` = "a AND-NOT b".
+    fn parse_not(&mut self) -> Option<QueryExpr> {
+        let mut left = self.parse_primary()?;
+        while matches!(self.peek(), Some(Tok::Not)) {
+            self.bump();
+            match self.parse_primary() {
+                Some(right) => left = QueryExpr::Not(Box::new(left), Box::new(right)),
+                None => break,
+            }
+        }
+        Some(left)
+    }
+
+    fn parse_primary(&mut self) -> Option<QueryExpr> {
+        // Iterative skip of stray leading operators / `)` (no recursion here, so
+        // a long run of them cannot deepen the stack).
+        loop {
+            match self.peek() {
+                Some(Tok::LParen) => {
+                    self.bump();
+                    self.depth += 1;
+                    // Only recurse while under the nesting cap; past it, bail so a
+                    // pathologically nested query degrades to the fallback leaf
+                    // instead of aborting the process.
+                    let inner = if self.depth > MAX_DEPTH {
+                        None
+                    } else {
+                        self.parse_and()
+                    };
+                    self.depth -= 1;
+                    if matches!(self.peek(), Some(Tok::RParen)) {
+                        self.bump();
+                    }
+                    return inner;
+                }
+                Some(Tok::Word(_)) => {
+                    return match self.bump() {
+                        Some(Tok::Word(s)) => Some(QueryExpr::Word(s.clone())),
+                        _ => None,
+                    };
+                }
+                Some(_) => {
+                    self.bump(); // stray operator / `)`: skip and loop
+                }
+                None => return None,
+            }
+        }
+    }
+}
+
+/// Parse the keyword field into a boolean expression tree. Never fails: an empty
+/// or all-operator string falls back to the raw trimmed text as one leaf, so the
+/// wire tree is always non-empty.
+fn parse_query(s: &str) -> QueryExpr {
+    let toks = tokenize(s);
+    let mut p = Parser {
+        toks: &toks,
+        pos: 0,
+        depth: 0,
+    };
+    // parse_and is the lowest-precedence (outermost) level.
+    p.parse_and()
+        .unwrap_or_else(|| QueryExpr::Word(s.trim().to_string()))
+}
+
+/// Write the search-expression tree for `p` into `w`. This is the SAME payload
+/// for both the TCP OP_SEARCHREQUEST and the UDP global-search opcodes (eMule
+/// reuses the identical packet body, only changing the opcode -
 /// SearchResultsWnd.cpp:1320-1341), so both callers share this encoder.
+///
+/// The keyword field is a boolean expression (implicit-AND between words, plus
+/// explicit AND/OR/NOT, parentheses, and "quoted phrases"), parsed into a
+/// subtree; the size/type/source filters are ANDed on top of it.
 fn write_search_tree(w: &mut Writer, p: &SearchParams) {
-    let mut terms: Vec<Term> = vec![Term::Keyword(&p.keyword)];
+    let keyword = parse_query(&p.keyword);
+    let mut filters: Vec<Term> = Vec::new();
     if let Some(ft) = &p.file_type {
-        terms.push(Term::StringMeta(FT_FILETYPE, ft));
+        filters.push(Term::StringMeta(FT_FILETYPE, ft));
     }
     if let Some(sz) = p.min_size {
-        terms.push(Term::NumericMeta(FT_FILESIZE, ED2K_SEARCH_OP_GREATER, sz));
+        filters.push(Term::NumericMeta(FT_FILESIZE, ED2K_SEARCH_OP_GREATER, sz));
     }
     if let Some(sz) = p.max_size {
-        terms.push(Term::NumericMeta(FT_FILESIZE, ED2K_SEARCH_OP_LESS, sz));
+        filters.push(Term::NumericMeta(FT_FILESIZE, ED2K_SEARCH_OP_LESS, sz));
     }
     if let Some(min) = p.min_sources {
         // `>= min` as `> min-1`; min 0 is a no-op filter, so skip it.
         if min > 0 {
-            terms.push(Term::NumericMeta(
+            filters.push(Term::NumericMeta(
                 FT_SOURCES,
                 ED2K_SEARCH_OP_GREATER,
                 min - 1,
@@ -106,16 +349,22 @@ fn write_search_tree(w: &mut Writer, p: &SearchParams) {
         }
     }
     if let Some(ext) = &p.extension {
-        terms.push(Term::StringMeta(FT_FILEFORMAT, ext));
+        filters.push(Term::StringMeta(FT_FILEFORMAT, ext));
     }
 
-    let n = terms.len();
-    for (i, t) in terms.iter().enumerate() {
-        // aMule writes an AND before every parameter except the last.
-        if i + 1 < n {
+    // Right-associative AND chain: `AND keyword AND f0 AND f1 ... f_last`, i.e. an
+    // AND before every operand except the last (aMule's rule). The keyword slot
+    // is a whole subtree, not a single leaf.
+    let total = 1 + filters.len();
+    if total > 1 {
+        write_and(w);
+    }
+    write_query_expr(w, &keyword);
+    for (i, f) in filters.iter().enumerate() {
+        if i + 1 < filters.len() {
             write_and(w);
         }
-        write_term(w, t);
+        write_term(w, f);
     }
 }
 
@@ -322,6 +571,123 @@ mod tests {
         assert_eq!(pkt.payload[0], 0x01);
         let len = u16::from_le_bytes([pkt.payload[1], pkt.payload[2]]);
         assert_eq!(len as usize, "related::".len() + 32);
+    }
+
+    #[test]
+    fn adjacent_words_are_implicitly_anded() {
+        let p = SearchParams {
+            keyword: "big movie".into(),
+            ..Default::default()
+        };
+        let pkt = build_search_request(&p);
+        // AND, then leaf "big" (0x01, u16 len 3), then leaf "movie" (len 5).
+        assert_eq!(
+            &pkt.payload[0..2],
+            &[0x00, 0x00],
+            "implicit AND between words"
+        );
+        assert_eq!(pkt.payload[2], 0x01);
+        assert_eq!(u16::from_le_bytes([pkt.payload[3], pkt.payload[4]]), 3);
+        assert_eq!(&pkt.payload[5..8], b"big");
+        assert_eq!(pkt.payload[8], 0x01);
+        assert_eq!(u16::from_le_bytes([pkt.payload[9], pkt.payload[10]]), 5);
+        assert_eq!(&pkt.payload[11..16], b"movie");
+    }
+
+    #[test]
+    fn explicit_or_and_not_operators() {
+        let or = build_search_request(&SearchParams {
+            keyword: "a OR b".into(),
+            ..Default::default()
+        });
+        assert_eq!(&or.payload[0..2], &[0x00, 0x01], "OR operator byte");
+
+        let not = build_search_request(&SearchParams {
+            keyword: "a NOT b".into(),
+            ..Default::default()
+        });
+        assert_eq!(
+            &not.payload[0..2],
+            &[0x00, 0x02],
+            "NOT operator byte (binary and-not)"
+        );
+    }
+
+    #[test]
+    fn a_quoted_phrase_is_a_single_leaf() {
+        let p = SearchParams {
+            keyword: "\"big movie\"".into(),
+            ..Default::default()
+        };
+        let pkt = build_search_request(&p);
+        // No operator: the whole phrase (spaces and all) is ONE string leaf.
+        assert_eq!(pkt.payload[0], 0x01, "single string leaf, no AND");
+        assert_eq!(u16::from_le_bytes([pkt.payload[1], pkt.payload[2]]), 9);
+        assert_eq!(&pkt.payload[3..12], b"big movie");
+    }
+
+    #[test]
+    fn parentheses_group_the_expression() {
+        // "(a OR b) c" -> AND( OR(a, b), c ): top AND, then the grouped OR.
+        let p = SearchParams {
+            keyword: "(a OR b) c".into(),
+            ..Default::default()
+        };
+        let pkt = build_search_request(&p);
+        assert_eq!(&pkt.payload[0..2], &[0x00, 0x00], "top-level AND");
+        assert_eq!(&pkt.payload[2..4], &[0x00, 0x01], "grouped OR");
+        assert_eq!(pkt.payload[4], 0x01, "leaf a");
+        assert_eq!(&pkt.payload[7..8], b"a");
+    }
+
+    #[test]
+    fn and_binds_looser_than_or_like_emule() {
+        // eMule parser.y makes AND the LOWEST precedence, so "a OR b AND c" is
+        // (a OR b) AND c - a top-level AND with the OR nested - NOT a OR (b AND c).
+        let pkt = build_search_request(&SearchParams {
+            keyword: "a OR b AND c".into(),
+            ..Default::default()
+        });
+        assert_eq!(
+            &pkt.payload[0..2],
+            &[0x00, 0x00],
+            "top operator is AND (lowest precedence)"
+        );
+        assert_eq!(&pkt.payload[2..4], &[0x00, 0x01], "the OR is nested inside");
+    }
+
+    #[test]
+    fn a_pathologically_nested_query_does_not_crash() {
+        // Thousands of nested parens must degrade to the fallback leaf via the
+        // depth guard, never abort the process (a Rust stack overflow is a hard,
+        // uncatchable SIGABRT - worse on the small iOS thread stack).
+        let deep = format!("{}{}", "(".repeat(20_000), ")".repeat(20_000));
+        let pkt = build_search_request(&SearchParams {
+            keyword: deep,
+            ..Default::default()
+        });
+        assert!(!pkt.payload.is_empty(), "produced a tree, no crash");
+    }
+
+    #[test]
+    fn a_boolean_keyword_ands_with_the_size_filter() {
+        // The keyword subtree is ANDed with a numeric filter, not flattened.
+        let p = SearchParams {
+            keyword: "a OR b".into(),
+            min_size: Some(1000),
+            ..Default::default()
+        };
+        let pkt = build_search_request(&p);
+        assert_eq!(
+            &pkt.payload[0..2],
+            &[0x00, 0x00],
+            "AND joining the keyword tree to the filter"
+        );
+        assert_eq!(
+            &pkt.payload[2..4],
+            &[0x00, 0x01],
+            "the OR stays inside the keyword subtree"
+        );
     }
 
     #[test]
