@@ -36,7 +36,8 @@ use crate::search::{
     SearchResultFile, OP_GLOBSEARCHRES,
 };
 use crate::server_messages::{
-    LoginRequest, OfferedFile, DEFAULT_SERVER_FLAGS, FILE_COMPLETE_ID, FILE_COMPLETE_PORT,
+    parse_serv_stat_res, LoginRequest, OfferedFile, DEFAULT_SERVER_FLAGS, FILE_COMPLETE_ID,
+    FILE_COMPLETE_PORT, OP_GLOBSERVSTATREQ, OP_GLOBSERVSTATRES,
 };
 use crate::share::{head_hash, is_upload_request, serve_shared, SharedFile, UploadGate};
 use crate::transfer::build_file_req_ans_no_fil;
@@ -45,7 +46,7 @@ use mule_files::{
     DEFAULT_IPFILTER_LEVEL,
 };
 use mule_kad::RoutingTable;
-use mule_proto::{Kad128, Packet, Tag, TagName, TagValue};
+use mule_proto::{Kad128, Packet, Tag, TagName, TagValue, PROT_EDONKEY};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -681,6 +682,10 @@ pub enum EngineEvent {
     Status(String),
     /// A server connection update.
     Server(String),
+    /// The server we were connected to CLOSED the connection (a clean kick or a
+    /// drop we did not request). The UI raises a prominent dialog so there is no
+    /// mistaking what happened. `addr` is the server we lost.
+    ServerDropped { addr: String },
     /// Kad status: the routing table now holds this many contacts.
     Kad { contacts: usize },
     /// Per-download progress.
@@ -699,6 +704,19 @@ pub enum EngineEvent {
 /// IP, and this struct exists to be rendered on a screen that gets
 /// screenshotted. `low_id` is the whole answer; the id itself is not worth the
 /// leak.
+/// One row of the Servers screen: a server from `server.met`, enriched with a
+/// live UDP status probe. `alive` servers are selectable; the rest are shown
+/// greyed out. `users`/`files` are `None` until a probe answers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerEntry {
+    pub addr: SocketAddr,
+    pub name: String,
+    pub users: Option<u32>,
+    pub files: Option<u32>,
+    pub alive: bool,
+    pub connected: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerInfo {
     /// The server we are logged into ("ip:port").
@@ -1023,8 +1041,9 @@ impl Engine {
             self.emit(EngineEvent::Status("Opening port...".into()));
             self.start_listener().await;
             self.map_port().await;
-            self.emit(EngineEvent::Status("Connecting...".into()));
-            self.connect_server().await;
+            // Do NOT auto-connect to a server (eMule does not either): the user
+            // picks a live server from the Servers screen. Kad still bootstraps,
+            // so search + downloads work serverless in the meantime.
             self.start_kad().await;
             // Report Running BEFORE the (time-bounded) resume pass, so the engine
             // is usable and the state is honest even while resume_fetches works.
@@ -1187,17 +1206,17 @@ impl Engine {
         tx
     }
 
-    /// Try each server in `server.met` until one accepts a login. Best effort:
-    /// coming up offline is a valid outcome, not an error.
-    async fn connect_server(&mut self) {
-        let Ok(bytes) = std::fs::read(self.config_dir.join("server.met")) else {
-            self.emit(EngineEvent::Server("no server list on disk".into()));
-            return;
-        };
-        let Ok(met) = read_server_met(&bytes) else {
-            self.emit(EngineEvent::Server("server list is unreadable".into()));
-            return;
-        };
+    /// Connect to ONE specific server the user chose (eMule never auto-connects).
+    /// Disconnects any current server first. Returns true on success. Records the
+    /// connection + announces our shared library. Kad + downloads are untouched.
+    pub async fn connect_to_server(&mut self, addr: SocketAddr) -> bool {
+        if self.offline {
+            return false;
+        }
+        if let Some(mut old) = self.server.take() {
+            old.disconnect().await;
+        }
+        self.connection = None;
         let login = LoginRequest {
             user_hash: self.identity.userhash,
             client_id: 0,
@@ -1206,35 +1225,137 @@ impl Engine {
             server_flags: DEFAULT_SERVER_FLAGS,
         };
         let tx = self.server_sender();
-        for srv in met.servers.iter().take(10) {
-            let addr = SocketAddr::new(IpAddr::V4(ip_from_met_u32(srv.ip)), srv.port);
-            let mut link = ServerLink::new(addr, login.clone(), tx.clone());
-            if let Ok(Ok(ServerState::Connected {
+        let mut link = ServerLink::new(addr, login, tx);
+        if let Ok(Ok(ServerState::Connected {
+            low_id,
+            related_search,
+            ..
+        })) = timeout(Duration::from_secs(12), link.connect()).await
+        {
+            // The client id is deliberately NOT recorded here: a HighID id encodes
+            // our public IP and this text reaches the screen.
+            self.connection = Some(ServerInfo {
+                addr: addr.to_string(),
                 low_id,
                 related_search,
-                ..
-            })) = timeout(Duration::from_secs(12), link.connect()).await
-            {
-                // The client id is deliberately NOT recorded here: a HighID id
-                // encodes our public IP and this text reaches the screen. (The
-                // OP_OFFERFILES record uses FILE_COMPLETE markers, not the id.)
-                self.connection = Some(ServerInfo {
-                    addr: addr.to_string(),
-                    low_id,
-                    related_search,
-                });
-                self.emit(EngineEvent::Server(format!(
-                    "Connected to {addr} ({})",
-                    if low_id { "LowID" } else { "HighID" }
-                )));
-                // Announce our shared library so the server indexes it (findable
-                // via keyword search) and can hand us out as a source.
-                Self::offer_shared_to(&self.shared, &mut link).await;
-                self.server = Some(link);
-                return;
+            });
+            self.emit(EngineEvent::Server(format!(
+                "Connected to {addr} ({})",
+                if low_id { "LowID" } else { "HighID" }
+            )));
+            Self::offer_shared_to(&self.shared, &mut link).await;
+            self.server = Some(link);
+            true
+        } else {
+            self.emit(EngineEvent::Server(format!("could not connect to {addr}")));
+            false
+        }
+    }
+
+    /// Disconnect from the current server at the user's request. Kad and any
+    /// in-progress downloads keep running (a download can proceed via Kad).
+    pub async fn disconnect_server(&mut self) {
+        if let Some(mut link) = self.server.take() {
+            link.disconnect().await;
+        }
+        self.connection = None;
+        self.emit(EngineEvent::Server("Disconnected from the server".into()));
+    }
+
+    /// The Servers screen: read `server.met` and probe each server's UDP status
+    /// port (TCP + 4), returning the list enriched with liveness + fresh
+    /// user/file counts. A server that answers OP_GLOBSERVSTATRES within the
+    /// budget is `alive` (selectable); the rest are shown greyed out. Best-effort:
+    /// a missing/unreadable list yields an empty vec.
+    pub async fn probe_server_list(&self) -> Vec<ServerEntry> {
+        let connected = self.server.as_ref().map(|l| l.addr());
+        let Ok(bytes) = std::fs::read(self.config_dir.join("server.met")) else {
+            return Vec::new();
+        };
+        let Ok(met) = read_server_met(&bytes) else {
+            return Vec::new();
+        };
+        let mut servers: Vec<ServerEntry> = met
+            .servers
+            .iter()
+            .map(|s| {
+                let addr = SocketAddr::new(IpAddr::V4(ip_from_met_u32(s.ip)), s.port);
+                ServerEntry {
+                    addr,
+                    name: tag_str(&s.tags, 0x01).unwrap_or_default(),
+                    users: None,
+                    files: None,
+                    alive: false,
+                    connected: Some(addr) == connected,
+                }
+            })
+            .collect();
+        if self.offline || servers.is_empty() {
+            return servers;
+        }
+        // Fan the status ping out to each server's UDP port (TCP + 4).
+        let Ok(sock) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0u16)).await else {
+            return servers;
+        };
+        let req = [PROT_EDONKEY, OP_GLOBSERVSTATREQ];
+        for e in &servers {
+            if let Some(udp) = e.addr.port().checked_add(4) {
+                let _ = sock.send_to(&req, SocketAddr::new(e.addr.ip(), udp)).await;
             }
         }
-        self.emit(EngineEvent::Server("no server accepted a login".into()));
+        // Collect answers within a short budget; match each back by (ip, port-4).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut buf = [0u8; 512];
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match timeout(remaining, sock.recv_from(&mut buf)).await {
+                Ok(Ok((n, src)))
+                    if n >= 2 && buf[0] == PROT_EDONKEY && buf[1] == OP_GLOBSERVSTATRES =>
+                {
+                    if let Some((users, files)) = parse_serv_stat_res(&buf[2..n]) {
+                        if let Some(e) = servers.iter_mut().find(|e| {
+                            e.addr.ip() == src.ip()
+                                && e.addr.port().checked_add(4) == Some(src.port())
+                        }) {
+                            e.alive = true;
+                            e.users = Some(users);
+                            e.files = Some(files);
+                        }
+                    }
+                }
+                Ok(Ok(_)) => {}
+                _ => break,
+            }
+        }
+        servers
+    }
+
+    /// Detect a server drop/kick between requests. Cancel-safe: a socket peek
+    /// never removes framed bytes, so this is safe to call from the 1s heartbeat.
+    /// On EOF it clears the link + connection and emits `ServerDropped` (the UI
+    /// raises a prominent dialog), returning the lost server's address.
+    pub async fn poll_server_drop(&mut self) -> Option<String> {
+        let dropped = match self.server.as_ref() {
+            Some(l) => l.peek_dropped().await,
+            None => return None,
+        };
+        if !dropped {
+            return None;
+        }
+        let addr = self
+            .server
+            .as_ref()
+            .map(|l| l.addr().to_string())
+            .unwrap_or_default();
+        if let Some(mut l) = self.server.take() {
+            l.disconnect().await;
+        }
+        self.connection = None;
+        self.emit(EngineEvent::ServerDropped { addr: addr.clone() });
+        Some(addr)
     }
 
     /// Announce our shared library to `link` via OP_OFFERFILES, so the server
@@ -1910,9 +2031,12 @@ impl Engine {
                 None => false,
             };
             if !resumed {
+                // The server we were on did not come back. Do NOT auto-pick
+                // another (eMule does not either); drop it and let the user
+                // reconnect from the Servers screen. If we had no server, this is
+                // a no-op - resume stays serverless.
                 self.server = None;
                 self.connection = None;
-                self.connect_server().await;
             }
             self.start_kad().await;
         }

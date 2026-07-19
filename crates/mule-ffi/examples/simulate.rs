@@ -39,6 +39,9 @@ fn drain(engine: &MuleEngine) {
             EngineEventFfi::State { state } => println!("   [event] state -> {}", state_str(state)),
             EngineEventFfi::Status { text } => println!("   [event] status: {text}"),
             EngineEventFfi::Server { text } => println!("   [event] server: {text}"),
+            EngineEventFfi::ServerDropped { addr } => {
+                println!("   [event] SERVER DROPPED: {addr}")
+            }
             EngineEventFfi::Kad { contacts } => println!("   [event] kad: {contacts} contacts"),
             EngineEventFfi::Progress { hash, have, total } => println!(
                 "   [event] progress {}: {} / {}",

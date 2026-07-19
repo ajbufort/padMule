@@ -33,6 +33,14 @@ final class EngineModel: ObservableObject {
     /// start() emits Server(...) then Status(...) into the same drain, so an
     /// event-derived ID is overwritten in the same frame it arrives.
     @Published private(set) var server: ServerInfoFfi?
+
+    // Servers screen: the probed server.met list, a loading flag, and the
+    // kick/drop banner (settable so the alert can clear it). padMule does NOT
+    // auto-connect; the user picks a live server here.
+    @Published private(set) var servers: [ServerEntryFfi] = []
+    @Published private(set) var loadingServers = false
+    @Published var serverKick: String?
+
     @Published private(set) var results: [SearchHit] = []
 
     // The incomplete-file preview currently open (drives the AVPlayer sheet).
@@ -507,10 +515,56 @@ final class EngineModel: ObservableObject {
                 // "Connected to <server> (HighID|LowID)" line.
                 notice = text
             }
+        case .serverDropped(let addr):
+            // The server kicked/dropped us: raise a prominent dialog and refresh
+            // the server list (the connected row is no longer connected).
+            serverKick = addr
+            server = nil
+            loadServers()
         case .kad(let contacts):
             kadContacts = contacts
         case .progress:
             break // downloads() already carries the numbers
+        }
+    }
+
+    // MARK: - Servers
+
+    /// Load + probe the server.met list for the Servers screen (off the main
+    /// thread; the UDP pings take a few seconds).
+    func loadServers() {
+        guard let e = engine, !loadingServers else { return }
+        loadingServers = true
+        work.async { [weak self] in
+            let list = e.serverList()
+            DispatchQueue.main.async {
+                self?.servers = list
+                self?.loadingServers = false
+            }
+        }
+    }
+
+    /// Connect to a chosen (live) server, then refresh the list + status.
+    func connectServer(_ addr: String) {
+        guard let e = engine else { return }
+        work.async { [weak self] in
+            _ = e.connectToServer(addr: addr)
+            DispatchQueue.main.async {
+                self?.refresh()
+                self?.loadServers()
+            }
+        }
+    }
+
+    /// Disconnect from the current server at the user's request.
+    func disconnectServer() {
+        guard let e = engine else { return }
+        work.async { [weak self] in
+            e.disconnectServer()
+            DispatchQueue.main.async {
+                self?.refresh()
+                self?.loadServers()
+            }
         }
     }
 }

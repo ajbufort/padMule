@@ -12,13 +12,14 @@ import SwiftUI
 
 /// The top-toolbar destinations. Each is one eD2k function, one icon.
 enum Screen: String, CaseIterable, Identifiable {
-    case search, transfers, shared, stats, status
+    case search, transfers, servers, shared, stats, status
     var id: String { rawValue }
 
     var title: String {
         switch self {
         case .search: return "Search"
         case .transfers: return "Transfers"
+        case .servers: return "Servers"
         case .shared: return "Shared"
         case .stats: return "Statistics"
         case .status: return "Status"
@@ -32,6 +33,7 @@ enum Screen: String, CaseIterable, Identifiable {
         switch self {
         case .search: return "magnifyingglass"
         case .transfers: return selected ? "arrow.down.circle.fill" : "arrow.down.circle"
+        case .servers: return "server.rack"
         case .shared: return selected ? "folder.fill" : "folder"
         case .stats: return selected ? "chart.xyaxis.line" : "chart.xyaxis.line"
         case .status: return "gauge"
@@ -67,6 +69,7 @@ struct ContentView: View {
                 switch screen {
                 case .search: searchScreen
                 case .transfers: transfersScreen
+                case .servers: serversScreen
                 case .shared: sharedScreen
                 case .stats: StatsView().environmentObject(model)
                 case .status: statusScreen
@@ -106,6 +109,22 @@ struct ContentView: View {
             }
             .sheet(item: $model.preview) { item in
                 PreviewPlayerView(item: item).environmentObject(model)
+            }
+            .alert(
+                "Disconnected from server",
+                isPresented: Binding(
+                    get: { model.serverKick != nil },
+                    set: { if !$0 { model.serverKick = nil } }
+                )
+            ) {
+                Button("OK", role: .cancel) { model.serverKick = nil }
+            } message: {
+                Text(
+                    model.serverKick.map {
+                        "The server \($0) closed the connection. "
+                            + "Pick another live server from the Servers tab to reconnect."
+                    } ?? ""
+                )
             }
             .sheet(item: $ratingFor) { f in
                 RatingEditorView(hash: f.hash, name: f.name, rating: f.rating, comment: f.comment) { rating, comment in
@@ -426,6 +445,97 @@ struct ContentView: View {
         }
     }
 
+    // MARK: - Servers screen
+
+    private var serversScreen: some View {
+        List {
+            Section {
+                if let s = model.server {
+                    HStack {
+                        Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Connected to \(s.addr)").font(.callout)
+                            Text(s.lowId ? "LowID" : "HighID")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Button("Disconnect", role: .destructive) { model.disconnectServer() }
+                            .buttonStyle(.borderless)
+                    }
+                } else {
+                    Text("Not connected. padMule does not auto-connect - pick a live server below.")
+                        .font(.callout).foregroundStyle(.secondary)
+                }
+                Button {
+                    model.loadServers()
+                } label: {
+                    Label(
+                        model.loadingServers ? "Probing servers..." : "Refresh server list",
+                        systemImage: "arrow.clockwise")
+                }
+                .disabled(model.loadingServers)
+            }
+
+            Section("Servers (\(model.servers.count))") {
+                HStack {
+                    Text("Server").frame(maxWidth: .infinity, alignment: .leading)
+                    Text("Users").frame(width: 70, alignment: .trailing)
+                    Text("Files").frame(width: 84, alignment: .trailing)
+                }
+                .font(.caption2).foregroundStyle(.secondary)
+
+                if model.servers.isEmpty {
+                    Text(model.loadingServers ? "Probing..." : "No server list on disk.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                ForEach(model.servers, id: \.addr) { srv in
+                    serverRow(srv)
+                }
+            }
+        }
+        .onAppear { if model.servers.isEmpty { model.loadServers() } }
+    }
+
+    /// One server row: name/address, live user/file counts, and connection state.
+    /// A live (probe-answering) server is black + selectable to connect; a dead
+    /// one is greyed out and disabled, matching eMule's server list.
+    private func serverRow(_ srv: ServerEntryFfi) -> some View {
+        Button {
+            if srv.alive && !srv.connected { model.connectServer(srv.addr) }
+        } label: {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(srv.name.isEmpty ? srv.addr : srv.name)
+                        .font(.callout)
+                        .foregroundStyle(srv.alive ? .primary : .secondary)
+                        .lineLimit(1)
+                    if !srv.name.isEmpty {
+                        Text(srv.addr).font(.caption2).foregroundStyle(.secondary)
+                    }
+                }
+                Spacer()
+                if srv.alive {
+                    Text(srv.users.formatted())
+                        .font(.caption).monospacedDigit()
+                        .frame(width: 70, alignment: .trailing)
+                    Text(srv.files.formatted())
+                        .font(.caption).monospacedDigit()
+                        .frame(width: 84, alignment: .trailing)
+                } else {
+                    Text("offline")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .frame(width: 154, alignment: .trailing)
+                }
+                if srv.connected {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                }
+            }
+        }
+        .disabled(!srv.alive || srv.connected)
+        .foregroundStyle(.primary)
+    }
+
     // MARK: - Shared screen
 
     private var sharedScreen: some View {
@@ -535,6 +645,18 @@ struct ContentView: View {
     /// One search hit: a status dot, the name, a metadata line (type + media when
     /// present), and the size/sources/complete stats. Tapping the row opens the
     /// detail sheet; the trailing Get button starts a download directly.
+    /// Result-name color, following eMule's `GetSearchItemColor`
+    /// (SearchListCtrl.cpp:1596): green when we already have the file, red when it
+    /// has NO sources (unavailable - it cannot be downloaded), else the normal text
+    /// color. eMule also shades new results by a source-count availability
+    /// gradient; padMule keeps the clear binary (0-source = red) and lets the
+    /// status dot carry the have/downloading state.
+    private func resultColor(_ hit: SearchHit) -> Color {
+        if hit.status == .have { return .green }
+        if hit.sources == 0 { return .red }
+        return .primary
+    }
+
     private func resultRow(_ hit: SearchHit) -> some View {
         HStack(alignment: .top, spacing: 8) {
             statusDot(hit.status)
@@ -542,6 +664,7 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
                     Text(hit.name).lineLimit(2)
+                        .foregroundStyle(resultColor(hit))
                     ratingBadge(hit.rating)
                 }
                 if let meta = metaLine(hit) {
