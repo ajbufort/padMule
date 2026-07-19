@@ -114,7 +114,7 @@ parsing, Kad anti-abuse hardening, and the "Automatic" search method). Ranked by
 | 27 | Collections (.emulecollection): open + add-all | med | high |
 | 28 | Connection limits + new-connection-rate throttle | small | none |
 | 29 | Protocol-overhead accounting | med | none |
-| 30 | Boolean search expression (AND/OR/NOT) | med | medium |
+| 30 | Boolean search expression (AND/OR/NOT) - DONE 2026-07-19 (commit 92a67e0; recursive-descent parser, eMule parser.y precedence AND<OR<NOT, exact wire bytes, depth-guarded; eserver-validated) | med | medium |
 | 31 | Kad network visibility tab (routing/keyspace/lookup viz) | large | low |
 
 ## Tier 3 - skip (poor platform fit)
