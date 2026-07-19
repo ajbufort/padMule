@@ -1142,7 +1142,6 @@ async fn cmd_search_download(met_path: &str, keyword: &str, out: &str) {
             size - dl.missing().await
         );
         let cfg = ManagerConfig {
-            parallel: 4,
             per_peer: Duration::from_secs(45),
             rounds: 3,
         };
@@ -1425,7 +1424,6 @@ async fn cmd_link(link: &str, out: Option<&str>) {
             let me = HelloInfo::baseline(demo_user_hash(), 0, 4662, 4672, "padMule");
             println!("downloading from {} embedded source(s)...", sources.len());
             let cfg = ManagerConfig {
-                parallel: 4,
                 per_peer: Duration::from_secs(60),
                 rounds: 6,
             };
@@ -1693,13 +1691,11 @@ async fn cmd_fetch_complete(
         // re-sweep its sources several rounds.
         let cfg = if r.size <= 1_000_000 {
             ManagerConfig {
-                parallel: 6,
                 per_peer: Duration::from_secs(12),
                 rounds: 1,
             }
         } else {
             ManagerConfig {
-                parallel: 8,
                 per_peer: Duration::from_secs(40),
                 rounds: 5,
             }

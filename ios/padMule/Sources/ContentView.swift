@@ -183,6 +183,50 @@ struct ContentView: View {
         }
     }
 
+    /// A context-menu submenu to set a download's priority. High makes padMule
+    /// contact more sources at once; Low fewer. The current level is checkmarked.
+    @ViewBuilder
+    private func priorityMenu(for dl: DownloadInfo) -> some View {
+        Menu {
+            priorityButton("High", 2, dl)
+            priorityButton("Normal", 1, dl)
+            priorityButton("Low", 0, dl)
+        } label: {
+            Label("Priority", systemImage: "arrow.up.arrow.down")
+        }
+    }
+
+    @ViewBuilder
+    private func priorityButton(_ name: String, _ value: UInt8, _ dl: DownloadInfo) -> some View {
+        Button {
+            model.setPriority(dl.hash, priority: value)
+        } label: {
+            if dl.priority == value {
+                Label(name, systemImage: "checkmark")
+            } else {
+                Text(name)
+            }
+        }
+    }
+
+    /// A small glyph for a non-Normal priority (High = up, Low = down); nothing
+    /// for Normal, to keep the common case uncluttered.
+    @ViewBuilder
+    private func priorityIcon(_ priority: UInt8) -> some View {
+        switch priority {
+        case 2:
+            Image(systemName: "arrow.up.circle.fill")
+                .font(.caption2)
+                .foregroundStyle(.orange)
+        case 0:
+            Image(systemName: "arrow.down.circle")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        default:
+            EmptyView()
+        }
+    }
+
     // MARK: - Search screen
 
     private var searchScreen: some View {
@@ -322,6 +366,7 @@ struct ContentView: View {
                                     Label("View sources", systemImage: "person.2")
                                 }
                                 Divider()
+                                priorityMenu(for: dl)
                                 categoryMenu(for: dl.hash)
                             }
                     }
@@ -560,6 +605,7 @@ struct ContentView: View {
                 }
                 Text(dl.name.isEmpty ? String(dl.hash.prefix(16)) : dl.name)
                     .lineLimit(1)
+                priorityIcon(dl.priority)
                 ratingBadge(dl.rating)
                 if dl.hasComment {
                     Image(systemName: "text.bubble")

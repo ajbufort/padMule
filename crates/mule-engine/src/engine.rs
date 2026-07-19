@@ -1386,7 +1386,8 @@ impl Engine {
         };
         let dl_task = dl;
         tokio::spawn(async move {
-            download_file(&dl_task, &sources, &me, ManagerConfig::default()).await;
+            let cfg = ManagerConfig::for_priority(dl_task.priority());
+            download_file(&dl_task, &sources, &me, cfg).await;
             // Cancelled while in flight: the engine already removed it and deleted
             // the .part. Do NOT finish or emit - there is nothing to save.
             if dl_task.is_cancelled() {
@@ -1415,6 +1416,9 @@ impl Engine {
                     v.push(Arc::clone(dl));
                 }
             }
+            // High priority first, so under the resume budget the downloads the
+            // user cares most about get their sources found before it runs out.
+            v.sort_by_key(|dl| std::cmp::Reverse(dl.priority()));
             v
         };
         // Bound the whole pass: start() holds the FFI engine lock for its whole
@@ -1483,6 +1487,35 @@ impl Engine {
             self.emit(EngineEvent::Server("Stopped sharing a file".into()));
         }
         removed
+    }
+
+    /// Set a download's priority (Low/Normal/High). Persisted to part.met and
+    /// read live by the running fetch sweep, so a higher priority contacts more
+    /// sources at once (and, after a restart, is re-driven first). An unknown
+    /// value is clamped to Normal. Returns false if we hold no such download.
+    pub async fn set_download_priority(&mut self, hash: [u8; 16], priority: u8) -> bool {
+        let priority = match priority {
+            crate::part_store::PR_LOW | crate::part_store::PR_HIGH => priority,
+            _ => crate::part_store::PR_NORMAL,
+        };
+        let dl = {
+            let guard = self.downloads.lock().await;
+            let mut found = None;
+            for d in guard.iter() {
+                if d.hash().await == hash {
+                    found = Some(Arc::clone(d));
+                    break;
+                }
+            }
+            found
+        };
+        match dl {
+            Some(d) => {
+                d.set_priority(priority).await;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Set the local user's own rating (0-5, 0 = none) and comment on a file we
@@ -2219,6 +2252,42 @@ mod tests {
             e,
             EngineEvent::Progress { total, have, .. } if *total == 5000 && *have == 0
         )));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn set_download_priority_updates_the_live_download_and_part_met() {
+        use crate::part_store::{PartStore, PR_HIGH, PR_NORMAL};
+        use mule_proto::ed2k_hash;
+        let dir = tmp("dl-priority");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let data = vec![7u8; 5000];
+        let hash = ed2k_hash(&data);
+        let store = PartStore::create(&dir, 1, hash, 5000, b"prio.bin").unwrap();
+        drop(store);
+
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+        engine.set_offline(true);
+        engine.start().await; // resumes the .part (Normal by default)
+        assert_eq!(engine.downloads().await[0].priority(), PR_NORMAL);
+
+        assert!(
+            engine.set_download_priority(hash, PR_HIGH).await,
+            "a known hash is updated"
+        );
+        assert!(
+            !engine.set_download_priority([0xEE; 16], PR_HIGH).await,
+            "an unknown hash returns false"
+        );
+        // Live download reflects it...
+        assert_eq!(engine.downloads().await[0].priority(), PR_HIGH);
+        // ...and it persisted to part.met (a fresh open reads it back).
+        assert_eq!(PartStore::open(&dir, 1).unwrap().priority, PR_HIGH);
+
+        // An out-of-range value clamps to Normal.
+        assert!(engine.set_download_priority(hash, 9).await);
+        assert_eq!(engine.downloads().await[0].priority(), PR_NORMAL);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

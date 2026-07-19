@@ -38,6 +38,18 @@ pub const FT_FILENAME: u8 = 0x01;
 pub const FT_FILESIZE: u8 = 0x02;
 /// Comma-separated decimal part numbers that failed verification.
 pub const FT_CORRUPTEDPARTS: u8 = 0x24;
+/// Download priority (eMule `m_iDownPriority`). aMule writes BOTH the modern
+/// 0x18 and the legacy 0x13, same value, always, as UINT32 (PartFile.cpp:928-933
+/// -> CFileDataIO::WriteTag). We match that.
+pub const FT_DLPRIORITY: u8 = 0x18;
+pub const FT_OLDDLPRIORITY: u8 = 0x13;
+
+/// Priority levels (eMule `Constants.h`): the three padMule honors. PR_AUTO(5)
+/// and the others are read-tolerantly (any unknown value -> Normal), matching
+/// aMule's own clamp (PartFile.cpp:512-515); Auto is not implemented yet.
+pub const PR_LOW: u8 = 0;
+pub const PR_NORMAL: u8 = 1;
+pub const PR_HIGH: u8 = 2;
 
 /// A download backed by a real `.part` file.
 pub struct PartStore {
@@ -46,6 +58,9 @@ pub struct PartStore {
     file: File,
     pub pf: PartFile,
     pub name: Vec<u8>,
+    /// The user's download priority (PR_LOW/PR_NORMAL/PR_HIGH). Persisted in
+    /// part.met, read on resume; biases source-finding effort (see fetch.rs).
+    pub priority: u8,
 }
 
 impl PartStore {
@@ -74,6 +89,7 @@ impl PartStore {
             file,
             pf: PartFile::new(hash, size),
             name: name.to_vec(),
+            priority: PR_NORMAL,
         };
         s.save_met()?;
         Ok(s)
@@ -118,6 +134,31 @@ impl PartStore {
             })
             .unwrap_or_default();
 
+        // Priority: prefer the modern tag, fall back to the legacy one. Read as
+        // any int width (mule-proto preserves the on-disk width; an old eMule may
+        // have written it narrow). Only Low/Normal/High are honored - anything
+        // else (incl. PR_AUTO 5, which padMule does not implement) reads as
+        // Normal, matching aMule's own unknown-value clamp.
+        let priority = met
+            .tags
+            .iter()
+            .find(|t| {
+                t.name == mule_proto::TagName::Id(FT_DLPRIORITY)
+                    || t.name == mule_proto::TagName::Id(FT_OLDDLPRIORITY)
+            })
+            .and_then(|t| match &t.value {
+                TagValue::U8(v) => Some(*v as u64),
+                TagValue::U16(v) => Some(*v as u64),
+                TagValue::U32(v) => Some(*v as u64),
+                _ => None,
+            })
+            .map(|v| match v as u8 {
+                PR_LOW => PR_LOW,
+                PR_HIGH => PR_HIGH,
+                _ => PR_NORMAL,
+            })
+            .unwrap_or(PR_NORMAL);
+
         let mut pf = PartFile::resume(met.file_hash, size, met_gaps(&met), corrupted);
         pf.part_hashes = met.part_hashes.clone();
 
@@ -128,6 +169,7 @@ impl PartStore {
             file,
             pf,
             name,
+            priority,
         })
     }
 
@@ -210,6 +252,13 @@ impl PartStore {
                 TagValue::Str(format_corrupted(self.pf.corrupted())),
             ));
         }
+        // Priority: both tags, same value, UINT32 - exactly as aMule writes them
+        // (PartFile.cpp:928-933), so the .met stays readable by a desktop client.
+        tags.push(Tag::id(FT_DLPRIORITY, TagValue::U32(self.priority as u32)));
+        tags.push(Tag::id(
+            FT_OLDDLPRIORITY,
+            TagValue::U32(self.priority as u32),
+        ));
         tags.extend(gap_tags(self.pf.gaps(), large));
 
         let met = PartMet {
@@ -329,6 +378,50 @@ mod tests {
         assert_eq!(s.read_part(0).unwrap(), data);
         assert_eq!(s.verify_part(0).unwrap(), Some(true));
 
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn priority_persists_byte_faithfully_and_reads_back() {
+        let dir = tmpdir("priority");
+        let mut s = PartStore::create(&dir, 1, [0x5A; 16], 500, b"p.bin").unwrap();
+        assert_eq!(s.priority, PR_NORMAL, "new downloads default to Normal");
+
+        s.priority = PR_HIGH;
+        s.save_met().unwrap();
+
+        // Assert the ACTUAL on-disk bytes, not just a round-trip: aMule writes
+        // each priority tag as <type=UINT32(0x03)><nameLen u16 LE = 1><id byte>
+        // <value u32 LE>. For PR_HIGH=2 that is exactly these 8 bytes, once for
+        // 0x18 and once for 0x13.
+        let met = fs::read(dir.join("001.part.met")).unwrap();
+        let dl = [0x03u8, 0x01, 0x00, FT_DLPRIORITY, 0x02, 0x00, 0x00, 0x00];
+        let old = [0x03u8, 0x01, 0x00, FT_OLDDLPRIORITY, 0x02, 0x00, 0x00, 0x00];
+        assert!(
+            met.windows(8).any(|w| w == dl),
+            "FT_DLPRIORITY(0x18) must be a UINT32 tag = 2"
+        );
+        assert!(
+            met.windows(8).any(|w| w == old),
+            "FT_OLDDLPRIORITY(0x13) must be a UINT32 tag = 2"
+        );
+
+        // ...and it reads back on resume.
+        let reopened = PartStore::open(&dir, 1).unwrap();
+        assert_eq!(reopened.priority, PR_HIGH);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_unknown_priority_value_reads_as_normal() {
+        // aMule may write PR_AUTO(5) or PR_VERYHIGH(3); padMule honors only
+        // Low/Normal/High and clamps the rest to Normal (like aMule's own clamp).
+        let dir = tmpdir("priority-auto");
+        let mut s = PartStore::create(&dir, 1, [0x11; 16], 500, b"a.bin").unwrap();
+        s.priority = 5; // PR_AUTO - not one of the three we honor
+        s.save_met().unwrap();
+        let reopened = PartStore::open(&dir, 1).unwrap();
+        assert_eq!(reopened.priority, PR_NORMAL);
         fs::remove_dir_all(&dir).ok();
     }
 
