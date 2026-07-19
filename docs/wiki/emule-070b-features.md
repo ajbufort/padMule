@@ -98,7 +98,7 @@ parsing, Kad anti-abuse hardening, and the "Automatic" search method). Ranked by
 | 11 | Corruption black box + dynamic client ban | med | none |
 | 12 | A4AF cross-download source reassignment | med | none |
 | 13 | "Load more results" paging (OP_QUERY_MORE_RESULT) | small | low |
-| 14 | Statistics tab (Swift Charts: rate history, totals, ratios) | med | none |
+| 14 | Statistics tab (Swift Charts: rate history, totals, ratios) - DONE 2026-07-19 (commit 81a58c6; engine keeps 2 global monotonic byte counters, UI samples + charts them; rate = delta/elapsed after a review found off-cadence sampling) | med | none |
 | 15 | Learning spam filter over results (heuristics + mark-as-spam) | med | none |
 | 16 | Static up/down speed caps + anti-leech ratio guard | small | none |
 | 17 | Preview / open incomplete files (AVPlayer; first+last chunk bias) | med | low |
