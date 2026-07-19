@@ -1,6 +1,6 @@
 # eMule 0.70b Feature Backlog (mined for padMule)
 
-Updated: 2026-07-19 (slices 1-3 + #20 authoring + #7 priority + #4 verified badge DONE)
+Updated: 2026-07-19 (Tier-1 largely done incl. #9 global UDP search; codec+CLI, engine/app integration a follow-up)
 
 **DONE so far:** #1 IP filter, #2 search history, #3 wire-side search filters,
 #4 verified badge (BOTH the encryption lock AND the identity checkmark - the
@@ -75,12 +75,18 @@ parsing, Kad anti-abuse hardening, and the "Automatic" search method). Ranked by
    file). Dropped clear-completed (finished downloads already auto-remove;
    swipe-cancel covers a stuck one); rename deferred (on-disk rename + known.met
    rewrite; keep IsValidEd2kString rules for a re-advertised name).
-9. **Global server UDP search** (medium, medium risk). Query the whole
-   serverlist, not just the connected server - the biggest widening of the result
-   set. padMule already owns the UDP socket + serverlist + search expression;
-   delta is a paced timer + per-server UDP opcode + dedupe. Ship with a spam
-   filter (#15) since global results are noisy. Heed the server-UDP +4 landmine
-   ([[padmule-protocol-landmines]]).
+9. **Global server UDP search** - DONE (2026-07-19, codec + CLI harness; commit
+   1d0b81e). build_global_search_udp = the SAME search tree as the TCP request
+   (shared write_search_tree) wrapped as OP_GLOBSEARCHREQ 0x98 (the universal
+   fallback; 0x92/0x90 large-file opcodes deferred). parse_global_search_res
+   walks the chained [0xE3][0x99] records (NO count field, unlike TCP). CLI
+   `global-search <server.met|host:port> <keyword>` fans out to each server's UDP
+   port = TCP port + 4 (the landmine, [[padmule-protocol-landmines]]), paced,
+   anti-spoof allow-list, dedupe by hash, zlib-packed reply handled. VALIDATED:
+   SEND interoperates with the local isolated eserver ([[ed2k-server-oracle]]);
+   full SEND+PARSE round-trip proven against LIVE public eservers (real
+   OP_GLOBSEARCHRES -> correct filenames+hashes). Engine/FFI/app integration +
+   OP_OFFERFILES (so the local eserver returns hits) are follow-ups.
 10. **Related-files search** (small, low risk). Long-press -> "Find related" via
     a `related::`+md4(hash) query, gated by the server's RELATEDSEARCH flag;
     degrade gracefully when absent.
