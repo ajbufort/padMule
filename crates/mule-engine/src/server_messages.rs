@@ -222,22 +222,30 @@ pub fn parse_server_status(payload: &[u8]) -> Result<(u32, u32), IoError> {
 }
 
 /// UDP server-status ping opcodes (protocol 0xE3, sent to the server's UDP port =
-/// TCP + 4). `OP_GLOBSERVSTATREQ` is a bare `[0xE3][0x96]` datagram; a server that
-/// answers `OP_GLOBSERVSTATRES` `<users u32><files u32>` (opcodes.h:192-193) is
-/// ALIVE and reports fresh counts. Newer servers append maxusers/soft/hard/version
-/// - ignored here.
+/// TCP + 4). The REQUEST carries a 4-byte CHALLENGE that the server echoes back;
+/// the response is `<challenge u32><users u32><files u32>[...]` (min 12 bytes).
+/// Authority: eMule 0.50a UDPSocket.cpp:331-346 + aMule 3.0.1
+/// ServerUDPSocket.cpp:180-194 (which REQUIRE size >= 12). The `opcodes.h` header
+/// comment's challenge-less `<USER 4><FILES 4>` is the STALE legacy format - a
+/// modern server IGNORES a challenge-less request, so trust the code, not the
+/// comment (see [[padmule-protocol-landmines]] #13/#17).
 pub const OP_GLOBSERVSTATREQ: u8 = 0x96;
 pub const OP_GLOBSERVSTATRES: u8 = 0x97;
 
-/// Parse an OP_GLOBSERVSTATRES payload into `(users, files)`, or None if it is too
-/// short. Only the leading two u32s are read; any trailing extension is ignored.
-pub fn parse_serv_stat_res(payload: &[u8]) -> Option<(u32, u32)> {
-    if payload.len() < 8 {
+/// The fixed challenge padMule stamps into every status ping; a real server echoes
+/// it as the FIRST u32 of the response, so we can confirm the answer is to OUR ping.
+pub const SERV_STAT_CHALLENGE: u32 = 0x5061_644D; // "PadM"
+
+/// Parse an OP_GLOBSERVSTATRES payload into `(challenge, users, files)`, or None if
+/// it is shorter than the 12-byte minimum. Any trailing extension is ignored.
+pub fn parse_serv_stat_res(payload: &[u8]) -> Option<(u32, u32, u32)> {
+    if payload.len() < 12 {
         return None;
     }
-    let users = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
-    let files = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
-    Some((users, files))
+    let challenge = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    let users = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+    let files = u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]);
+    Some((challenge, users, files))
 }
 
 /// Parse an OP_SERVERLIST payload: `u8 count` then `count * (u32 IP, u16 port)`.
@@ -467,16 +475,24 @@ mod tests {
     }
 
     #[test]
-    fn serv_stat_res_reads_users_and_files_ignoring_extras() {
-        // <users 4><files 4>, then a trailing extension a newer server appends.
+    fn serv_stat_res_reads_challenge_users_and_files() {
+        // <challenge 4><users 4><files 4>, then a trailing extension.
         let res = [
+            0x4D, 0x64, 0x61, 0x50, // challenge = 0x5061644D (our SERV_STAT_CHALLENGE)
             0x2A, 0x00, 0x00, 0x00, // users = 42
             0x40, 0xE2, 0x01, 0x00, // files = 123456
             0xFF, 0xFF, // trailing bytes -> ignored
         ];
-        assert_eq!(parse_serv_stat_res(&res), Some((42, 123_456)));
-        // Too short -> None (never index past the end).
-        assert_eq!(parse_serv_stat_res(&[0x01, 0x02, 0x03]), None);
+        assert_eq!(
+            parse_serv_stat_res(&res),
+            Some((SERV_STAT_CHALLENGE, 42, 123_456))
+        );
+        // Below the 12-byte minimum -> None (the challenge-less 8-byte form the
+        // stale header comment described is NOT a valid response).
+        assert_eq!(
+            parse_serv_stat_res(&[0x2A, 0, 0, 0, 0x40, 0xE2, 0x01, 0x00]),
+            None
+        );
     }
 
     #[test]

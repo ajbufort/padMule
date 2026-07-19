@@ -488,7 +488,9 @@ struct ContentView: View {
                     Text(model.loadingServers ? "Probing..." : "No server list on disk.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
-                ForEach(model.servers, id: \.addr) { srv in
+                // Index-keyed: server.met is not deduped, so addresses are not a
+                // unique identity (duplicate rows would collide on \.addr).
+                ForEach(Array(model.servers.enumerated()), id: \.offset) { _, srv in
                     serverRow(srv)
                 }
             }
