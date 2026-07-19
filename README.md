@@ -1,15 +1,29 @@
 # padMule
 
-A port of **aMule** (the eD2k / Kademlia peer-to-peer client) to the iPad.
+An **eD2k / Kademlia peer-to-peer client for the iPad** - a from-scratch **Rust**
+engine behind a native **SwiftUI** interface.
 
-padMule keeps aMule's protocol and file-format behavior but replaces everything
-iPadOS cannot run: the engine is a **Rust rewrite** and the interface is native
-**SwiftUI**. It talks to the real eD2k and Kad networks and is byte-compatible
-with aMule's on-disk formats, so an aMule download and a padMule download can pick
-up where the other left off.
+padMule is not a UI reskin of a desktop app. The engine is rewritten from scratch
+to run where iPadOS clients cannot, but it stays faithful to the network: it
+speaks the real eD2k and Kad protocols and its on-disk formats are byte-compatible
+with the desktop clients, so an aMule (or eMule) download and a padMule download
+can pick up where the other left off.
 
-Upstream aMule is a wxWidgets desktop app, and wxWidgets has no usable iOS port.
-padMule reimplements the engine below the UI rather than porting the GUI.
+It draws on the whole lineage of the network's software, and adds its own:
+
+- **aMule 3.0.1** - vendored in-repo as the reference oracle for wire-neutral
+  behavior, and the client padMule differential-tests its transfers against.
+- **eMule 0.50a** - the authority for the wire protocol and on-disk formats;
+  padMule matches its bytes.
+- **eMule 0.70b** - a community fork mined for features: IP filter, search
+  history, wire-side search filters, download categories, file ratings and
+  comments, a per-source detail view, and more.
+- **padMule's own** - features that only make sense on an iPad: a Leech-Mode
+  upload toggle, client-side categories, HighID over unicast UPnP (iOS blocks the
+  multicast kind), and a padMule-to-padMule enhancement channel.
+
+wxWidgets (aMule's GUI toolkit) has no usable iOS port, so padMule reimplements
+the engine below the UI rather than porting the desktop app.
 
 ## Status
 
@@ -20,12 +34,16 @@ failed for us). What works today, proven on-device:
 
 - **Connect** to live eD2k servers and bootstrap the Kad DHT.
 - **Search** the connected server and the Kad network together, deduped and
-  ranked into one result list.
+  ranked into one list, with sort/filter, file-rating badges, and remembered
+  recent searches.
 - **Download** a file from its sources, **verify** it against its eD2k hash, and
-  save it to the Files app (On My iPad > padMule).
-- **Share** completed files back to other peers, with a toggle to turn uploading
-  off ("download only").
-- **Cancel** an in-progress download (swipe to remove).
+  save it to the Files app (On My iPad > padMule); sort downloads into
+  **categories**.
+- **Share** completed files back to other peers (with a Leech-Mode toggle to turn
+  uploading off), and **rate or comment** your own shared files - served to
+  downloaders the way eMule does.
+- **Cancel** a download or **unshare** a file (swipe), with an **IP blocklist**
+  (`ipfilter.dat` / `.p2p`) filtering both sources and inbound peers.
 
 Reachability follows the usual eD2k rules: a LowID client downloads fine but
 cannot receive inbound connections, so a device behind NAT stays LowID unless its
@@ -33,8 +51,8 @@ gateway forwards the listening port. padMule asks the gateway to do that over
 UPnP (multicast on desktop, unicast on iOS, where multicast is unavailable); this
 only earns HighID on a gateway that has UPnP enabled.
 
-The port strategy, protocol notes, and every design decision are written up in
-`docs/wiki/` (start at `docs/wiki/index.md`).
+The design, protocol notes, and every decision are written up in `docs/wiki/`
+(start at `docs/wiki/index.md`).
 
 ## Architecture
 
@@ -84,10 +102,11 @@ is documented in `docs/wiki/mac-toolchain-setup.md`.
 padMule is free software licensed **GPL-2.0-or-later**. See `LICENSE` for the
 full text and `NOTICE` for the derivation.
 
-It is a port of aMule 3.0.1 (Copyright the aMule Team, GPL-2.0-or-later), which
-itself descends from eMule (Copyright the eMule Team, GPL-2.0-or-later). The
-vendored `amule-3.0.1/` tree keeps its own license and author files intact. Any
-code borrowed from aMule, eMule, or another fork retains its original notices.
+padMule is a derivative work in the aMule / eMule lineage: it reimplements and
+draws on aMule 3.0.1 (Copyright the aMule Team) and eMule (Copyright the eMule
+Team), both GPL-2.0-or-later. The vendored `amule-3.0.1/` tree keeps its own
+license and author files intact. Any code adopted from aMule, eMule, or another
+fork retains its original notices.
 
 ## Responsible use
 
