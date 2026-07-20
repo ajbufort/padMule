@@ -74,7 +74,12 @@ targets:
         # uniffi glue: find module.modulemap + the header, and link the staticlib.
         SWIFT_INCLUDE_PATHS: $(SRCROOT)/gen
         HEADER_SEARCH_PATHS: $(SRCROOT)/gen
-        LIBRARY_SEARCH_PATHS: $(SRCROOT)/libs
+        # The staticlib is arch+platform specific: the device .ipa build stages
+        # libs/ (aarch64-apple-ios); the simulator test build stages libs-sim/
+        # (aarch64-apple-ios-sim). A device .a cannot link into a simulator binary,
+        # so the search path is SDK-conditional.
+        "LIBRARY_SEARCH_PATHS[sdk=iphoneos*]": $(SRCROOT)/libs
+        "LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*]": $(SRCROOT)/libs-sim
         OTHER_LDFLAGS: -lmule_ffi
         # Built unsigned; AltStore/Sideloadly re-signs with your Apple ID at install.
         CODE_SIGNING_ALLOWED: "NO"
@@ -82,3 +87,36 @@ targets:
         CODE_SIGN_IDENTITY: ""
         ENABLE_BITCODE: "NO"
         ENABLE_USER_SCRIPT_SANDBOXING: "NO"
+
+  # Unit tests for the pure Swift decision logic (present() sort/filter, and later
+  # the result color + model state mapping). Runs on the iOS SIMULATOR in CI only
+  # (no Apple toolchain locally): the FFI is built for aarch64-apple-ios-sim and
+  # `xcodebuild test` hosts the bundle inside the padMule app, so `@testable import
+  # padMule` reaches internal symbols and the generated FFI types (SearchHit, ...)
+  # resolve from the app binary. See .github/workflows/ios-test.yml.
+  padMuleTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: padMuleTests
+    dependencies:
+      - target: padMule
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: us.ajbconsulting.padMuleTests
+        GENERATE_INFOPLIST_FILE: "YES"
+        CODE_SIGNING_ALLOWED: "NO"
+        CODE_SIGNING_REQUIRED: "NO"
+        CODE_SIGN_IDENTITY: ""
+
+# A shared scheme so `xcodebuild test -scheme padMule` builds the app + runs the
+# unit-test bundle against it on a simulator.
+schemes:
+  padMule:
+    build:
+      targets:
+        padMule: all
+        padMuleTests: [test]
+    test:
+      targets:
+        - padMuleTests

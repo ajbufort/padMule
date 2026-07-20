@@ -1,0 +1,98 @@
+# Swift unit tests on the iOS SIMULATOR. Separate from the .ipa build so the
+# device artifact stays fast and independent. Builds the FFI for the simulator
+# arch (aarch64-apple-ios-sim), generates the uniffi Swift bindings, and runs the
+# padMuleTests bundle inside the padMule app on a booted iPad simulator. No Apple
+# credentials (unsigned, CODE_SIGNING_ALLOWED=NO). See ios/padMuleTests/.
+name: iOS unit tests (simulator)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "ios/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/ios-test.yml"
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          sw_vers
+
+      - name: Rust toolchain + iOS simulator target
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup target add aarch64-apple-ios-sim
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-ios-sim-${{ hashFiles('Cargo.lock') }}
+
+      # The engine, compiled for the iOS simulator (Apple-silicon runners).
+      - name: Build mule-ffi staticlib (aarch64-apple-ios-sim)
+        run: cargo build -p mule-ffi --release --target aarch64-apple-ios-sim
+
+      # Bindings are arch-independent, generated from the HOST cdylib.
+      - name: Generate Swift bindings
+        run: |
+          cargo build -p mule-ffi --release
+          cargo run -q -p mule-ffi --bin uniffi-bindgen -- generate \
+            --library target/release/libmule_ffi.dylib \
+            --language swift \
+            --out-dir ios/gen
+          mv ios/gen/mule_ffiFFI.modulemap ios/gen/module.modulemap
+          ls -la ios/gen
+
+      - name: Stage the simulator staticlib for the linker
+        run: |
+          mkdir -p ios/libs-sim
+          cp target/aarch64-apple-ios-sim/release/libmule_ffi.a ios/libs-sim/
+          ls -la ios/libs-sim
+
+      - name: Generate the Xcode project
+        run: |
+          brew install xcodegen
+          cd ios && xcodegen generate
+
+      - name: Pick an available iPad simulator
+        id: sim
+        run: |
+          UDID=$(xcrun simctl list devices available --json | python3 -c "
+          import json, sys
+          devs = json.load(sys.stdin)['devices']
+          ids = [d['udid'] for rt in devs for d in devs[rt] if 'iPad' in d['name']]
+          print(ids[0] if ids else '')
+          ")
+          if [ -z "$UDID" ]; then
+            echo "No iPad simulator available; creating one."
+            UDID=$(xcrun simctl create padMule-iPad "iPad Pro (11-inch) (4th generation)")
+          fi
+          echo "Using simulator $UDID"
+          echo "udid=$UDID" >> "$GITHUB_OUTPUT"
+
+      - name: Run unit tests
+        run: |
+          cd ios
+          xcodebuild test \
+            -project padMule.xcodeproj \
+            -scheme padMule \
+            -sdk iphonesimulator \
+            -destination "platform=iOS Simulator,id=${{ steps.sim.outputs.udid }}" \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=""
