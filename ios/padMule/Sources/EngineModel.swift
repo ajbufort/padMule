@@ -229,7 +229,7 @@ final class EngineModel: ObservableObject {
                 self.searching = false
                 let u = EngineModel.searchUpdate(for: outcome, emptyMessage: "")
                 if let r = u.results { self.results = r }
-                self.moreAvailable = u.moreAvailable
+                if let m = u.moreAvailable { self.moreAvailable = m }
                 if let n = u.notice, !n.isEmpty { self.notice = n }
             }
         }
