@@ -491,6 +491,15 @@ struct FinishCtx {
     events: mpsc::UnboundedSender<EngineEvent>,
 }
 
+/// Clears a download's in-flight fetch flag on drop, so `try_begin_fetch`'s claim
+/// is released no matter how the fetch task exits (cancel, completion, panic).
+struct FetchGuard(Arc<Download>);
+impl Drop for FetchGuard {
+    fn drop(&mut self) {
+        self.0.end_fetch();
+    }
+}
+
 async fn finish_download(
     dl: Arc<Download>,
     ctx: FinishCtx,
@@ -509,20 +518,24 @@ async fn finish_download(
     let name = dl.name().await;
     let verified = dl.verify_whole_file(size, hash).await;
     if !verified {
-        // Do NOT strand the file at 100%: re-open the corrupt region so it gets
-        // re-fetched. verify_ready_parts re-gaps any part whose hash is now wrong
-        // (localized AICH-style recovery). If that blames no part (no hashset, or a
-        // spoofed hashset whose parts each "pass"), reset the WHOLE file. The
-        // download STAYS registered, so the next resume_fetches re-drives it.
-        let _ = dl.verify_ready_parts().await;
-        if dl.is_complete().await {
-            dl.reset_all_gaps().await;
-        }
-        // Release the finalize claim so the re-fetched file can finalize again.
+        // Re-open the WHOLE file so it re-downloads instead of stranding at 100%.
+        // (We could localize with verify_ready_parts, but that re-hashes every part
+        // UNDER the download lock - stalling the heartbeat and pause() - and a
+        // whole-file failure after every part individually verified is near
+        // impossible, so a full re-fetch is the simpler, lock-cheap recovery.) The
+        // download STAYS registered; the next resume re-drives it.
+        dl.reset_all_gaps().await;
         dl.reset_finalize();
         let _ = events.send(EngineEvent::Server(format!(
-            "'{name}' failed verification - re-fetching the bad blocks"
+            "'{name}' failed verification - will re-fetch on the next resume"
         )));
+        return;
+    }
+    // Cancelled during the (multi-second) verify window: do NOT save or share a
+    // file the user just cancelled (it would land in Documents + re-seed to the
+    // swarm on every start). finish_to re-checks under the lock to close the
+    // remaining tiny window atomically.
+    if dl.is_cancelled() {
         return;
     }
     // A finished file becomes a shared source, and answering OP_HASHSETREQUEST
@@ -2145,6 +2158,13 @@ impl Engine {
         name: &str,
         sources: Vec<PeerSource>,
     ) {
+        // One live fetch task per download: skip if one is already running. pause()
+        // does not abort in-flight tasks, so without this resume()/resume_fetches
+        // would stack a duplicate download_file every background/foreground cycle,
+        // multiplying outbound peer connections.
+        if !dl.try_begin_fetch() {
+            return;
+        }
         // Advertise SecureIdent v1 in the fetch HELLO so a source will initiate
         // the exchange toward us; pass our RSA identity so we can respond + verify.
         let me = HelloInfo::baseline(self.identity.userhash, 0, TCP_PORT, KAD_UDP_PORT, "padMule")
@@ -2162,6 +2182,8 @@ impl Engine {
         };
         let dl_task = dl;
         tokio::spawn(async move {
+            // Release the in-flight fetch slot however this task exits.
+            let _fetch_guard = FetchGuard(Arc::clone(&dl_task));
             // ByPriority: the sweep reads dl.priority() live each round, so a
             // priority change on this download while it is fetching takes effect.
             let cfg = ManagerConfig::ByPriority {
@@ -2192,7 +2214,11 @@ impl Engine {
             let guard = self.downloads.lock().await;
             let mut v = Vec::new();
             for dl in guard.iter() {
-                if !dl.is_complete().await && !dl.is_cancelled() {
+                // Skip ones already being fetched: pause() does not abort in-flight
+                // tasks, so a still-running fetch must not be re-driven (spawn_fetch
+                // would bail anyway, but this also avoids wasted source-finding under
+                // the engine lock).
+                if !dl.is_complete().await && !dl.is_cancelled() && !dl.is_fetching() {
                     v.push(Arc::clone(dl));
                 }
             }
@@ -2467,7 +2493,11 @@ impl Engine {
     /// only fills the IN-MEMORY gaps, so this durability-boundary flush is what
     /// makes resume-from-disk actually resume instead of restarting at 0%.
     async fn persist_downloads(&self) {
-        for dl in self.downloads.lock().await.iter() {
+        // Snapshot the Arcs, then drop the registry lock BEFORE the blocking
+        // per-download writes, matching downloads()/finalize_completed - so pause()
+        // does not hold the registry lock across every .part.met flush.
+        let dls: Vec<Arc<Download>> = self.downloads.lock().await.clone();
+        for dl in dls {
             dl.persist().await;
         }
     }

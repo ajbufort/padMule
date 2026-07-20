@@ -85,6 +85,11 @@ pub struct Download {
     /// fetch-task tail and the 1s heartbeat finalize-sweep from both finalizing the
     /// same download. Reset if finalize fails so a re-fetched file can finalize again.
     finalizing: AtomicBool,
+    /// True while a `download_file` task is live for this download. Prevents
+    /// resume()/resume_fetches from stacking a SECOND concurrent fetch task on top
+    /// of one that is still running (pause() does not abort the old task), which
+    /// would multiply outbound peer connections every background/foreground cycle.
+    fetching: AtomicBool,
 }
 
 struct Inner {
@@ -117,7 +122,27 @@ impl Download {
             priority,
             preview: AtomicBool::new(false),
             finalizing: AtomicBool::new(false),
+            fetching: AtomicBool::new(false),
         })
+    }
+
+    /// Claim the single in-flight fetch slot. The FIRST caller gets `true` and must
+    /// clear it with `end_fetch` when its task ends; a caller that gets `false`
+    /// must NOT spawn a duplicate fetch task (one is already running).
+    pub fn try_begin_fetch(&self) -> bool {
+        self.fetching
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Release the in-flight fetch slot (the fetch task has ended).
+    pub fn end_fetch(&self) {
+        self.fetching.store(false, Ordering::Release);
+    }
+
+    /// True while a fetch task is live for this download.
+    pub fn is_fetching(&self) -> bool {
+        self.fetching.load(Ordering::Acquire)
     }
 
     /// Claim the right to finalize this download exactly once (complete -> verify
@@ -447,7 +472,19 @@ impl Download {
     /// happens to hold an Arc clone at the same instant - which would otherwise
     /// leave a byte-complete `.part` stranded.
     pub async fn finish_to(&self, dest: &std::path::Path) -> std::io::Result<()> {
-        self.inner.lock().await.store.finish_in_place(dest)
+        let mut g = self.inner.lock().await;
+        // Atomic with the move: if the user cancelled while we were finalizing, do
+        // NOT move the file into place. cancel_download sets `cancelled` before it
+        // takes this same inner lock to delete the files, so checking it here (under
+        // the lock, no await before the move) makes cancel and finalize mutually
+        // exclusive - the file is either moved or deleted, never both.
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "cancelled during finalize",
+            ));
+        }
+        g.store.finish_in_place(dest)
     }
 }
 
