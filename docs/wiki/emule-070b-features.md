@@ -97,14 +97,14 @@ parsing, Kad anti-abuse hardening, and the "Automatic" search method). Ranked by
 |---|---------|--------|-----------|
 | 11 | Corruption black box + dynamic client ban | med | none |
 | 12 | A4AF cross-download source reassignment | med | none |
-| 13 | "Load more results" paging (OP_QUERY_MORE_RESULT) | small | low |
+| 13 | "Load more results" paging (OP_QUERY_MORE_RESULT) - DONE 2026-07-20 (commit 9c37495; opcode 0x21 bodiless, trailing more-byte on 0x33, Engine::search_more continues the same query/connection via SearchSession, cap 5, SwiftUI "Load more" button) | small | low |
 | 14 | Statistics tab (Swift Charts: rate history, totals, ratios) - DONE 2026-07-19 (commit 81a58c6; engine keeps 2 global monotonic byte counters, UI samples + charts them; rate = delta/elapsed after a review found off-cadence sampling) | med | none |
 | 15 | Learning spam filter over results (heuristics + mark-as-spam) | med | none |
 | 16 | Static up/down speed caps + anti-leech ratio guard | small | none |
 | 17 | Preview / open incomplete files (AVPlayer) - DONE 2026-07-19 (commit 39c59fe; per-download SEQUENTIAL block bias, snapshot the contiguous prefix, AVKit VideoPlayer; review-hardened: lock-free copy, revert-on-dismiss, honest moov-at-end message. NB: we do SEQUENTIAL not "first+last" - the snapshot only uses the contiguous head, so a tail island would not help it) | med | low |
-| 18 | Server manager (priority, pin, prune, auto-update from URL) | med | low |
+| 18 | Server manager (pin, prune, auto-update from URL) - DONE 2026-07-20 (commit 9c37495; reuse bootstrap::http_get_bytes to fetch+MERGE server.met, pins in pinned.txt side store, prune_dead_servers keeps alive+pinned; star toggle + Update/Prune UI). Priority-ordering deferred. | med | low |
 | 19 | Live server status ping (OP_GLOBSERVSTATREQ) - DONE 2026-07-19/20 (the Servers-screen probe; build-progress row 8x). Request carries a 4-byte challenge; response `<challenge u32><users u32><files u32>` (challenge echo verified). Live: eserver reports users/files. | med | medium |
-| 32 | Client-side search throttle + "wait N s" feedback (like eMule) | small | none |
+| 32 | Client-side search throttle + "wait N s" feedback - DONE 2026-07-20 (commit 9c37495; aMule's 2s guard IMPROVED to surface remaining seconds; SearchOutcome::Throttled; live-validated vs eserver oracle "wait 2s"). Wire-neutral. | small | none |
 | 20 | Author your own rating/comment + serve it back - DONE 2026-07-19 (Shared-screen editor -> known.met -> OP_FILEDESC, byte-faithful to aMule SendCommentInfo) | med | medium |
 | 21 | Per-peer / per-source detail sheet - DONE 2026-07-19 (SourcesView) | small | none |
 | 22 | Kad notes search (ratings by hash, no connected source needed) | large | high |
