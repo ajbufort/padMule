@@ -451,11 +451,18 @@ fn update_shared_file_meta(config_dir: &Path, hash: [u8; 16], rating: u8, commen
 /// Write `met` to `path` atomically (temp file + rename), so a crash mid-write
 /// never leaves a torn known.met that would read back as an empty library.
 fn write_known_met_atomic(path: &Path, met: &mule_files::KnownMet) {
-    let bytes = mule_files::write_known_met(met);
-    let tmp = path.with_extension("met.tmp");
-    if std::fs::write(&tmp, &bytes).is_ok() {
-        let _ = std::fs::rename(&tmp, path);
-    }
+    let _ = write_bytes_atomic(path, &mule_files::write_known_met(met));
+}
+
+/// Write `bytes` to `path` atomically (temp file + rename), so a crash mid-write
+/// (routine on iOS, which suspends/terminates aggressively) never leaves a
+/// truncated file that the next launch would choke on.
+fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)
 }
 
 /// Verify a finished download and move it into place.
@@ -1303,6 +1310,9 @@ impl Engine {
             old.disconnect().await;
         }
         self.connection = None;
+        // A new connection means the server no longer holds our last query, so any
+        // "load more" session is stale even if we reconnect to the SAME address.
+        self.search_session = None;
         let login = LoginRequest {
             user_hash: self.identity.userhash,
             client_id: 0,
@@ -1345,6 +1355,7 @@ impl Engine {
             link.disconnect().await;
         }
         self.connection = None;
+        self.search_session = None;
         self.emit(EngineEvent::Server("Disconnected from the server".into()));
     }
 
@@ -1485,7 +1496,7 @@ impl Engine {
         let before = base.servers.len() as u32;
         let merged = merge_server_met(&base, &incoming);
         let total = merged.servers.len() as u32;
-        if std::fs::write(&path, write_server_met(&merged)).is_err() {
+        if write_bytes_atomic(&path, &write_server_met(&merged)).is_err() {
             return ServerListUpdate::Unreachable;
         }
         ServerListUpdate::Updated {
@@ -1497,12 +1508,15 @@ impl Engine {
     /// Probe the server list and drop every server that is DEAD and not pinned,
     /// rewriting `config_dir/server.met`. Returns how many were removed.
     pub async fn prune_dead_servers(&mut self) -> u32 {
-        // Keep a server if it answered the probe OR the user pinned it.
+        // Keep a server if it answered the probe, is pinned, OR is the one we are
+        // connected to right now. Many servers are TCP-reachable but do not answer
+        // the UDP status ping, so `alive` alone would prune the server in active use
+        // (eMule never removes the connected server on "remove dead servers").
         let keep: std::collections::HashSet<String> = self
             .probe_server_list()
             .await
             .iter()
-            .filter(|e| e.alive || e.pinned)
+            .filter(|e| e.alive || e.pinned || e.connected)
             .map(|e| e.addr.to_string())
             .collect();
         let path = self.config_dir.join("server.met");
@@ -1527,7 +1541,7 @@ impl Engine {
                 header: met.header,
                 servers,
             };
-            let _ = std::fs::write(&path, write_server_met(&out));
+            let _ = write_bytes_atomic(&path, &write_server_met(&out));
         }
         removed
     }
@@ -1811,20 +1825,24 @@ impl Engine {
         if self.offline {
             return empty();
         }
-        // Same flood guard as a normal search (it hits the same server), but only
-        // stamp when we actually issue - an unsupported server never gets queried.
-        let now = Instant::now();
-        if let Some(wait_secs) =
-            throttle_wait_secs(self.last_server_search, now, SERVER_SEARCH_MIN_INTERVAL)
-        {
-            return SearchOutcome::Throttled { wait_secs };
-        }
+        // A related search is a no-op unless a related-search-capable server is
+        // connected, so check that BEFORE the flood guard - otherwise a related tap
+        // within 2s of a normal search would falsely report "wait 2s" for something
+        // that would do nothing, and the UI would not fall back to a keyword search.
         if !self
             .server
             .as_ref()
             .is_some_and(|l| l.related_search_supported())
         {
             return empty();
+        }
+        // Same flood guard as a normal search (it hits the same server); stamp only
+        // when we actually issue.
+        let now = Instant::now();
+        if let Some(wait_secs) =
+            throttle_wait_secs(self.last_server_search, now, SERVER_SEARCH_MIN_INTERVAL)
+        {
+            return SearchOutcome::Throttled { wait_secs };
         }
         self.last_server_search = Some(now);
         let params = SearchParams {

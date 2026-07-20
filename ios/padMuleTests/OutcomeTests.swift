@@ -19,7 +19,7 @@ final class OutcomeTests: XCTestCase {
             for: .results(hits: [hit("a"), hit("b")], moreAvailable: true),
             emptyMessage: "none")
         XCTAssertEqual(u.results?.map(\.name), ["a", "b"])
-        XCTAssertTrue(u.moreAvailable)
+        XCTAssertEqual(u.moreAvailable, true)
         XCTAssertNil(u.notice, "a non-empty result set shows no notice")
     }
 
@@ -27,7 +27,7 @@ final class OutcomeTests: XCTestCase {
         let u = EngineModel.searchUpdate(
             for: .results(hits: [], moreAvailable: false), emptyMessage: "none found")
         XCTAssertEqual(u.results?.count, 0)
-        XCTAssertFalse(u.moreAvailable)
+        XCTAssertEqual(u.moreAvailable, false)
         XCTAssertEqual(u.notice, "none found")
     }
 
@@ -37,7 +37,7 @@ final class OutcomeTests: XCTestCase {
     func testThrottledKeepsResultsAndWarns() {
         let u = EngineModel.searchUpdate(for: .throttled(waitSecs: 2), emptyMessage: "none")
         XCTAssertNil(u.results, "throttle must not clear the current results")
-        XCTAssertFalse(u.moreAvailable)
+        XCTAssertNil(u.moreAvailable, "throttle must not clear the Load-more flag")
         XCTAssertEqual(u.notice, "Searching too fast - wait 2s and try again.")
     }
 }
