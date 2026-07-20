@@ -44,8 +44,8 @@ larger item (build, or ship documented as not-yet-active).
 | AICH part-level + block RECOVERY | PARTIAL | master hash byte-valid but DEAD; no per-part MD4; recovery unimplemented; AICH bit advertised-then-dropped |
 | Poisoning defense (bad part re-fetchable) | PARTIAL | whole-file MD4 holds, but no per-part verify + no source attribution -> one bad source = full re-download loop / stall |
 | Search-result SPAM filter | PARTIAL | intra-hash heuristics only; eMule's cross-hash filename-repetition defense absent |
-| Server MOTD/result FLOOD rate-limit | PARTIAL | forwards into an UNBOUNDED events channel -> memory-exhaustion DoS via auto get_sources |
-| Server-trust (source/IP sanity) | PARTIAL | LowID/port0 rejected, no reserved/loopback/LAN guard -> SSRF-lite localhost/LAN probe on fresh install |
+| Server MOTD/result FLOOD rate-limit | OPERATIONAL (B6 fixed 625df39) | forwarder now rate-limits server events 30/10s (State exempt); MOTD attributed + 500-char capped |
+| Server-trust (source/IP sanity) | OPERATIONAL (B8 fixed 625df39) | PeerSource::from_found/from_kad now reject non-public IPv4 unconditionally (SSRF closed); LowID/port0 already rejected |
 | ipfilter Kad UDP coverage | PARTIAL | routing inserts + inbound Kad UDP NOT ipfiltered -> blocklisted ranges poison routing |
 | Input safety: bounded inbound listener | PARTIAL | 200-permit semaphore but no per-IP cap + no serve-session budget -> one IP starves all permits |
 | Credit system (clients.met, ident-gated) | MISSING | dead code: FIFO gate, no accounting, clients.met never used |
