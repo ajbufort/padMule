@@ -189,6 +189,22 @@ a UI event, and the login event embedded the client id, which ENCODES the public
 on HighID. Both removed - this screen gets screenshotted. See
 [[padmule-dev-box-networking]].
 
+## Two CI workflows (2026-07-20)
+
+- **`.github/workflows/ios-build.yml`** - the ACTIVE path above: builds the
+  unsigned device `.ipa` (FFI for `aarch64-apple-ios`, staged to `ios/libs/`).
+- **`.github/workflows/ios-test.yml`** - Swift UNIT TESTS on an iPad SIMULATOR.
+  Builds the FFI for `aarch64-apple-ios-sim` (staged to `ios/libs-sim/`), generates
+  the uniffi bindings, `xcodegen`s, then `xcodebuild test` on a dynamically-selected
+  iPad sim. The `padMuleTests` bundle is hosted inside the padMule app, so
+  `@testable import padMule` reaches internal symbols (`present`, `SortKey`) and the
+  generated FFI records (`SearchHit`) resolve from the app binary. Key wiring:
+  `LIBRARY_SEARCH_PATHS` is SDK-conditional (device `.a` cannot link a simulator
+  binary) and `project.yml` defines a shared `padMule` scheme with a test action.
+  First harness covers `SearchPresentation.present()` (the descending-sort
+  strict-weak-ordering fix + all filters). Both workflows are secret-free (unsigned).
+  This is the client-side half of task #46 (engine settings were already FFI-tested).
+
 ## Related
 
 - [[padmule-ios-app-path]]
