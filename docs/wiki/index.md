@@ -22,6 +22,7 @@ the Ingest / Query / Lint workflows.
 ## Reference
 - [[ref-ecosystem]] - eMule AI fork, eMule-Board dev forums, official aMule docs site.
 - [[ref-source-trees]] - the reference source oracles under refs/ (eMule 0.50a/0.70b, aMule master); protocol authority + findings.
+- [[ed2k-protocol-archaeology]] - historical study materials (Gosling 2003 GIAC paper, dtool.pl, oldversion.com MetaMachine binaries); cross-confirm padMule's wire + leads for the Lugdunum project.
 - [[emule-peer-oracle]] - a SECOND live peer oracle: real eMule on the Windows host (mirrored-mode 127.0.0.1:4663), driven by scripts/emule-oracle.sh; complements the headless amuled differential test and is the faithful other-side for secure-ident (#32). Manual (Anthony launches eMule).
 - [[ed2k-server-oracle]] - the SERVER oracle: real Lugdunum eserver 17.15 run LOCALLY + fully ISOLATED (unshare -rn, zero egress), driven by scripts/eserver-oracle.sh. padMule logs in against real eserver; enables #9 global-UDP-search testing. Untrusted binary, gitignored, sha256-verified; i686 build (x86_64 hits the vsyscall trap).
 

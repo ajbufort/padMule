@@ -48,6 +48,8 @@ mirrors our tree's `src/` layout.
 
 ## Related
 
+- [[ed2k-protocol-archaeology]] - historical MetaMachine-era study materials that cross-confirm this wire.
+
 - [[protocol-reference]]
 - [[protocol-understanding]]
 - [[decisions-and-lessons]]
