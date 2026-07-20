@@ -51,6 +51,28 @@ fn ed2k_ip(ip: u32) -> Ipv4Addr {
     )
 }
 
+/// A publicly routable unicast IPv4 - the only thing that can be a real eD2k
+/// SOURCE. Rejects loopback / RFC1918 / link-local / CGNAT / multicast /
+/// broadcast / reserved, UNCONDITIONALLY (independent of the user ipfilter, which
+/// may be absent on a fresh install). This closes "SSRF-lite": a hostile server or
+/// Kad node cannot hand us 127.0.0.1 or a LAN address and make us port-probe it.
+/// Interop-safe: a real source is always on a public IP (eMule's IsGoodIP does the
+/// same), so no legitimate peer is dropped.
+pub fn is_routable_public_v4(ip: Ipv4Addr) -> bool {
+    let o = ip.octets();
+    !(ip.is_private()
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_broadcast()
+        || ip.is_multicast()
+        || ip.is_unspecified()
+        || ip.is_documentation()
+        // 100.64.0.0/10 carrier-grade NAT (not covered by is_private on stable).
+        || (o[0] == 100 && (64..=127).contains(&o[1]))
+        // 240.0.0.0/4 reserved / experimental.
+        || o[0] >= 240)
+}
+
 impl PeerSource {
     /// From a Kad source-search result. Only HighID types (1 and 4) carry a
     /// directly-connectable IP:port; firewalled types (3/5/6) need a
@@ -65,8 +87,12 @@ impl PeerSource {
         if ip == 0 || tcp == 0 {
             return None;
         }
+        let addr = Ipv4Addr::from(ip);
+        if !is_routable_public_v4(addr) {
+            return None;
+        }
         Some(PeerSource {
-            addr: SocketAddr::from((Ipv4Addr::from(ip), tcp)),
+            addr: SocketAddr::from((addr, tcp)),
             user_hash: Some(s.client_hash.to_hash()),
             origin: SourceOrigin::Kad,
         })
@@ -79,8 +105,12 @@ impl PeerSource {
         if s.port == 0 || s.ip < 0x0100_0000 {
             return None;
         }
+        let addr = ed2k_ip(s.ip);
+        if !is_routable_public_v4(addr) {
+            return None;
+        }
         Some(PeerSource {
-            addr: SocketAddr::from((ed2k_ip(s.ip), s.port)),
+            addr: SocketAddr::from((addr, s.port)),
             user_hash: s.user_hash,
             origin: SourceOrigin::Server,
         })
@@ -491,6 +521,45 @@ mod tests {
     }
 
     #[test]
+    fn reserved_and_lan_sources_are_rejected_ssrf_guard() {
+        // A hostile server/Kad node handing us loopback/LAN must NOT become a
+        // dialable source (SSRF-lite), independent of any user ipfilter.
+        for octets in [
+            [127, 0, 0, 1],       // loopback
+            [192, 168, 1, 5],     // RFC1918
+            [10, 0, 0, 7],        // RFC1918
+            [172, 16, 0, 9],      // RFC1918
+            [169, 254, 1, 1],     // link-local
+            [100, 100, 0, 1],     // CGNAT 100.64/10
+            [224, 0, 0, 1],       // multicast
+            [255, 255, 255, 255], // broadcast
+            [0, 0, 0, 0],         // unspecified
+        ] {
+            assert!(
+                !is_routable_public_v4(Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3])),
+                "{octets:?} must be rejected"
+            );
+            // eD2k low-byte-first encoding of the same address.
+            let ip = octets[0] as u32
+                | (octets[1] as u32) << 8
+                | (octets[2] as u32) << 16
+                | (octets[3] as u32) << 24;
+            let s = FoundSource {
+                ip,
+                port: 4662,
+                crypt: None,
+                user_hash: None,
+            };
+            assert!(
+                PeerSource::from_found(&s).is_none(),
+                "{octets:?} must not become a source"
+            );
+        }
+        // A normal public address still works.
+        assert!(is_routable_public_v4(Ipv4Addr::new(49, 118, 243, 134)));
+    }
+
+    #[test]
     fn lowid_server_source_is_skipped() {
         let s = FoundSource {
             ip: 123_456, // < 0x01000000 -> LowID, needs a callback
@@ -505,8 +574,10 @@ mod tests {
     fn drop_blocked_removes_filtered_sources() {
         use mule_files::{IpFilter, DEFAULT_IPFILTER_LEVEL};
         let mut reg = SourceRegistry::new();
-        // Two directly-connectable server sources: one blocked, one not.
-        let bad_ip = 10u32 | (5 << 24); // eD2k low-byte 10.0.0.5
+        // Two directly-connectable PUBLIC server sources: one ipfilter-blocked, one
+        // not. (Public, because the always-on SSRF guard now drops LAN/reserved IPs
+        // before they can even enter the registry.)
+        let bad_ip = 1u32 | (2 << 8) | (3 << 16) | (4 << 24); // 1.2.3.4 (blocked below)
         let ok_ip = 8u32 | (8 << 8) | (8 << 16) | (8 << 24); // 8.8.8.8
         for ip in [bad_ip, ok_ip] {
             reg.add_found(&[FoundSource {
@@ -517,7 +588,7 @@ mod tests {
             }]);
         }
         assert_eq!(reg.len(), 2);
-        let filter = IpFilter::parse("10.0.0.0 - 10.0.0.255 , 0 , x\n", DEFAULT_IPFILTER_LEVEL);
+        let filter = IpFilter::parse("1.2.3.0 - 1.2.3.255 , 0 , x\n", DEFAULT_IPFILTER_LEVEL);
         let dropped = reg.drop_blocked(|addr| match addr {
             SocketAddr::V4(v4) => filter.is_blocked(*v4.ip()),
             SocketAddr::V6(_) => false,
