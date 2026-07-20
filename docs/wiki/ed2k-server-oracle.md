@@ -73,10 +73,19 @@ and `wsl --shutdown`; not needed - i686 works.)
   library named with the keyword, then runs the FFI `simulate` engine (a distinct
   user hash) which PROBES + connects + searches. Live: the status probe reports
   users=1 files=3 alive=true (the OP_GLOBSERVSTATREQ challenge fix, commit
-  05fbe5a) and SEARCH returns the 3 real typed sourced results. Boolean `NOT` and
-  UDP global search return 0 from THIS server - padMule's boolean encoding is
-  byte-identical to eMule 0.50a (ops 00 00 / 00 01 / 00 02, string 01, prefix
-  order), so those are Lugdunum server-side evaluation quirks, not padMule bugs.
+  05fbe5a) and SEARCH returns the 3 real typed sourced results.
+- **SEARCH RATE-LIMIT (2026-07-20, corrects an earlier misread).** The eserver
+  answers only the FIRST search in a rapid burst and silently returns 0 for the
+  rest (a standard per-client anti-flood cooldown). An initial run misread the
+  resulting boolean/global 0-results as "server boolean quirks" - WRONG. With the
+  operator battery spaced past the cooldown (`MATRIX_GAP=20 scripts/simulate.sh`),
+  padMule's boolean search is FULLY CORRECT: implicit-AND=1, AND=1, OR=2, OR-one-
+  side=1, NOT-excludes-1=2, NOT-excludes-nothing=3, phrase=1 - every count exact.
+  padMule's encoding is also byte-identical to eMule 0.50a (ops 00 00 / 00 01 /
+  00 02, string 01, prefix `<op><left><right>`). The global-search 0 is unrelated:
+  Engine::global_udp_search deliberately SKIPS the connected server, and the sim's
+  server.met lists only that one. Follow-up idea: padMule has no client-side search
+  throttle / "wait N s" feedback like eMule -> a real UX gap ([[emule-070b-features]]).
   `KEEP_LOG=1 scripts/simulate.sh` persists the eserver log out of the namespace.
 - DONE: #10 related-files search - `mule-cli related-search 127.0.0.1 4661
   <hash>` logs in and sends `related::<UPPERHEX>` (a normal OP_SEARCHREQUEST).

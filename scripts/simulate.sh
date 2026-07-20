@@ -65,7 +65,9 @@ PY
 # content (validates SEARCH + result color-coding, not the byte transfer, which the
 # amuled differential test already covers).
 SEED_LIB="$KEYWORD sample video.avi|$KEYWORD music track.mp3|$KEYWORD readme notes.txt"
-"$CLI" offer-hold 127.0.0.1 "$PORT" "$SEED_LIB" 120 &
+# Hold well past the run; the seeder is killed as soon as the simulation returns.
+# A large ceiling lets MATRIX_GAP>0 space searches past the server cooldown.
+"$CLI" offer-hold 127.0.0.1 "$PORT" "$SEED_LIB" 300 &
 SEED_PID=$!
 sleep 2 # let the seeder log in + offer before the search runs
 echo "== seeded the eserver index (keyword '$KEYWORD'); running the app simulation =="

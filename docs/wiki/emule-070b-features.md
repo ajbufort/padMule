@@ -103,7 +103,8 @@ parsing, Kad anti-abuse hardening, and the "Automatic" search method). Ranked by
 | 16 | Static up/down speed caps + anti-leech ratio guard | small | none |
 | 17 | Preview / open incomplete files (AVPlayer) - DONE 2026-07-19 (commit 39c59fe; per-download SEQUENTIAL block bias, snapshot the contiguous prefix, AVKit VideoPlayer; review-hardened: lock-free copy, revert-on-dismiss, honest moov-at-end message. NB: we do SEQUENTIAL not "first+last" - the snapshot only uses the contiguous head, so a tail island would not help it) | med | low |
 | 18 | Server manager (priority, pin, prune, auto-update from URL) | med | low |
-| 19 | Live server status ping (OP_GLOBSERVSTATREQ) | med | medium |
+| 19 | Live server status ping (OP_GLOBSERVSTATREQ) - DONE 2026-07-19/20 (the Servers-screen probe; build-progress row 8x). Request carries a 4-byte challenge; response `<challenge u32><users u32><files u32>` (challenge echo verified). Live: eserver reports users/files. | med | medium |
+| 32 | Client-side search throttle + "wait N s" feedback (like eMule) | small | none |
 | 20 | Author your own rating/comment + serve it back - DONE 2026-07-19 (Shared-screen editor -> known.met -> OP_FILEDESC, byte-faithful to aMule SendCommentInfo) | med | medium |
 | 21 | Per-peer / per-source detail sheet - DONE 2026-07-19 (SourcesView) | small | none |
 | 22 | Kad notes search (ratings by hash, no connected source needed) | large | high |
@@ -114,7 +115,7 @@ parsing, Kad anti-abuse hardening, and the "Automatic" search method). Ranked by
 | 27 | Collections (.emulecollection): open + add-all | med | high |
 | 28 | Connection limits + new-connection-rate throttle | small | none |
 | 29 | Protocol-overhead accounting | med | none |
-| 30 | Boolean search expression (AND/OR/NOT) - DONE 2026-07-19 (commit 92a67e0; recursive-descent parser, eMule parser.y precedence AND<OR<NOT, exact wire bytes, depth-guarded; eserver-validated) | med | medium |
+| 30 | Boolean search expression (AND/OR/NOT) - DONE 2026-07-19 (commit 92a67e0; recursive-descent parser, eMule parser.y precedence AND<OR<NOT, exact wire bytes, depth-guarded). FULLY LIVE-VALIDATED 2026-07-20: the seeded eserver returns exact counts for implicit-AND/AND/OR/NOT/phrase once searches are spaced past the server rate-limit (`MATRIX_GAP=20 scripts/simulate.sh`); an earlier "NOT returns 0" read was a rapid-burst artifact, not a bug. See [[ed2k-server-oracle]]. | med | medium |
 | 31 | Kad network visibility tab (routing/keyspace/lookup viz) | large | low |
 
 ## Tier 3 - skip (poor platform fit)
