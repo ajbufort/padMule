@@ -600,6 +600,10 @@ impl MuleEngine {
             // share change here, so a download that finished mid-session gets
             // re-announced to the server (OP_OFFERFILES) within about a second.
             g.maintain_shares().await;
+            // Finalize any download that reached 100% outside a fetch task (a LowID
+            // callback served the last bytes, or completion after the sweep budget),
+            // so it gets verified + moved + shared instead of sitting complete.
+            g.finalize_completed().await;
             // Detect a server drop/kick within ~1s and emit ServerDropped (the UI
             // shows a dialog). Cancel-safe peek, so this never disturbs framing.
             g.poll_server_drop().await;

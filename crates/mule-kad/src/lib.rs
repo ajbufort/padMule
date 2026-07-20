@@ -26,7 +26,9 @@ pub use message::{
     OP_SEARCH_KEY_REQ, OP_SEARCH_RES, OP_SEARCH_SOURCE_REQ, TAG_FILENAME, TAG_FILESIZE,
     TAG_KADMISCOPTIONS, TAG_SOURCEIP, TAG_SOURCEPORT, TAG_SOURCES, TAG_SOURCETYPE, TAG_SOURCEUPORT,
 };
-pub use routing::{Contact, RoutingTable, K, KBASE, KK, MAXLEVELS};
+pub use routing::{
+    Contact, RoutingTable, K, KBASE, KK, MAXLEVELS, MAX_CONTACTS_PER_IP, MAX_CONTACTS_PER_SUBNET,
+};
 pub use udp_obf::{
     kad_deobfuscate, kad_obfuscate_request, kad_obfuscate_response, udp_verify_key, KadDecrypted,
     MAGICVALUE_UDP_SYNC_CLIENT,

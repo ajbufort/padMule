@@ -8,6 +8,12 @@ use mule_proto::Kad128;
 
 /// Contacts per leaf bin.
 pub const K: usize = 10;
+/// Sybil/poisoning defense (eMule CRoutingBin): a single host must not flood the
+/// table with fake node IDs. Cap how many contacts may share one IP / one /24.
+/// Interop-safe: the global Kad network is IP-diverse, so a legitimate peer is
+/// never rejected - only an attacker packing many IDs behind one address is.
+pub const MAX_CONTACTS_PER_IP: usize = 2;
+pub const MAX_CONTACTS_PER_SUBNET: usize = 10;
 /// A full bin below this level always splits (fine resolution shallow in the tree).
 pub const KBASE: u8 = 4;
 /// A full bin whose zone index is below this also splits (fine resolution near self).
@@ -160,13 +166,42 @@ impl RoutingTable {
         }
     }
 
-    /// Add (or refresh) a contact. Ignores our own ID.
+    /// Add (or refresh) a contact. Ignores our own ID. The anti-sybil per-IP//24
+    /// cap is enforced one layer up (kad_live::add_contact, a LIVE-layer concern -
+    /// see the lookup.rs module note), so this stays a pure routing primitive.
     pub fn add(&mut self, id: Kad128, ip: u32, udp_port: u16, tcp_port: u16, version: u8) {
         if id == self.self_id {
             return;
         }
         let c = Contact::new(&self.self_id, id, ip, udp_port, tcp_port, version);
         self.root.add(c);
+    }
+
+    /// True if a contact with this id is already in the table.
+    pub fn contains(&self, id: &Kad128) -> bool {
+        let mut all: Vec<&Contact> = Vec::new();
+        self.root.collect(&mut all);
+        all.iter().any(|c| c.id == *id)
+    }
+
+    /// (contacts sharing this exact IP, contacts sharing its /24 subnet). Used by
+    /// the live layer to enforce the anti-sybil cap before inserting a network
+    /// contact.
+    pub fn ip_counts(&self, ip: u32) -> (usize, usize) {
+        let subnet = ip & 0xFFFF_FF00;
+        let mut all: Vec<&Contact> = Vec::new();
+        self.root.collect(&mut all);
+        let mut same_ip = 0;
+        let mut same_subnet = 0;
+        for c in all {
+            if c.ip == ip {
+                same_ip += 1;
+            }
+            if c.ip & 0xFFFF_FF00 == subnet {
+                same_subnet += 1;
+            }
+        }
+        (same_ip, same_subnet)
     }
 
     /// Load every contact from a parsed nodes.dat.

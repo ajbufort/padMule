@@ -252,7 +252,7 @@ pub fn parse_bootstrap_res(payload: &[u8]) -> Result<BootstrapRes, IoError> {
     let tcp_port = r.read_u16()?;
     let version = r.read_u8()?;
     let count = r.read_u16()?;
-    let mut contacts = Vec::with_capacity(count as usize);
+    let mut contacts = Vec::new();
     for _ in 0..count {
         contacts.push(read_wire_contact(&mut r)?);
     }
@@ -534,7 +534,7 @@ pub fn parse_search_res(payload: &[u8]) -> Result<SearchRes, IoError> {
     let responder = read_id(&mut r)?;
     let target = read_id(&mut r)?;
     let count = r.read_u16()?;
-    let mut results = Vec::with_capacity(count as usize);
+    let mut results = Vec::new();
     for _ in 0..count {
         let answer = read_id(&mut r)?;
         let tags = read_kad_taglist(&mut r)?;

@@ -65,12 +65,12 @@ pub fn read_part_met(bytes: &[u8]) -> Result<PartMet, IoError> {
     let date = r.read_u32()?;
     let file_hash = read_hash16(&mut r)?;
     let phcount = r.read_u16()?;
-    let mut part_hashes = Vec::with_capacity(phcount as usize);
+    let mut part_hashes = Vec::new();
     for _ in 0..phcount {
         part_hashes.push(read_hash16(&mut r)?);
     }
     let tagcount = r.read_u32()?;
-    let mut tags = Vec::with_capacity(tagcount as usize);
+    let mut tags = Vec::new();
     for _ in 0..tagcount {
         tags.push(read_tag(&mut r)?);
     }

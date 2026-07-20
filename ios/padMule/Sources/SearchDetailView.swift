@@ -17,7 +17,10 @@ struct SearchDetailView: View {
                 Section {
                     Text(hit.name).font(.headline)
                     row("Type", hit.fileType)
-                    row("Size", ByteCountFormatter.string(fromByteCount: Int64(hit.size), countStyle: .file))
+                    row(
+                        "Size",
+                        ByteCountFormatter.string(
+                            fromByteCount: Int64(clamping: hit.size), countStyle: .file))
                     row("Sources", "\(hit.sources)"
                         + (hit.completeSources > 0 ? " (\(hit.completeSources) complete)" : ""))
                     if hit.rating > 0 { row("Rating", ratingText(hit.rating)) }

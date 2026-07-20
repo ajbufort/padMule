@@ -187,6 +187,10 @@ const MAX_UPLOAD_SLOTS: usize = 8;
 /// thousands, which assumes an always-on seedbox); a queued peer holds an open
 /// connection here, so this also bounds fd/memory use.
 const UPLOAD_QUEUE_CAP: usize = 32;
+/// Cap on CONCURRENT inbound peer-connection tasks the listener will spawn. A
+/// hostile peer opening thousands would otherwise exhaust file descriptors + task
+/// memory; excess connections are dropped (the peer can retry).
+const MAX_INBOUND_CONNS: usize = 200;
 /// Total wall-clock budget for the resume-fetch pass in `start()`, and the
 /// per-download cap on source-finding within it. Small so a batch of dead
 /// downloads cannot stall startup (which holds the FFI engine lock).
@@ -505,8 +509,19 @@ async fn finish_download(
     let name = dl.name().await;
     let verified = dl.verify_whole_file(size, hash).await;
     if !verified {
+        // Do NOT strand the file at 100%: re-open the corrupt region so it gets
+        // re-fetched. verify_ready_parts re-gaps any part whose hash is now wrong
+        // (localized AICH-style recovery). If that blames no part (no hashset, or a
+        // spoofed hashset whose parts each "pass"), reset the WHOLE file. The
+        // download STAYS registered, so the next resume_fetches re-drives it.
+        let _ = dl.verify_ready_parts().await;
+        if dl.is_complete().await {
+            dl.reset_all_gaps().await;
+        }
+        // Release the finalize claim so the re-fetched file can finalize again.
+        dl.reset_finalize();
         let _ = events.send(EngineEvent::Server(format!(
-            "'{name}' finished but FAILED verification - keeping the .part, not saving"
+            "'{name}' failed verification - re-fetching the bad blocks"
         )));
         return;
     }
@@ -724,10 +739,25 @@ async fn global_udp_search(
     h.clone()
 }
 
+/// A privacy-safe label for a server state. NEVER Debug-format `ServerState`: its
+/// `Connected.id` is our client id, which ENCODES our public IP on HighID, and
+/// this string reaches the (screenshotted, public-repo) UI notice.
+fn server_state_label(s: &ServerState) -> String {
+    match s {
+        ServerState::Disconnected => "Disconnected".into(),
+        ServerState::Connecting => "Connecting".into(),
+        ServerState::Connected { low_id, .. } => {
+            format!("Connected ({})", if *low_id { "LowID" } else { "HighID" })
+        }
+        ServerState::PausedForBackground => "Paused".into(),
+        ServerState::Rejected => "Rejected".into(),
+    }
+}
+
 /// Flatten a server-link event into the UI's event stream.
 fn map_server_event(e: ServerEvent) -> EngineEvent {
     match e {
-        ServerEvent::State(s) => EngineEvent::Server(format!("{s:?}")),
+        ServerEvent::State(s) => EngineEvent::Server(server_state_label(&s)),
         ServerEvent::Message(m) => EngineEvent::Server(m),
         ServerEvent::Status { users, files } => {
             EngineEvent::Server(format!("{users} users, {files} files"))
@@ -1181,9 +1211,24 @@ impl Engine {
         let sharing = Arc::clone(&self.sharing);
         let gate = Arc::clone(&self.upload_gate);
         let ip_filter = self.ip_filter.clone();
+        let inbound = Arc::new(Semaphore::new(MAX_INBOUND_CONNS));
         let handle = tokio::spawn(async move {
             loop {
-                let Ok((stream, peer)) = listener.accept().await else {
+                let (stream, peer) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    // On error (notably EMFILE when the fd table is exhausted) do
+                    // NOT busy-loop - a bare `continue` spins accept() at 100% CPU.
+                    // Back off so the box can recover a descriptor.
+                    Err(_) => {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
+                // Cap concurrent inbound connections: a hostile peer opening
+                // thousands would exhaust fds/tasks. Reject the excess (it can
+                // retry); the permit frees when the connection task ends.
+                let Ok(permit) = Arc::clone(&inbound).try_acquire_owned() else {
+                    drop(stream);
                     continue;
                 };
                 let me = me.clone();
@@ -1193,6 +1238,7 @@ impl Engine {
                 let gate = Arc::clone(&gate);
                 let ip_filter = ip_filter.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     let mut fs = FramedStream::new(stream);
                     // A bare connect+close (the server's HighID probe) ends here:
                     // it never sends OP_HELLO, so the handshake errors and we bail.
@@ -1613,10 +1659,13 @@ impl Engine {
                 size: *sz,
             })
             .collect();
-        // Bounded + best-effort: a stalled write must NOT hang connect/resume
-        // (the lifecycle hard requirement), and a rejected offer is not fatal.
+        // Bounded + best-effort: a stalled write must NOT hang connect/resume, and
+        // a rejected offer is not fatal. 4s (not 10s) because this runs UNDER the
+        // shared engine lock via the 1s downloads() heartbeat, so it also caps how
+        // long a re-offer can delay pause()'s socket teardown - iPadOS only grants
+        // ~5s to background before it kills us.
         let _ = timeout(
-            Duration::from_secs(10),
+            Duration::from_secs(4),
             link.offer_files(&offers, FILE_COMPLETE_ID, FILE_COMPLETE_PORT),
         )
         .await;
@@ -1654,6 +1703,34 @@ impl Engine {
         Self::offer_shared_to(&self.shared, link).await;
     }
 
+    /// Finalize any download that reached 100% OUTSIDE a fetch task - e.g. a LowID
+    /// source that dialed our listener and served the last bytes, or a completion
+    /// after the fetch sweep's round budget. Without this, such a download would
+    /// sit complete-but-not-saved (never verified, moved, or shared). Idempotent
+    /// via try_begin_finalize; runs each 1s heartbeat. Spawns finish_download
+    /// (which verifies off-lock) rather than awaiting it, so the heartbeat - and
+    /// thus the shared engine lock - is never held across the verify + file move.
+    pub async fn finalize_completed(&self) {
+        let pending: Vec<Arc<Download>> = self.downloads.lock().await.clone();
+        for dl in pending {
+            if !dl.is_complete().await || !dl.try_begin_finalize() {
+                continue;
+            }
+            let hash = dl.hash().await;
+            let size = dl.size().await;
+            let dest = self.downloads_dir.join(safe_filename(&dl.name().await));
+            let ctx = FinishCtx {
+                registry: Arc::clone(&self.downloads),
+                shared: Arc::clone(&self.shared),
+                shared_dirty: Arc::clone(&self.shared_dirty),
+                config_dir: self.config_dir.clone(),
+                known_met_lock: Arc::clone(&self.known_met_lock),
+                events: self.events.clone(),
+            };
+            tokio::spawn(finish_download(dl, ctx, hash, size, dest));
+        }
+    }
+
     /// Bind the Kad UDP socket and bootstrap off the persisted contacts.
     async fn start_kad(&mut self) {
         let contacts: Vec<KadContact> = match std::fs::read(self.config_dir.join("nodes.dat")) {
@@ -1679,20 +1756,32 @@ impl Engine {
             self.emit(EngineEvent::Server("Kad UDP port unavailable".into()));
             return;
         };
-        match node
-            .bootstrap_any(&contacts, Duration::from_millis(1200), 40)
-            .await
-        {
-            Ok(_) => {
-                // Fold what Kad learned back into the persisted routing table.
-                self.routing.load_nodes(&routing_to_nodes(node.routing()));
-                self.emit(EngineEvent::Kad {
-                    contacts: node.contacts_known(),
-                });
-                self.kad = Some(node);
-            }
-            Err(_) => self.emit(EngineEvent::Server("Kad bootstrap failed".into())),
+        // Cap the OVERALL bootstrap: 40 contacts * 1200ms is ~48s worst case, and
+        // start_kad runs while the single shared engine lock is held (start/resume
+        // via the FFI), so an uncapped bootstrap would block pause()'s socket
+        // teardown and every other FFI call for that whole window. The server path
+        // is bounded the same way. Kad keeps working incrementally on its socket
+        // after, so a timed-out-but-partial bootstrap is still useful.
+        let bootstrapped = matches!(
+            timeout(
+                Duration::from_secs(5),
+                node.bootstrap_any(&contacts, Duration::from_millis(1200), 40),
+            )
+            .await,
+            Ok(Ok(_))
+        );
+        // Fold whatever Kad learned into the persisted routing table (even a
+        // timed-out bootstrap may have found contacts). Keep the node either way:
+        // it owns a live UDP socket + our persisted identity, and downloads pull
+        // Kad sources through it.
+        self.routing.load_nodes(&routing_to_nodes(node.routing()));
+        self.emit(EngineEvent::Kad {
+            contacts: node.contacts_known(),
+        });
+        if !bootstrapped {
+            self.emit(EngineEvent::Server("Kad bootstrap incomplete".into()));
         }
+        self.kad = Some(node);
     }
 
     /// Search BOTH the connected server AND the Kad network, deduped + ranked by
@@ -2087,7 +2176,7 @@ impl Engine {
             let total = dl_task.size().await;
             let have = total - dl_task.missing().await;
             let _ = events.send(EngineEvent::Progress { hash, have, total });
-            if dl_task.is_complete().await {
+            if dl_task.is_complete().await && dl_task.try_begin_finalize() {
                 finish_download(dl_task, ctx, hash, size, dest).await;
             }
         });
@@ -2292,6 +2381,11 @@ impl Engine {
         if let Some(h) = self.listener.take() {
             h.abort(); // release TCP 4662; resume() rebinds it
         }
+        // Flush download progress to disk BEFORE we may be suspended/killed: the
+        // hot receive path only fills the in-memory gap list, so without this a
+        // background-kill would lose all session progress and re-download from
+        // scratch. iPadOS calls pause() on .background, so this is the boundary.
+        self.persist_downloads().await;
         self.checkpoint();
         self.emit(EngineEvent::Status("Paused".into()));
         self.set_state(EngineState::Paused);
@@ -2342,8 +2436,20 @@ impl Engine {
                 // a no-op - resume stays serverless.
                 self.server = None;
                 self.connection = None;
+                self.search_session = None;
             }
             self.start_kad().await;
+            // Re-drive in-progress downloads: while suspended, iPadOS reclaimed the
+            // peer sockets, so the one-shot fetch tasks ended. Without this a
+            // download is byte-frozen after any background/foreground cycle. start()
+            // does the same via resume_fetches (this closes the start()-vs-resume()
+            // asymmetry the audit found).
+            self.resume_fetches().await;
+            // Re-announce our shared library on the fresh login: the server dropped
+            // our offers when the old connection died.
+            if resumed {
+                self.shared_dirty.store(true, Ordering::Relaxed);
+            }
         }
 
         self.emit(EngineEvent::Status(self.online_status()));
@@ -2351,13 +2457,25 @@ impl Engine {
 
     /// Final checkpoint and stop. Safe from any state.
     pub async fn shutdown(&mut self) {
+        self.persist_downloads().await;
         self.checkpoint();
         self.set_state(EngineState::Stopped);
     }
 
+    /// Flush every active download's `.part.met` (its gap list) so the progress
+    /// made this session survives a suspend-kill. The hot receive path (`commit`)
+    /// only fills the IN-MEMORY gaps, so this durability-boundary flush is what
+    /// makes resume-from-disk actually resume instead of restarting at 0%.
+    async fn persist_downloads(&self) {
+        for dl in self.downloads.lock().await.iter() {
+            dl.persist().await;
+        }
+    }
+
     /// Persist durable state: the identity and the Kad routing table
-    /// (`nodes.dat`). Each download's `.part.met` is written by its PartStore as
-    /// blocks land, so progress is already durable.
+    /// (`nodes.dat`). Download `.part.met` progress is flushed separately on the
+    /// pause/shutdown boundary by `persist_downloads` (the hot path only updates
+    /// the in-memory gaps, so this is NOT already durable per-block).
     fn checkpoint(&self) {
         let _ = self.identity.save(&self.config_dir);
         let contacts = routing_to_nodes(&self.routing);

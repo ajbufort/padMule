@@ -128,8 +128,31 @@ impl PartFile {
         !self.gaps.iter().any(|g| g.start < end && g.end > start)
     }
 
+    /// Re-open the ENTIRE file for download (one gap `[0, size)`). Last-resort
+    /// recovery when the whole-file hash fails but no single part can be blamed
+    /// (e.g. a spoofed hashset), rather than stranding a corrupt file at 100%.
+    pub fn reset_all_gaps(&mut self) {
+        self.gaps = if self.size == 0 {
+            Vec::new()
+        } else {
+            vec![Gap {
+                start: 0,
+                end: self.size,
+            }]
+        };
+        self.corrupted.clear();
+    }
+
     /// Sort and merge the gap list so the allocator can assume it is tidy.
     fn normalize(&mut self) {
+        // Clamp to the file size FIRST: a corrupt/tampered .part.met (it lives in a
+        // Files-accessible sandbox) could carry a gap with end > size, which would
+        // make missing() exceed size and underflow `size - missing()` on the FFI hot
+        // path. Clamping start to end too drops an inverted gap in the retain below.
+        for g in &mut self.gaps {
+            g.end = g.end.min(self.size);
+            g.start = g.start.min(g.end);
+        }
         self.gaps.retain(|g| g.start < g.end);
         self.gaps.sort_by_key(|g| g.start);
         let mut merged: Vec<Gap> = Vec::with_capacity(self.gaps.len());
@@ -356,6 +379,47 @@ mod tests {
     use mule_proto::ed2k_hash;
 
     const H: [u8; 16] = [0xAB; 16];
+
+    #[test]
+    fn resume_clamps_a_tampered_gap_to_the_file_size() {
+        // A corrupt/tampered .part.met (it lives in a Files-accessible sandbox)
+        // could carry a gap running past the file size. Without clamping, missing()
+        // would exceed size and `size - missing()` would underflow on the FFI hot
+        // path. resume() -> normalize() must clamp it.
+        let size = 1000u64;
+        let pf = PartFile::resume(
+            H,
+            size,
+            vec![Gap {
+                start: 500,
+                end: 5000,
+            }],
+            Vec::new(),
+        );
+        assert_eq!(pf.missing(), 500, "gap clamped to [500, size)");
+        assert!(pf.missing() <= size, "missing never exceeds size");
+        // A fully out-of-range / inverted gap drops out entirely.
+        let pf2 = PartFile::resume(
+            H,
+            size,
+            vec![Gap {
+                start: 2000,
+                end: 3000,
+            }],
+            Vec::new(),
+        );
+        assert_eq!(pf2.missing(), 0);
+    }
+
+    #[test]
+    fn reset_all_gaps_reopens_the_whole_file() {
+        let size = 1000u64;
+        let mut pf = PartFile::resume(H, size, Vec::new(), Vec::new());
+        assert!(pf.is_complete());
+        pf.reset_all_gaps();
+        assert!(!pf.is_complete());
+        assert_eq!(pf.missing(), size);
+    }
 
     #[test]
     fn data_part_count_differs_from_the_ed2k_part_count_on_exact_multiples() {

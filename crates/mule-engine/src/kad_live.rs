@@ -144,9 +144,22 @@ impl KadNode {
     /// public address with a usable UDP port (eMule 0.70b hardening) - junk /
     /// unroutable / port-0 contacts never enter the table.
     fn add_contact(&mut self, id: Kad128, ip: u32, udp_port: u16, tcp_port: u16, version: u8) {
-        if is_acceptable_contact(ip, udp_port, /*allow_private=*/ false) {
-            self.routing.add(id, ip, udp_port, tcp_port, version);
+        if !is_acceptable_contact(ip, udp_port, /*allow_private=*/ false) {
+            return;
         }
+        // Anti-sybil (live-layer): cap how many contacts share one IP / /24, so a
+        // hostile node cannot flood our routing table with fake IDs behind one
+        // address. Refreshing an id we already hold is always allowed. Interop-safe:
+        // the real Kad network is IP-diverse, so a legitimate peer is never dropped.
+        if ip != 0 && !self.routing.contains(&id) {
+            let (same_ip, same_subnet) = self.routing.ip_counts(ip);
+            if same_ip >= mule_kad::MAX_CONTACTS_PER_IP
+                || same_subnet >= mule_kad::MAX_CONTACTS_PER_SUBNET
+            {
+                return;
+            }
+        }
+        self.routing.add(id, ip, udp_port, tcp_port, version);
     }
 
     /// Send an obfuscated Kad request (NodeID-keyed on `target_id`, our
