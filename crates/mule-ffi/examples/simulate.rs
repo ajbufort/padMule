@@ -12,6 +12,7 @@
 
 use mule_ffi::{
     AddOutcome, DownloadInfo, EngineEventFfi, EngineStateFfi, MuleEngine, SearchFilters, SearchHit,
+    SearchOutcome,
 };
 use std::thread::sleep;
 use std::time::Duration;
@@ -22,6 +23,15 @@ fn screen(title: &str) {
 
 fn mib(bytes: u64) -> String {
     format!("{:.2} MiB", bytes as f64 / (1024.0 * 1024.0))
+}
+
+/// Pull just the hits out of a search outcome (throttled -> empty), for the call
+/// sites that only care about the count.
+fn hits_of(o: SearchOutcome) -> Vec<SearchHit> {
+    match o {
+        SearchOutcome::Results { hits, .. } => hits,
+        SearchOutcome::Throttled { .. } => Vec::new(),
+    }
 }
 
 fn state_str(s: EngineStateFfi) -> &'static str {
@@ -202,10 +212,50 @@ fn main() {
     };
 
     screen(&format!("SEARCH \"{keyword}\" (server + Kad)"));
-    let hits = engine.search(keyword.clone(), filters());
-    println!("{} result(s):", hits.len());
+    let (hits, more_available) = match engine.search(keyword.clone(), filters()) {
+        SearchOutcome::Results {
+            hits,
+            more_available,
+        } => (hits, more_available),
+        SearchOutcome::Throttled { wait_secs } => {
+            println!("throttled: wait {wait_secs}s");
+            (Vec::new(), false)
+        }
+    };
+    println!(
+        "{} result(s){}",
+        hits.len(),
+        if more_available {
+            "  [server has more - Load More]"
+        } else {
+            ""
+        }
+    );
     for (i, h) in hits.iter().take(6).enumerate() {
         render_hit(i, h);
+    }
+
+    // THROTTLE (#32): an IMMEDIATE second server search is refused with a "wait N
+    // s" notice (aMule's 2 s guard), rather than silently returning empty.
+    screen("SEARCH THROTTLE (#32: immediate repeat -> wait notice)");
+    match engine.search(keyword.clone(), filters()) {
+        SearchOutcome::Throttled { wait_secs } => {
+            println!("throttled as expected: wait {wait_secs}s")
+        }
+        SearchOutcome::Results { hits, .. } => {
+            println!("not throttled ({} hits) - no server connected", hits.len())
+        }
+    }
+
+    // LOAD MORE (#13): if the server advertised more pages, fetch the next one
+    // (OP_QUERY_MORE_RESULT - a continuation, not throttled). The seeded oracle
+    // has only 3 files, so this usually reports "no more".
+    if more_available {
+        screen("LOAD MORE (#13: OP_QUERY_MORE_RESULT)");
+        println!(
+            "after search_more: {} total result(s)",
+            hits_of(engine.search_more()).len()
+        );
     }
 
     // Boolean OPERATOR MATRIX: the keyword is parsed into an AND/OR/NOT tree for
@@ -254,7 +304,7 @@ fn main() {
             if i > 0 {
                 sleep(Duration::from_secs(gap));
             }
-            let n = engine.search(q.clone(), filters()).len();
+            let n = hits_of(engine.search(q.clone(), filters())).len();
             println!("  {label} {n:>2} result(s)   <- \"{q}\"");
         }
     }
@@ -269,7 +319,7 @@ fn main() {
     };
     println!(
         "{} result(s)",
-        engine.search(keyword.clone(), gfilters).len()
+        hits_of(engine.search(keyword.clone(), gfilters)).len()
     );
 
     // Full transfer journey on the top hit: Get -> preview bias -> watch it grow
@@ -323,7 +373,7 @@ fn main() {
         }
 
         screen("RELATED SEARCH (server related:: feature)");
-        let related = engine.related_search(h.hash.clone());
+        let related = hits_of(engine.related_search(h.hash.clone()));
         println!(
             "{} related result(s) (empty with no server / a server that lacks it)",
             related.len()

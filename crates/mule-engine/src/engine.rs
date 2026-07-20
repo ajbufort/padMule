@@ -33,7 +33,7 @@ use crate::peer::HelloInfo;
 use crate::peer_conn::peer_handshake_inbound;
 use crate::search::{
     build_global_search_udp, parse_global_search_res, related_keyword, SearchParams,
-    SearchResultFile, OP_GLOBSEARCHRES,
+    SearchResultFile, SearchResultPage, OP_GLOBSEARCHRES,
 };
 use crate::server_messages::{
     parse_serv_stat_res, LoginRequest, OfferedFile, DEFAULT_SERVER_FLAGS, FILE_COMPLETE_ID,
@@ -42,8 +42,8 @@ use crate::server_messages::{
 use crate::share::{head_hash, is_upload_request, serve_shared, SharedFile, UploadGate};
 use crate::transfer::build_file_req_ans_no_fil;
 use mule_files::{
-    read_nodes_dat, read_server_met, write_nodes_dat, IpFilter, KadContact, NodesDat,
-    DEFAULT_IPFILTER_LEVEL,
+    merge_server_met, read_nodes_dat, read_pins, read_server_met, write_nodes_dat, write_pins,
+    write_server_met, IpFilter, KadContact, NodesDat, ServerMet, DEFAULT_IPFILTER_LEVEL,
 };
 use mule_kad::RoutingTable;
 use mule_proto::{Kad128, Packet, Tag, TagName, TagValue, PROT_EDONKEY};
@@ -52,7 +52,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{mpsc, Mutex, Semaphore};
@@ -103,6 +103,74 @@ const SOURCES_WAIT: Duration = Duration::from_secs(10);
 const KAD_SEARCH_WAIT: Duration = Duration::from_secs(15);
 /// Per-node wait during a Kad keyword lookup.
 const KAD_PER_QUERY: Duration = Duration::from_millis(750);
+
+/// Minimum interval between SERVER searches - a client-side flood guard mirroring
+/// aMule's silent 2 s (SearchDlg.cpp:277). padMule improves on aMule by surfacing
+/// the remaining seconds instead of silently ignoring the click. Wire-neutral.
+const SERVER_SEARCH_MIN_INTERVAL: Duration = Duration::from_secs(2);
+/// eMule caps a search at 5 "load more" follow-up pages (opcodes.h:60).
+const MAX_MORE_SEARCH_REQ: u8 = 5;
+
+/// The result of a search: ranked files (with whether the server has more pages)
+/// or a throttle notice. `Throttled` is a normal answer the UI reports, not an
+/// error - the same "result, not error" shape as [`AddResult`].
+pub enum SearchOutcome {
+    Results {
+        ranked: Vec<RankedFile>,
+        more_available: bool,
+    },
+    Throttled {
+        wait_secs: u32,
+    },
+}
+
+/// The result of auto-updating the server list from a URL. A URL problem is a
+/// normal outcome the UI reports, not an error it throws (mirrors [`AddResult`]).
+pub enum ServerListUpdate {
+    /// Merged `added` new servers; the file now holds `total`.
+    Updated { added: u32, total: u32 },
+    /// The URL was not `http://` (v1 fetches plain http only).
+    BadUrl,
+    /// Fetched, but the bytes were not a server.met (an HTML error page, or a
+    /// gzip/zip-wrapped list, which v1 does not unwrap).
+    NotServerMet,
+    /// The host could not be reached / the GET or the write failed.
+    Unreachable,
+}
+
+/// The live server-search window, so "load more" continues the SAME query on the
+/// SAME connection and folds new pages into the same dedupe. Ephemeral - rebuilt
+/// on every [`Engine::search`]; guarded by `server_addr` so a reconnect voids it.
+struct SearchSession {
+    server_addr: SocketAddr,
+    combined: Vec<SearchResultFile>,
+    filters: SearchFilters,
+    server_more: bool,
+    more_reqs: u8,
+}
+
+/// Seconds a caller must wait before the next server search, or `None` if it may
+/// search now. Rounds UP so "wait 1s" never displays 0. Pure (takes `now`), so it
+/// is unit-testable without a real clock.
+fn throttle_wait_secs(last: Option<Instant>, now: Instant, interval: Duration) -> Option<u32> {
+    let elapsed = now.saturating_duration_since(last?);
+    let remaining = interval.checked_sub(elapsed)?;
+    if remaining.is_zero() {
+        return None;
+    }
+    Some(remaining.as_secs() as u32 + u32::from(remaining.subsec_nanos() > 0))
+}
+
+/// Apply the user's numeric filters to a ranked set (Kad hits are not filtered on
+/// the wire, so the merged set must be re-filtered). Shared by search + load-more.
+fn apply_search_filters(mut ranked: Vec<RankedFile>, filters: &SearchFilters) -> Vec<RankedFile> {
+    ranked.retain(|r| {
+        filters.min_sources.is_none_or(|m| r.sources >= m)
+            && filters.min_size.is_none_or(|m| r.size >= m)
+            && filters.max_size.is_none_or(|m| r.size <= m)
+    });
+    ranked
+}
 
 /// How long to wait for an inbound peer to speak first. A leecher sends
 /// OP_REQUESTFILENAME within a round-trip; a called-back LowID source stays
@@ -715,6 +783,8 @@ pub struct ServerEntry {
     pub files: Option<u32>,
     pub alive: bool,
     pub connected: bool,
+    /// A user favorite: kept by `prune_dead_servers` even when down.
+    pub pinned: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -789,6 +859,15 @@ pub struct Engine {
     /// The IP blocklist (ipfilter.dat / .p2p), if the user placed one. Shared with
     /// the listener task so inbound peers are gated too. `None` = no filtering.
     ip_filter: Option<Arc<IpFilter>>,
+    /// When we last issued a SERVER search, for the client-side flood guard
+    /// ([`SERVER_SEARCH_MIN_INTERVAL`]). In-memory only; a fresh session may search
+    /// at once. `None` = never searched this session.
+    last_server_search: Option<Instant>,
+    /// The live server-search window for "load more" (see [`SearchSession`]).
+    search_session: Option<SearchSession>,
+    /// Servers the user pinned (canonical `"ip:port"` keys), so `prune_dead_servers`
+    /// keeps them even when down. Persisted to `config_dir/pinned.txt`.
+    pinned: std::collections::HashSet<String>,
     /// Suppress ALL network activity. Tests set this so the unit suite never
     /// touches the real network; the UI never does.
     offline: bool,
@@ -826,6 +905,9 @@ impl Engine {
             kad: None,
             listener: None,
             server_tx: None,
+            last_server_search: None,
+            search_session: None,
+            pinned: std::collections::HashSet::new(),
             offline: false,
         };
         Ok((engine, rx))
@@ -980,6 +1062,8 @@ impl Engine {
             return;
         }
         let _ = std::fs::create_dir_all(&self.config_dir);
+        // Restore the user's pinned servers (best-effort).
+        self.load_pins();
 
         // Load the IP blocklist if the user placed one. Best-effort: absent or
         // unparseable means no filtering (never a startup failure).
@@ -1289,6 +1373,7 @@ impl Engine {
                     files: None,
                     alive: false,
                     connected: Some(addr) == connected,
+                    pinned: self.pinned.contains(&addr.to_string()),
                 }
             })
             .collect();
@@ -1339,6 +1424,112 @@ impl Engine {
             }
         }
         servers
+    }
+
+    /// Path to the pin side store (padMule-specific; kept out of server.met).
+    fn pins_path(&self) -> PathBuf {
+        self.config_dir.join("pinned.txt")
+    }
+
+    /// Load pinned server keys from disk into memory (called on start).
+    fn load_pins(&mut self) {
+        if let Ok(text) = std::fs::read_to_string(self.pins_path()) {
+            self.pinned = read_pins(&text).into_iter().collect();
+        }
+    }
+
+    /// Persist the pin set (best-effort; a write failure just means it will not
+    /// survive a restart, never a crash). Sorted, for a stable file.
+    fn save_pins(&self) {
+        let mut keys: Vec<String> = self.pinned.iter().cloned().collect();
+        keys.sort();
+        let _ = std::fs::write(self.pins_path(), write_pins(&keys));
+    }
+
+    /// Pin or unpin a server (canonical `"ip:port"`); persisted immediately.
+    pub fn set_server_pinned(&mut self, addr: &str, pinned: bool) {
+        if pinned {
+            self.pinned.insert(addr.to_string());
+        } else {
+            self.pinned.remove(addr);
+        }
+        self.save_pins();
+    }
+
+    /// Fetch a server.met from `url` (plain http, unwrapped bytes) and MERGE its
+    /// entries into `config_dir/server.met` - every existing entry (and its tags)
+    /// is kept and only new `(ip, port)`s are appended. The fetched bytes are
+    /// validated as a real server.met BEFORE writing, so a bad URL / HTML error
+    /// page never corrupts the list.
+    pub async fn update_server_list(&self, url: &str) -> ServerListUpdate {
+        if !url.starts_with("http://") {
+            return ServerListUpdate::BadUrl;
+        }
+        let Ok(body) = bootstrap::http_get_bytes(url).await else {
+            return ServerListUpdate::Unreachable;
+        };
+        if !bootstrap::looks_like_server_met(&body) {
+            return ServerListUpdate::NotServerMet;
+        }
+        let Ok(incoming) = read_server_met(&body) else {
+            return ServerListUpdate::NotServerMet;
+        };
+        let path = self.config_dir.join("server.met");
+        let base = std::fs::read(&path)
+            .ok()
+            .and_then(|b| read_server_met(&b).ok())
+            .unwrap_or_else(|| ServerMet {
+                header: incoming.header,
+                servers: Vec::new(),
+            });
+        let before = base.servers.len() as u32;
+        let merged = merge_server_met(&base, &incoming);
+        let total = merged.servers.len() as u32;
+        if std::fs::write(&path, write_server_met(&merged)).is_err() {
+            return ServerListUpdate::Unreachable;
+        }
+        ServerListUpdate::Updated {
+            added: total - before,
+            total,
+        }
+    }
+
+    /// Probe the server list and drop every server that is DEAD and not pinned,
+    /// rewriting `config_dir/server.met`. Returns how many were removed.
+    pub async fn prune_dead_servers(&mut self) -> u32 {
+        // Keep a server if it answered the probe OR the user pinned it.
+        let keep: std::collections::HashSet<String> = self
+            .probe_server_list()
+            .await
+            .iter()
+            .filter(|e| e.alive || e.pinned)
+            .map(|e| e.addr.to_string())
+            .collect();
+        let path = self.config_dir.join("server.met");
+        let Ok(bytes) = std::fs::read(&path) else {
+            return 0;
+        };
+        let Ok(met) = read_server_met(&bytes) else {
+            return 0;
+        };
+        let before = met.servers.len();
+        let servers: Vec<_> = met
+            .servers
+            .into_iter()
+            .filter(|s| {
+                let addr = SocketAddr::new(IpAddr::V4(ip_from_met_u32(s.ip)), s.port);
+                keep.contains(&addr.to_string())
+            })
+            .collect();
+        let removed = (before - servers.len()) as u32;
+        if removed > 0 {
+            let out = ServerMet {
+                header: met.header,
+                servers,
+            };
+            let _ = std::fs::write(&path, write_server_met(&out));
+        }
+        removed
     }
 
     /// Drain buffered server packets (kick message / MOTD -> events) and detect a
@@ -1500,10 +1691,25 @@ impl Engine {
     /// sum. Blocks up to `SEARCH_WAIT`; the FFI facade runs it off the UI thread.
     /// Filters (bounds in BYTES) are applied on the server wire query and to the
     /// merged set.
-    pub async fn search(&mut self, keyword: &str, filters: SearchFilters) -> Vec<RankedFile> {
+    pub async fn search(&mut self, keyword: &str, filters: SearchFilters) -> SearchOutcome {
         let keyword = keyword.trim();
         if self.offline || keyword.is_empty() {
-            return Vec::new();
+            return SearchOutcome::Results {
+                ranked: Vec::new(),
+                more_available: false,
+            };
+        }
+        // Client-side flood guard for the SERVER query only (aMule's 2 s): Kad and
+        // global UDP are not the eserver's flood budget, so a serverless search is
+        // never throttled. Stamp the time BEFORE issuing so bursts are caught.
+        if self.server.is_some() {
+            let now = Instant::now();
+            if let Some(wait_secs) =
+                throttle_wait_secs(self.last_server_search, now, SERVER_SEARCH_MIN_INTERVAL)
+            {
+                return SearchOutcome::Throttled { wait_secs };
+            }
+            self.last_server_search = Some(now);
         }
         let params = SearchParams {
             keyword: keyword.to_string(),
@@ -1531,11 +1737,14 @@ impl Engine {
         // borrowed and driven at once.
         let server = self.server.as_mut();
         let kad = self.kad.as_mut();
-        let (server_files, kad_files, global_files) = tokio::join!(
+        let (server_page, kad_files, global_files) = tokio::join!(
             async {
                 match server {
-                    Some(link) => link.search(&params, SEARCH_WAIT).await.unwrap_or_default(),
-                    None => Vec::new(),
+                    Some(link) => link
+                        .search_page(&params, SEARCH_WAIT)
+                        .await
+                        .unwrap_or_default(),
+                    None => SearchResultPage::default(),
                 }
             },
             async {
@@ -1563,18 +1772,26 @@ impl Engine {
         );
         // Fold the Kad + global-UDP hits into the same shape the server hits
         // arrive in, so a single catalog pass dedupes across all three by hash.
-        let mut combined = server_files;
+        let server_more = server_page.more;
+        let mut combined = server_page.files;
         combined.extend(kad_files.iter().map(kad_to_search));
         combined.extend(global_files);
-        let mut ranked = catalog(&combined);
-        // Apply the same bounds to the merged set, so Kad hits (not filtered on
-        // the wire) and any server slack obey the user's filters too.
-        ranked.retain(|r| {
-            filters.min_sources.is_none_or(|m| r.sources >= m)
-                && filters.min_size.is_none_or(|m| r.size >= m)
-                && filters.max_size.is_none_or(|m| r.size <= m)
+        let ranked = apply_search_filters(catalog(&combined), &filters);
+        // Remember this window so "load more" can continue the SERVER query on the
+        // same connection (server-only: Kad/global are one-shot). No server -> no
+        // session and nothing more to fetch.
+        let more_available = server_more && connected.is_some();
+        self.search_session = connected.map(|server_addr| SearchSession {
+            server_addr,
+            combined,
+            filters,
+            server_more,
+            more_reqs: 0,
         });
-        ranked
+        SearchOutcome::Results {
+            ranked,
+            more_available,
+        }
     }
 
     /// Related-files search: ask the connected server for the files its index
@@ -1586,16 +1803,30 @@ impl Engine {
     /// filename keyword search instead (see `ServerInfo::related_search`). Ranked
     /// through the same [`catalog`] pass as a normal search, so results render
     /// identically.
-    pub async fn related_search(&mut self, hash: [u8; 16]) -> Vec<RankedFile> {
-        if self.offline {
-            return Vec::new();
-        }
-        let Some(link) = self.server.as_mut() else {
-            return Vec::new();
+    pub async fn related_search(&mut self, hash: [u8; 16]) -> SearchOutcome {
+        let empty = || SearchOutcome::Results {
+            ranked: Vec::new(),
+            more_available: false,
         };
-        if !link.related_search_supported() {
-            return Vec::new();
+        if self.offline {
+            return empty();
         }
+        // Same flood guard as a normal search (it hits the same server), but only
+        // stamp when we actually issue - an unsupported server never gets queried.
+        let now = Instant::now();
+        if let Some(wait_secs) =
+            throttle_wait_secs(self.last_server_search, now, SERVER_SEARCH_MIN_INTERVAL)
+        {
+            return SearchOutcome::Throttled { wait_secs };
+        }
+        if !self
+            .server
+            .as_ref()
+            .is_some_and(|l| l.related_search_supported())
+        {
+            return empty();
+        }
+        self.last_server_search = Some(now);
         let params = SearchParams {
             keyword: related_keyword(&hash),
             file_type: None,
@@ -1604,8 +1835,55 @@ impl Engine {
             min_sources: None,
             extension: None,
         };
+        let link = self.server.as_mut().expect("checked supported just above");
         let files = link.search(&params, SEARCH_WAIT).await.unwrap_or_default();
-        catalog(&files)
+        SearchOutcome::Results {
+            ranked: catalog(&files),
+            more_available: false,
+        }
+    }
+
+    /// Fetch the next page of the last SERVER search and merge it into the same
+    /// ranked view - eMule's "Load more results" (server-only, bodiless
+    /// OP_QUERY_MORE_RESULT, up to [`MAX_MORE_SEARCH_REQ`] pages). Returns the
+    /// current ranked view with the button OFF when there is nothing more, the
+    /// session is stale (a reconnect voids it), or the page cap is reached.
+    pub async fn search_more(&mut self) -> SearchOutcome {
+        let connected = self.server.as_ref().map(|l| l.addr());
+        let can_page = !self.offline
+            && matches!(&self.search_session, Some(s)
+                if connected == Some(s.server_addr)
+                    && s.server_more
+                    && s.more_reqs < MAX_MORE_SEARCH_REQ);
+        if !can_page {
+            let ranked = self
+                .search_session
+                .as_ref()
+                .map(|s| apply_search_filters(catalog(&s.combined), &s.filters))
+                .unwrap_or_default();
+            return SearchOutcome::Results {
+                ranked,
+                more_available: false,
+            };
+        }
+        // Continue the query on the SAME link; the server holds it in session state.
+        let page = match self.server.as_mut() {
+            Some(link) => link.search_more(SEARCH_WAIT).await.unwrap_or_default(),
+            None => SearchResultPage::default(),
+        };
+        let session = self
+            .search_session
+            .as_mut()
+            .expect("can_page implies a session");
+        session.combined.extend(page.files);
+        session.server_more = page.more;
+        session.more_reqs += 1;
+        let ranked = apply_search_filters(catalog(&session.combined), &session.filters);
+        let more_available = session.server_more && session.more_reqs < MAX_MORE_SEARCH_REQ;
+        SearchOutcome::Results {
+            ranked,
+            more_available,
+        }
     }
 
     /// Classify a search hit's hash against our downloads + shared files, so the
@@ -2522,6 +2800,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn ranked_of(o: SearchOutcome) -> Vec<RankedFile> {
+        match o {
+            SearchOutcome::Results { ranked, .. } => ranked,
+            SearchOutcome::Throttled { wait_secs } => panic!("unexpected throttle ({wait_secs}s)"),
+        }
+    }
+
     #[tokio::test]
     async fn search_is_empty_rather_than_erroring_when_no_server_has_us() {
         let dir = tmp("search");
@@ -2529,12 +2814,40 @@ mod tests {
         let (mut engine, _rx) = Engine::new(&dir).unwrap();
         engine.set_offline(true);
         let f = SearchFilters::default();
-        assert!(engine.search("anything", f).await.is_empty());
+        assert!(ranked_of(engine.search("anything", f).await).is_empty());
         assert!(
-            engine.search("", f).await.is_empty(),
+            ranked_of(engine.search("", f).await).is_empty(),
             "empty keyword is a no-op"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn throttle_wait_secs_guards_the_min_interval() {
+        let interval = Duration::from_secs(2);
+        let base = Instant::now();
+        // Never searched -> may search now.
+        assert_eq!(throttle_wait_secs(None, base, interval), None);
+        // 0.5s after the last search -> must wait, rounded UP to 2s.
+        assert_eq!(
+            throttle_wait_secs(Some(base), base + Duration::from_millis(500), interval),
+            Some(2)
+        );
+        // 1.2s after -> 0.8s left, rounds up to 1s.
+        assert_eq!(
+            throttle_wait_secs(Some(base), base + Duration::from_millis(1200), interval),
+            Some(1)
+        );
+        // Exactly the interval later -> may search (no wait).
+        assert_eq!(
+            throttle_wait_secs(Some(base), base + interval, interval),
+            None
+        );
+        // Well past -> may search.
+        assert_eq!(
+            throttle_wait_secs(Some(base), base + Duration::from_secs(10), interval),
+            None
+        );
     }
 
     /// The device screen is our only diagnostic, so the ID type must reach it.

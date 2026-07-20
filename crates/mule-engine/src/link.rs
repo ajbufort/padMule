@@ -7,7 +7,10 @@
 
 use crate::connection::{connect_server, login_handshake, ServerEvent, ServerState};
 use crate::framed::{FrameError, FramedStream};
-use crate::search::{build_search_request, parse_search_result, SearchParams, SearchResultFile};
+use crate::search::{
+    build_search_more_request, build_search_request, parse_search_result_page, SearchParams,
+    SearchResultFile, SearchResultPage,
+};
 use crate::server_messages::LoginRequest;
 use crate::sources::{build_callback_request, build_get_sources, parse_found_sources, FoundSource};
 use mule_proto::Packet;
@@ -208,13 +211,40 @@ impl ServerLink {
         params: &SearchParams,
         wait: Duration,
     ) -> Result<Vec<SearchResultFile>, FrameError> {
+        Ok(self.search_page(params, wait).await?.files)
+    }
+
+    /// Like [`search`](Self::search) but also reports the trailing "more results
+    /// available" flag, so a caller can offer "Load more results".
+    pub async fn search_page(
+        &mut self,
+        params: &SearchParams,
+        wait: Duration,
+    ) -> Result<SearchResultPage, FrameError> {
         let pkt = build_search_request(params);
+        self.read_search_page(&pkt, wait).await
+    }
+
+    /// Ask for the NEXT page of the last search (bodiless OP_QUERY_MORE_RESULT;
+    /// the query is held server-side, so this MUST run on the same connection).
+    pub async fn search_more(&mut self, wait: Duration) -> Result<SearchResultPage, FrameError> {
+        let pkt = build_search_more_request();
+        self.read_search_page(&pkt, wait).await
+    }
+
+    /// Send `pkt`, read one OP_SEARCHRESULT, and parse it into a page (files +
+    /// the more-flag). Timeout / no answer -> an empty page (`more = false`).
+    async fn read_search_page(
+        &mut self,
+        pkt: &Packet,
+        wait: Duration,
+    ) -> Result<SearchResultPage, FrameError> {
         match self
-            .request(&pkt, crate::search::OP_SEARCHRESULT, wait)
+            .request(pkt, crate::search::OP_SEARCHRESULT, wait)
             .await?
         {
-            Some(p) => Ok(parse_search_result(&p.payload).unwrap_or_default()),
-            None => Ok(Vec::new()),
+            Some(p) => Ok(parse_search_result_page(&p.payload).unwrap_or_default()),
+            None => Ok(SearchResultPage::default()),
         }
     }
 

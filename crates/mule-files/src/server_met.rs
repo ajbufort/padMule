@@ -71,6 +71,27 @@ pub fn write_server_met(m: &ServerMet) -> Vec<u8> {
     w.into_inner()
 }
 
+/// Merge `incoming` server entries into `base`: keep every `base` entry verbatim
+/// (tags + order preserved), then append each `incoming` entry whose `(ip, port)`
+/// is not already present in `base`. `base.header` is preserved. Only the APPENDED
+/// set is deduped against `base`; any pre-existing duplicates in `base` are left
+/// untouched, so the UI's index-keyed server rows stay valid.
+pub fn merge_server_met(base: &ServerMet, incoming: &ServerMet) -> ServerMet {
+    let mut servers = base.servers.clone();
+    let mut have: std::collections::HashSet<(u32, u16)> =
+        base.servers.iter().map(|s| (s.ip, s.port)).collect();
+    for s in &incoming.servers {
+        // insert() is false when the key was already present -> skip that entry.
+        if have.insert((s.ip, s.port)) {
+            servers.push(s.clone());
+        }
+    }
+    ServerMet {
+        header: base.header,
+        servers,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,6 +142,60 @@ mod tests {
         assert_eq!(parsed.header, 0x0E);
         // Round-trips the legacy header rather than forcing 0xE0.
         assert_eq!(write_server_met(&parsed), bytes);
+    }
+
+    #[test]
+    fn merge_appends_only_new_addresses_and_preserves_base() {
+        let base = ServerMet {
+            header: 0xE0,
+            servers: vec![
+                Server {
+                    ip: 0x0A00_0001,
+                    port: 4661,
+                    tags: vec![Tag::id(0x01, TagValue::Str(b"A".to_vec()))],
+                },
+                Server {
+                    ip: 0x0A00_0002,
+                    port: 4661,
+                    tags: vec![],
+                },
+            ],
+        };
+        let incoming = ServerMet {
+            header: 0x0E, // different header -> ignored, base.header wins
+            servers: vec![
+                // duplicate of base entry A (same ip+port) -> skipped, base tag kept
+                Server {
+                    ip: 0x0A00_0001,
+                    port: 4661,
+                    tags: vec![Tag::id(0x01, TagValue::Str(b"A-renamed".to_vec()))],
+                },
+                // new entry C -> appended
+                Server {
+                    ip: 0x0A00_0003,
+                    port: 5000,
+                    tags: vec![Tag::id(0x01, TagValue::Str(b"C".to_vec()))],
+                },
+            ],
+        };
+        let merged = merge_server_met(&base, &incoming);
+        assert_eq!(merged.header, 0xE0);
+        let addrs: Vec<(u32, u16)> = merged.servers.iter().map(|s| (s.ip, s.port)).collect();
+        assert_eq!(
+            addrs,
+            vec![
+                (0x0A00_0001, 4661),
+                (0x0A00_0002, 4661),
+                (0x0A00_0003, 5000)
+            ]
+        );
+        // Base entry A kept its ORIGINAL tag (the incoming duplicate did not clobber).
+        assert_eq!(
+            merged.servers[0].tags[0].value,
+            TagValue::Str(b"A".to_vec())
+        );
+        // Round-trips on disk.
+        assert_eq!(read_server_met(&write_server_met(&merged)).unwrap(), merged);
     }
 
     #[test]

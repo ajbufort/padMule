@@ -42,6 +42,8 @@ final class EngineModel: ObservableObject {
     @Published var serverKick: String?
 
     @Published private(set) var results: [SearchHit] = []
+    /// The connected server has more result pages ("Load more results", #13).
+    @Published private(set) var moreAvailable = false
 
     // The incomplete-file preview currently open (drives the AVPlayer sheet).
     // Settable so the sheet can clear it on dismiss.
@@ -167,15 +169,66 @@ final class EngineModel: ObservableObject {
             global: wireGlobal
         )
         work.async { [weak self] in
-            let hits = e.search(keyword: q, filters: filters)
+            let outcome = e.search(keyword: q, filters: filters)
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.searching = false
-                self.results = hits
-                self.searched = true
-                if hits.isEmpty {
-                    self.notice = "No results for \"\(q)\"."
-                }
+                self.apply(
+                    EngineModel.searchUpdate(for: outcome, emptyMessage: "No results for \"\(q)\"."))
+            }
+        }
+    }
+
+    /// How a search outcome maps to the UI. Pure + `static` so it is unit-testable
+    /// without an engine (see padMuleTests). `results == nil` means "leave the list
+    /// untouched" (a throttle notice must not blank the current results).
+    struct SearchUpdate {
+        var results: [SearchHit]?
+        var moreAvailable: Bool
+        var notice: String?
+    }
+
+    nonisolated static func searchUpdate(for outcome: SearchOutcome, emptyMessage: String)
+        -> SearchUpdate
+    {
+        switch outcome {
+        case let .results(hits, more):
+            return SearchUpdate(
+                results: hits, moreAvailable: more,
+                notice: hits.isEmpty ? emptyMessage : nil)
+        case let .throttled(waitSecs):
+            // eMule/aMule guard: too-fast searches are refused. Keep the results,
+            // tell the user to wait (aMule silently ignores; padMule is honest).
+            return SearchUpdate(
+                results: nil, moreAvailable: false,
+                notice: "Searching too fast - wait \(waitSecs)s and try again.")
+        }
+    }
+
+    private func apply(_ u: SearchUpdate) {
+        if let r = u.results {
+            results = r
+            searched = true
+        }
+        moreAvailable = u.moreAvailable
+        notice = u.notice
+    }
+
+    /// Fetch the next page of the last search and replace the list with the merged
+    /// set (eMule's "Load more results", #13). The engine returns the full ranked
+    /// view, so no client-side merge is needed.
+    func loadMore() {
+        guard let e = engine, !searching, moreAvailable else { return }
+        searching = true
+        work.async { [weak self] in
+            let outcome = e.searchMore()
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.searching = false
+                let u = EngineModel.searchUpdate(for: outcome, emptyMessage: "")
+                if let r = u.results { self.results = r }
+                self.moreAvailable = u.moreAvailable
+                if let n = u.notice, !n.isEmpty { self.notice = n }
             }
         }
     }
@@ -197,15 +250,13 @@ final class EngineModel: ObservableObject {
         let hash = hit.hash
         let name = hit.name
         work.async { [weak self] in
-            let hits = e.relatedSearch(hash: hash)
+            let outcome = e.relatedSearch(hash: hash)
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.searching = false
-                self.results = hits
-                self.searched = true
-                if hits.isEmpty {
-                    self.notice = "No files related to \"\(name)\"."
-                }
+                self.apply(
+                    EngineModel.searchUpdate(
+                        for: outcome, emptyMessage: "No files related to \"\(name)\"."))
             }
         }
     }
@@ -564,6 +615,59 @@ final class EngineModel: ObservableObject {
             DispatchQueue.main.async {
                 self?.refresh()
                 self?.loadServers()
+            }
+        }
+    }
+
+    /// The canonical public server-list URL (plain http; the engine fetches over a
+    /// raw socket, so no ATS exemption is needed).
+    nonisolated static let defaultServerListUrl = "http://upd.emule-security.org/server.met"
+
+    /// Fetch a server.met from `url` and merge it into the on-disk list, then
+    /// re-probe. Reports the outcome via the notice banner.
+    func updateServerList(_ url: String) {
+        guard let e = engine, !loadingServers else { return }
+        loadingServers = true
+        work.async { [weak self] in
+            let result = e.updateServerList(url: url)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.loadingServers = false
+                switch result {
+                case let .updated(added, total):
+                    self.notice = "Server list updated: +\(added) new (\(total) total)."
+                case .badUrl:
+                    self.notice = "The server-list URL must start with http://"
+                case .notServerMet:
+                    self.notice = "That URL did not return a server.met."
+                case .unreachable:
+                    self.notice = "Could not reach the server-list URL."
+                }
+                self.loadServers()
+            }
+        }
+    }
+
+    /// Toggle the pin (favorite) on a server; a pinned server survives Prune.
+    func togglePin(_ addr: String) {
+        guard let e = engine else { return }
+        let pinned = servers.first(where: { $0.addr == addr })?.pinned ?? false
+        e.setServerPinned(addr: addr, pinned: !pinned)
+        loadServers()
+    }
+
+    /// Drop every dead, unpinned server from the list, then re-probe.
+    func pruneDeadServers() {
+        guard let e = engine, !loadingServers else { return }
+        loadingServers = true
+        work.async { [weak self] in
+            let removed = e.pruneDeadServers()
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.loadingServers = false
+                self.notice =
+                    removed == 0 ? "No dead servers to prune." : "Pruned \(removed) dead server(s)."
+                self.loadServers()
             }
         }
     }

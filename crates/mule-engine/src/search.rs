@@ -13,6 +13,11 @@ use mule_proto::{read_tag, IoError, Packet, Reader, Tag, Writer, PROT_EDONKEY};
 pub const OP_SEARCHREQUEST: u8 = 0x16;
 /// Server search result opcode.
 pub const OP_SEARCHRESULT: u8 = 0x33;
+/// "Give me the next page of the last search" opcode (opcodes.h:170, tagged
+/// `// (null)` because it is BODILESS: the server holds the query in session
+/// state, so the request is the bare opcode with no payload). The reply is
+/// another OP_SEARCHRESULT.
+pub const OP_QUERY_MORE_RESULT: u8 = 0x21;
 
 // Search comparison operators (Constants.h ED2K_SEARCH_OP_*).
 pub const ED2K_SEARCH_OP_EQUAL: u8 = 0;
@@ -375,6 +380,14 @@ pub fn build_search_request(p: &SearchParams) -> Packet {
     Packet::new(PROT_EDONKEY, OP_SEARCHREQUEST, w.into_inner())
 }
 
+/// Build the "load more results" request: a bodiless OP_QUERY_MORE_RESULT. The
+/// query is NOT resent - the server continues the last search on this same TCP
+/// connection (eMule `CSearchResultsWnd::SearchMore` sends `new Packet()` with
+/// just the opcode set).
+pub fn build_search_more_request() -> Packet {
+    Packet::new(PROT_EDONKEY, OP_QUERY_MORE_RESULT, Vec::new())
+}
+
 /// The keyword that asks a server for files "related" to `hash` - the ones its
 /// index says clients who share this file also share. It is an ORDINARY keyword
 /// search whose string is `related::<HEXHASH>`; the server special-cases the
@@ -436,16 +449,35 @@ fn read_one_result_file(r: &mut Reader) -> Result<SearchResultFile, IoError> {
     })
 }
 
-/// Parse an OP_SEARCHRESULT payload into its result files.
-pub fn parse_search_result(payload: &[u8]) -> Result<Vec<SearchResultFile>, IoError> {
+/// One page of an OP_SEARCHRESULT: the result files plus the optional trailing
+/// "more results available" flag. `more` drives the "Load more results" button.
+#[derive(Default)]
+pub struct SearchResultPage {
+    pub files: Vec<SearchResultFile>,
+    pub more: bool,
+}
+
+/// Parse an OP_SEARCHRESULT payload into its result files AND the trailing
+/// more-results flag. The flag is a single byte after the `<count>` + N records;
+/// eMule only treats it as the flag when EXACTLY one byte is left over
+/// (`SearchList.cpp` `iAddData == 1`). Anything else -> `more = false`, so a
+/// server that appends nothing (or stray padding) still parses cleanly.
+pub fn parse_search_result_page(payload: &[u8]) -> Result<SearchResultPage, IoError> {
     let mut r = Reader::new(payload);
     let count = r.read_u32()?;
     // Do NOT pre-allocate from the untrusted count; grow as we read.
-    let mut out = Vec::new();
+    let mut files = Vec::new();
     for _ in 0..count {
-        out.push(read_one_result_file(&mut r)?);
+        files.push(read_one_result_file(&mut r)?);
     }
-    Ok(out)
+    let more = r.remaining() == 1 && r.read_u8()? == 0x01;
+    Ok(SearchResultPage { files, more })
+}
+
+/// Parse an OP_SEARCHRESULT payload into just its result files (drops the
+/// more-flag). Kept for callers that do not page.
+pub fn parse_search_result(payload: &[u8]) -> Result<Vec<SearchResultFile>, IoError> {
+    Ok(parse_search_result_page(payload)?.files)
 }
 
 // -------------------------------------------------- global server UDP search
@@ -852,6 +884,41 @@ mod tests {
         v.extend_from_slice(&port.to_le_bytes());
         v.extend_from_slice(&0u32.to_le_bytes()); // tagcount 0
         v
+    }
+
+    #[test]
+    fn search_more_request_is_bodiless() {
+        let p = build_search_more_request();
+        assert_eq!(p.opcode, OP_QUERY_MORE_RESULT);
+        assert_eq!(p.protocol, PROT_EDONKEY);
+        assert!(p.payload.is_empty(), "the query is NOT resent");
+    }
+
+    #[test]
+    fn search_result_page_reads_the_trailing_more_byte() {
+        let base = || {
+            let mut v = vec![0x01, 0x00, 0x00, 0x00]; // count = 1
+            v.extend_from_slice(&record(0xAB, 0x11, 4662));
+            v
+        };
+        // trailing 0x01 -> more = true.
+        let mut yes = base();
+        yes.push(0x01);
+        let page = parse_search_result_page(&yes).unwrap();
+        assert_eq!(page.files.len(), 1);
+        assert!(page.more);
+        // trailing 0x00 -> more = false.
+        let mut no = base();
+        no.push(0x00);
+        assert!(!parse_search_result_page(&no).unwrap().more);
+        // no trailing byte -> more = false; parse_search_result still returns files.
+        let none = base();
+        assert!(!parse_search_result_page(&none).unwrap().more);
+        assert_eq!(parse_search_result(&none).unwrap().len(), 1);
+        // >1 stray trailing bytes -> NOT the flag (more = false), still parses.
+        let mut stray = base();
+        stray.extend_from_slice(&[0x00, 0x00]);
+        assert!(!parse_search_result_page(&stray).unwrap().more);
     }
 
     #[test]

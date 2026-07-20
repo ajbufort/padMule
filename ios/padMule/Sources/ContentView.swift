@@ -45,6 +45,7 @@ struct ContentView: View {
     @EnvironmentObject var model: EngineModel
     @State private var screen: Screen = .search
     @State private var query = ""
+    @State private var serverListUrl = EngineModel.defaultServerListUrl
     @State private var detail: SearchHit?
     @State private var showAddCategory = false
     @State private var newCategoryName = ""
@@ -353,6 +354,16 @@ struct ContentView: View {
                             .foregroundStyle(.secondary)
                     }
                 }
+                // The server said it has more pages (#13): fetch the next one and
+                // merge it into this same list. Hidden once the server is tapped out.
+                if model.moreAvailable, !model.searching {
+                    Button {
+                        model.loadMore()
+                    } label: {
+                        Label("Load more results", systemImage: "arrow.down.circle")
+                    }
+                    .font(.callout)
+                }
             }
 
             // Recent queries: shown when the box is empty, so you can re-run a
@@ -474,6 +485,25 @@ struct ContentView: View {
                         systemImage: "arrow.clockwise")
                 }
                 .disabled(model.loadingServers)
+
+                // Auto-update the list from a public URL (#18): fetch + MERGE, so
+                // existing servers are kept and only new ones added.
+                HStack {
+                    TextField("Server list URL", text: $serverListUrl)
+                        .textInputAutocapitalization(.never)
+                        .disableAutocorrection(true)
+                        .font(.caption)
+                    Button("Update") { model.updateServerList(serverListUrl) }
+                        .buttonStyle(.borderless)
+                        .disabled(model.loadingServers)
+                }
+                // Prune: drop every dead, unpinned server (pinned stars survive).
+                Button(role: .destructive) {
+                    model.pruneDeadServers()
+                } label: {
+                    Label("Prune dead servers", systemImage: "trash")
+                }
+                .disabled(model.loadingServers)
             }
 
             Section("Servers (\(model.servers.count))") {
@@ -502,40 +532,55 @@ struct ContentView: View {
     /// A live (probe-answering) server is black + selectable to connect; a dead
     /// one is greyed out and disabled, matching eMule's server list.
     private func serverRow(_ srv: ServerEntryFfi) -> some View {
-        Button {
-            if srv.alive && !srv.connected { model.connectServer(srv.addr) }
-        } label: {
-            HStack {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(srv.name.isEmpty ? srv.addr : srv.name)
-                        .font(.callout)
-                        .foregroundStyle(srv.alive ? .primary : .secondary)
-                        .lineLimit(1)
-                    if !srv.name.isEmpty {
-                        Text(srv.addr).font(.caption2).foregroundStyle(.secondary)
+        HStack {
+            // Pin star: independently tappable even on an offline row (a pin
+            // protects a temporarily-down favorite from Prune). Borderless so its
+            // tap does not trigger the connect button beside it.
+            Button {
+                model.togglePin(srv.addr)
+            } label: {
+                Image(systemName: srv.pinned ? "star.fill" : "star")
+                    .foregroundStyle(srv.pinned ? .yellow : .secondary)
+            }
+            .buttonStyle(.borderless)
+            .accessibilityLabel(srv.pinned ? "Unpin server" : "Pin server")
+
+            Button {
+                if srv.alive && !srv.connected { model.connectServer(srv.addr) }
+            } label: {
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(srv.name.isEmpty ? srv.addr : srv.name)
+                            .font(.callout)
+                            .foregroundStyle(srv.alive ? .primary : .secondary)
+                            .lineLimit(1)
+                        if !srv.name.isEmpty {
+                            Text(srv.addr).font(.caption2).foregroundStyle(.secondary)
+                        }
+                    }
+                    Spacer()
+                    if srv.alive {
+                        Text(srv.users.formatted())
+                            .font(.caption).monospacedDigit()
+                            .frame(width: 70, alignment: .trailing)
+                        Text(srv.files.formatted())
+                            .font(.caption).monospacedDigit()
+                            .frame(width: 84, alignment: .trailing)
+                    } else {
+                        Text("offline")
+                            .font(.caption).foregroundStyle(.secondary)
+                            .frame(width: 154, alignment: .trailing)
+                    }
+                    if srv.connected {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
                     }
                 }
-                Spacer()
-                if srv.alive {
-                    Text(srv.users.formatted())
-                        .font(.caption).monospacedDigit()
-                        .frame(width: 70, alignment: .trailing)
-                    Text(srv.files.formatted())
-                        .font(.caption).monospacedDigit()
-                        .frame(width: 84, alignment: .trailing)
-                } else {
-                    Text("offline")
-                        .font(.caption).foregroundStyle(.secondary)
-                        .frame(width: 154, alignment: .trailing)
-                }
-                if srv.connected {
-                    Image(systemName: "checkmark.circle.fill")
-                        .foregroundStyle(.green)
-                }
             }
+            .buttonStyle(.borderless)
+            .disabled(!srv.alive || srv.connected)
+            .foregroundStyle(.primary)
         }
-        .disabled(!srv.alive || srv.connected)
-        .foregroundStyle(.primary)
     }
 
     // MARK: - Shared screen
