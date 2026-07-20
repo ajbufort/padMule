@@ -81,6 +81,10 @@ pub struct Download {
     /// rarest-first, so the file grows contiguously from offset 0 and the user can
     /// play its leading run while it is still downloading. Transient, not persisted.
     preview: AtomicBool,
+    /// Claimed by whoever runs the one-shot finalize (verify -> move). Prevents the
+    /// fetch-task tail and the 1s heartbeat finalize-sweep from both finalizing the
+    /// same download. Reset if finalize fails so a re-fetched file can finalize again.
+    finalizing: AtomicBool,
 }
 
 struct Inner {
@@ -112,7 +116,23 @@ impl Download {
             cancelled: AtomicBool::new(false),
             priority,
             preview: AtomicBool::new(false),
+            finalizing: AtomicBool::new(false),
         })
+    }
+
+    /// Claim the right to finalize this download exactly once (complete -> verify
+    /// -> move). The FIRST caller gets `true`; concurrent callers get `false`, so
+    /// the fetch tail and the heartbeat sweep never double-finalize the same file.
+    pub fn try_begin_finalize(&self) -> bool {
+        self.finalizing
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Release the finalize claim (finalize failed - the file was re-gapped for a
+    /// re-fetch), so it can be finalized again once it re-completes.
+    pub fn reset_finalize(&self) {
+        self.finalizing.store(false, Ordering::Release);
     }
 
     /// Record (or refresh) the base facts about a source we connected to:
@@ -204,6 +224,24 @@ impl Download {
         self.priority.store(priority, Ordering::Relaxed);
         let mut g = self.inner.lock().await;
         g.store.priority = priority;
+        let _ = g.store.save_met();
+    }
+
+    /// Re-open the ENTIRE file for download and persist - the last resort when the
+    /// whole-file hash fails but no individual part could be blamed (e.g. a spoofed
+    /// hashset). Forces a full re-download instead of stranding a corrupt file.
+    pub async fn reset_all_gaps(&self) {
+        let mut g = self.inner.lock().await;
+        g.store.pf.reset_all_gaps();
+        let _ = g.store.save_met();
+    }
+
+    /// Flush this download's on-disk `.part.met` (its gap list + priority). The hot
+    /// receive path (`commit`) only fills the IN-MEMORY gap list, so without a flush
+    /// on the durability boundary a suspend-kill loses ALL session progress and
+    /// re-downloads from scratch. Called from `pause()`/`shutdown()`.
+    pub async fn persist(&self) {
+        let mut g = self.inner.lock().await;
         let _ = g.store.save_met();
     }
 
@@ -373,11 +411,27 @@ impl Download {
     /// peer's hashset, and a file of a single part has no part hashes at all.
     /// Hashed part-by-part, so a large file is never held in memory.
     pub async fn verify_whole_file(&self, size: u64, want: [u8; 16]) -> bool {
-        let mut g = self.inner.lock().await;
-        match mule_proto::ed2k_hash_parts(size, |p| g.store.read_part(p)) {
-            Ok(got) => got == want,
-            Err(_) => false,
-        }
+        // Snapshot the backing path under a BRIEF lock, then rehash off the lock
+        // AND off the async reactor via spawn_blocking: a multi-GB MD4 is slow and
+        // CPU-bound. Holding the download lock across it would stall the 1s
+        // downloads() heartbeat - which runs under the shared engine lock - and so
+        // pause()/every FFI call. Mirrors the preview snapshot's off-lock read.
+        let path = {
+            let g = self.inner.lock().await;
+            g.store.part_path().to_path_buf()
+        };
+        let got = tokio::task::spawn_blocking(move || {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut f = std::fs::File::open(&path)?;
+            mule_proto::ed2k_hash_parts(size, |p| {
+                let mut buf = vec![0u8; crate::part_file::part_size(p, size) as usize];
+                f.seek(SeekFrom::Start(p * mule_proto::PARTSIZE))?;
+                f.read_exact(&mut buf)?;
+                io::Result::Ok(buf)
+            })
+        })
+        .await;
+        matches!(got, Ok(Ok(g)) if g == want)
     }
 
     /// Take the finished store back out (to move the file into place).

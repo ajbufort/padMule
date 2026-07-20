@@ -848,7 +848,8 @@ struct ContentView: View {
     }
 
     private func bytes(_ n: UInt64) -> String {
-        ByteCountFormatter.string(fromByteCount: Int64(n), countStyle: .file)
+        // clamping: a hostile size > Int64.max would TRAP a plain Int64() init.
+        ByteCountFormatter.string(fromByteCount: Int64(clamping: n), countStyle: .file)
     }
 
     /// The eMule rating scale (1 Fake .. 5 Excellent) as a small colored pill.

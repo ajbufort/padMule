@@ -126,8 +126,15 @@ final class EngineModel: ObservableObject {
     /// contacts) lives in Application Support, which is invisible to the user
     /// and excluded from their view; FINISHED files land in Documents, which the
     /// Files app can see. A download the user cannot open is not a download.
+    private var booting = false
+
     func boot() {
-        guard engine == nil, bootError == nil else { return }
+        // Retry on a later call (foreground) after a transient init failure - do
+        // NOT latch on bootError, or one bad launch bricks the app forever. The
+        // `booting` guard prevents a concurrent double-construct (onAppear + .active).
+        guard engine == nil, !booting else { return }
+        booting = true
+        bootError = nil
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         let dir = base.appendingPathComponent("padMule", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -142,13 +149,17 @@ final class EngineModel: ObservableObject {
                 e.start()
                 DispatchQueue.main.async {
                     guard let self else { return }
+                    self.booting = false
                     self.engine = e
                     self.identity = ident
                     self.startPolling()
                     self.refresh()
                 }
             } catch {
-                DispatchQueue.main.async { self?.bootError = "\(error)" }
+                DispatchQueue.main.async {
+                    self?.booting = false
+                    self?.bootError = "\(error)"
+                }
             }
         }
     }

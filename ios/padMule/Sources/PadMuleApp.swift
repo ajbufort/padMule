@@ -35,6 +35,9 @@ struct PadMuleApp: App {
         .onChange(of: scenePhase) { phase in
             switch phase {
             case .active:
+                // Retry a failed cold-boot on foreground (no-op once booted), THEN
+                // resume; without the boot() a transient launch failure was terminal.
+                model.boot()
                 model.resume()
             case .background:
                 // Only on .background - .inactive fires for transient things

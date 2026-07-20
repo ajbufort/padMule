@@ -88,11 +88,15 @@ struct StatsView: View {
     }
 
     private func byteText(_ bytes: UInt64) -> String {
-        ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
+        // clamping: a hostile size > Int64.max would TRAP a plain Int64() init.
+        ByteCountFormatter.string(fromByteCount: Int64(clamping: bytes), countStyle: .file)
     }
 
     private func rateText(_ bytesPerSec: Double) -> String {
-        let b = max(0, Int64(bytesPerSec))
+        // Guard NaN/Inf and the out-of-range case (Double(Int64.max) rounds UP and
+        // traps), so a degenerate rate cannot crash the UI. 9e18 is well under max.
+        let clamped = bytesPerSec.isFinite ? min(max(bytesPerSec, 0), 9.0e18) : 0
+        let b = Int64(clamped)
         return ByteCountFormatter.string(fromByteCount: b, countStyle: .file) + "/s"
     }
 }
