@@ -5,8 +5,9 @@
 # uniffi-bindgen output (mule_ffi.swift, mule_ffiFFI.h, module.modulemap)
 gen/
 
-# libmule_ffi.a staticlib, staged for the linker
+# libmule_ffi.a staticlib, staged for the linker (device build + simulator tests)
 libs/
+libs-sim/
 
 # xcodebuild derived data
 build/
