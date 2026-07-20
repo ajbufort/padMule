@@ -769,6 +769,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn finish_to_refuses_to_move_a_cancelled_download() {
+        // A cancel that lands during finalize must WIN: finish_to bails (Err) under
+        // the lock instead of moving + sharing the file the user cancelled.
+        let dir = tmpdir("finish-cancel");
+        let store = PartStore::create(&dir, 1, [0x44; 16], 500, b"c.bin").unwrap();
+        let part_path = dir.join("001.part");
+        let dl = Download::new(store);
+        dl.cancel();
+        let dest = dir.join("c.bin");
+        assert!(dl.finish_to(&dest).await.is_err(), "cancelled -> no move");
+        assert!(
+            !dest.exists(),
+            "the cancelled file was NOT moved into place"
+        );
+        assert!(
+            part_path.exists(),
+            ".part is left for cancel_download to delete"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fetch_and_finalize_guards_admit_exactly_one_claimant() {
+        let dir = tmpdir("guards");
+        let store = PartStore::create(&dir, 1, [0x55; 16], 500, b"g.bin").unwrap();
+        let dl = Download::new(store);
+        // Only the FIRST caller may spawn a fetch task; released on task end.
+        assert!(dl.try_begin_fetch());
+        assert!(!dl.try_begin_fetch(), "a second fetch task is refused");
+        assert!(dl.is_fetching());
+        dl.end_fetch();
+        assert!(!dl.is_fetching());
+        assert!(dl.try_begin_fetch(), "re-claimable after the task ends");
+        // Same one-shot semantics for finalize; released only on a failed finalize.
+        assert!(dl.try_begin_finalize());
+        assert!(!dl.try_begin_finalize(), "a second finalize is refused");
+        dl.reset_finalize();
+        assert!(
+            dl.try_begin_finalize(),
+            "re-claimable after a failed finalize"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn a_sources_comment_is_recorded_during_the_session() {
         use crate::transfer::{build_file_desc, build_file_req_ans_no_fil, OP_SETREQFILEID};
         let dir = tmpdir("filedesc");
