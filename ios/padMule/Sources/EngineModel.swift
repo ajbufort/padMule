@@ -183,8 +183,8 @@ final class EngineModel: ObservableObject {
     /// without an engine (see padMuleTests). `results == nil` means "leave the list
     /// untouched" (a throttle notice must not blank the current results).
     struct SearchUpdate {
-        var results: [SearchHit]?
-        var moreAvailable: Bool
+        var results: [SearchHit]?  // nil = leave the list untouched (throttle)
+        var moreAvailable: Bool?  // nil = leave the Load-more flag untouched
         var notice: String?
     }
 
@@ -197,10 +197,12 @@ final class EngineModel: ObservableObject {
                 results: hits, moreAvailable: more,
                 notice: hits.isEmpty ? emptyMessage : nil)
         case let .throttled(waitSecs):
-            // eMule/aMule guard: too-fast searches are refused. Keep the results,
-            // tell the user to wait (aMule silently ignores; padMule is honest).
+            // eMule/aMule guard: too-fast searches are refused. Keep the results
+            // AND the Load-more flag as they are (the still-displayed results may
+            // legitimately have more pages); just tell the user to wait. aMule
+            // silently ignores the click; padMule is honest about the wait.
             return SearchUpdate(
-                results: nil, moreAvailable: false,
+                results: nil, moreAvailable: nil,
                 notice: "Searching too fast - wait \(waitSecs)s and try again.")
         }
     }
@@ -210,7 +212,7 @@ final class EngineModel: ObservableObject {
             results = r
             searched = true
         }
-        moreAvailable = u.moreAvailable
+        if let m = u.moreAvailable { moreAvailable = m }
         notice = u.notice
     }
 
@@ -264,6 +266,7 @@ final class EngineModel: ObservableObject {
     func clearSearch() {
         results = []
         searched = false
+        moreAvailable = false
         notice = nil
     }
 
@@ -648,12 +651,17 @@ final class EngineModel: ObservableObject {
         }
     }
 
-    /// Toggle the pin (favorite) on a server; a pinned server survives Prune.
+    /// Toggle the pin (favorite) on a server; a pinned server survives Prune. The
+    /// FFI call takes the shared engine lock (block_on), so dispatch it off the UI
+    /// thread like every other engine action - otherwise a pin tap during a
+    /// multi-second op (Prune/Update/Connect) would freeze the main thread.
     func togglePin(_ addr: String) {
         guard let e = engine else { return }
         let pinned = servers.first(where: { $0.addr == addr })?.pinned ?? false
-        e.setServerPinned(addr: addr, pinned: !pinned)
-        loadServers()
+        work.async { [weak self] in
+            e.setServerPinned(addr: addr, pinned: !pinned)
+            DispatchQueue.main.async { self?.loadServers() }
+        }
     }
 
     /// Drop every dead, unpinned server from the list, then re-probe.

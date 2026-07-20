@@ -41,12 +41,17 @@ pub fn read_server_met(bytes: &[u8]) -> Result<ServerMet, IoError> {
         return Err(IoError::BadTag(header));
     }
     let count = r.read_u32()?;
-    let mut servers = Vec::with_capacity(count as usize);
+    // Do NOT pre-allocate from the untrusted count; grow as we read. A bogus count
+    // (e.g. 0xFFFFFFFF from a hostile/MITM'd URL via update_server_list) would make
+    // Vec::with_capacity request ~137 GB and abort the process before a single
+    // element is read. Growing incrementally means a short body just hits EOF and
+    // errors cheaply. Mirrors parse_search_result_page's rule.
+    let mut servers = Vec::new();
     for _ in 0..count {
         let ip = r.read_u32()?;
         let port = r.read_u16()?;
         let tagcount = r.read_u32()?;
-        let mut tags = Vec::with_capacity(tagcount as usize);
+        let mut tags = Vec::new();
         for _ in 0..tagcount {
             tags.push(read_tag(&mut r)?);
         }
@@ -132,6 +137,22 @@ mod tests {
     fn rejects_bad_header() {
         let bytes = [0x99, 0x00, 0x00, 0x00, 0x00];
         assert_eq!(read_server_met(&bytes), Err(IoError::BadTag(0x99)));
+    }
+
+    #[test]
+    fn a_huge_untrusted_count_errors_instead_of_pre_allocating() {
+        // count claims 4.29 billion servers but the body ends -> EOF error, NOT a
+        // ~137 GB Vec::with_capacity that would abort the process (the #18 URL DoS).
+        assert_eq!(
+            read_server_met(&[0xE0, 0xFF, 0xFF, 0xFF, 0xFF]),
+            Err(IoError::UnexpectedEof)
+        );
+        // Same guard on the per-server tag count.
+        let mut b = vec![0xE0, 0x01, 0x00, 0x00, 0x00]; // count = 1
+        b.extend_from_slice(&[0x04, 0x03, 0x02, 0x01]); // ip
+        b.extend_from_slice(&[0x35, 0x12]); // port
+        b.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]); // tagcount = huge
+        assert_eq!(read_server_met(&b), Err(IoError::UnexpectedEof));
     }
 
     #[test]

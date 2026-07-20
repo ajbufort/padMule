@@ -90,11 +90,19 @@ pub async fn http_get_bytes(url: &str) -> Result<Vec<u8>, BootstrapError> {
         .write_all(req.as_bytes())
         .await
         .map_err(|e| BootstrapError::Io(e.to_string()))?;
+    // Cap the response so a hostile/MITM'd host (update_server_list now accepts a
+    // user-entered URL) cannot stream unbounded data into memory for the whole 30s.
+    // A server.met / nodes.dat is far under this; a larger body is truncated and
+    // then fails to parse, which is reported cleanly rather than OOMing.
+    const MAX_HTTP_BODY: u64 = 16 * 1024 * 1024;
     let mut buf = Vec::new();
-    timeout(Duration::from_secs(30), stream.read_to_end(&mut buf))
-        .await
-        .map_err(|_| BootstrapError::Io("read timeout".into()))?
-        .map_err(|e| BootstrapError::Io(e.to_string()))?;
+    timeout(
+        Duration::from_secs(30),
+        (&mut stream).take(MAX_HTTP_BODY).read_to_end(&mut buf),
+    )
+    .await
+    .map_err(|_| BootstrapError::Io("read timeout".into()))?
+    .map_err(|e| BootstrapError::Io(e.to_string()))?;
 
     let (status, body_at) = split_head(&buf).ok_or(BootstrapError::Empty)?;
     if status != 200 {
