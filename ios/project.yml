@@ -105,6 +105,11 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: us.ajbconsulting.padMuleTests
         GENERATE_INFOPLIST_FILE: "YES"
+        # `@testable import padMule` transitively imports the generated mule_ffiFFI
+        # clang module, so the test target must also see gen/module.modulemap. The
+        # FFI symbols themselves come from the host app (TEST_HOST), so no -lmule_ffi.
+        SWIFT_INCLUDE_PATHS: $(SRCROOT)/gen
+        HEADER_SEARCH_PATHS: $(SRCROOT)/gen
         CODE_SIGNING_ALLOWED: "NO"
         CODE_SIGNING_REQUIRED: "NO"
         CODE_SIGN_IDENTITY: ""
