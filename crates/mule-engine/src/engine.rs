@@ -553,6 +553,13 @@ async fn finish_download(
     // set_download_priority - can no longer strand a byte-complete .part.
     match dl.finish_to(&dest).await {
         Ok(()) => {
+            // A cancel that raced the move (landed after finish_to's under-lock
+            // check but before we share) must NOT re-seed the file. It is already in
+            // Documents; just skip adding it to the shared library / known.met, so a
+            // cancelled file is never re-announced to the swarm on future starts.
+            if dl.is_cancelled() {
+                return;
+            }
             // Seed it: a verified, complete file is a full source other peers can
             // pull. The listener only serves it while sharing is on. Use the
             // ACTUAL on-disk name (unique_dest may have renamed it), so the
