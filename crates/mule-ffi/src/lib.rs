@@ -13,7 +13,8 @@ use std::sync::Arc;
 
 use mule_engine::{
     AddResult, Engine, EngineEvent, EngineState, HitStatus, RankedFile,
-    SearchFilters as EngineSearchFilters, Trust,
+    SearchFilters as EngineSearchFilters, SearchOutcome as EngineSearchOutcome,
+    ServerListUpdate as EngineServerListUpdate, Trust,
 };
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -132,6 +133,31 @@ pub struct ServerEntryFfi {
     pub files: u32,
     pub alive: bool,
     pub connected: bool,
+    /// A user favorite: kept by `prune_dead_servers` even when down.
+    pub pinned: bool,
+}
+
+/// The outcome of a search: hits (with whether the server has more pages to load)
+/// or a throttle notice. `Throttled` is a normal answer the UI reports, not an
+/// error - mirrors `AddOutcome`.
+#[derive(Debug, Clone, PartialEq, uniffi::Enum)]
+pub enum SearchOutcome {
+    Results {
+        hits: Vec<SearchHit>,
+        more_available: bool,
+    },
+    Throttled {
+        wait_secs: u32,
+    },
+}
+
+/// The outcome of auto-updating the server list from a URL.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum ServerListUpdate {
+    Updated { added: u32, total: u32 },
+    BadUrl,
+    NotServerMet,
+    Unreachable,
 }
 
 /// A snapshot of one in-progress download.
@@ -302,6 +328,21 @@ impl std::error::Error for FfiError {}
 /// have/fetching/new status. Shared by `search` and `related_search`. `g` is
 /// borrowed immutably, so call it AFTER the `&mut self` search has returned its
 /// owned Vec - the borrows never overlap.
+/// Map the engine's search outcome to the FFI one, converting ranked files to
+/// hits (which needs `&g` for hit status) and carrying the throttle/more flags.
+async fn search_outcome_to_ffi(g: &Engine, outcome: EngineSearchOutcome) -> SearchOutcome {
+    match outcome {
+        EngineSearchOutcome::Results {
+            ranked,
+            more_available,
+        } => SearchOutcome::Results {
+            hits: ranked_to_hits(g, ranked).await,
+            more_available,
+        },
+        EngineSearchOutcome::Throttled { wait_secs } => SearchOutcome::Throttled { wait_secs },
+    }
+}
+
 async fn ranked_to_hits(g: &Engine, ranked: Vec<RankedFile>) -> Vec<SearchHit> {
     let mut out = Vec::with_capacity(ranked.len());
     for r in ranked {
@@ -454,9 +495,40 @@ impl MuleEngine {
                     files: e.files.unwrap_or(0),
                     alive: e.alive,
                     connected: e.connected,
+                    pinned: e.pinned,
                 })
                 .collect()
         })
+    }
+
+    /// Fetch a server.met from `url` (plain http) and MERGE it into the on-disk
+    /// list - existing servers (and tags) are kept, only new ones appended. Call
+    /// `server_list()` afterwards to re-probe. Blocks on the fetch; off the UI
+    /// thread. The default list URL is `http://upd.emule-security.org/server.met`.
+    pub fn update_server_list(&self, url: String) -> ServerListUpdate {
+        self.rt.block_on(async {
+            match self.inner.lock().await.update_server_list(&url).await {
+                EngineServerListUpdate::Updated { added, total } => {
+                    ServerListUpdate::Updated { added, total }
+                }
+                EngineServerListUpdate::BadUrl => ServerListUpdate::BadUrl,
+                EngineServerListUpdate::NotServerMet => ServerListUpdate::NotServerMet,
+                EngineServerListUpdate::Unreachable => ServerListUpdate::Unreachable,
+            }
+        })
+    }
+
+    /// Pin/unpin a server ("ip:port"); a pinned server survives `prune_dead_servers`.
+    pub fn set_server_pinned(&self, addr: String, pinned: bool) {
+        self.rt
+            .block_on(async { self.inner.lock().await.set_server_pinned(&addr, pinned) });
+    }
+
+    /// Probe the list and drop every dead, unpinned server, rewriting server.met.
+    /// Returns how many were removed. Blocks ~3s on the probe; off the UI thread.
+    pub fn prune_dead_servers(&self) -> u32 {
+        self.rt
+            .block_on(async { self.inner.lock().await.prune_dead_servers().await })
     }
 
     /// Connect to the server at `addr` ("ip:port"). Returns false if the address
@@ -666,11 +738,23 @@ impl MuleEngine {
     /// Search the connected server. BLOCKS for up to ~20s waiting on the
     /// server, so call it off the UI thread. Empty means no server, no answer,
     /// or genuinely no hits - all of which the UI renders the same way.
-    pub fn search(&self, keyword: String, filters: SearchFilters) -> Vec<SearchHit> {
+    pub fn search(&self, keyword: String, filters: SearchFilters) -> SearchOutcome {
         self.rt.block_on(async {
             let mut g = self.inner.lock().await;
-            let ranked = g.search(&keyword, filters.into()).await;
-            ranked_to_hits(&g, ranked).await
+            let outcome = g.search(&keyword, filters.into()).await;
+            search_outcome_to_ffi(&g, outcome).await
+        })
+    }
+
+    /// Fetch the next page of the last search and merge it into the results -
+    /// eMule's "Load more results" (server-only). Only meaningful right after a
+    /// `search` whose outcome had `more_available = true`; otherwise it returns
+    /// the current results with `more_available = false`. Blocks up to ~20s.
+    pub fn search_more(&self) -> SearchOutcome {
+        self.rt.block_on(async {
+            let mut g = self.inner.lock().await;
+            let outcome = g.search_more().await;
+            search_outcome_to_ffi(&g, outcome).await
         })
     }
 
@@ -680,14 +764,17 @@ impl MuleEngine {
     /// support - the UI checks `ServerInfoFfi::related_search` and falls back to a
     /// filename keyword search in that case. Results have the same shape as
     /// `search`, so the UI renders them through the same list.
-    pub fn related_search(&self, hash: String) -> Vec<SearchHit> {
+    pub fn related_search(&self, hash: String) -> SearchOutcome {
         let Some(h) = parse_hash16(&hash) else {
-            return Vec::new();
+            return SearchOutcome::Results {
+                hits: Vec::new(),
+                more_available: false,
+            };
         };
         self.rt.block_on(async {
             let mut g = self.inner.lock().await;
-            let ranked = g.related_search(h).await;
-            ranked_to_hits(&g, ranked).await
+            let outcome = g.related_search(h).await;
+            search_outcome_to_ffi(&g, outcome).await
         })
     }
 

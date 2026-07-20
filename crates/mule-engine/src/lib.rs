@@ -38,7 +38,8 @@ pub use connection::{connect_server, login_handshake, ServerEvent, ServerState};
 pub use credits::{resolve_ident_state, score_ratio, score_ratio_ident, IdentState};
 pub use crypt_policy::{should_obfuscate_outbound, should_reject, CryptPrefs};
 pub use engine::{
-    AddResult, Engine, EngineEvent, EngineState, HitStatus, SearchFilters, ServerInfo,
+    AddResult, Engine, EngineEvent, EngineState, HitStatus, SearchFilters, SearchOutcome,
+    ServerInfo, ServerListUpdate,
 };
 pub use fetch::{
     download_file, fetch_from_sources, FetchOutcome, ManagerConfig, PeerScoreboard, PeerSource,
