@@ -778,7 +778,13 @@ fn server_state_label(s: &ServerState) -> String {
 fn map_server_event(e: ServerEvent) -> EngineEvent {
     match e {
         ServerEvent::State(s) => EngineEvent::Server(server_state_label(&s)),
-        ServerEvent::Message(m) => EngineEvent::Server(m),
+        ServerEvent::Message(m) => {
+            // Attribute + length-cap the server's MOTD, so a hostile server's text
+            // (e.g. a fake "Your IP is x.x.x.x") is never shown as padMule's OWN
+            // words, and a huge message cannot bloat the UI. char-safe truncation.
+            let capped: String = m.chars().take(500).collect();
+            EngineEvent::Server(format!("[server] {capped}"))
+        }
         ServerEvent::Status { users, files } => {
             EngineEvent::Server(format!("{users} users, {files} files"))
         }
@@ -1357,7 +1363,29 @@ impl Engine {
         let (tx, mut rx) = mpsc::channel(64);
         let out = self.events.clone();
         tokio::spawn(async move {
+            // Rate-limit SERVER-DRIVEN events (Message/Status/ServerList): a hostile
+            // server could otherwise flood them (e.g. OP_SERVERMESSAGE) into the
+            // unbounded UI event channel and exhaust memory -> jetsam kill, with no
+            // user action (it fires during automatic get_sources). A legitimate
+            // connect emits only a handful, so a generous per-window cap is
+            // invisible to real servers. Our OWN lifecycle State events are exempt -
+            // dropping one would leave the UI's connection state stale.
+            const WINDOW: Duration = Duration::from_secs(10);
+            const PER_WINDOW: u32 = 30;
+            let mut win_start = tokio::time::Instant::now();
+            let mut count = 0u32;
             while let Some(e) = rx.recv().await {
+                if !matches!(e, ServerEvent::State(_)) {
+                    let now = tokio::time::Instant::now();
+                    if now.duration_since(win_start) >= WINDOW {
+                        win_start = now;
+                        count = 0;
+                    }
+                    count += 1;
+                    if count > PER_WINDOW {
+                        continue; // drop the flood
+                    }
+                }
                 let _ = out.send(map_server_event(e));
             }
         });
