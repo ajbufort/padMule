@@ -208,11 +208,56 @@ fn main() {
         render_hit(i, h);
     }
 
-    // Boolean expression: the keyword is parsed into an AND/OR/NOT tree for the
-    // SERVER query (Kad matches the raw keyword string), end to end here.
-    let bexpr = format!("{keyword} NOT zzqnomatch");
-    screen(&format!("BOOLEAN SEARCH \"{bexpr}\""));
-    println!("{} result(s)", engine.search(bexpr, filters()).len());
+    // Boolean OPERATOR MATRIX: the keyword is parsed into an AND/OR/NOT tree for
+    // the SERVER query (Kad matches the raw keyword string). Run a battery so the
+    // seeded oracle characterizes exactly which operators the server honors - this
+    // is what separates a padMule encoding bug from a server-side evaluation quirk.
+    // Assumes the simulate.sh seed library "<kw> sample video.avi | <kw> music
+    // track.mp3 | <kw> readme notes.txt" (3 files, all contain <kw>).
+    // A real eD2k server RATE-LIMITS searches per client: in a rapid burst only the
+    // FIRST query is answered and the rest silently return 0 (proven: the plain
+    // SEARCH above returns 3, an immediate repeat returns 0). So this operator
+    // battery is meaningful ONLY when each query is spaced past that cooldown, and
+    // it is OPT-IN via MATRIX_GAP (secs). MATRIX_GAP=20 shows full, correct boolean
+    // support (AND/OR/NOT/phrase); unset, we skip it rather than print a misleading
+    // wall of zeros. See docs/wiki/ed2k-server-oracle.md.
+    let gap: u64 = std::env::var("MATRIX_GAP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    if gap == 0 {
+        screen("BOOLEAN OPERATOR MATRIX (skipped)");
+        println!("  set MATRIX_GAP=20 to characterize server boolean support");
+        println!("  (spaced past the server's per-client search rate-limit)");
+    } else {
+        screen(&format!(
+            "BOOLEAN OPERATOR MATRIX (server boolean support; gap={gap}s)"
+        ));
+        for (i, (label, q)) in [
+            ("implicit AND (2 words)   ", format!("{keyword} sample")),
+            ("explicit AND             ", format!("{keyword} AND music")),
+            ("OR (union)               ", "music OR readme".to_string()),
+            (
+                "OR (one side no match)   ",
+                "music OR zzqnomatch".to_string(),
+            ),
+            ("NOT (excludes 1)         ", format!("{keyword} NOT sample")),
+            (
+                "NOT (excludes nothing)   ",
+                format!("{keyword} NOT zzqnomatch"),
+            ),
+            ("phrase                   ", "\"sample video\"".to_string()),
+        ]
+        .iter()
+        .enumerate()
+        {
+            if i > 0 {
+                sleep(Duration::from_secs(gap));
+            }
+            let n = engine.search(q.clone(), filters()).len();
+            println!("  {label} {n:>2} result(s)   <- \"{q}\"");
+        }
+    }
 
     // Global search: also fan the query across the whole serverlist over UDP.
     screen(&format!(
