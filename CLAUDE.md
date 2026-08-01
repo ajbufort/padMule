@@ -27,7 +27,9 @@ current build state is `docs/wiki/build-progress.md`.
   Anything borrowed from other forks (e.g. eMule AI) stays GPL-compatible.
 - The repo is PUBLIC (github.com/ajbufort/padMule). Never commit real public
   IPs, client IDs, MACs, or other personal network identifiers; use
-  placeholders like `<public-ip>`.
+  placeholders like `<public-ip>`. Private RFC1918 LAN addresses (192.168.x.x,
+  10.x.x.x) are FINE - they are non-routable and document the topology; the
+  wiki uses them throughout by established convention.
 
 ## Architecture (the working tree)
 
@@ -37,7 +39,7 @@ current build state is `docs/wiki/build-progress.md`.
 | `crates/mule-files` | On-disk formats, byte-compatible with upstream: server.met, known.met, part.met (+gaps), clients.met, nodes.dat, preferences. |
 | `crates/mule-kad` | Kad2: UDP framing + obfuscation, message codecs, routing bin-tree, iterative lookup, anti-abuse hardening. Offline-testable. |
 | `crates/mule-engine` | The live engine: server link, peer transfer, TCP obfuscation, secure ident, credits, Kad node, fetch/search/catalog, share/upload, UPnP + NAT-PMP, and the `Engine` lifecycle facade. |
-| `crates/mule-cli` | Dev + live-network harness (20 subcommands: login, listen, peer-*, kad-*, upnp-*, link, fetch-complete, ...). |
+| `crates/mule-cli` | Dev + live-network harness (26 subcommands: login, listen, peer-*, kad-*, upnp-*, *-search, offer-*, link, fetch-complete, ...). |
 | `crates/mule-ffi` | UniFFI seam: sync facade over the async engine; Swift bindings generated in CI from the compiled library. |
 | `ios/` | SwiftUI app. XcodeGen `project.yml`; the pbxproj is generated in CI, never committed. |
 | `amule-3.0.1/` | Vendored upstream C++ - reference oracle only. `build-oracle/` holds a built amuled for differential tests. |
@@ -76,7 +78,7 @@ Details and what is portable from them: `docs/wiki/ref-ecosystem.md`.
 source "$HOME/.cargo/env"              # cargo is NOT on the default PATH
 
 cargo build --workspace
-cargo test --workspace                 # the unit gate (379 tests, offline)
+cargo test --workspace                 # the unit gate (~450 tests, offline)
 cargo clippy --workspace --all-targets # must be warning-free
 cargo fmt --all -- --check
 
@@ -84,8 +86,11 @@ cargo fmt --all -- --check
 scripts/build-amuled-oracle.sh         # one-time build into build-oracle/
 scripts/differential-test.sh           # padMule downloads from real amuled, byte-for-byte
 
-# iOS: push to main (or workflow_dispatch) -> .github/workflows/ios-build.yml
-# builds the unsigned padMule.ipa artifact on a macOS runner. No Apple secrets.
+# CI: push to main (or workflow_dispatch) triggers
+#   .github/workflows/rust.yml      - the unit gate above (test+clippy+fmt) on ubuntu
+#   .github/workflows/ios-build.yml - unsigned padMule.ipa artifact (macOS runner)
+#   .github/workflows/ios-test.yml  - Swift unit tests on an iPad simulator
+# No Apple secrets anywhere.
 ```
 
 Gate before every commit: cargo test + clippy + fmt clean, and changed files
@@ -137,8 +142,12 @@ have to say "update the docs/wiki/memory".
 - **Lint** - periodically health-check: contradictions, stale claims, orphan
   pages, missing concepts. Record the pass in `log.md`.
 
-Entry conventions: kebab-case filenames; keep entries under ~150 lines;
-cross-link liberally with `[[name]]`; `## Related` is the last section; bump an
+Entry conventions: kebab-case filenames; keep entries under ~150 lines -
+EXCEPT append-only ledgers (`log.md`, `decisions-and-lessons`) and archive
+entries (`build-history`), which grow by nature; when a ledger's completed
+narratives make it unwieldy, split them verbatim into a `*-history` archive
+(as build-progress did 2026-08-01) rather than trimming content to fit.
+Cross-link liberally with `[[name]]`; `## Related` is the last section; bump an
 `Updated:` date on edit. A `[[name]]` with no `docs/wiki/` file may point to a
 cross-session MEMORY file (the memory index lists them) - that is intentional,
 not an orphan. When a milestone supersedes older text in a dated section,
