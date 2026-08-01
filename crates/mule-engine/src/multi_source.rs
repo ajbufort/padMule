@@ -477,8 +477,10 @@ impl Download {
         // NOT move the file into place. cancel_download sets `cancelled` before it
         // takes this same inner lock to delete the files, so checking it here (under
         // the lock, no await before the move) makes cancel and finalize mutually
-        // exclusive - the file is either moved or deleted, never both.
-        if self.cancelled.load(Ordering::Acquire) {
+        // exclusive - the file is either moved or deleted, never both. Relaxed is
+        // enough: the `inner` mutex provides the happens-before (every other use of
+        // this flag is Relaxed too - do not read ordering semantics into it).
+        if self.cancelled.load(Ordering::Relaxed) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Interrupted,
                 "cancelled during finalize",

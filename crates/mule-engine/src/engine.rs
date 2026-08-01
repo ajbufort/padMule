@@ -13,11 +13,12 @@
 //!     "Reconnecting..." then "Connected". Idempotent, correct across an IP
 //!     change.
 //!
-//! KNOWN GAP (candidate fix, not yet built): neither touches DOWNLOADS. An
-//! in-flight fetch task keeps its own peer sockets across pause(), and a
-//! download resumed from disk by `start()` gets no fetch task at all - only
-//! `add_download` spawns one - so a restarted `.part` progresses only when a
-//! called-back peer dials our listener.
+//! Downloads ride the same lifecycle (the 8z readiness-audit fixes): `start()`
+//! and `resume()` re-drive every incomplete download through `resume_fetches`,
+//! and `pause()`/`shutdown()` flush gap progress to `.part.met` via
+//! `persist_downloads`. The one DELIBERATE gap: pause() does not abort in-flight
+//! fetch tasks (iPadOS suspends all threads anyway; resume() re-drives, and a
+//! CancellationToken refactor was judged not worth it - see build-progress 8z).
 
 use crate::bootstrap;
 use crate::catalog::{catalog, tag_str, tag_u64, RankedFile};

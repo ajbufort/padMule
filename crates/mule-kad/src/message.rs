@@ -142,8 +142,11 @@ fn write_kad_tag(w: &mut Writer, tag: &KadTag) {
         KadTagValue::Bsob(b) => {
             w.write_u8(TT_BSOB);
             write_name(w, tag.name);
-            w.write_u8(b.len() as u8);
-            w.write_bytes(b);
+            // BSOB length is a single byte; cap so prefix and payload agree (a
+            // wrapped count would desync the whole taglist).
+            let n = b.len().min(u8::MAX as usize);
+            w.write_u8(n as u8);
+            w.write_bytes(&b[..n]);
         }
         KadTagValue::Hash(h) => {
             w.write_u8(TT_HASH16);
@@ -271,6 +274,8 @@ pub fn build_bootstrap_res(
     version: u8,
     contacts: &[WireContact],
 ) -> (u8, Vec<u8>) {
+    // Cap so the u16 count and the emitted records always agree.
+    let contacts = &contacts[..contacts.len().min(u16::MAX as usize)];
     let mut w = Writer::new();
     w.write_bytes(&id.to_wire());
     w.write_u16(tcp_port);
@@ -464,6 +469,9 @@ pub struct Kad2Res {
 
 /// Build a KADEMLIA2_RES: `target 16 | count 1 | count x 25-byte contact`.
 pub fn build_kad2_res(target: &Kad128, contacts: &[WireContact]) -> (u8, Vec<u8>) {
+    // The count is one byte; cap so it always matches the emitted records (a
+    // wrapped count is a malformed packet). eMule never sends more than 32.
+    let contacts = &contacts[..contacts.len().min(u8::MAX as usize)];
     let mut w = Writer::new();
     w.write_bytes(&target.to_wire());
     w.write_u8(contacts.len() as u8);
@@ -686,6 +694,8 @@ pub fn build_search_res(
     target: &Kad128,
     results: &[SearchResult],
 ) -> (u8, Vec<u8>) {
+    // Cap so the u16 count and the emitted records always agree.
+    let results = &results[..results.len().min(u16::MAX as usize)];
     let mut w = Writer::new();
     w.write_bytes(&responder.to_wire());
     w.write_bytes(&target.to_wire());
@@ -856,6 +866,26 @@ mod tests {
         assert_eq!(res.contacts, contacts);
         // A truncated packet fails the exact-length check.
         assert!(parse_kad2_res(&payload[..payload.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn kad2_res_caps_the_one_byte_count_instead_of_wrapping() {
+        // 300 contacts would wrap the u8 count to 44 and desync the packet;
+        // the builder caps at 255 so count and records always agree.
+        let target = Kad128::from_hash(&[0x55; 16]);
+        let contacts: Vec<WireContact> = (0..300u16)
+            .map(|i| WireContact {
+                id: Kad128::from_hash(&[(i % 251) as u8 + 1; 16]),
+                ip: 0x0A00_0000 | i as u32,
+                udp_port: 4000,
+                tcp_port: 5000,
+                version: 8,
+            })
+            .collect();
+        let (_, payload) = build_kad2_res(&target, &contacts);
+        assert_eq!(payload.len(), 17 + 25 * 255);
+        let res = parse_kad2_res(&payload).unwrap();
+        assert_eq!(res.contacts.len(), 255);
     }
 
     #[test]

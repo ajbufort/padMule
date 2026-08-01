@@ -139,6 +139,53 @@ mod tests {
     }
 
     #[test]
+    fn reads_a_v0_file_where_the_first_dword_is_the_count() {
+        // v0: no leading zero, no version field; 25-byte records ending in a
+        // "type" byte we discard.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // count (nonzero => v0)
+        bytes.extend_from_slice(&Kad128::from_hash(&[0xCD; 16]).to_wire());
+        bytes.extend_from_slice(&0x0102_0304u32.to_le_bytes()); // ip
+        bytes.extend_from_slice(&4672u16.to_le_bytes()); // udp
+        bytes.extend_from_slice(&4662u16.to_le_bytes()); // tcp
+        bytes.push(2); // type byte, discarded
+        let n = read_nodes_dat(&bytes).unwrap();
+        assert_eq!(n.version, 0);
+        assert_eq!(n.contacts.len(), 1);
+        let c = &n.contacts[0];
+        assert_eq!(c.ip, 0x0102_0304);
+        assert_eq!((c.udp_port, c.tcp_port), (4672, 4662));
+        // v0 has no contact version / udp key / verified flag.
+        assert_eq!(
+            (c.version, c.udp_key, c.udp_key_ip, c.verified),
+            (0, 0, 0, false)
+        );
+    }
+
+    #[test]
+    fn reads_a_v1_file_with_25_byte_records() {
+        // v1: leading zero + version 1; the trailing byte is the contact version.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // file version
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // count
+        bytes.extend_from_slice(&Kad128::from_hash(&[0xEF; 16]).to_wire());
+        bytes.extend_from_slice(&0x0A00_0002u32.to_le_bytes()); // ip
+        bytes.extend_from_slice(&1234u16.to_le_bytes()); // udp
+        bytes.extend_from_slice(&5678u16.to_le_bytes()); // tcp
+        bytes.push(9); // contact version (eMule)
+        let n = read_nodes_dat(&bytes).unwrap();
+        assert_eq!(n.version, 1);
+        assert_eq!(n.contacts.len(), 1);
+        let c = &n.contacts[0];
+        assert_eq!(c.version, 9);
+        assert_eq!((c.udp_key, c.udp_key_ip, c.verified), (0, 0, false));
+        // The writer re-emits the modern v2 form regardless of the read version.
+        let rewritten = write_nodes_dat(&n);
+        assert_eq!(&rewritten[4..8], &2u32.to_le_bytes());
+    }
+
+    #[test]
     fn a_truncated_file_errors_rather_than_panicking() {
         let n = NodesDat {
             version: 2,

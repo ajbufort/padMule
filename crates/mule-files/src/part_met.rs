@@ -229,6 +229,16 @@ mod tests {
     }
 
     #[test]
+    fn accepts_the_edonkey_import_version_byte() {
+        // 0xE1 (edonkey import) is accepted on read and preserved.
+        let mut bytes = GOLDEN.to_vec();
+        bytes[0] = PARTFILE_VERSION_EDONKEY;
+        let parsed = read_part_met(&bytes).unwrap();
+        assert_eq!(parsed.version, PARTFILE_VERSION_EDONKEY);
+        assert_eq!(write_part_met(&parsed), bytes);
+    }
+
+    #[test]
     fn rejects_bad_version() {
         let bytes = [0x99u8, 0, 0, 0, 0];
         assert_eq!(read_part_met(&bytes), Err(IoError::BadTag(0x99)));
