@@ -1,6 +1,6 @@
 # Security Model + the "Bulletproof" Release Gate
 
-Updated: 2026-07-20 (security-completeness audit run - SCORECARD below)
+Updated: 2026-08-01 (tally re-synced to the B6+B8 closures, commit 625df39)
 
 RELEASE BLOCKER (Anthony, 2026-07-20; memory: [[security-bulletproof-release-gate]]):
 before padMule ships to the community, security must be **BULLETPROOF** =
@@ -12,16 +12,19 @@ off from most peers/servers).
 ## SCORECARD (security-completeness audit, 2026-07-20)
 
 A 26-measure adversarial audit (6 domain finders -> per-measure attacker ->
-synthesis, 33 agents). Tally: **11 OPERATIONAL, 12 PARTIAL, 3 MISSING**.
-Full adversarial detail: workflow wf_231184f5-a1b transcript.
+synthesis, 33 agents). Tally as of 2026-08-01: **13 OPERATIONAL, 10 PARTIAL,
+3 MISSING** (the 2026-07-20 audit scored 11/12/3; B6 MOTD-flood + B8 SSRF
+closed since, commit 625df39). Full adversarial detail: workflow
+wf_231184f5-a1b transcript.
 
 **BOTTOM LINE: NOT yet bulletproof.** BUT no failure delivers a corrupt file or
 RCE - whole-file ed2k MD4, ipfilter, hash-keyed transfers, and the OOM/parse
-hardening are genuinely OPERATIONAL + oracle-proven. The gaps are
-anti-impersonation/anti-leech completeness + two reachable DoSes + routing/SSRF
-poison vectors. Shortest path to yes = the Band A/B fixes (almost all LOW burden,
-~a week) + convert code-only claims to oracle-proven; the credit system is the one
-larger item (build, or ship documented as not-yet-active).
+hardening are genuinely OPERATIONAL + oracle-proven. The remaining gaps are
+anti-impersonation/anti-leech completeness + the inbound per-IP starvation DoS
++ Kad routing-poison vectors (the MOTD-flood DoS and the SSRF source vector are
+CLOSED - B6/B8). Shortest path to yes = the Band A/B fixes (almost all LOW
+burden, ~a week) + convert code-only claims to oracle-proven; the credit system
+is the one larger item (build, or ship documented as not-yet-active).
 
 | Measure | Status | Note |
 |---------|--------|------|
@@ -57,21 +60,23 @@ larger item (build, or ship documented as not-yet-active).
 Band A (HIGH): TCP c2c obf both-roles [LOW], secure-ident SERVE side [LOW-MED],
 per-part verify + poison recovery in the engine [LOW], AICH block recovery
 [per-part LOW / full HIGH, or clear the advertised bit], credit system [MED-HIGH
-or document as not-active]. Band B (MED, mostly LOW fix): server MOTD flood DoS,
-inbound per-IP cap + serve-session budget, reserved/loopback/LAN source drop
-(SSRF), Kad node-ID/IP verified bit, Kad receiver-verify-key, ipfilter into the
-Kad path, cross-hash spam score [MED], tighten Kad sybil caps + wire/delete
-FloodTracker. Band C (LOW, opt-in): server TCP/UDP obf - ship documented.
+or document as not-active]. Band B (MED, mostly LOW fix): inbound per-IP cap +
+serve-session budget, Kad node-ID/IP verified bit, Kad receiver-verify-key,
+ipfilter into the Kad path, cross-hash spam score [MED], tighten Kad sybil caps
++ wire/delete FloodTracker. (CLOSED 2026-07-20, commit 625df39: server MOTD
+flood DoS [B6]; reserved/loopback/LAN source drop / SSRF [B8].) Band C (LOW,
+opt-in): server TCP/UDP obf - ship documented.
 
 ## Interop-safe hardening backlog (all degrade gracefully)
 
 The Band A/B fixes above ARE the top hardening (each closes a blocker with a
 LOW-burden internal change - no wire break, no peer cut off). Plus: random
-per-request status-ping challenge; move ipfilter is_blocked to accept()-time;
-length-cap + "[server]" attribution on MOTD; and CI regression guards that turn
-the code-only claims (secure-ident wire crypto, whole-file finalize, ipfilter
-dial-block) into oracle-proven ones (differential-test assertions + a parse fuzz
-target + a >200-conn/trickle loopback test).
+per-request status-ping challenge; move ipfilter is_blocked to accept()-time
+(the MOTD length-cap + "[server]" attribution landed with B6); and CI
+regression guards that turn the code-only claims (secure-ident wire crypto,
+whole-file finalize, ipfilter dial-block) into oracle-proven ones
+(differential-test assertions + a parse fuzz target + a >200-conn/trickle
+loopback test).
 
 ## Related
 

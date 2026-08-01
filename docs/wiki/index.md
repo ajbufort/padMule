@@ -29,16 +29,20 @@ the Ingest / Query / Lint workflows.
 
 ## Process
 - [[decisions-and-lessons]] - locked decisions, rejected approaches, gotchas.
+- [[build-history]] - archive: the completed-milestone narratives (code-fix rounds, live milestones, differential-test history, wave notes) split verbatim out of [[build-progress]] on 2026-08-01.
 - [[build-progress]] - wave-by-wave build status. Engine complete through Kad + multi-source fetch; padMule RUNS on the iPad and does the full search->download->verify->save loop on-device; on-device feature round + search-panel parity + splash/icon DONE by 2026-07-18. Since then (2026-07-19): the 0.70b Tier-1 slices (IP filter, search history, wire filters, categories, ratings/comments read+author, per-source sheet, per-download priority, per-file unshare) and the verified-identity badge (secure-ident redo) landed, plus a real-peer/real-server ORACLE SET ([[emule-peer-oracle]], [[ed2k-server-oracle]]). Repo has LICENSE (GPL v2) + NOTICE + README.
 
 ## Backlog / feature ideas
 - [[feature-server-hunter]] - discover + verify live eD2k servers (auto-update, health-check, server-graph crawl); NOT literal whole-net scanning. Future work.
-- [[emule-070b-features]] - ranked backlog of eMule 0.70b features to adopt (34 items). From the 2026-07-18 dive; Tier 1 is now largely DONE (#1-8 landed, some partial). Remaining Tier-1: #9 global server UDP search (next, testable vs [[ed2k-server-oracle]]) + #10 related search.
+- [[emule-070b-features]] - ranked backlog of eMule 0.70b features to adopt (34 items). From the 2026-07-18 dive; Tier 1 is DONE (#1-8 landed, some partial; #9 global UDP search + #10 related search landed 2026-07-19). Tier 2+ remains open backlog.
 
 ## Strategy
 (All the big forks are LOCKED and executed - Rust engine rewrite, no-Mac
 CI+Sideloadly deploy path, foreground-only v1 - see [[decisions-and-lessons]];
-the app is shipped and on-device. Current direction: eMule 0.70b functional
-parity - Tier-1 largely landed (see [[emule-070b-features]]); next up is #9
-global server UDP search, now testable against a real local server
-([[ed2k-server-oracle]]). Wave 9 seedbox mode is the open v1.1 item.)
+the app is shipped and on-device, and 0.70b Tier-1 parity is done
+([[emule-070b-features]]). Current direction: the BULLETPROOF security release
+gate - close the [[security-model]] scorecard's PARTIAL/MISSING rows (13
+operational / 10 partial / 3 missing as of 2026-08-01; B6+B8 closed) before any
+community release. Next Band-B items: FloodTracker wiring + Kad
+receiver-verify-key, against eMule 0.50a. Wave 9 seedbox mode is the open v1.1
+item.)
