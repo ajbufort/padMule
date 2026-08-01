@@ -117,9 +117,11 @@ fn read_value(r: &mut Reader, tagtype: u8) -> Result<TagValue, IoError> {
         }
         TAGTYPE_STRING => TagValue::Str(r.read_string_u16()?),
         TAGTYPE_UINT32 => TagValue::U32(r.read_u32()?),
-        TAGTYPE_FLOAT32 => TagValue::F32(f32::from_le_bytes(
-            r.read_bytes(4)?.try_into().expect("4 bytes"),
-        )),
+        TAGTYPE_FLOAT32 => {
+            let mut b = [0u8; 4];
+            b.copy_from_slice(&r.read_bytes(4)?);
+            TagValue::F32(f32::from_le_bytes(b))
+        }
         TAGTYPE_BOOL => TagValue::Bool(r.read_u8()?),
         TAGTYPE_BOOLARRAY => {
             let bit_len = r.read_u16()?;
@@ -261,6 +263,34 @@ mod tests {
             assert_eq!(read_tag(&mut r).unwrap(), t);
             assert_eq!(r.remaining(), 0);
         }
+    }
+
+    #[test]
+    fn remaining_value_types_round_trip() {
+        // The types no other test covers: FLOAT32, BLOB, BSOB, UINT8, UINT16.
+        let tags = vec![
+            Tag::id(0x21, TagValue::F32(1.5)),
+            Tag::id(0x22, TagValue::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF])),
+            Tag::id(0x23, TagValue::Bsob(vec![0x01, 0x02, 0x03])),
+            Tag::id(0x24, TagValue::U8(0xFE)),
+            Tag::id(0x25, TagValue::U16(0xCAFE)),
+        ];
+        for t in tags {
+            let mut w = Writer::new();
+            write_tag(&mut w, &t);
+            let bytes = w.into_inner();
+            let mut r = Reader::new(&bytes);
+            assert_eq!(read_tag(&mut r).unwrap(), t);
+            assert_eq!(r.remaining(), 0);
+        }
+    }
+
+    #[test]
+    fn truncated_float32_errors_rather_than_panicking() {
+        // type FLOAT32, id 0x21, then only 2 of the 4 value bytes.
+        let bytes = vec![0x04, 0x01, 0x00, 0x21, 0x00, 0x00];
+        let mut r = Reader::new(&bytes);
+        assert!(read_tag(&mut r).is_err());
     }
 
     #[test]

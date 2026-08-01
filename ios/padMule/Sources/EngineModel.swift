@@ -474,9 +474,9 @@ final class EngineModel: ObservableObject {
     func pause() { run { $0.pause() } }
 
     /// App foregrounded: rebuild + reconnect.
+    /// (There is deliberately no shutdown() here: iOS gives no reliable
+    /// termination hook, and pause() already checkpoints on .background.)
     func resume() { run { $0.resume() } }
-
-    func shutdown() { run { $0.shutdown() } }
 
     private func run(_ body: @escaping (MuleEngine) -> Void) {
         guard let e = engine else { return }
@@ -496,6 +496,9 @@ final class EngineModel: ObservableObject {
     }
 
     /// Pull a fresh snapshot + drain queued events, all off the main thread.
+    /// The downloads() call is ALSO the engine's heartbeat (share re-announce,
+    /// completion finalize, server-drop detection) - the 1s timer must keep
+    /// firing this even when no screen shows transfers.
     private func refresh() {
         guard let e = engine else { return }
         work.async { [weak self] in

@@ -574,7 +574,11 @@ impl MuleEngine {
             .block_on(async { self.inner.lock().await.set_sharing(on) });
     }
 
-    /// Snapshots of every in-progress download.
+    /// Snapshots of every in-progress download. This is ALSO the engine's
+    /// heartbeat: each call drains pending share re-announces, finalizes
+    /// downloads that completed outside a fetch task, and detects a server
+    /// drop/kick. The UI's 1s poll must keep calling it - if this ever stops,
+    /// those three background duties silently stop with it.
     pub fn downloads(&self) -> Vec<DownloadInfo> {
         self.rt.block_on(async {
             let mut g = self.inner.lock().await;
@@ -836,6 +840,26 @@ mod tests {
             .into_owned()
     }
 
+    /// Build the facade with the engine forced OFFLINE (no list fetch, no server
+    /// dial, no 4662 bind) so facade tests stay hermetic. `set_offline` is
+    /// deliberately not exported - the app must never silently run offline - so
+    /// tests assemble the facade by hand instead of going through `new()`.
+    fn offline_engine(config_dir: &str, downloads_dir: &str) -> Arc<MuleEngine> {
+        let (mut engine, rx) = Engine::new(config_dir).unwrap();
+        engine.set_downloads_dir(downloads_dir);
+        engine.set_offline(true);
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        Arc::new(MuleEngine {
+            rt,
+            inner: Mutex::new(engine),
+            events: Mutex::new(rx),
+        })
+    }
+
     #[test]
     fn search_hit_has_the_rich_fields() {
         // Compile-level guarantee that the record carries the new shape.
@@ -917,7 +941,7 @@ mod tests {
         let dir = tmp("life");
         let _ = std::fs::remove_dir_all(&dir);
         let dl_dir = format!("{dir}-downloads");
-        let eng = MuleEngine::new(dir.clone(), dl_dir.clone()).unwrap();
+        let eng = offline_engine(&dir, &dl_dir);
 
         assert_eq!(eng.state(), EngineStateFfi::Stopped);
         // Identity is a 32-hex-char userhash.

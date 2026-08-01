@@ -1,12 +1,13 @@
 //! mule-cli: the headless dev + live-network harness for the engine on Linux.
-//! 20 subcommands across the whole surface: server login + lifecycle (login,
-//! login-any, listen), hashing + serving (hash-file, serve-file), peer
-//! transfer + diagnostics (peer-download, peer-probe, sec-ident), the full
-//! Kad surface (kad-bootstrap, kad-search, kad-fetch, kad-keyword), links
-//! (link), port mapping (upnp, upnp-unicast, upnp-query, upnp-unmap, natpmp),
-//! and the completion-optimized fetchers (search-download, fetch-complete).
-//! Run with no arguments for usage; the match in `main` is the authoritative
-//! list.
+//! 26 subcommands across the whole surface: server login + lifecycle (login,
+//! login-any, listen), server search + offers (global-search, server-search,
+//! related-search, offer-search, offer-hold), hashing + serving (hash-file,
+//! serve-file), peer transfer + diagnostics (peer-download, peer-probe,
+//! sec-ident), the full Kad surface (kad-bootstrap, kad-search, kad-fetch,
+//! kad-keyword), links + filters (link, ipfilter), port mapping (upnp,
+//! upnp-unicast, upnp-query, upnp-unmap, natpmp), and the completion-optimized
+//! fetchers (search-download, fetch-complete). Run with no arguments for
+//! usage; the match in `main` is the authoritative list.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::path::Path;
@@ -232,11 +233,6 @@ async fn cmd_global_search(target: &str, keyword: &str) {
     }
 }
 
-/// offer-search <host> <port> <name>: log into a server, OFFER a synthetic
-/// complete file named <name> (OP_OFFERFILES), then GLOBAL-SEARCH the server for
-/// a keyword from it - proving OP_OFFERFILES makes our shares findable (the
-/// deterministic local-eserver oracle loop). The TCP login is held open across
-/// the UDP search so the server keeps the file indexed.
 /// server-search <host> <port> <query>: log in and send a TCP OP_SEARCHREQUEST
 /// for <query> (a boolean expression: implicit-AND words, AND/OR/NOT, parens,
 /// "quoted phrases"), then print the hits. Used to prove a real server accepts
@@ -352,6 +348,11 @@ async fn cmd_related_search(host: &str, port: u16, hash: [u8; 16]) {
     let _ = printer.await;
 }
 
+/// offer-search <host> <port> <name>: log into a server, OFFER a synthetic
+/// complete file named <name> (OP_OFFERFILES), then GLOBAL-SEARCH the server for
+/// a keyword from it - proving OP_OFFERFILES makes our shares findable (the
+/// deterministic local-eserver oracle loop). The TCP login is held open across
+/// the UDP search so the server keeps the file indexed.
 async fn cmd_offer_search(host: &str, port: u16, name: &str) {
     use mule_engine::server_messages::{OfferedFile, FILE_COMPLETE_ID, FILE_COMPLETE_PORT};
     use tokio::net::UdpSocket;
@@ -1768,8 +1769,6 @@ async fn cmd_upnp_unicast(port: u16) {
     }
 }
 
-/// Parse an ed2k:// or magnet: link and show what it contains; for a file link
-/// with embedded sources and an out path, download it from those sources.
 /// Load an ipfilter.dat/.p2p list, report how many ranges block, and optionally
 /// test whether a given IP is blocked.
 fn cmd_ipfilter(path: &str, test_ip: Option<&str>) {
@@ -1803,6 +1802,8 @@ fn cmd_ipfilter(path: &str, test_ip: Option<&str>) {
     }
 }
 
+/// Parse an ed2k:// or magnet: link and show what it contains; for a file link
+/// with embedded sources and an out path, download it from those sources.
 async fn cmd_link(link: &str, out: Option<&str>) {
     let parsed = match mule_proto::parse_link(link) {
         Some(p) => p,
@@ -2353,8 +2354,13 @@ async fn main() {
             eprintln!("  mule-cli hash-file <path>");
             eprintln!("  mule-cli serve-file <port> <path>");
             eprintln!("  mule-cli peer-download <host> <port> <hash> <size> <out> [obf-peer-hash]");
-            eprintln!("  mule-cli peer-probe <host> <port> <hash> <size>");
+            eprintln!("  mule-cli peer-probe <host> <port> <hash>");
             eprintln!("  mule-cli sec-ident <host> <port> [obf-peer-hash]");
+            eprintln!("  mule-cli global-search <server.met|host:port> <keyword>");
+            eprintln!("  mule-cli server-search <host> <port> <boolean-query>");
+            eprintln!("  mule-cli related-search <host> <port> <ed2k-hash-hex>");
+            eprintln!("  mule-cli offer-search <host> <port> <name>");
+            eprintln!("  mule-cli offer-hold <host> <port> <name[|name2|...]> [secs]");
             eprintln!("  mule-cli kad-bootstrap <nodes.dat>");
             eprintln!("  mule-cli kad-search <nodes.dat> <ed2k-hash-hex> <size>");
             eprintln!("  mule-cli kad-fetch <nodes.dat> <ed2k-hash-hex> <size> <out>");
