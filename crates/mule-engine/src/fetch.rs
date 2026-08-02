@@ -12,6 +12,7 @@
 //!     is the LOW byte (`Ipv4Addr::new(ip, ip>>8, ip>>16, ip>>24)`).
 
 use crate::credit_store::CreditStore;
+use crate::crypt_policy::{should_obfuscate_outbound, CryptPrefs, PeerCrypt};
 use crate::multi_source::{download_from_peer_at, Download, SecIdentCtx};
 use crate::peer::HelloInfo;
 use crate::peer_conn::{connect_peer, connect_peer_obf};
@@ -38,8 +39,13 @@ pub enum SourceOrigin {
 pub struct PeerSource {
     /// Resolved, ready-to-connect address.
     pub addr: SocketAddr,
-    /// The source's userhash, if known - lets us obfuscate the connection.
+    /// The source's userhash, if known - the RC4 key seed, so obfuscation is
+    /// impossible without it (necessary, but NOT sufficient: see `crypt`).
     pub user_hash: Option<[u8; 16]>,
+    /// The source's obfuscation connect-options byte, if the discovery channel
+    /// carried one (Kad TAG_ENCRYPTION, an SX v4 record, or the obfuscated
+    /// server source/callback). `None` = never learned -> dial PLAINTEXT.
+    pub crypt: Option<u8>,
     pub origin: SourceOrigin,
 }
 
@@ -96,6 +102,7 @@ impl PeerSource {
         Some(PeerSource {
             addr: SocketAddr::from((addr, tcp)),
             user_hash: Some(s.client_hash.to_hash()),
+            crypt: s.crypt,
             origin: SourceOrigin::Kad,
         })
     }
@@ -114,8 +121,22 @@ impl PeerSource {
         Some(PeerSource {
             addr: SocketAddr::from((addr, s.port)),
             user_hash: s.user_hash,
+            crypt: s.crypt,
             origin: SourceOrigin::Server,
         })
+    }
+
+    /// Whether to dial this source with obfuscation. Delegates to the single
+    /// eMule-faithful predicate ([`crypt_policy::should_obfuscate_outbound`]),
+    /// which needs BOTH the userhash (the RC4 key seed) and the peer's own
+    /// advertised crypt support - the latter learned from the discovery channel,
+    /// since a hello only exists once the connection already does.
+    pub fn should_obfuscate(&self, ours: &CryptPrefs) -> bool {
+        should_obfuscate_outbound(
+            PeerCrypt::from_connect_options(self.crypt),
+            ours,
+            self.user_hash.is_some(),
+        )
     }
 }
 
@@ -204,10 +225,16 @@ async fn fetch_one(
     identity: Option<&Arc<Identity>>,
     credit_store: Option<&Arc<CreditStore>>,
 ) -> Result<u64, ()> {
+    // Obfuscate only when eMule would (crypt_policy, byte-faithful to
+    // BaseClient.cpp:1647): we hold the userhash AND the source advertised crypt
+    // support. Dialing obfuscated on the hash alone sends an RC4 handshake to a
+    // peer that may read it as a malformed packet and hang up - and nothing,
+    // here or in eMule, retries such a dial in plaintext.
+    let obfuscate = src.should_obfuscate(&CryptPrefs::default());
     let connect = async {
-        match src.user_hash {
-            Some(h) => connect_peer_obf(src.addr, me, &h).await,
-            None => connect_peer(src.addr, me).await,
+        match (obfuscate, src.user_hash) {
+            (true, Some(h)) => connect_peer_obf(src.addr, me, &h).await,
+            _ => connect_peer(src.addr, me).await,
         }
     };
     let (peer, mut fs) = match timeout(per_peer, connect).await {
@@ -215,15 +242,11 @@ async fn fetch_one(
         _ => return Err(()),
     };
     // Record what we learned about this source (software, obfuscation, LowID)
-    // for the per-source UI. Obfuscated iff we knew its userhash and dialed obf.
+    // for the per-source UI. Report the connection we ACTUALLY made, so the
+    // SourcesView lock reflects the wire rather than merely knowing a hash.
     let low_id = peer.client_id < 0x0100_0000;
-    dl.note_source(
-        peer.client_software(),
-        src.addr,
-        src.user_hash.is_some(),
-        low_id,
-    )
-    .await;
+    dl.note_source(peer.client_software(), src.addr, obfuscate, low_id)
+        .await;
     // Secure-ident: run it inline with the transfer when we have an identity.
     // `peer_supports` (from the peer's advertised MISCOPTIONS1) tells us whether
     // to proactively ask it to prove itself. Verifying it marks the source's blue
@@ -506,12 +529,64 @@ mod tests {
             ip: Some(0x3176_F386),
             tcp_port: Some(4662),
             udp_port: Some(4672),
+            crypt: None,
         };
         let ps = PeerSource::from_kad(&s).unwrap();
         assert_eq!(ps.addr, "49.118.243.134:4662".parse().unwrap());
         assert_eq!(ps.origin, SourceOrigin::Kad);
         // The userhash is the canonical form of the client hash.
         assert_eq!(ps.user_hash, Some([0xAB; 16]));
+    }
+
+    #[test]
+    fn the_dial_obfuscates_only_a_source_that_advertised_crypt() {
+        // The live rule (eMule Connect(), BaseClient.cpp:1647): knowing the
+        // userhash is necessary but NOT sufficient - the peer must have told us
+        // it speaks obfuscation. Before this, padMule obfuscated on a known hash
+        // alone, so a crypt-DISABLED source was dialed with an RC4 handshake it
+        // could not answer and was lost with no plaintext retry (eMule has none
+        // either; it simply never dials obfuscated blind).
+        let base = Source {
+            client_hash: Kad128::from_hash(&[0xAB; 16]),
+            source_type: 1,
+            ip: Some(0x3176_F386),
+            tcp_port: Some(4662),
+            udp_port: Some(4672),
+            crypt: None,
+        };
+        let unknown = PeerSource::from_kad(&base).unwrap();
+        assert!(unknown.user_hash.is_some(), "we DO hold its hash");
+        assert!(
+            !unknown.should_obfuscate(&CryptPrefs::default()),
+            "no advertised crypt support -> plaintext dial"
+        );
+
+        let supports = PeerSource::from_kad(&Source {
+            crypt: Some(0x01),
+            ..base.clone()
+        })
+        .unwrap();
+        assert!(supports.should_obfuscate(&CryptPrefs::default()));
+
+        // Advertised support but no userhash (no RC4 key seed) -> plaintext.
+        let mut keyless = supports.clone();
+        keyless.user_hash = None;
+        assert!(!keyless.should_obfuscate(&CryptPrefs::default()));
+    }
+
+    #[test]
+    fn a_server_source_carries_its_crypt_options_to_the_dial() {
+        // The obfuscated OP_FOUNDSOURCES variant carries the same connect-options
+        // byte; it must reach the dial decision like the Kad tag does.
+        let s = FoundSource {
+            ip: 0x8602_0102, // ed2k low-byte order
+            port: 4662,
+            crypt: Some(0x03),
+            user_hash: Some([0xCD; 16]),
+        };
+        let ps = PeerSource::from_found(&s).unwrap();
+        assert_eq!(ps.crypt, Some(0x03));
+        assert!(ps.should_obfuscate(&CryptPrefs::default()));
     }
 
     #[test]
@@ -523,6 +598,7 @@ mod tests {
                 ip: Some(0x3176_F386),
                 tcp_port: Some(4662),
                 udp_port: Some(4672),
+                crypt: None,
             };
             assert!(
                 PeerSource::from_kad(&s).is_none(),
@@ -653,6 +729,7 @@ mod tests {
             ip: Some(0x3176_F386), // 49.118.243.134
             tcp_port: Some(4662),
             udp_port: Some(4672),
+            crypt: None,
         };
         // The same peer from the server (eD2k low-byte 49.118.243.134, same port).
         let srv = FoundSource {

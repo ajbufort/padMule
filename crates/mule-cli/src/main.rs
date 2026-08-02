@@ -1944,6 +1944,7 @@ async fn cmd_link(link: &str, out: Option<&str>) {
                 .map(|&addr| mule_engine::PeerSource {
                     addr,
                     user_hash: None,
+                    crypt: None,
                     origin: mule_engine::SourceOrigin::PeerExchange,
                 })
                 .collect();

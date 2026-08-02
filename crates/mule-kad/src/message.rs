@@ -69,6 +69,13 @@ pub const TAG_SOURCETYPE: u8 = 0xFF;
 pub const TAG_SOURCEIP: u8 = 0xFE;
 /// Source TCP port (u16).
 pub const TAG_SOURCEPORT: u8 = 0xFD;
+/// The source's obfuscation connect-options byte (u8): `0x01` crypt supported,
+/// `0x02` requested, `0x04` required (`0x08` is direct-UDP callback, not crypt).
+/// eMule publishes it with every source (Search.cpp:798) and reads it back
+/// (:1096) - it is how a client decides to obfuscate an outbound dial BEFORE any
+/// hello. Same byte layout as the SX v4 / server crypt field
+/// (`CUpDownClient::SetConnectOptions`, BaseClient.cpp:3188).
+pub const TAG_ENCRYPTION: u8 = 0xF3;
 /// Keyword-result file tags. Filename (string).
 pub const TAG_FILENAME: u8 = 0x01;
 /// File size (u32, or a BSOB u64 for >4GB).
@@ -572,6 +579,10 @@ pub struct Source {
     pub tcp_port: Option<u16>,
     /// TAG_SOURCEUPORT (UDP), if present.
     pub udp_port: Option<u16>,
+    /// TAG_ENCRYPTION connect-options byte, if the publisher sent one. `None`
+    /// means we know nothing about this source's obfuscation support, which is
+    /// eMule's default (an all-zero byte) and dials PLAINTEXT.
+    pub crypt: Option<u8>,
 }
 
 impl SearchResult {
@@ -583,6 +594,7 @@ impl SearchResult {
         let mut ip = None;
         let mut tcp_port = None;
         let mut udp_port = None;
+        let mut crypt = None;
         for t in &self.tags {
             if let KadTagValue::Int(v) = t.value {
                 match t.name {
@@ -590,6 +602,7 @@ impl SearchResult {
                     TAG_SOURCEIP => ip = Some(v as u32),
                     TAG_SOURCEPORT => tcp_port = Some(v as u16),
                     TAG_SOURCEUPORT => udp_port = Some(v as u16),
+                    TAG_ENCRYPTION => crypt = Some(v as u8),
                     _ => {}
                 }
             }
@@ -604,6 +617,7 @@ impl SearchResult {
             ip,
             tcp_port,
             udp_port,
+            crypt,
         })
     }
 }
@@ -964,6 +978,40 @@ mod tests {
                 value: KadTagValue::Str(b"movie.avi".to_vec()),
             }],
         };
+        let enc = SearchResult {
+            answer: Kad128::from_hash(&[0xCC; 16]),
+            tags: vec![
+                KadTag {
+                    name: TAG_SOURCETYPE,
+                    value: KadTagValue::Int(1),
+                },
+                KadTag {
+                    name: TAG_SOURCEIP,
+                    value: KadTagValue::Int(0x5FEC_24FA),
+                },
+                KadTag {
+                    name: TAG_SOURCEPORT,
+                    value: KadTagValue::Int(4662),
+                },
+                // TAG_ENCRYPTION: the publisher's connect-options byte
+                // (supports|requests). eMule Search.cpp:798 publishes it and
+                // :1096 reads it back - it is how a client knows to obfuscate
+                // an outbound dial BEFORE any hello.
+                KadTag {
+                    name: TAG_ENCRYPTION,
+                    value: KadTagValue::Int(0x03),
+                },
+            ],
+        };
+        assert_eq!(
+            enc.as_source().unwrap().crypt,
+            Some(0x03),
+            "TAG_ENCRYPTION must reach the Source so the dial can be obfuscated"
+        );
+        // A source WITHOUT the tag carries no crypt info (-> plaintext dial,
+        // matching eMule's default of an all-zero connect-options byte).
+        assert_eq!(hi.as_source().unwrap().crypt, None);
+
         let (op, payload) = build_search_res(&responder, &target, &[hi.clone(), kw.clone()]);
         assert_eq!(op, OP_SEARCH_RES);
 
