@@ -14,10 +14,11 @@
 //!   peer will ever be offered, and the download would stall a few bytes short
 //!   with no visible error.
 
+use std::collections::{HashMap, HashSet};
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Mutex;
@@ -92,6 +93,17 @@ pub struct Download {
     /// of one that is still running (pause() does not abort the old task), which
     /// would multiply outbound peer connections every background/foreground cycle.
     fetching: AtomicBool,
+    /// Which source IP(s) contributed to each data part, recorded as blocks commit.
+    /// On a part-hash failure, the SOLE contributor of a bad part is the
+    /// unambiguous culprit (no false-positive). Keyed by IP, NOT SocketAddr: a
+    /// LowID source reaches us on a fresh ephemeral port every callback, so a
+    /// port-inclusive key would never match. A separate std lock: a quick insert on
+    /// the hot commit path must never contend the async transfer lock.
+    part_sources: StdMutex<HashMap<u64, HashSet<IpAddr>>>,
+    /// Source IPs banned for THIS download after being caught delivering a corrupt
+    /// part (eMule's CorruptionBlackBox, per-file). BOTH the outbound fetch sweep
+    /// AND the inbound called-back-source path skip them.
+    banned: StdMutex<HashSet<IpAddr>>,
 }
 
 struct Inner {
@@ -125,6 +137,8 @@ impl Download {
             preview: AtomicBool::new(false),
             finalizing: AtomicBool::new(false),
             fetching: AtomicBool::new(false),
+            part_sources: StdMutex::new(HashMap::new()),
+            banned: StdMutex::new(HashSet::new()),
         })
     }
 
@@ -409,9 +423,32 @@ impl Download {
     }
 
     /// Write received bytes through to disk and close their gap.
-    async fn commit(&self, start: u64, data: &[u8]) -> io::Result<()> {
+    async fn commit(&self, start: u64, data: &[u8], source: Option<SocketAddr>) -> io::Result<()> {
+        // Remember which source contributed each part this block touches, so a
+        // later part-hash failure can be attributed (localize_corruption).
+        if let Some(addr) = source {
+            let end = start.saturating_add(data.len() as u64);
+            let first = start / PARTSIZE;
+            let last = end.saturating_sub(1) / PARTSIZE;
+            let mut ps = self.part_sources.lock().unwrap();
+            for p in first..=last {
+                ps.entry(p).or_default().insert(addr.ip());
+            }
+        }
         let mut g = self.inner.lock().await;
         g.store.write_block(start, data)
+    }
+
+    /// True if `addr`'s IP was banned for this download (caught delivering
+    /// corruption). Compared by IP, so it catches a LowID source dialing back from
+    /// a new ephemeral port. Both serve paths (sweep + callback) consult this.
+    pub fn is_banned(&self, addr: &SocketAddr) -> bool {
+        self.banned.lock().unwrap().contains(&addr.ip())
+    }
+
+    /// Banned source IPs so far, for tests/telemetry.
+    pub fn banned_sources(&self) -> Vec<IpAddr> {
+        self.banned.lock().unwrap().iter().copied().collect()
     }
 
     /// Verify every part whose bytes have all arrived. A part that fails is
@@ -487,6 +524,22 @@ impl Download {
             g.store.pf.mark_corrupt(*p);
         }
         let _ = g.store.save_met();
+        drop(g);
+        // Attribute each bad part to its SOLE contributor and BAN it (eMule's
+        // CorruptionBlackBox, per-file). Only a sole contributor is unambiguous -
+        // a part fed by several sources is NOT blamed (we cannot tell which block
+        // was bad without AICH block hashes), so a good source is never
+        // false-banned. Clear each bad part's contributor set: its bytes were just
+        // re-gapped, so a re-fetch re-attributes from scratch.
+        let mut ps = self.part_sources.lock().unwrap();
+        let mut banned = self.banned.lock().unwrap();
+        for p in &bad {
+            if let Some(sources) = ps.remove(p) {
+                if sources.len() == 1 {
+                    banned.extend(sources);
+                }
+            }
+        }
         true
     }
 
@@ -784,7 +837,7 @@ where
                 if let Some((cs, uh)) = &credit {
                     cs.add_downloaded(*uh, w.data.len() as u64, now_secs());
                 }
-                dl.commit(w.offset, &w.data)
+                dl.commit(w.offset, &w.data, peer)
                     .await
                     .map_err(TransferError::Io)?;
             }
@@ -832,11 +885,15 @@ mod tests {
         let dl = Download::new(store);
         dl.set_hashset(ph).await;
 
-        // Part 0 arrives intact; part 1 arrives corrupted (but "complete").
-        dl.commit(0, &good[..PARTSIZE as usize]).await.unwrap();
+        // Part 0 arrives intact from GOOD; part 1 arrives corrupted from BAD.
+        let good_src: SocketAddr = "1.2.3.4:4662".parse().unwrap();
+        let bad_src: SocketAddr = "5.6.7.8:4662".parse().unwrap();
+        dl.commit(0, &good[..PARTSIZE as usize], Some(good_src))
+            .await
+            .unwrap();
         let mut bad = good[PARTSIZE as usize..].to_vec();
         bad[0] ^= 0xFF;
-        dl.commit(PARTSIZE, &bad).await.unwrap();
+        dl.commit(PARTSIZE, &bad, Some(bad_src)).await.unwrap();
         assert!(dl.is_complete().await, "all bytes present");
         assert!(
             !dl.verify_whole_file(size as u64, hash).await,
@@ -849,6 +906,63 @@ mod tests {
             dl.missing().await,
             crate::part_file::part_size(1, size as u64),
             "ONLY part 1 was re-opened, not the whole file"
+        );
+        // The SOLE contributor of the bad part is banned; the good source is not.
+        assert!(
+            dl.is_banned(&bad_src),
+            "the corrupt part's source is banned"
+        );
+        assert!(
+            !dl.is_banned(&good_src),
+            "the source of the GOOD part is never banned"
+        );
+        // Banned by IP, not SocketAddr: the same host on a DIFFERENT port (a LowID
+        // source dialing back from a fresh ephemeral port) is still caught.
+        let bad_callback: SocketAddr = "5.6.7.8:51000".parse().unwrap();
+        assert!(
+            dl.is_banned(&bad_callback),
+            "the ban catches the same IP on a new port (LowID callback case)"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_part_from_two_sources_bans_neither_no_false_positive() {
+        // Without AICH block hashes we cannot tell WHICH of two contributors sent
+        // the bad block, so a part fed by more than one source blames NOBODY - a
+        // good source is never false-banned.
+        let dir = tmpdir("localize-shared");
+        let size = (PARTSIZE + 300_000) as usize;
+        let good: Vec<u8> = (0..size as u32)
+            .map(|i| (i.wrapping_mul(17)) as u8)
+            .collect();
+        let hash = ed2k_hash(&good);
+        let ph = vec![
+            md4(&good[..PARTSIZE as usize]),
+            md4(&good[PARTSIZE as usize..]),
+        ];
+        let store = PartStore::create(&dir, 1, hash, size as u64, b"loc.bin").unwrap();
+        let dl = Download::new(store);
+        dl.set_hashset(ph).await;
+
+        let a: SocketAddr = "1.1.1.1:4662".parse().unwrap();
+        let b: SocketAddr = "2.2.2.2:4662".parse().unwrap();
+        // Part 0 intact (from A). Part 1 corrupt, delivered in TWO blocks from A and B.
+        dl.commit(0, &good[..PARTSIZE as usize], Some(a))
+            .await
+            .unwrap();
+        let mut bad = good[PARTSIZE as usize..].to_vec();
+        bad[0] ^= 0xFF;
+        let half = bad.len() / 2;
+        dl.commit(PARTSIZE, &bad[..half], Some(a)).await.unwrap();
+        dl.commit(PARTSIZE + half as u64, &bad[half..], Some(b))
+            .await
+            .unwrap();
+
+        assert!(dl.localize_corruption().await, "localized the bad part");
+        assert!(
+            dl.banned_sources().is_empty(),
+            "a part with two contributors blames neither"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -864,7 +978,7 @@ mod tests {
         let hash = ed2k_hash(&file);
         let store = PartStore::create(&dir, 1, hash, file.len() as u64, b"one.bin").unwrap();
         let dl = Download::new(store);
-        dl.commit(0, &file).await.unwrap();
+        dl.commit(0, &file, None).await.unwrap();
         assert!(
             !dl.localize_corruption().await,
             "no hashset -> cannot localize"

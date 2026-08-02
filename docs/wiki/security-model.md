@@ -12,10 +12,11 @@ off from most peers/servers).
 ## SCORECARD (security-completeness audit, 2026-07-20)
 
 A 26-measure adversarial audit (6 domain finders -> per-measure attacker ->
-synthesis, 33 agents). Tally as of 2026-08-02: **20 OPERATIONAL, 4 PARTIAL,
-2 MISSING** (the credit-system row went MISSING -> PARTIAL when its store landed,
-8ag, then -> OPERATIONAL when the upload-queue reweight + download accrual landed,
-8ah; the secure-ident + credits gate item is now complete end to end). History: the 2026-07-20 audit scored 11/12/3; B6 MOTD-flood + B8
+synthesis, 33 agents). Tally as of 2026-08-02: **21 OPERATIONAL, 3 PARTIAL,
+2 MISSING** (credit-system row: MISSING -> PARTIAL when its store landed, 8ag, ->
+OPERATIONAL with the reweight + download accrual, 8ah; poisoning-defense row ->
+OPERATIONAL with per-source corruption attribution + ban, 8ai). The 3 remaining
+PARTIAL are all Kad or AICH completeness; the 2 MISSING are opt-in server obf. History: the 2026-07-20 audit scored 11/12/3; B6 MOTD-flood + B8
 SSRF closed it to 13/10/3 (commit 625df39); the 2026-08-01 security-hardening
 batch (Kad receiver-key/verified-bit + ipfilter/sybil/answer-validation, per-part
 poison recovery, per-IP inbound cap, inbound TCP obfuscation, search availability
@@ -29,10 +30,13 @@ eMule-0.50a-grounded, test-first, and adversarially re-reviewed - see
 file or RCE - the integrity core is OPERATIONAL + oracle-proven. Serve-side
 secure-ident (8af) AND the full credit system (8ag store + 8ah reweight/accrual)
 landed 2026-08-02, closing the whole anti-impersonation/anti-leech identity+credit
-axis. The 4 remaining PARTIAL rows are narrower COMPLETENESS items (Kad verified-bit
-not yet ENFORCED in routing; Kad send-side receiver keys; per-source corruption
-attribution; AICH block recovery) - none is an integrity or RCE hole. The 2 MISSING
-are server TCP/UDP obfuscation (opt-in anti-DPI, shippable documented-as-not-active).
+axis, and per-source corruption attribution + ban (8ai) closed the poisoning row.
+The 3 remaining PARTIAL rows are narrower COMPLETENESS items (Kad verified-bit not
+yet ENFORCED in routing; Kad send-side receiver keys; AICH block recovery) - none
+is an integrity or RCE hole, and the two Kad items need a real-Kad validation path
+(no reverse-Kad oracle exists, so the send-side "a real eMule verifies us" cannot be
+faithfully proven yet). The 2 MISSING are server TCP/UDP obfuscation (opt-in
+anti-DPI, shippable documented-as-not-active).
 Shortest path to yes = the Kad hard-verify pair (send-side keys + verified-bit
 enforcement via the HELLO_RES_ACK challenge), validated against the real Kad network.
 
@@ -55,7 +59,7 @@ enforcement via the HELLO_RES_ACK challenge), validated against the real Kad net
 | Kad node-ID/IP verification + 2^120 | PARTIAL | tolerance proven; verified bit now TRACKED + persisted + set from the receiver key + CLEARED on any ip change (2026-08-01); still not ENFORCED (unverified contacts are used in routing) - hard exclusion needs the HELLO_RES_ACK challenge machinery |
 | Kad anti-flood hardening | OPERATIONAL (2026-08-01) | sybil cap now 1/IP + 10//24 (matches eMule RoutingBin.cpp:56); a known id re-pointed to a new IP faces the cap (no free hijack). FloodTracker is N/A for a requests-only client (eMule exempts RESPONSE opcodes from its inbound flood limiter; padMule serves no inbound Kad requests) - documented, ready if a request-server is ever added |
 | AICH part-level + block RECOVERY | PARTIAL | per-part MD4 blame + targeted re-fetch now live (localize_corruption, 2026-08-01), so integrity is safe without AICH; AICH master hash byte-valid; the 180KB block-recovery protocol (OP_AICHREQUEST) is a future OPTIMIZATION, not an integrity/interop gap. KEEP advertising the AICH bit: 0x34103212 is byte-verified against real aMule (which also advertises it), and an unanswered AICH request is NON-breaking - eMule calls ClientAICHRequestFailed and re-downloads the part (DownloadClient.cpp:2295), never disconnects/bans (verified 2026-08-01). Clearing the bit would DIVERGE from every real client for no benefit. |
-| Poisoning defense (bad part re-fetchable) | PARTIAL | whole-file MD4 holds AND a bad part is now blamed per-MD4 and re-fetched alone (2026-08-01, closes the full-re-download loop); per-SOURCE attribution + ban (eMule CorruptionBlackBox) still absent |
+| Poisoning defense (bad part re-fetchable) | OPERATIONAL (2026-08-02) | whole-file MD4 holds; a bad part is blamed per-MD4 and re-fetched alone (8ab); AND the SOURCE that delivered a bad part is now attributed + BANNED for that file (8ai, eMule CorruptionBlackBox). SOLE-contributor rule = a good source is never false-banned (a part fed by >1 source blames nobody, since without AICH block hashes we cannot pinpoint the bad block). LIMITATION: an attacker sharing every poisoned part with a good source evades the ban (finer attribution needs the deferred AICH block recovery) - strictly better than no attribution, never false-positives. |
 | Search-result SPAM filter | OPERATIONAL (2026-08-01) | intra-hash heuristics + a spam-availability cap (Suspect rows ranked at min(sources,5), eMule SearchList.cpp:813). eMule's "cross-hash filename-repetition" is NOT a real 0.50a feature (audit correction); a padMule cross-hash score was built then REMOVED - it flagged legit files sharing a generic name (adversarial review finding) |
 | Server MOTD/result FLOOD rate-limit | OPERATIONAL (B6 fixed 625df39) | forwarder now rate-limits server events 30/10s (State exempt); MOTD attributed + 500-char capped |
 | Server-trust (source/IP sanity) | OPERATIONAL (B8 fixed 625df39) | PeerSource::from_found/from_kad now reject non-public IPv4 unconditionally (SSRF closed); LowID/port0 already rejected |

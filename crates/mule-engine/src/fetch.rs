@@ -453,6 +453,11 @@ pub async fn download_file(
                     let Some(src) = queue.lock().await.pop_front() else {
                         break;
                     };
+                    // Skip a source banned for delivering a corrupt part to this
+                    // file (per-source poisoning defense, multi_source::localize_corruption).
+                    if dl.is_banned(&src.addr) {
+                        continue;
+                    }
                     tried += 1;
                     match fetch_one(
                         &dl,
