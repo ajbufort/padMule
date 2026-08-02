@@ -989,6 +989,13 @@ pub struct Engine {
     connection: Option<ServerInfo>,
     /// The live Kad node (owns the UDP socket), once bootstrapped.
     kad: Option<KadNode>,
+    /// Our public IPv4, as UPnP/SSDP reported it (`theApp.GetPublicIP`). Learned
+    /// in `map_port`, fed to the Kad node so it can echo a peer's UDP verify key
+    /// (bound to THIS ip) and be verified faster. `None` until a mapping succeeds;
+    /// a stale value only disables the echo (the key-echo gate is IP-equality),
+    /// never mis-verifies. Host order (first octet = MSByte), matching
+    /// `udp_verify_key`. Never emitted - it is our public IP verbatim.
+    public_ip: Option<Ipv4Addr>,
     /// The inbound peer listener's accept loop (dropping it frees port 4662).
     listener: Option<JoinHandle<()>>,
     /// Sender handed to each ServerLink; its forwarder task is spawned once.
@@ -1044,6 +1051,7 @@ impl Engine {
             server: None,
             connection: None,
             kad: None,
+            public_ip: None,
             listener: None,
             server_tx: None,
             last_server_search: None,
@@ -1498,11 +1506,14 @@ impl Engine {
     /// because on a debugger-less device this line is the only window into why the
     /// port did or did not open. Messages are prefixed "UPnP:" so the UI can pin
     /// them to a durable row instead of the transient notice.
-    async fn map_port(&self) {
+    async fn map_port(&mut self) {
         match crate::upnp::map_port(TCP_PORT, "padMule", 0).await {
-            Ok(_ip) => {
+            Ok(ip) => {
                 // The external IP the gateway reports is deliberately NOT emitted:
-                // this reaches the UI, and that is our public IP verbatim.
+                // this reaches the UI, and that is our public IP verbatim. It IS
+                // kept internally: the Kad node keys its UDP-verify-key echo on it
+                // (see `public_ip`), which is how a peer verifies us faster.
+                self.public_ip = Some(ip);
                 self.emit(EngineEvent::Server(format!("UPnP: mapped port {TCP_PORT}")));
             }
             Err(e) => {
@@ -1966,6 +1977,12 @@ impl Engine {
         // Thread the user blocklist into Kad so it gates routing inserts (eMule
         // filters every Kad contact, RoutingZone.cpp:477), matching the eD2k path.
         node.set_ip_filter(self.ip_filter.clone());
+        // Feed our public IP (from the UPnP map above) so the node echoes a peer's
+        // UDP verify key bound to THIS ip - the send-side of Kad hard-verify. `None`
+        // (no mapping) leaves it 0, which disables the echo (the proven baseline).
+        // On resume the last-learned value persists; a stale one only skips the
+        // optimization (the echo gate is IP-equality), it never mis-verifies.
+        node.set_public_ip(self.public_ip.map_or(0, u32::from));
         // Cap the OVERALL bootstrap: 40 contacts * 1200ms is ~48s worst case, and
         // start_kad runs while the single shared engine lock is held (start/resume
         // via the FFI), so an uncapped bootstrap would block pause()'s socket
