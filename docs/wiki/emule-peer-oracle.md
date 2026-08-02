@@ -1,6 +1,6 @@
 # eMule peer oracle (real eMule on the Windows host)
 
-Updated: 2026-07-19
+Updated: 2026-08-01
 
 A SECOND, independent peer oracle for padMule's client-to-client protocol: a
 real **eMule running on the Windows host**, alongside the headless **amuled**
@@ -81,6 +81,51 @@ SecureIdent v1 and run the exchange, so `scripts/emule-oracle.sh` prints
 "source identity verified (secure-ident): true/false" - the live confirmation
 against real eMule. (`peer-probe` still uses the sec_ident=0 baseline, so it is
 only a plain-handshake tracer; use the oracle script for the secure-ident check.)
+
+## The REVERSE-direction oracle (real amuled downloads FROM padMule) - AUTOMATED
+
+`scripts/differential-test.sh` and the eMule test above both have padMule
+DOWNLOAD from the other side, so they exercise padMule's DOWNLOADER wire bytes.
+They never touch padMule's SERVE side. `scripts/amuled-reverse-oracle.sh`
+(added 2026-08-01) closes that gap fully unattended: a real **amuled 3.0.1
+downloads a file FROM padMule**, relayed through the real Lugdunum eserver
+([[ed2k-server-oracle]]), all inside one isolated `unshare -rn` namespace.
+
+Why the eserver relay: amuled will NOT dial an OFFLINE, link-embedded source,
+but it WILL request sources from a connected server and dial them. So padMule
+serves the file AND offers it to the eserver (`serve-file <port> <path>
+<eserver-host> <eserver-port>` logs in + OP_OFFERFILES); amuled, connected to the
+same eserver, discovers padMule as a source and dials it. This is the same
+"server relays the source" technique the live network uses for HighID sources.
+
+Namespace details that MATTER (each was a real failure before the test passed):
+
+- **Public-looking IPs on distinct /24s.** amuled filters PRIVATE server IPs
+  (`FilterLanIPs`), and a source must differ from both the server IP and
+  amuled's own IP. The script uses 45.45/77.77/88.88 addresses on one dummy
+  interface; nothing leaves the namespace.
+- **padMule's serve IP is added FIRST** so it is the interface primary -> that
+  is the HighID source address the eserver hands to amuled.
+- **server.met stores the IP in dotted-quad order** (`inet_aton`, NOT reversed).
+- amuled is driven headlessly: `-c CFG -o -i`, `Autoconnect=1`, crypt/ipfilter
+  off, the download queued via its `ED2KLinks` file (NO embedded source).
+
+Run it (after `build-amuled-oracle.sh` + `eserver-oracle.sh` once, release CLI):
+
+```bash
+cargo build --release -p mule-cli
+scripts/amuled-reverse-oracle.sh    # PASS = amuled pulled the file byte-for-byte
+```
+
+What it caught on day one: the **multipacket serve bug** ([[build-progress]] row
+8ad). padMule's HELLO advertised ext_multipacket, so amuled sent the bundled
+OP_MULTIPACKET_EXT (0xa4) request, which padMule's serve loop drops - transfer
+died at 0 bytes. Every symmetric test missed it because padMule-as-downloader
+sends the INDIVIDUAL opcodes. Fix (commit 04d9116): stop advertising multipacket
+so real clients fall back to the individual OP_REQUESTFILENAME sequence padMule
+serves. With the fix the oracle PASSES - the FIRST validation of padMule's serve
+bytes (filename/status/hashset/accept/sending-part) against a genuine client. Set
+`SERVE_DEBUG=1` to trace the serve opcodes padMule receives.
 
 ## Troubleshooting
 

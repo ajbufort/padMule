@@ -100,6 +100,21 @@ bullet each; Locked decisions newest first, Lessons in the order learned.
 
 ## Lessons
 
+- 2026-08-01 **A symmetric interop test suite is blind exactly where the two
+  roles send different bytes.** padMule had two peer oracles (the amuled
+  differential + the manual eMule oracle) and a full padMule<->padMule test set -
+  and ALL of them had padMule DOWNLOAD, so padMule's SERVE-side wire bytes were
+  never once driven by a real client. When a real amuled finally downloaded FROM
+  padMule (via `scripts/amuled-reverse-oracle.sh`, the eserver relaying the
+  source), it failed at 0 bytes on the very first run: padMule advertised
+  ext_multipacket in its HELLO but its serve loop drops the bundled
+  OP_MULTIPACKET_EXT (0xa4) - the download-side never sends a multipacket (it
+  sends the individual opcodes), so no symmetric path had ever delivered one to
+  padMule's serve side. Same class as the Wave-4d advertise-what-you-honour bug.
+  Rule: for a two-role protocol, you need an oracle for EACH direction; a test
+  where both peers are the code under test, or where your code only ever plays
+  one role, cannot see a bug that lives in the other role's bytes. See
+  [[emule-peer-oracle]] (reverse-direction oracle) and [[build-progress]] row 8ad.
 - 2026-07-14 **Agent-derived constants are a HYPOTHESIS until a test pins them
   against real bytes.** The Wave-4d research pass reported the source-exchange
   record sizes as 14/30/31. They are 12/28/29 - upstream's own size checks are

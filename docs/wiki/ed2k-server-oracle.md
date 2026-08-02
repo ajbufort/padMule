@@ -39,6 +39,12 @@ reaches it on 127.0.0.1. The binary is NOT committed - it lives gitignored under
 
 Provenance: `https://www.emule-security.org/downloads/100` (the same site padMule
 already trusts for `server.met`) -> `lugdunum_eserver_17.15_linux.zip`.
+
+Lugdunum's own operator docs (config keys, `donkey.ini`, the console commands)
+survive only on archive.org - the canonical reference is the "kiten" page:
+`https://web.archive.org/web/20071012044411/http://lugdunum2k.free.fr/kiten.html`
+(Anthony, 2026-08-01). Useful both for driving this oracle and for the future
+Lugdunum-modernization project ([[future-lugdunum-modernization]]).
 - zip sha256:    `e518451a619edef5eb8aab1486715fab6364bacd9fc79a47a5d45b77250b47ea`
 - eserver-i686:  `fe38ecdf7165badf0ca47185e6aff813e4c0b074b48f7fc4094231b5303b6f55`
 - eserver-x86_64:`82d190179bb64a3806659f47344102840de919c011fd0cab5bda251308e72ed7`
