@@ -16,7 +16,21 @@ is independent of obfuscation.
 - **Client-to-client TCP obfuscation (RC4)** - both roles. Outbound proven vs
   amuled; inbound wired via `obf_accept` auto-detect; the listener advertises
   crypt-SUPPORTED (never REQUIRED) so a crypt-required peer can reach us and a
-  plaintext peer stays byte-identical. See [[build-progress]] rows 5a / 8ab.
+  plaintext peer stays byte-identical. See [[build-progress]] rows 5a / 8ab / 8al.
+
+  **When an OUTBOUND dial is obfuscated (the trigger, corrected 2026-08-02, row
+  8al):** only when we hold the source's userhash (the RC4 key seed) AND the
+  source itself advertised crypt support - byte-faithful to eMule `Connect()`
+  (BaseClient.cpp:1647). The peer's crypt bits arrive WITH the source, before
+  any hello can exist: Kad `TAG_ENCRYPTION` (0xF3), an SX v4 record, or the
+  obfuscated server source/callback; all three are the same connect-options byte
+  (0x01 supported / 0x02 requested / 0x04 required, `SetConnectOptions`). A
+  source that never advertised crypt is dialed PLAINTEXT. That is not a weaker
+  posture, it is the only safe one: an RC4 handshake sent to a crypt-disabled
+  peer reads as a malformed packet and it hangs up, and NEITHER eMule NOR
+  padMule retries such a dial in plaintext - the source is simply lost. padMule
+  previously obfuscated on a known hash alone, which could strand exactly those
+  peers.
 - **Kad UDP obfuscation** - every Kad2 datagram is obfuscated (NodeID-keyed
   requests, ReceiverKey-keyed responses); live-proven decoding real v8 nodes.
 - **Secure identification (RSA)** - both roles verify a peer's userhash ownership
