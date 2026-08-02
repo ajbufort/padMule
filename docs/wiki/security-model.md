@@ -12,9 +12,10 @@ off from most peers/servers).
 ## SCORECARD (security-completeness audit, 2026-07-20)
 
 A 26-measure adversarial audit (6 domain finders -> per-measure attacker ->
-synthesis, 33 agents). Tally as of 2026-08-02: **19 OPERATIONAL, 5 PARTIAL,
-2 MISSING** (the credit-system row moved MISSING -> PARTIAL when its store went
-live, 8ag; only the queue reweight + download accrual remain on it). History: the 2026-07-20 audit scored 11/12/3; B6 MOTD-flood + B8
+synthesis, 33 agents). Tally as of 2026-08-02: **20 OPERATIONAL, 4 PARTIAL,
+2 MISSING** (the credit-system row went MISSING -> PARTIAL when its store landed,
+8ag, then -> OPERATIONAL when the upload-queue reweight + download accrual landed,
+8ah; the secure-ident + credits gate item is now complete end to end). History: the 2026-07-20 audit scored 11/12/3; B6 MOTD-flood + B8
 SSRF closed it to 13/10/3 (commit 625df39); the 2026-08-01 security-hardening
 batch (Kad receiver-key/verified-bit + ipfilter/sybil/answer-validation, per-part
 poison recovery, per-IP inbound cap, inbound TCP obfuscation, search availability
@@ -24,14 +25,16 @@ gap - both roles now verify, oracle-proven (-> 19/4/3). Each change was
 eMule-0.50a-grounded, test-first, and adversarially re-reviewed - see
 [[build-progress]] rows 8ab / 8af.
 
-**BOTTOM LINE: NOT yet bulletproof, but close.** No failure delivers a corrupt
-file or RCE - the integrity core is OPERATIONAL + oracle-proven. The 4 remaining
-PARTIAL rows are anti-impersonation/anti-leech COMPLETENESS (Kad verified-bit not
-yet ENFORCED in routing; Kad send-side receiver keys; per-source corruption
-attribution; AICH block recovery) - none is an integrity or RCE hole. Serve-side
-secure-ident landed 2026-08-02 (8af). Shortest path to yes = the credit system
-(wire the verified identity, now available both roles, into an upload-queue
-reweight) + Kad hard-verify, all validated against the real-eMule/eserver oracles.
+**BOTTOM LINE: NOT yet bulletproof, but very close.** No failure delivers a corrupt
+file or RCE - the integrity core is OPERATIONAL + oracle-proven. Serve-side
+secure-ident (8af) AND the full credit system (8ag store + 8ah reweight/accrual)
+landed 2026-08-02, closing the whole anti-impersonation/anti-leech identity+credit
+axis. The 4 remaining PARTIAL rows are narrower COMPLETENESS items (Kad verified-bit
+not yet ENFORCED in routing; Kad send-side receiver keys; per-source corruption
+attribution; AICH block recovery) - none is an integrity or RCE hole. The 2 MISSING
+are server TCP/UDP obfuscation (opt-in anti-DPI, shippable documented-as-not-active).
+Shortest path to yes = the Kad hard-verify pair (send-side keys + verified-bit
+enforcement via the HELLO_RES_ACK challenge), validated against the real Kad network.
 
 | Measure | Status | Note |
 |---------|--------|------|
@@ -58,7 +61,7 @@ reweight) + Kad hard-verify, all validated against the real-eMule/eserver oracle
 | Server-trust (source/IP sanity) | OPERATIONAL (B8 fixed 625df39) | PeerSource::from_found/from_kad now reject non-public IPv4 unconditionally (SSRF closed); LowID/port0 already rejected |
 | ipfilter Kad UDP coverage | OPERATIONAL (2026-08-01) | the user blocklist now gates every Kad routing insert (kad_live::add_contact, matches eMule RoutingZone.cpp:477); inbound Kad UDP is only ever a reply from an IP we queried (from the now-filtered routing table) |
 | Input safety: bounded inbound listener | OPERATIONAL (2026-08-01) | 200-permit global semaphore + a per-IP cap (16/IP, IpConnSlot) so one address cannot starve all permits; serve-session budget (60s idle / 120s queue) already present |
-| Credit system (clients.met, ident-gated) | PARTIAL (2026-08-02) | The STORE is now live (build-progress 8ag, commit dbcc0ab): credit_store::CreditStore persists clients.met (load on start / save on pause), binds a verified peer's key with eMule's anti-theft wipe, accrues UPLOAD bytes per peer, and exposes a reweight-only score (resolve_ident_state + score_ratio_ident, clamped [1.0,10.0]). REMAINING: (a) DOWNLOAD-side accrual (source userhash through the download hot path); (b) the upload-queue REWEIGHT that CONSUMES the score - the one no-oracle hot-path change (UploadGate FIFO needs priority admission). Until the reweight lands, verified identity is accrued/bound but not yet reordering the queue. |
+| Credit system (clients.met, ident-gated) | OPERATIONAL (2026-08-02) | FULLY live (build-progress 8ag store + 8ah reweight, commits dbcc0ab + b6262c8). credit_store::CreditStore persists clients.met (load on start / save on pause), binds a verified peer's key with eMule's anti-theft wipe, accrues BOTH upload bytes (per leecher) and download bytes (per source, threaded through the download path), resolves a reweight-only score (resolve_ident_state + score_ratio_ident, clamped [1.0,10.0]), and the upload queue is a PRIORITY UploadGate that serves the best-scored waiter first. NEVER-REFUSE: score only reorders; the sole refusal is a full queue, identity-independent. Adversarial review of the concurrency (lost-wakeup/leak/starvation/ordering) came back CLEAN; proven end-to-end by a client SIMULATION (a HIGH-credit leecher queued 2nd is served before a fresh one queued 1st). This is what makes serve-side secure-ident (the row above) do WORK - the verified identity now feeds the reweight. |
 | Server TCP obfuscation | MISSING | plaintext-only; OPT-IN anti-DPI, no server cut off (ship documented) |
 | Server UDP obfuscation | MISSING | cleartext port+4; OPT-IN; low-burden partial via OP_GETSOURCES_OBFU |
 
