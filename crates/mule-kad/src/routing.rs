@@ -205,6 +205,14 @@ impl Zone {
 pub struct RoutingTable {
     self_id: Kad128,
     root: Zone,
+    /// Hand out only IP-VERIFIED contacts as lookup candidates, as eMule does
+    /// unconditionally (`CRoutingBin::GetClosestTo`, RoutingBin.cpp:244). ON by
+    /// default: an unverified contact has never proven it lives at the address
+    /// we hold for it, so using it to steer a search is exactly the opening a
+    /// spoofer wants. Bootstrap does not go through here (it dials the nodes.dat
+    /// list directly) and every node that answers becomes verified, so the
+    /// candidate pool fills as the session runs.
+    enforce_verified: bool,
 }
 
 impl RoutingTable {
@@ -213,6 +221,28 @@ impl RoutingTable {
         RoutingTable {
             self_id,
             root: Zone::leaf(0, 0),
+            enforce_verified: true,
+        }
+    }
+
+    /// Lift (or restore) the verified-only rule. Provided for a live diagnostic
+    /// that needs to see the raw table; the shipped engine leaves it ON.
+    pub fn set_enforce_verified(&mut self, on: bool) {
+        self.enforce_verified = on;
+    }
+
+    /// Whether a lookup ANSWER naming `id` at `ip`:`udp_port` may be accepted,
+    /// mirroring eMule's `CRoutingZone::IsAcceptableContact` (RoutingZone.cpp:
+    /// 1014-1020): a contact we have already VERIFIED owns its id at its address,
+    /// so the same id arriving at a different address is a hijack attempt and is
+    /// refused. An unverified contact never proved anything, so it may be
+    /// replaced freely.
+    pub fn is_acceptable_answer(&self, id: &Kad128, ip: u32, udp_port: u16) -> bool {
+        let mut all: Vec<&Contact> = Vec::new();
+        self.root.collect(&mut all);
+        match all.iter().find(|c| c.id == *id) {
+            Some(known) if known.verified => known.ip == ip && known.udp_port == udp_port,
+            _ => true,
         }
     }
 
@@ -344,6 +374,9 @@ impl RoutingTable {
     pub fn closest_to(&self, target: &Kad128, count: usize) -> Vec<Contact> {
         let mut all: Vec<&Contact> = Vec::new();
         self.root.collect(&mut all);
+        if self.enforce_verified {
+            all.retain(|c| c.verified);
+        }
         all.sort_by_key(|c| target.distance(&c.id));
         all.into_iter().take(count).cloned().collect()
     }
@@ -358,6 +391,61 @@ mod tests {
 
     fn id(seed: u8) -> Kad128 {
         Kad128::from_hash(&[seed; 16])
+    }
+
+    #[test]
+    fn closest_to_hands_out_only_ip_verified_contacts() {
+        // Wave-10 Batch B, the enforcement eMule applies unconditionally:
+        // CRoutingBin::GetClosestTo returns a contact only when
+        // `IsIpVerified()` (RoutingBin.cpp:244). An unverified contact has not
+        // proven it actually lives at the IP we hold, so handing it out as a
+        // lookup candidate is what lets a spoofer steer our searches.
+        let mut rt = RoutingTable::new(id(0));
+        rt.add(id(1), 0x0101_0101, 1, 2, 8, /*verified=*/ true);
+        rt.add(id(2), 0x0202_0202, 1, 2, 8, /*verified=*/ false);
+        let got = rt.closest_to(&id(3), 10);
+        assert_eq!(got.len(), 1, "the unverified contact is withheld");
+        assert_eq!(got[0].id, id(1));
+        assert!(got.iter().all(|c| c.verified));
+
+        // It is a FILTER, not a reordering: with nothing verified there are no
+        // candidates at all, and a lookup correctly reports NotReady rather than
+        // querying peers that never proved their address. (Bootstrap is
+        // unaffected - it dials the nodes.dat list directly, not closest_to -
+        // and each node that answers becomes verified, so the pool grows.)
+        let mut fresh = RoutingTable::new(id(0));
+        fresh.add(id(9), 0x0909_0909, 1, 2, 8, false);
+        assert!(fresh.closest_to(&id(3), 10).is_empty());
+    }
+
+    #[test]
+    fn the_verified_gate_can_be_lifted_for_diagnostics() {
+        // An escape hatch for a live diagnostic (e.g. proving a routing table
+        // loaded correctly before anything has answered). OFF by default, so the
+        // shipped engine always enforces.
+        let mut rt = RoutingTable::new(id(0));
+        rt.add(id(1), 0x0101_0101, 1, 2, 8, false);
+        assert!(rt.closest_to(&id(3), 10).is_empty());
+        rt.set_enforce_verified(false);
+        assert_eq!(rt.closest_to(&id(3), 10).len(), 1);
+    }
+
+    #[test]
+    fn a_verified_contact_is_not_hijacked_to_a_new_address() {
+        // eMule's IsAcceptableContact (RoutingZone.cpp:1014-1020): once a
+        // contact is VERIFIED, an answer naming that same KadID at a DIFFERENT
+        // ip/port is refused outright - a KadID is semi-public, so this is the
+        // move an attacker makes to take over a known node's identity.
+        let mut rt = RoutingTable::new(id(0));
+        rt.add(id(1), 0x0101_0101, 4672, 4662, 8, true);
+        assert!(!rt.is_acceptable_answer(&id(1), 0x0505_0505, 4672));
+        // Same address is fine (an ordinary refresh), as is an unknown id.
+        assert!(rt.is_acceptable_answer(&id(1), 0x0101_0101, 4672));
+        assert!(rt.is_acceptable_answer(&id(7), 0x0707_0707, 4672));
+        // An UNVERIFIED contact never proved its address, so it has no claim on
+        // the id: a different address is allowed to replace it.
+        rt.add(id(2), 0x0202_0202, 4672, 4662, 8, false);
+        assert!(rt.is_acceptable_answer(&id(2), 0x0606_0606, 4672));
     }
 
     #[test]
@@ -475,9 +563,11 @@ mod tests {
         // A small controlled table: 15 distinct contacts near self all fit (near
         // zones split), so none is dropped and we can assert exact closeness.
         let mut rt = RoutingTable::new(id(0));
+        // Verified, because closest_to hands out only IP-verified contacts (the
+        // Batch-B gate); this test is about XOR ordering, not verification.
         let ids: Vec<Kad128> = (1..=15u8).map(id).collect();
         for (i, cid) in ids.iter().enumerate() {
-            rt.add(*cid, i as u32, 1, 2, 8, false);
+            rt.add(*cid, i as u32, 1, 2, 8, true);
         }
         assert_eq!(rt.len(), 15);
 
