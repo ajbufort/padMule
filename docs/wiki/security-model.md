@@ -13,10 +13,13 @@ off from most peers/servers).
 
 A 26-measure adversarial audit (6 domain finders -> per-measure attacker ->
 synthesis, 33 agents). Tally as of 2026-08-02: **21 OPERATIONAL, 3 PARTIAL,
-2 MISSING** (credit-system row: MISSING -> PARTIAL when its store landed, 8ag, ->
-OPERATIONAL with the reweight + download accrual, 8ah; poisoning-defense row ->
-OPERATIONAL with per-source corruption attribution + ban, 8ai). The 3 remaining
-PARTIAL are all Kad or AICH completeness; the 2 MISSING are opt-in server obf. History: the 2026-07-20 audit scored 11/12/3; B6 MOTD-flood + B8
+2 DOCUMENTED opt-outs** (credit-system row: MISSING -> PARTIAL when its store
+landed, 8ag, -> OPERATIONAL with the reweight + download accrual, 8ah;
+poisoning-defense row -> OPERATIONAL with per-source corruption attribution + ban,
+8ai; the two server-obfuscation rows moved MISSING -> DEFERRED-documented, a
+deliberate interop-safe v1 opt-out recorded in [[obfuscation-posture]]). The 3
+remaining PARTIAL are Kad (x2) + AICH completeness. History: the 2026-07-20 audit
+scored 11/12/3; B6 MOTD-flood + B8
 SSRF closed it to 13/10/3 (commit 625df39); the 2026-08-01 security-hardening
 batch (Kad receiver-key/verified-bit + ipfilter/sybil/answer-validation, per-part
 poison recovery, per-IP inbound cap, inbound TCP obfuscation, search availability
@@ -35,8 +38,10 @@ The 3 remaining PARTIAL rows are narrower COMPLETENESS items (Kad verified-bit n
 yet ENFORCED in routing; Kad send-side receiver keys; AICH block recovery) - none
 is an integrity or RCE hole, and the two Kad items need a real-Kad validation path
 (no reverse-Kad oracle exists, so the send-side "a real eMule verifies us" cannot be
-faithfully proven yet). The 2 MISSING are server TCP/UDP obfuscation (opt-in
-anti-DPI, shippable documented-as-not-active).
+faithfully proven yet - the Kad hard-verify is now a committed dedicated build,
+[[build-progress]] wave 10). Server TCP/UDP obfuscation is a DELIBERATE, documented
+v1 opt-out ([[obfuscation-posture]]): opt-in anti-DPI, never REQUIRED, cuts off no
+server - not a gap, a choice.
 Shortest path to yes = the Kad hard-verify pair (send-side keys + verified-bit
 enforcement via the HELLO_RES_ACK challenge), validated against the real Kad network.
 
@@ -66,22 +71,27 @@ enforcement via the HELLO_RES_ACK challenge), validated against the real Kad net
 | ipfilter Kad UDP coverage | OPERATIONAL (2026-08-01) | the user blocklist now gates every Kad routing insert (kad_live::add_contact, matches eMule RoutingZone.cpp:477); inbound Kad UDP is only ever a reply from an IP we queried (from the now-filtered routing table) |
 | Input safety: bounded inbound listener | OPERATIONAL (2026-08-01) | 200-permit global semaphore + a per-IP cap (16/IP, IpConnSlot) so one address cannot starve all permits; serve-session budget (60s idle / 120s queue) already present |
 | Credit system (clients.met, ident-gated) | OPERATIONAL (2026-08-02) | FULLY live (build-progress 8ag store + 8ah reweight, commits dbcc0ab + b6262c8). credit_store::CreditStore persists clients.met (load on start / save on pause), binds a verified peer's key with eMule's anti-theft wipe, accrues BOTH upload bytes (per leecher) and download bytes (per source, threaded through the download path), resolves a reweight-only score (resolve_ident_state + score_ratio_ident, clamped [1.0,10.0]), and the upload queue is a PRIORITY UploadGate that serves the best-scored waiter first. NEVER-REFUSE: score only reorders; the sole refusal is a full queue, identity-independent. Adversarial review of the concurrency (lost-wakeup/leak/starvation/ordering) came back CLEAN; proven end-to-end by a client SIMULATION (a HIGH-credit leecher queued 2nd is served before a fresh one queued 1st). This is what makes serve-side secure-ident (the row above) do WORK - the verified identity now feeds the reweight. |
-| Server TCP obfuscation | MISSING | plaintext-only; OPT-IN anti-DPI, no server cut off (ship documented) |
-| Server UDP obfuscation | MISSING | cleartext port+4; OPT-IN; low-burden partial via OP_GETSOURCES_OBFU |
+| Server TCP obfuscation | DEFERRED (documented v1 opt-out) | plaintext server link; OPT-IN anti-DPI, never REQUIRED, no server cut off. A DELIBERATE, documented v1 decision - see [[obfuscation-posture]]. Not an integrity/reachability gap (the c2c + Kad traffic that carries transfers IS obfuscated); reversible into an opt-in feature without a wire break. |
+| Server UDP obfuscation | DEFERRED (documented v1 opt-out) | cleartext server UDP (port+4); OPT-IN; low-burden partial via OP_GETSOURCES_OBFU. Same deliberate deferral, documented in [[obfuscation-posture]]. |
 
 ## Release blockers (fix before community release)
 
-REMAINING (after the 2026-08-01 batch): secure-ident SERVE side [LOW-MED, validate
-vs [[emule-peer-oracle]]]; Kad verified-bit ENFORCEMENT in routing [MED, needs the
-HELLO_RES_ACK challenge]; per-source corruption attribution + ban [MED]; AICH block
-recovery [full HIGH, or clear the advertised bit]; credit system [MED-HIGH, or ship
-documented as not-active]; server TCP/UDP obf [Band C, LOW-MED, opt-in - ship
-documented, never REQUIRE].
+REMAINING (as of 2026-08-02): the **Kad hard-verify** pair - verified-bit
+ENFORCEMENT in routing + send-side receiver keys, which need the HELLO_RES_ACK
+challenge machinery AND a real-Kad validation path (now a committed dedicated build,
+[[build-progress]] wave 10); and AICH block recovery [OPTIMIZATION - integrity
+already holds via per-part MD4 + the poisoning ban, and the advertised AICH bit is
+non-breaking, so this is not release-blocking].
 
-CLOSED: server MOTD flood [B6, 625df39]; SSRF source drop [B8, 625df39]; TCP c2c
-obf both-roles, ipfilter-into-Kad, per-IP inbound cap, Kad sybil caps + IP-change
-hijack, Kad receiver-key -> verified bit, per-part poison recovery, search
-availability cap (all 2026-08-01, [[build-progress]] row 8ab).
+NOT blockers (documented decisions): server TCP/UDP obfuscation - a deliberate,
+interop-safe v1 opt-out, [[obfuscation-posture]].
+
+CLOSED 2026-08-02: serve-side secure-ident [8af]; full credit system - store + bind
++ both-side accrual + upload-queue reweight [8ag/8ah]; per-source corruption
+attribution + ban [8ai]. CLOSED 2026-08-01: server MOTD flood [B6]; SSRF source drop
+[B8]; TCP c2c obf both-roles, ipfilter-into-Kad, per-IP inbound cap, Kad sybil caps +
+IP-change hijack, Kad receiver-key -> verified bit, per-part poison recovery, search
+availability cap [8ab].
 
 ## Interop-safe hardening backlog (all degrade gracefully)
 

@@ -9,6 +9,7 @@ the Ingest / Query / Lint workflows.
 ## Protocol
 - [[protocol-reference]] - load-bearing aMule constants (framing, PARTSIZE, hashing edge cases, obfuscation, EC, timers); index into the full recon in docs/raw.
 - [[security-model]] - the "bulletproof" release gate: eMule/Kad spec security measures (checklist + status) + non-burdensome additions; RELEASE BLOCKER.
+- [[obfuscation-posture]] - what padMule obfuscates (c2c TCP, Kad UDP) vs the deliberate v1 opt-out (server TCP/UDP obf); the documented decision behind the 2 server-obf scorecard rows.
 - [[protocol-understanding]] - the mental model: eD2k + Kad flows/state machines, interop landmines, capability gating, padMule recommendations. The background for any wire work (it informed Waves 3-6).
 - [[padmule-enhancement-channel]] - padMule-to-padMule capability channel on a provably-ignored HELLO tag (source-grounded carrier proof); Layer 1 detection DONE + amuled-validated; Layer 2 wire spec'd (opcode 0xD8 on 0xC5).
 - [[nat-traversal-design]] - design for connecting two firewalled (LowID) padMule peers (hole punching + QUIC over Kad/buddy rendezvous); confirmed no stock hole punching; reusable Kad primitives; phased plan. Not built.
@@ -41,8 +42,11 @@ the Ingest / Query / Lint workflows.
 CI+Sideloadly deploy path, foreground-only v1 - see [[decisions-and-lessons]];
 the app is shipped and on-device, and 0.70b Tier-1 parity is done
 ([[emule-070b-features]]). Current direction: the BULLETPROOF security release
-gate - close the [[security-model]] scorecard's PARTIAL/MISSING rows (13
-operational / 10 partial / 3 missing as of 2026-08-01; B6+B8 closed) before any
-community release. Next Band-B items: FloodTracker wiring + Kad
-receiver-verify-key, against eMule 0.50a. Wave 9 seedbox mode is the open v1.1
-item.)
+gate - close the [[security-model]] scorecard (21 operational / 3 partial / 2
+documented opt-outs as of 2026-08-02). Serve-side secure-ident, the full credit
+system (store + reweight + accrual), and per-source corruption attribution + ban
+all landed 2026-08-02 ([[build-progress]] 8af-8ai); server-obf is a documented v1
+opt-out ([[obfuscation-posture]]). The last real protocol piece is the Kad
+hard-verify (verified-bit enforcement + send-side keys via HELLO_RES_ACK), a
+committed dedicated build ([[build-progress]] wave 10). Wave 9 seedbox mode is the
+open v1.1 item.)
