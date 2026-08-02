@@ -47,6 +47,50 @@ use crate::transfer::{
     OP_REQUESTFILENAME, OP_REQUESTPARTS, OP_REQUESTPARTS_I64, OP_SETREQFILEID, OP_STARTUPLOADREQ,
 };
 
+/// Re-asking for the SAME file sooner than this is an "aggressive" request
+/// (eMule `MIN_REQUESTTIME`, opcodes.h:116 = MIN2MS(10) = 10 minutes).
+pub const MIN_REQUESTTIME_SECS: u64 = 600;
+/// Bad requests for one file before we stop answering it (eMule `BADCLIENTBAN`,
+/// opcodes.h:115 = 4, where it triggers `Ban()`).
+pub const BADCLIENTBAN: u32 = 4;
+
+/// Per-connection, per-FILE request scoring - eMule's
+/// `CUpDownClient::AddRequestCount` (UploadClient.cpp:895-918). A peer that
+/// re-asks about the same file inside `MIN_REQUESTTIME` scores a bad request;
+/// one that waits politely has its score DECREMENTED instead, so a long-lived
+/// well-behaved peer never creeps into a refusal.
+///
+/// Scope, deliberately: this gates cheap METADATA requests (name/status/hashset/
+/// sources), never block delivery - a downloader legitimately sends a stream of
+/// OP_REQUESTPARTS, and throttling those would break transfers. padMule keeps
+/// this per-connection because that is the model share.rs already documents (no
+/// cross-connection queue persistence); dropping the connection is our
+/// equivalent of upstream's `Ban()` for the session.
+#[derive(Default)]
+pub struct RequestCounter {
+    /// file hash -> (last asked at, bad-request score)
+    files: HashMap<[u8; 16], (u64, u32)>,
+}
+
+impl RequestCounter {
+    /// Score a request for `hash` at `now_secs` and report whether to ANSWER it.
+    pub fn allow(&mut self, hash: &[u8; 16], now_secs: u64) -> bool {
+        let e = self.files.entry(*hash).or_insert((now_secs, 0));
+        let (last, score) = *e;
+        // The very first ask for a file is always polite (upstream inserts a
+        // fresh record with badrequests = 0 and returns).
+        if last != now_secs || score > 0 {
+            if now_secs.saturating_sub(last) < MIN_REQUESTTIME_SECS {
+                e.1 = score.saturating_add(1);
+            } else {
+                e.1 = score.saturating_sub(1);
+            }
+        }
+        e.0 = now_secs;
+        e.1 < BADCLIENTBAN
+    }
+}
+
 /// A bounded upload gate: `slots_total` concurrent uploads plus a wait queue
 /// ordered by CREDIT SCORE. When every slot is busy a new requester is queued and
 /// told its 1-based place (OP_QUEUERANKING), then granted a slot IN PLACE on the
@@ -571,6 +615,8 @@ where
     // frees the slot for the next waiter.
     let mut permit: Option<SlotGuard> = None;
     let mut pending = first;
+    // Per-file request scoring for THIS connection (eMule AddRequestCount).
+    let mut requests = RequestCounter::default();
     // Register the peer against the file it is after, so OTHER peers asking us
     // for sources can be told about it (and so it is excluded from its own
     // answer). Re-run after each latch point; the guard removes it on exit.
@@ -614,6 +660,36 @@ where
                 pkt.opcode,
                 pkt.payload.len()
             );
+        }
+        // Score the cheap metadata requests before answering any of them: each
+        // is a small ask with a comparatively expensive answer (a name+status, a
+        // hashset, or a whole source list), so an unthrottled peer could make us
+        // rebuild them in a loop. Block requests are NEVER scored - a real
+        // downloader streams OP_REQUESTPARTS and must not be penalised for it.
+        // A peer already holding a slot is exempt, mirroring upstream's
+        // `GetDownloadState() != DS_DOWNLOADING` carve-out.
+        if permit.is_none()
+            && matches!(
+                pkt.opcode,
+                OP_REQUESTFILENAME
+                    | OP_SETREQFILEID
+                    | OP_MULTIPACKET
+                    | OP_MULTIPACKET_EXT
+                    | OP_HASHSETREQUEST
+                    | OP_REQUESTSOURCES
+                    | OP_REQUESTSOURCES2
+            )
+        {
+            // Score against the file the packet names; a request with no usable
+            // hash is left to the individual arms to reject.
+            let asked = head_hash(&pkt.payload)
+                .or_else(|| file.as_ref().map(|f| f.hash))
+                .unwrap_or([0u8; 16]);
+            if !requests.allow(&asked, now_secs() as u64) {
+                // Upstream bans here; we hold one connection, so dropping it is
+                // the equivalent - the peer may reconnect and start fresh.
+                return Ok(());
+            }
         }
         match pkt.opcode {
             OP_REQUESTFILENAME => {
@@ -1424,6 +1500,47 @@ mod tests {
 
         drop(fs);
         up.await.unwrap();
+    }
+
+    #[test]
+    fn repeat_file_requests_are_scored_and_eventually_refused() {
+        // eMule 0.50a CUpDownClient::AddRequestCount (UploadClient.cpp:895-918):
+        // per (client, FILE), re-asking inside MIN_REQUESTTIME (10 min) bumps a
+        // badrequests counter and BADCLIENTBAN=4 bans; a polite gap decrements
+        // it instead. Time is injected so the policy is testable without waiting.
+        let mut rc = RequestCounter::default();
+        let a = [0x11; 16];
+        let b = [0x22; 16];
+
+        // First ask for a file is always fine, for any number of DISTINCT files:
+        // a peer legitimately asks about several files on one connection.
+        assert!(rc.allow(&a, 0));
+        assert!(rc.allow(&b, 0));
+
+        // Hammering the SAME file inside the window scores it; the 4th bad
+        // request crosses BADCLIENTBAN and is refused.
+        assert!(rc.allow(&a, 1));
+        assert!(rc.allow(&a, 2));
+        assert!(rc.allow(&a, 3));
+        assert!(!rc.allow(&a, 4), "BADCLIENTBAN reached -> refuse");
+
+        // The other file is untouched - scoring is per FILE, as upstream.
+        assert!(rc.allow(&b, 4));
+
+        // A POLITE re-ask (outside the window) decrements instead of scoring,
+        // so a long-lived well-behaved peer recovers rather than creeping to a
+        // ban. MIN_REQUESTTIME is 10 minutes.
+        let mut polite = RequestCounter::default();
+        let t = MIN_REQUESTTIME_SECS;
+        assert!(polite.allow(&a, 0));
+        assert!(polite.allow(&a, 1)); // bad (score 1)
+        assert!(polite.allow(&a, 1 + t)); // polite -> back to 0
+        assert!(polite.allow(&a, 1 + 2 * t)); // polite
+                                              // Having been forgiven, it can still take the full budget of bad asks.
+        assert!(polite.allow(&a, 1 + 2 * t + 1));
+        assert!(polite.allow(&a, 1 + 2 * t + 2));
+        assert!(polite.allow(&a, 1 + 2 * t + 3));
+        assert!(!polite.allow(&a, 1 + 2 * t + 4));
     }
 
     #[tokio::test]
