@@ -456,6 +456,11 @@ impl KadNode {
         let responder_ip = node.ip;
         let mut seen_ips = std::collections::HashSet::new();
         contacts.retain(|c| c.ip != responder_ip && seen_ips.insert(c.ip));
+        // ...and it may not re-point a contact we have already VERIFIED to some
+        // other address: a KadID is semi-public, so that is precisely how an
+        // attacker takes over a known node's identity (eMule
+        // CRoutingZone::IsAcceptableContact, RoutingZone.cpp:1014-1020).
+        contacts.retain(|c| self.routing.is_acceptable_answer(&c.id, c.ip, c.udp_port));
         Ok((contacts, verified, sender_vk))
     }
 
