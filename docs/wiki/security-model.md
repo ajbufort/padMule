@@ -12,8 +12,9 @@ off from most peers/servers).
 ## SCORECARD (security-completeness audit, 2026-07-20)
 
 A 26-measure adversarial audit (6 domain finders -> per-measure attacker ->
-synthesis, 33 agents). Tally as of 2026-08-02: **19 OPERATIONAL, 4 PARTIAL,
-3 MISSING**. History: the 2026-07-20 audit scored 11/12/3; B6 MOTD-flood + B8
+synthesis, 33 agents). Tally as of 2026-08-02: **19 OPERATIONAL, 5 PARTIAL,
+2 MISSING** (the credit-system row moved MISSING -> PARTIAL when its store went
+live, 8ag; only the queue reweight + download accrual remain on it). History: the 2026-07-20 audit scored 11/12/3; B6 MOTD-flood + B8
 SSRF closed it to 13/10/3 (commit 625df39); the 2026-08-01 security-hardening
 batch (Kad receiver-key/verified-bit + ipfilter/sybil/answer-validation, per-part
 poison recovery, per-IP inbound cap, inbound TCP obfuscation, search availability
@@ -57,7 +58,7 @@ reweight) + Kad hard-verify, all validated against the real-eMule/eserver oracle
 | Server-trust (source/IP sanity) | OPERATIONAL (B8 fixed 625df39) | PeerSource::from_found/from_kad now reject non-public IPv4 unconditionally (SSRF closed); LowID/port0 already rejected |
 | ipfilter Kad UDP coverage | OPERATIONAL (2026-08-01) | the user blocklist now gates every Kad routing insert (kad_live::add_contact, matches eMule RoutingZone.cpp:477); inbound Kad UDP is only ever a reply from an IP we queried (from the now-filtered routing table) |
 | Input safety: bounded inbound listener | OPERATIONAL (2026-08-01) | 200-permit global semaphore + a per-IP cap (16/IP, IpConnSlot) so one address cannot starve all permits; serve-session budget (60s idle / 120s queue) already present |
-| Credit system (clients.met, ident-gated) | MISSING | dead code: FIFO gate, no accounting, clients.met never used |
+| Credit system (clients.met, ident-gated) | PARTIAL (2026-08-02) | The STORE is now live (build-progress 8ag, commit dbcc0ab): credit_store::CreditStore persists clients.met (load on start / save on pause), binds a verified peer's key with eMule's anti-theft wipe, accrues UPLOAD bytes per peer, and exposes a reweight-only score (resolve_ident_state + score_ratio_ident, clamped [1.0,10.0]). REMAINING: (a) DOWNLOAD-side accrual (source userhash through the download hot path); (b) the upload-queue REWEIGHT that CONSUMES the score - the one no-oracle hot-path change (UploadGate FIFO needs priority admission). Until the reweight lands, verified identity is accrued/bound but not yet reordering the queue. |
 | Server TCP obfuscation | MISSING | plaintext-only; OPT-IN anti-DPI, no server cut off (ship documented) |
 | Server UDP obfuscation | MISSING | cleartext port+4; OPT-IN; low-burden partial via OP_GETSOURCES_OBFU |
 
