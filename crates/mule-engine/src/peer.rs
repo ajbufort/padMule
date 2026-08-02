@@ -157,6 +157,18 @@ impl HelloInfo {
         self.misc_options1 = baseline_misc_options1(1);
         self
     }
+
+    /// Advertise that padMule ACCEPTS obfuscated (RC4) connections: crypt
+    /// SUPPORTED, not requested, not required - exactly stock eMule's default
+    /// (Preferences.cpp:2410-2412). Per eMule's only crypt reject rule
+    /// (BaseClient.cpp:1437) SUPPORTED (required=0) never causes a peer to refuse
+    /// us and is never refused; it just lets crypt-REQUIRED peers reach us. Only
+    /// set this once the inbound obf-accept path is actually wired (never advertise
+    /// a capability we do not honor, and never set REQUIRED).
+    pub fn with_crypt_supported(mut self) -> Self {
+        self.misc_options2 = baseline_misc_options2(1, 0, 0, KADEMLIA_VERSION);
+        self
+    }
 }
 
 /// Build the padMule enhancement-channel marker tag (Layer 1 detection). `caps`

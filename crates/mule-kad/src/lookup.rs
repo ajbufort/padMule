@@ -204,7 +204,7 @@ mod tests {
         fn respond(&self, node: &Kad128, target: &Kad128, resp: usize) -> Vec<WireContact> {
             let mut rt = crate::routing::RoutingTable::new(*node);
             for x in &self.nodes {
-                rt.add(*x, 0x0A00_0001, 4672, 4662, 8);
+                rt.add(*x, 0x0A00_0001, 4672, 4662, 8, false);
             }
             rt.closest_to(target, resp)
                 .into_iter()
