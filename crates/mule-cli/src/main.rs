@@ -1141,7 +1141,7 @@ async fn cmd_peer_download(
 /// Wave-6 live gate: load a nodes.dat, then send obfuscated BOOTSTRAP_REQs to
 /// its contacts until one answers - proving the Kad UDP framing, obfuscation,
 /// and message codecs against a real node. On success, follow with a HELLO.
-async fn cmd_kad_bootstrap(nodes_path: &str) {
+async fn cmd_kad_bootstrap(nodes_path: &str, bind_ip: Option<&str>) {
     let bytes = match std::fs::read(nodes_path) {
         Ok(b) => b,
         Err(e) => {
@@ -1168,7 +1168,20 @@ async fn cmd_kad_bootstrap(nodes_path: &str) {
         .filter(|c| c.version >= 2)
         .collect();
 
-    let bind: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 4672);
+    // Optional explicit bind IP: on a multi-homed / isolated-namespace test box the
+    // UNSPECIFIED source can be wrong (the kernel picks the peer's own subnet
+    // address for a local dest); pinning the source IP fixes the oracle topology.
+    let bind_addr: IpAddr = match bind_ip {
+        Some(s) => match s.parse() {
+            Ok(ip) => ip,
+            Err(e) => {
+                eprintln!("bad bind IP {s}: {e}");
+                return;
+            }
+        },
+        None => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+    };
+    let bind: SocketAddr = SocketAddr::new(bind_addr, 4672);
     let mut node = match KadNode::bind(bind, 4662).await {
         Ok(n) => n,
         Err(e) => {
@@ -2393,7 +2406,10 @@ async fn main() {
                 (_, _, None, _) => eprintln!("bad size: {}", args[5]),
             }
         }
-        Some("kad-bootstrap") if args.len() == 3 => cmd_kad_bootstrap(&args[2]).await,
+        Some("kad-bootstrap") if args.len() == 3 => cmd_kad_bootstrap(&args[2], None).await,
+        Some("kad-bootstrap") if args.len() == 4 => {
+            cmd_kad_bootstrap(&args[2], Some(&args[3])).await
+        }
         Some("kad-search") if args.len() == 5 => {
             match (parse_hex16(&args[3]), args[4].parse::<u64>()) {
                 (Some(hash), Ok(size)) => cmd_kad_search(&args[2], hash, size).await,
@@ -2461,7 +2477,7 @@ async fn main() {
             eprintln!("  mule-cli related-search <host> <port> <ed2k-hash-hex>");
             eprintln!("  mule-cli offer-search <host> <port> <name>");
             eprintln!("  mule-cli offer-hold <host> <port> <name[|name2|...]> [secs]");
-            eprintln!("  mule-cli kad-bootstrap <nodes.dat>");
+            eprintln!("  mule-cli kad-bootstrap <nodes.dat> [bind-ip]");
             eprintln!("  mule-cli kad-search <nodes.dat> <ed2k-hash-hex> <size>");
             eprintln!("  mule-cli kad-fetch <nodes.dat> <ed2k-hash-hex> <size> <out>");
             eprintln!("  mule-cli kad-keyword <nodes.dat> <keyword>");

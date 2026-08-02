@@ -1,0 +1,27 @@
+--- a/src/kademlia/routing/RoutingZone.cpp	2026-06-24 05:54:18.000000000 -0700
++++ b/src/kademlia/routing/RoutingZone.cpp	2026-08-02 06:11:54.191264396 -0700
+@@ -488,6 +488,12 @@
+ 						// don't unset the verified flag (will clear itself on ipchanges)
+ 						if (!contactUpdate->IsIPVerified()) {
+ 							contactUpdate->SetIPVerified(contact->IsIPVerified());
++							// PADMULE-ORACLE (logging-only): the other verify path - an
++							// existing contact flips to verified because a HELLO_REQ
++							// carried a valid receiver key (AddContact2 -> here).
++							if (contactUpdate->IsIPVerified()) {
++								AddDebugLogLineC(logKadRouting, "PADMULE-ORACLE-VERIFIED contact (sender: " + KadIPToString(contact->GetIPAddress()) + ") via HELLO receiver key");
++							}
+ 						}
+ 						outIpVerified = contactUpdate->IsIPVerified();
+ 						m_bin->SetAlive(contactUpdate);
+@@ -879,6 +885,11 @@
+ 			AddDebugLogLineN(logKadRouting, "Sender already verified (sender: " + KadIPToString(ip) + ")");
+ 		} else {
+ 			contact->SetIPVerified(true);
++			// PADMULE-ORACLE (logging-only instrumentation): a contact's IP-verified
++			// bit flips false->true here when a valid receiver key arrives via a
++			// HELLO_RES_ACK (Process2HelloResponseAck) or a legacy challenge. Critical
++			// log so it survives a Release build and needs no verbose config.
++			AddDebugLogLineC(logKadRouting, "PADMULE-ORACLE-VERIFIED contact (sender: " + KadIPToString(ip) + ") via VerifyContact");
+ 		}
+ 		return true;
+ 	}
