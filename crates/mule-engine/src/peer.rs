@@ -49,8 +49,8 @@ pub const KADEMLIA_VERSION: u32 = 0x08;
 
 /// Compute CT_EMULE_MISCOPTIONS1 with the padMule baseline capabilities.
 /// `sec_ident` is 0 (no crypto) or 3 (secure-ident available, Wave 5). Derived
-/// from BaseClient.cpp:1096-1109; baseline (sec_ident=0) = 0x34103210. This is
-/// eMule's 0x34103212 with the MULTIPACKET bit CLEARED - see `multipacket` below.
+/// from BaseClient.cpp:1096-1109; baseline (sec_ident=0) = 0x34103212, byte-equal
+/// to a real aMule/eMule.
 pub const fn baseline_misc_options1(sec_ident: u32) -> u32 {
     let aich: u32 = 1;
     let unicode: u32 = 1;
@@ -61,15 +61,13 @@ pub const fn baseline_misc_options1(sec_ident: u32) -> u32 {
     let accept_comment: u32 = 1;
     let peercache: u32 = 0;
     let no_view_shared: u32 = 0;
-    // NOT advertised: padMule's serve path handles OP_MULTIPACKET(_EXT) for
-    // neither this bit nor ext_multipacket (MISCOPTIONS2). A real aMule/eMule
-    // downloader that saw either bit set would send the bundled request
-    // (0x92/0xa4), which our serve loop drops -> the download fails (caught by the
-    // eserver-relayed amuled reverse test). Advertise no capability we do not
-    // honour: with these clear, a downloader falls back to the individual
-    // OP_REQUESTFILENAME sequence our serve path DOES answer. (Honouring
-    // multipacket serve-side and re-advertising is a tracked follow-up.)
-    let multipacket: u32 = 0;
+    // Advertised (with ext_multipacket in MISCOPTIONS2): our serve path answers
+    // the bundled OP_MULTIPACKET(_EXT) request with OP_MULTIPACKETANSWER
+    // (serve/serve_shared -> build_multipacket_answer), validated by the
+    // eserver-relayed amuled reverse test. A downloader that sees this sends the
+    // one-packet request instead of the individual OP_REQUESTFILENAME sequence
+    // (which our serve path also still answers).
+    let multipacket: u32 = 1;
     let preview: u32 = 0;
     (aich << 29)
         | (unicode << 28)
@@ -88,7 +86,7 @@ pub const fn baseline_misc_options1(sec_ident: u32) -> u32 {
 /// Compute CT_EMULE_MISCOPTIONS2 with the padMule baseline capabilities.
 /// Crypt flags are 0 until Wave 5; captcha/direct-UDP-callback are 0 (not
 /// supported in v1). Derived from BaseClient.cpp:1131-1144; baseline (crypt off,
-/// kad 0x08) = 0x418 - eMule's 0x438 with ext_multipacket CLEARED (see below).
+/// kad 0x08) = 0x438, byte-equal to a real aMule/eMule.
 pub const fn baseline_misc_options2(
     crypt_supported: u32,
     crypt_requested: u32,
@@ -98,9 +96,9 @@ pub const fn baseline_misc_options2(
     let direct_udp_callback: u32 = 0;
     let captcha: u32 = 0;
     let source_ex2: u32 = 1;
-    // NOT advertised - our serve path does not answer OP_MULTIPACKET_EXT (0xa4).
-    // See baseline_misc_options1's multipacket note.
-    let ext_multipacket: u32 = 0;
+    // Advertised - our serve path answers OP_MULTIPACKET_EXT (0xa4). See
+    // baseline_misc_options1's multipacket note.
+    let ext_multipacket: u32 = 1;
     let large_files: u32 = 1;
     (direct_udp_callback << 12)
         | (captcha << 11)
@@ -408,12 +406,11 @@ mod tests {
 
     #[test]
     fn baseline_misc_options_match_amule() {
-        // eMule's 0x34103212 with the multipacket bit cleared (padMule does not
-        // honour OP_MULTIPACKET on the serve side, so it must not advertise it).
-        assert_eq!(baseline_misc_options1(0), 0x3410_3210);
-        assert_eq!(baseline_misc_options1(3), 0x3413_3210); // secure ident = 3
-                                                            // eMule's 0x438 with ext_multipacket cleared.
-        assert_eq!(baseline_misc_options2(0, 0, 0, KADEMLIA_VERSION), 0x418);
+        // Byte-equal to a real aMule/eMule: multipacket + ext_multipacket set
+        // (padMule's serve path answers OP_MULTIPACKET(_EXT)).
+        assert_eq!(baseline_misc_options1(0), 0x3410_3212);
+        assert_eq!(baseline_misc_options1(3), 0x3413_3212); // secure ident = 3
+        assert_eq!(baseline_misc_options2(0, 0, 0, KADEMLIA_VERSION), 0x438);
         assert_eq!(COMPAT_OPTIONS_BASELINE, 1);
     }
 

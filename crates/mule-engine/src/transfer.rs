@@ -60,6 +60,12 @@ pub const OP_COMPRESSEDPART_I64: u8 = 0xA1; // C5
 pub const OP_SENDINGPART_I64: u8 = 0xA2; // C5
 pub const OP_REQUESTPARTS_I64: u8 = 0xA3; // C5
 
+// The multipacket bundles a whole file request (name + status + sources + AICH)
+// into ONE packet. _EXT differs only by an extra 8-byte file size after the hash.
+pub const OP_MULTIPACKET: u8 = 0x92; // C5
+pub const OP_MULTIPACKETANSWER: u8 = 0x93; // C5
+pub const OP_MULTIPACKET_EXT: u8 = 0xA4; // C5
+
 /// The requestable transfer block size (180 KiB).
 pub const EMBLOCKSIZE: u64 = 184_320;
 /// Blocks requested per OP_REQUESTPARTS on the wire (always 3).
@@ -321,6 +327,50 @@ pub fn build_file_status(hash: &[u8; 16], parts: &[bool]) -> Packet {
     w.write_bytes(hash);
     w.write_bytes(&write_part_status(parts));
     Packet::new(PROT_EDONKEY, OP_FILESTATUS, w.into_inner())
+}
+
+/// Read the requested file hash from an OP_MULTIPACKET(_EXT) request. The hash is
+/// the first field of both variants (EXT then carries an 8-byte size); the bundled
+/// sub-requests that follow are deliberately not parsed here - see
+/// [`build_multipacket_answer`].
+pub fn parse_multipacket_hash(payload: &[u8]) -> Result<[u8; 16], IoError> {
+    let mut r = Reader::new(payload);
+    read_hash16(&mut r)
+}
+
+/// Build OP_MULTIPACKETANSWER: `<hash 16><OP_REQFILENAMEANSWER><u16 name><name>
+/// <OP_FILESTATUS><status>`.
+///
+/// eMule answers a multipacket by emitting one sub-answer per requested sub-opcode
+/// (ListenSocket.cpp:1178-1297). padMule instead always answers the two things a
+/// file request fundamentally asks - the name and the part status - regardless of
+/// exactly which sub-opcodes were bundled. This is safe because the downloader's
+/// OP_MULTIPACKETANSWER reader processes each sub-answer WITHOUT cross-checking it
+/// against its own request (aMule ClientTCPSocket.cpp:1264-1289, eMule
+/// ListenSocket.cpp:1347-1379), and it lets us skip parsing OP_REQUESTFILENAME's
+/// variable extended info, which would need the peer's ExtendedRequestsVersion (not
+/// tracked on the serve side). IMPORTANT: eMule's reader DOES `default: throw` on an
+/// UNRECOGNISED sub-opcode (ListenSocket.cpp:1373); we are safe only because it
+/// handles both opcodes we emit - OP_REQFILENAMEANSWER (0x59) and OP_FILESTATUS
+/// (0x50). Any new sub-answer opcode added here must first be confirmed present in
+/// BOTH readers' switch statements. `available` mirrors
+/// [`build_file_status`]/`_complete`: `None` is a complete source (part count 0),
+/// `Some(parts)` writes the part-status bitmap.
+pub fn build_multipacket_answer(
+    hash: &[u8; 16],
+    name: &[u8],
+    available: Option<&[bool]>,
+) -> Packet {
+    let mut w = Writer::new();
+    w.write_bytes(hash);
+    w.write_u8(OP_REQFILENAMEANSWER);
+    w.write_string_u16(name);
+    w.write_u8(OP_FILESTATUS);
+    match available {
+        Some(parts) => w.write_bytes(&write_part_status(parts)),
+        None => w.write_u16(0),
+    }
+    Packet::new(PROT_EMULE, OP_MULTIPACKETANSWER, w.into_inner())
 }
 
 /// OP_HASHSETANSWER: the per-part MD4 list, which the downloader needs before it
@@ -621,6 +671,49 @@ mod tests {
         0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
         0x0F,
     ];
+
+    #[test]
+    fn multipacket_answer_is_hash_then_name_then_status() {
+        // A COMPLETE source: <hash><0x59 REQFILENAMEANSWER><u16 len><name>
+        //                    <0x50 FILESTATUS><u16 0>. This mirrors the pair of
+        // sub-answers eMule bundles for a file-request multipacket
+        // (ListenSocket.cpp:1199/1225) and the downloader reads leniently.
+        let pkt = build_multipacket_answer(&H, b"movie.bin", None);
+        assert_eq!(pkt.protocol, PROT_EMULE);
+        assert_eq!(pkt.opcode, OP_MULTIPACKETANSWER);
+        let mut r = Reader::new(&pkt.payload);
+        assert_eq!(read_hash16(&mut r).unwrap(), H);
+        assert_eq!(r.read_u8().unwrap(), OP_REQFILENAMEANSWER);
+        let n = r.read_u16().unwrap();
+        assert_eq!(r.read_bytes(n as usize).unwrap(), b"movie.bin");
+        assert_eq!(r.read_u8().unwrap(), OP_FILESTATUS);
+        assert_eq!(r.read_u16().unwrap(), 0); // complete -> part count 0
+
+        // A PARTIAL source writes the part-status bitmap instead of the 0 count.
+        let parts = [true, false, true];
+        let pkt = build_multipacket_answer(&H, b"x", Some(&parts));
+        let mut r = Reader::new(&pkt.payload);
+        let _ = read_hash16(&mut r).unwrap();
+        assert_eq!(r.read_u8().unwrap(), OP_REQFILENAMEANSWER);
+        let n = r.read_u16().unwrap();
+        let _ = r.read_bytes(n as usize).unwrap();
+        assert_eq!(r.read_u8().unwrap(), OP_FILESTATUS);
+        assert_eq!(r.read_u16().unwrap(), 3); // <u16 count=3>
+        assert_eq!(r.read_u8().unwrap(), 0b0000_0101); // bitmap: parts 0 and 2
+    }
+
+    #[test]
+    fn parse_multipacket_hash_reads_the_leading_hash() {
+        // Both OP_MULTIPACKET and OP_MULTIPACKET_EXT put the 16-byte hash first
+        // (EXT then carries an 8-byte size we do not need). A short payload is an
+        // error, not a panic.
+        let mut ext = Vec::new();
+        ext.extend_from_slice(&H);
+        ext.extend_from_slice(&300_000u64.to_le_bytes()); // EXT size field
+        ext.push(OP_REQUESTFILENAME); // a bundled sub-request we do not parse
+        assert_eq!(parse_multipacket_hash(&ext).unwrap(), H);
+        assert!(parse_multipacket_hash(&[0u8; 4]).is_err());
+    }
 
     // ---- BlockReceiver: the hardened receive path (review findings 1, 2, 3) ----
 
