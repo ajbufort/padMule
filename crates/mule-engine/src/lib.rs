@@ -50,7 +50,9 @@ pub use framed::{FrameError, FramedStream};
 pub use identity::NodeIdentity;
 pub use kad_live::{KadError, KadNode, ResolveOutcome};
 pub use link::ServerLink;
-pub use multi_source::{download_from_peer, download_from_peer_at, Download, SecIdentCtx};
+pub use multi_source::{
+    download_from_peer, download_from_peer_at, Download, PeerSession, SecIdentCtx,
+};
 pub use obf_handshake::{obf_accept, obf_initiate, ObfDetect};
 pub use part_file::{data_part_count, part_size, PartFile};
 pub use part_store::{copy_file_prefix, PartStore};
@@ -72,7 +74,7 @@ pub use server_messages::{
     parse_server_message, parse_server_status, IdChange, LoginRequest, ServerIdent,
     DEFAULT_SERVER_FLAGS, EMULE_VERSION_TAG,
 };
-pub use share::{serve_shared, SharedFile};
+pub use share::{serve_shared, ServeSession, SharedFile};
 pub use sources::{
     build_answer_sources, build_callback_request, build_get_sources, build_request_sources,
     build_request_sources2, parse_answer_sources, parse_callback_requested, parse_found_sources,

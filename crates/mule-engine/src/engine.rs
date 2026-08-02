@@ -44,8 +44,7 @@ use crate::server_messages::{
     FILE_COMPLETE_PORT, OP_GLOBSERVSTATREQ, OP_GLOBSERVSTATRES, SERV_STAT_CHALLENGE,
 };
 use crate::share::{
-    classify_inbound, head_hash, serve_shared, CreditCtx, InboundKind, ServeSec, SharedFile,
-    UploadGate,
+    classify_inbound, head_hash, serve_shared, InboundKind, ServeSec, SharedFile, UploadGate,
 };
 use crate::transfer::build_file_req_ans_no_fil;
 use mule_files::{
@@ -691,8 +690,7 @@ async fn serve_inbound<S>(
     gate: &Arc<UploadGate>,
     first: Packet,
     peer_accept_comment: u8,
-    sec: Option<ServeSec>,
-    credit: Option<CreditCtx>,
+    session: crate::share::ServeSession,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -710,8 +708,7 @@ async fn serve_inbound<S>(
         Some(first),
         Some(gate),
         peer_accept_comment,
-        sec,
-        credit,
+        session,
     )
     .await;
 }
@@ -1416,16 +1413,26 @@ impl Engine {
                     };
                     // A bare connect+close (the server's HighID probe) ends here:
                     // it never sends OP_HELLO, so the handshake errors and we bail.
-                    let (peer_hash, peer_accept_comment, peer_secident) =
+                    let (peer_hash, peer_accept_comment, peer_secident, peer_crypt, peer_sx1) =
                         match timeout(Duration::from_secs(8), peer_handshake_inbound(&mut fs, &me))
                             .await
                         {
                             Ok(Ok(h)) => {
-                                let (ac, si) = h
+                                let (ac, si, crypt, sx1) = h
                                     .capabilities()
-                                    .map(|c| (c.accept_comment, c.sec_ident))
-                                    .unwrap_or((0, 0));
-                                (h.user_hash, ac, si)
+                                    .map(|c| {
+                                        // Re-encode the peer's crypt bits as the
+                                        // connect-options byte source exchange
+                                        // carries (SetConnectOptions layout), so a
+                                        // peer we name to others can be dialed
+                                        // obfuscated by them.
+                                        let b = (c.supports_crypt as u8)
+                                            | ((c.requests_crypt as u8) << 1)
+                                            | ((c.requires_crypt as u8) << 2);
+                                        (c.accept_comment, c.sec_ident, Some(b), c.source_exchange)
+                                    })
+                                    .unwrap_or((0, 0, None, 0));
+                                (h.user_hash, ac, si, crypt, sx1)
                             }
                             _ => return,
                         };
@@ -1468,8 +1475,13 @@ impl Engine {
                                 &gate,
                                 first,
                                 peer_accept_comment,
-                                sec,
-                                Some((Arc::clone(&credit_store), peer_hash)),
+                                crate::share::ServeSession {
+                                    sec,
+                                    credit: Some((Arc::clone(&credit_store), peer_hash)),
+                                    peer: Some(peer),
+                                    peer_crypt,
+                                    peer_sx1,
+                                },
                             )
                             .await;
                         }
@@ -1490,17 +1502,17 @@ impl Engine {
                                     continue;
                                 }
                                 // Credit this called-back source for what it gives us.
-                                let credit = Some((Arc::clone(&credit_store), peer_hash));
+                                let session = crate::multi_source::PeerSession {
+                                    credit: Some((Arc::clone(&credit_store), peer_hash)),
+                                    // A called-back LowID peer reached US; asking
+                                    // it for sources is free and it may know
+                                    // others holding the file.
+                                    ask_sources: dl.mark_asked_sources(peer.ip()),
+                                    ..Default::default()
+                                };
                                 match timeout(
                                     Duration::from_secs(120),
-                                    download_from_peer_at(
-                                        &mut fs,
-                                        &dl,
-                                        false,
-                                        Some(peer),
-                                        None,
-                                        credit,
-                                    ),
+                                    download_from_peer_at(&mut fs, &dl, false, Some(peer), session),
                                 )
                                 .await
                                 {
@@ -2425,6 +2437,8 @@ impl Engine {
             .with_secident();
         let identity = Arc::clone(&self.identity.rsa);
         let credit_store = Arc::clone(&self.credit_store);
+        // Sources learned mid-sweep via source exchange are filtered too.
+        let ip_filter = self.ip_filter.clone();
         let dest = self.downloads_dir.join(safe_filename(name));
         let events = self.events.clone();
         let ctx = FinishCtx {
@@ -2451,6 +2465,7 @@ impl Engine {
                 cfg,
                 Some(identity),
                 Some(credit_store),
+                ip_filter,
             )
             .await;
             // Cancelled while in flight: the engine already removed it and deleted
@@ -2956,8 +2971,7 @@ mod tests {
                 &gate,
                 first,
                 0,
-                None,
-                None,
+                Default::default(),
             )
             .await
         });
@@ -2998,7 +3012,15 @@ mod tests {
 
         let gate2 = Arc::clone(&gate);
         let srv = tokio::spawn(async move {
-            let _ = serve_shared(&mut server_fs, &shared, None, Some(&gate2), 0, None, None).await;
+            let _ = serve_shared(
+                &mut server_fs,
+                &shared,
+                None,
+                Some(&gate2),
+                0,
+                Default::default(),
+            )
+            .await;
         });
 
         // Name the file, then ask to upload - the slot is taken, so we are queued.
@@ -3056,7 +3078,15 @@ mod tests {
 
         let gate2 = Arc::clone(&gate);
         let srv = tokio::spawn(async move {
-            let _ = serve_shared(&mut server_fs, &shared, None, Some(&gate2), 0, None, None).await;
+            let _ = serve_shared(
+                &mut server_fs,
+                &shared,
+                None,
+                Some(&gate2),
+                0,
+                Default::default(),
+            )
+            .await;
         });
 
         client_fs
@@ -3121,8 +3151,7 @@ mod tests {
                 &gate,
                 first,
                 0,
-                None,
-                None,
+                Default::default(),
             )
             .await;
         });

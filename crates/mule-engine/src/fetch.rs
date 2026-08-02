@@ -13,12 +13,13 @@
 
 use crate::credit_store::CreditStore;
 use crate::crypt_policy::{should_obfuscate_outbound, CryptPrefs, PeerCrypt};
-use crate::multi_source::{download_from_peer_at, Download, SecIdentCtx};
+use crate::multi_source::{download_from_peer_at, Download, PeerSession, SecIdentCtx};
 use crate::peer::HelloInfo;
 use crate::peer_conn::{connect_peer, connect_peer_obf};
 use crate::secure_ident::Identity;
 use crate::share::CreditCtx;
 use crate::sources::FoundSource;
+use mule_files::IpFilter;
 use std::collections::VecDeque;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -123,6 +124,26 @@ impl PeerSource {
             user_hash: s.user_hash,
             crypt: s.crypt,
             origin: SourceOrigin::Server,
+        })
+    }
+
+    /// From a peer source-exchange record (OP_ANSWERSOURCES). Same eD2k
+    /// low-byte IP convention as a server source - `parse_answer_sources` has
+    /// already undone the v3+ "hybrid" byte swap - so a LowID id and an
+    /// unroutable address are refused exactly as they are there.
+    pub fn from_sx(s: &crate::sources::Source) -> Option<Self> {
+        if s.port == 0 || s.ip < 0x0100_0000 {
+            return None;
+        }
+        let addr = ed2k_ip(s.ip);
+        if !is_routable_public_v4(addr) {
+            return None;
+        }
+        Some(PeerSource {
+            addr: SocketAddr::from((addr, s.port)),
+            user_hash: s.user_hash,
+            crypt: s.crypt,
+            origin: SourceOrigin::PeerExchange,
         })
     }
 
@@ -264,12 +285,25 @@ async fn fetch_one(
     // Credit what this source gives us against ITS userhash (from the handshake),
     // so it earns a better place in our upload queue later.
     let credit: Option<CreditCtx> = credit_store.map(|cs| (Arc::clone(cs), peer.user_hash));
+    // Source exchange: ask this peer who ELSE holds the file, but only if it
+    // advertised SX support (aMule requires SX2 or SX1 v>1,
+    // IsSourceRequestAllowed) and only once per peer for this download.
+    let peer_does_sx = peer
+        .capabilities()
+        .map(|c| c.source_ex2 || c.source_exchange > 1)
+        .unwrap_or(false);
+    let ask_sources = peer_does_sx && dl.mark_asked_sources(src.addr.ip());
+    let session = PeerSession {
+        sec,
+        credit,
+        ask_sources,
+    };
     // Multi-source manager: bail the instant this peer queues us and try another
     // source rather than burning `per_peer` in its queue. Pass the addr so a
     // rating/comment (OP_FILEDESC) the source sends is recorded against it.
     match timeout(
         per_peer,
-        download_from_peer_at(&mut fs, dl, true, Some(src.addr), sec, credit),
+        download_from_peer_at(&mut fs, dl, true, Some(src.addr), session),
     )
     .await
     {
@@ -431,8 +465,13 @@ pub async fn download_file(
     config: ManagerConfig,
     identity: Option<Arc<Identity>>,
     credit_store: Option<Arc<CreditStore>>,
+    ip_filter: Option<Arc<IpFilter>>,
 ) -> FetchOutcome {
     let mut out = FetchOutcome::default();
+    // The working set GROWS: peers answer our source-exchange requests mid-sweep
+    // (see PeerSession::ask_sources), and those sources join the dial pool for
+    // later rounds. Starts as the caller's discovered set.
+    let mut pool: Vec<PeerSource> = sources.to_vec();
     // Learned across rounds: which sources actually delivered.
     let scoreboard = Arc::new(Mutex::new(PeerScoreboard::new()));
     let mut round = 0usize;
@@ -443,14 +482,31 @@ pub async fn download_file(
         if round >= config.rounds(dl.priority()).max(1) {
             break;
         }
-        if dl.is_complete().await || dl.is_cancelled() || sources.is_empty() {
+        // Fold in sources peers handed us since the last round. Each is
+        // re-validated exactly like a Kad/server source (from_sx: LowID and
+        // unroutable addresses refused) AND re-checked against the user
+        // blocklist, which a mid-sweep source would otherwise bypass.
+        for s in dl.take_sx_sources() {
+            let Some(ps) = PeerSource::from_sx(&s) else {
+                continue;
+            };
+            if let (Some(f), SocketAddr::V4(v4)) = (&ip_filter, ps.addr) {
+                if f.is_blocked(*v4.ip()) {
+                    continue;
+                }
+            }
+            if !pool.iter().any(|e| e.addr == ps.addr) {
+                pool.push(ps);
+            }
+        }
+        if dl.is_complete().await || dl.is_cancelled() || pool.is_empty() {
             break;
         }
         round += 1;
         let parallel = config.parallel(dl.priority()).max(1);
         // Order the sweep best-first by what each source delivered in prior
         // rounds (proven deliverers, then untried, then proven failures).
-        let mut ordered: Vec<PeerSource> = sources.to_vec();
+        let mut ordered: Vec<PeerSource> = pool.clone();
         {
             let sb = scoreboard.lock().await;
             ordered.sort_by_key(|s| std::cmp::Reverse(sb.score(&s.addr)));
@@ -572,6 +628,38 @@ mod tests {
         let mut keyless = supports.clone();
         keyless.user_hash = None;
         assert!(!keyless.should_obfuscate(&CryptPrefs::default()));
+    }
+
+    #[test]
+    fn a_peer_exchanged_source_is_connectable_with_its_hash_and_crypt() {
+        // Source exchange is the third discovery channel (peers telling us about
+        // peers). Its v2+ record carries the userhash and its v4 record the
+        // crypt byte, so an SX source can be dialed obfuscated like any other.
+        let s = crate::sources::Source {
+            ip: 0x8602_0102, // ed2k low-byte order -> 2.1.2.134
+            port: 4662,
+            server_ip: 0,
+            server_port: 0,
+            user_hash: Some([0xEE; 16]),
+            crypt: Some(0x01),
+        };
+        let ps = PeerSource::from_sx(&s).unwrap();
+        assert_eq!(ps.addr, "2.1.2.134:4662".parse().unwrap());
+        assert_eq!(ps.origin, SourceOrigin::PeerExchange);
+        assert!(ps.should_obfuscate(&CryptPrefs::default()));
+
+        // A LowID id is not directly connectable, and an unroutable address is
+        // refused by the same SSRF guard the other channels use.
+        let low = crate::sources::Source {
+            ip: 0x0000_0042,
+            ..s.clone()
+        };
+        assert!(PeerSource::from_sx(&low).is_none());
+        let lan = crate::sources::Source {
+            ip: 0x0100_A8C0, // 192.168.0.1 in ed2k order
+            ..s.clone()
+        };
+        assert!(PeerSource::from_sx(&lan).is_none());
     }
 
     #[test]
