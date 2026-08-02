@@ -1,8 +1,8 @@
 # Security Model + the "Bulletproof" Release Gate
 
-Updated: 2026-08-02 (Kad send-side terminal proof 7e8fe9c reflected; credit +
-poisoning rows OPERATIONAL per 8ag-8ai; stale row notes re-synced in the
-2026-08-02 reanalysis lint)
+Updated: 2026-08-02 (wave-10 Batch B landed - the Kad verified bit is ENFORCED,
+23/1/2; send-side terminal proof 7e8fe9c; credit + poisoning rows OPERATIONAL per
+8ag-8ai; row notes re-synced in the 2026-08-02 reanalysis lint)
 
 RELEASE BLOCKER (Anthony, 2026-07-20; memory: [[security-bulletproof-release-gate]]):
 before padMule ships to the community, security must be **BULLETPROOF** =
@@ -14,15 +14,15 @@ off from most peers/servers).
 ## SCORECARD (security-completeness audit, 2026-07-20)
 
 A 26-measure adversarial audit (6 domain finders -> per-measure attacker ->
-synthesis, 33 agents). Tally as of 2026-08-02: **22 OPERATIONAL, 2 PARTIAL,
+synthesis, 33 agents). Tally as of 2026-08-02: **23 OPERATIONAL, 1 PARTIAL,
 2 DOCUMENTED opt-outs** (credit-system row: MISSING -> PARTIAL when its store
 landed, 8ag, -> OPERATIONAL with the reweight + download accrual, 8ah;
 poisoning-defense row -> OPERATIONAL with per-source corruption attribution + ban,
 8ai; Kad verify/sender-keys -> OPERATIONAL when 8ak closed the search-path
 key-capture gap on top of the wave-10 terminal proof; the two server-obfuscation
 rows moved MISSING -> DEFERRED-documented, a deliberate interop-safe v1 opt-out
-recorded in [[obfuscation-posture]]). The 2 remaining PARTIAL are the Kad
-verified-bit ENFORCEMENT (wave-10 Batch B) + AICH completeness. History: the 2026-07-20 audit
+recorded in [[obfuscation-posture]]). The 1 remaining PARTIAL is AICH completeness (block recovery), an
+OPTIMIZATION rather than an integrity gap. History: the 2026-07-20 audit
 scored 11/12/3; B6 MOTD-flood + B8
 SSRF closed it to 13/10/3 (commit 625df39); the 2026-08-01 security-hardening
 batch (Kad receiver-key/verified-bit + ipfilter/sybil/answer-validation, per-part
@@ -41,9 +41,8 @@ file or RCE - the integrity core is OPERATIONAL + oracle-proven. Serve-side
 secure-ident (8af) AND the full credit system (8ag store + 8ah reweight/accrual)
 landed 2026-08-02, closing the whole anti-impersonation/anti-leech identity+credit
 axis, and per-source corruption attribution + ban (8ai) closed the poisoning row.
-The 2 remaining PARTIAL rows are narrower COMPLETENESS items (Kad verified-bit not
-yet ENFORCED in routing; AICH block recovery) - neither is an integrity or RCE
-hole. The send-side "a real eMule verifies
+The 1 remaining PARTIAL row is AICH block recovery, an OPTIMIZATION rather than an
+integrity gap (per-part MD4 + the poisoning ban already carry integrity). The send-side "a real eMule verifies
 us" claim IS now faithfully proven: the wave-10 build landed the per-contact key
 store + echo (3bf0162, 9c12e88), completed the v8 HELLO_RES_ACK handshake
 (65a186b), and a log-patched REAL amuled Kad oracle ([[kad-verify-oracle]],
@@ -51,10 +50,11 @@ commit 7e8fe9c) observed VerifyContact fire for padMule reproducibly. Server
 TCP/UDP obfuscation is a DELIBERATE, documented v1 opt-out
 ([[obfuscation-posture]]): opt-in anti-DPI, never REQUIRED, cuts off no server -
 not a gap, a choice.
-Shortest path to yes = wave-10 Batch B (verified-bit ENFORCEMENT in routing,
-flag-gated, offline-provable) + closing the send-side key-capture gaps the
-2026-08-02 reanalysis found (the two search paths that discard a peer's sender key,
-kad_live.rs search_source/search_keyword_node).
+Wave-10 Batch B LANDED 2026-08-02 (commit 5ef4c2e), so the Kad hard-verify pair is
+complete: the verified bit is now ENFORCED in routing, not merely tracked. What is
+left before "yes" is no longer a protocol gap - it is AICH block recovery
+(an optimization) plus the standing bar of re-proving the whole set against the
+oracles before release.
 
 | Measure | Status | Note |
 |---------|--------|------|
@@ -72,7 +72,7 @@ kad_live.rs search_source/search_keyword_node).
 | Secure identification (RSA, both roles) | OPERATIONAL (2026-08-02) | BOTH roles now compute verified. Download side: oracle-proven vs amuled + real eMule, DoS-bounded (one RSA verify per connection). SERVE side (build-progress 8af, commit 4d874e5): padMule advertises sec-ident on the listener + drives the mutual exchange via `classify_inbound` (a bounded secure-ident DRAIN that re-applies the leecher-vs-source discriminator on the first NON-secident packet - the fix for the 8ac regression where a leading OP_SECIDENTSTATE broke the first-packet peek) + finishes verification interleaved with serving in `serve_shared`. Oracle-proven: the reverse oracle asserts padMule verified a REAL amuled 3.0.1 serve-side (byte-for-byte download + verified) - the [[interop-test-fidelity]] rule satisfied against a faithful other-side (a real downloader + a faithful mock LEECHER that INITIATES). [SUPERSEDED 2026-08-02 by 8ag/8ah: verification is no longer observational - the on_verified sink binds the peer's key in the live credit store, and the score-ordered UploadGate consumes the verified-gated score; see the now-OPERATIONAL "Credit system" row.] Never-refuse holds: no ident outcome denies a slot or drops a connection. |
 | TCP c2c obfuscation (RC4) | OPERATIONAL (2026-08-01) | outbound proven vs amuled; INBOUND obf now wired (obf_accept auto-detect) + listener advertises crypt-SUPPORTED (never REQUIRED) -> crypt-required peers reachable. Plaintext byte-identical (differential passes); live inbound-obf vs real eMule dialing us pending [[emule-peer-oracle]] |
 | Kad UDP verify/sender keys | OPERATIONAL (2026-08-02) | RECEIVE side computes bValidReceiverKey (== udp_verify_key(our_key, senderIP)) and sets the contact verified bit (2026-08-01). SEND side landed in wave 10: per-contact key store + IP-gated echo (3bf0162, 9c12e88) and the completed v8 HELLO_RES_ACK handshake (65a186b), TERMINAL-PROVEN - a log-patched real amuled marks padMule IP-verified via VerifyContact ([[kad-verify-oracle]], 7e8fe9c, now 3/3 first-attempt). The last gap closed in 8ak (commit 2ab7800): EVERY answered request records the responder through one `note_responder` path, so the two search paths no longer discard the peer's sender key (a search-only node used to be permanently un-echoable). |
-| Kad node-ID/IP verification + 2^120 | PARTIAL | tolerance proven; verified bit now TRACKED + persisted + set from the receiver key + CLEARED on any ip change (2026-08-01); still not ENFORCED (unverified contacts are used in routing) - hard exclusion needs the HELLO_RES_ACK challenge machinery |
+| Kad node-ID/IP verification + 2^120 | OPERATIONAL (2026-08-02) | tolerance proven; verified bit TRACKED + persisted + set from the receiver key + CLEARED on any ip change (2026-08-01); ENFORCED since wave-10 Batch B (2026-08-02, commit 5ef4c2e): closest_to hands out ONLY IP-verified contacts, exactly as eMule's CRoutingBin::GetClosestTo does unconditionally (RoutingBin.cpp:244), plus IsAcceptableContact's companion rule - an answer naming an already-verified KadID at a different ip/port is refused (RoutingZone.cpp:1014-1020). Proven live: with the gate ON, bootstrap and a real Kad keyword search both still work (bootstrap does not seed from closest_to, and every node that answers becomes verified) |
 | Kad anti-flood hardening | OPERATIONAL (2026-08-01) | sybil cap now 1/IP + 10//24 (matches eMule RoutingBin.cpp:56); a known id re-pointed to a new IP faces the cap (no free hijack). FloodTracker is N/A for a requests-only client (eMule exempts RESPONSE opcodes from its inbound flood limiter; padMule serves no inbound Kad requests) - documented, ready if a request-server is ever added |
 | AICH part-level + block RECOVERY | PARTIAL | per-part MD4 blame + targeted re-fetch now live (localize_corruption, 2026-08-01), so integrity is safe without AICH; AICH master hash byte-valid; the 180KB block-recovery protocol (OP_AICHREQUEST) is a future OPTIMIZATION, not an integrity/interop gap. KEEP advertising the AICH bit: 0x34103212 is byte-verified against real aMule (which also advertises it), and an unanswered AICH request is NON-breaking - eMule calls ClientAICHRequestFailed and re-downloads the part (DownloadClient.cpp:2295), never disconnects/bans (verified 2026-08-01). Clearing the bit would DIVERGE from every real client for no benefit. |
 | Poisoning defense (bad part re-fetchable) | OPERATIONAL (2026-08-02) | whole-file MD4 holds; a bad part is blamed per-MD4 and re-fetched alone (8ab); AND the SOURCE that delivered a bad part is now attributed + BANNED for that file (8ai, eMule CorruptionBlackBox). SOLE-contributor rule = a good source is never false-banned (a part fed by >1 source blames nobody, since without AICH block hashes we cannot pinpoint the bad block). LIMITATION: an attacker sharing every poisoned part with a good source evades the ban (finer attribution needs the deferred AICH block recovery) - strictly better than no attribution, never false-positives. |
@@ -87,11 +87,10 @@ kad_live.rs search_source/search_keyword_node).
 
 ## Release blockers (fix before community release)
 
-REMAINING (as of 2026-08-02, post terminal proof): the **Kad hard-verify** tail -
-send-side receiver keys are DONE + terminal-proven (wave 10 Batches A + handshake,
-[[kad-verify-oracle]]); what remains is Batch B verified-bit ENFORCEMENT in routing
-(flag-gated, offline-provable) plus the send-side key-capture completeness gap
-(the two search paths that discard a peer's sender key); and AICH block recovery
+REMAINING (as of 2026-08-02, post Batch B): the **Kad hard-verify is COMPLETE** -
+send-side receiver keys terminal-proven ([[kad-verify-oracle]]), key capture closed
+(8ak), and the verified bit now ENFORCED in routing (8ao, commit 5ef4c2e). What is
+left is AICH block recovery
 [OPTIMIZATION - integrity already holds via per-part MD4 + the poisoning ban, and
 the advertised AICH bit is non-breaking, so this is not release-blocking].
 
