@@ -122,7 +122,10 @@ pub fn build_initiator_handshake(
     out.push(marker);
     out.extend_from_slice(&random_key.to_le_bytes());
 
-    // The encrypted portion.
+    // The encrypted portion. Cap the padding at 254 so the one-byte length
+    // prefix and the payload never disagree (a wrapped cast would desync the
+    // whole RC4 stream that follows).
+    let padding = &padding[..padding.len().min(254)];
     let mut enc = Vec::with_capacity(7 + padding.len());
     enc.extend_from_slice(&MAGICVALUE_SYNC.to_le_bytes());
     enc.push(ENM_OBFUSCATION); // methods supported
@@ -157,6 +160,23 @@ mod tests {
 
         let mut got = tcp_cipher(&TARGET, MAGICVALUE_REQUESTER, random_key);
         assert_eq!(got.keystream(32), expected.keystream(32));
+    }
+
+    #[test]
+    fn initiator_handshake_caps_oversized_padding_instead_of_wrapping() {
+        // The padlen field is one byte; a >254 padding slice must be capped AND
+        // truncated in agreement (the crate's "prefix and payload never
+        // disagree" discipline), not cast mod 256, which would desync the
+        // entire RC4 stream that follows.
+        let mut send = tcp_cipher(&TARGET, MAGICVALUE_REQUESTER, 7);
+        let out = build_initiator_handshake(&mut send, 0xAB, 7, &[0x55u8; 300]);
+        let mut recv = tcp_cipher(&TARGET, MAGICVALUE_REQUESTER, 7);
+        let mut enc = out[5..].to_vec();
+        recv.apply(&mut enc);
+        assert_eq!(&enc[0..4], &MAGICVALUE_SYNC.to_le_bytes());
+        let padlen = enc[6] as usize;
+        assert_eq!(padlen, 254, "capped, not wrapped");
+        assert_eq!(enc.len(), 7 + padlen, "padding truncated to match");
     }
 
     #[test]

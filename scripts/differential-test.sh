@@ -25,6 +25,7 @@ cleanup() {
   [ -n "${AM_PID:-}" ] && kill "$AM_PID" 2>/dev/null
   # give it a moment to release the port (the disown happens at spawn time)
   sleep 1
+  rm -rf "$WORK"
 }
 trap cleanup EXIT
 

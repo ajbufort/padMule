@@ -15,6 +15,13 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/ios-test.yml"
+  pull_request:
+    paths:
+      - "crates/**"
+      - "ios/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/ios-test.yml"
 
 jobs:
   test:
@@ -78,8 +85,18 @@ jobs:
           print(ids[0] if ids else '')
           ")
           if [ -z "$UDID" ]; then
-            echo "No iPad simulator available; creating one."
-            UDID=$(xcrun simctl create padMule-iPad "iPad Pro (11-inch) (4th generation)")
+            # Pick a CURRENT iPad device type instead of hardcoding one: named
+            # types get retired across Xcode releases (the old "iPad Pro
+            # (11-inch) (4th generation)" no longer exists on macos-latest).
+            DTYPE=$(xcrun simctl list devicetypes --json | python3 -c "
+          import json, sys
+          types = json.load(sys.stdin)['devicetypes']
+          pads = [t['identifier'] for t in types if 'iPad' in t['name']]
+          print(pads[-1] if pads else '')
+          ")
+            [ -n "$DTYPE" ] || { echo "no iPad device type available"; exit 1; }
+            echo "No iPad simulator available; creating one ($DTYPE)."
+            UDID=$(xcrun simctl create padMule-iPad "$DTYPE")
           fi
           echo "Using simulator $UDID"
           echo "udid=$UDID" >> "$GITHUB_OUTPUT"

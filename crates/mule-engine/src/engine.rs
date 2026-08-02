@@ -103,6 +103,24 @@ fn routing_to_nodes(rt: &RoutingTable) -> Vec<KadContact> {
         .collect()
 }
 
+/// Gate nodes.dat contacts at LOAD the way aMule does (RoutingZone.cpp:195-199):
+/// Kad2-only (contactVersion > 1), routable public ip:port, the user's ipfilter,
+/// and no legacy DNS-port contact. The file may have just been DOWNLOADED
+/// (bootstrap::ensure), so an ungated load would let a hostile list seed the
+/// routing table with unroutable or user-blocked contacts.
+fn gate_loaded_nodes(contacts: &[KadContact], filter: Option<&IpFilter>) -> Vec<KadContact> {
+    contacts
+        .iter()
+        .filter(|c| {
+            c.version > 1
+                && mule_kad::is_acceptable_contact(c.ip, c.udp_port, /*allow_private=*/ false)
+                && !(c.udp_port == 53 && c.version <= 5)
+                && filter.is_none_or(|f| !f.is_blocked_u32(c.ip))
+        })
+        .cloned()
+        .collect()
+}
+
 /// How long to wait for a server's search answer / source list. Servers reply in
 /// well under this or not at all.
 const SEARCH_WAIT: Duration = Duration::from_secs(20);
@@ -1245,10 +1263,12 @@ impl Engine {
             .await;
         }
 
-        // Persisted Kad contacts.
+        // Persisted Kad contacts, gated like aMule's loader (the file may have
+        // just been downloaded by bootstrap::ensure above).
         if let Ok(bytes) = std::fs::read(self.config_dir.join("nodes.dat")) {
             if let Ok(nd) = read_nodes_dat(&bytes) {
-                self.routing.load_nodes(&nd.contacts);
+                self.routing
+                    .load_nodes(&gate_loaded_nodes(&nd.contacts, self.ip_filter.as_deref()));
             }
         }
         self.emit(EngineEvent::Kad {
@@ -2775,6 +2795,38 @@ impl Engine {
 mod tests {
     use super::*;
 
+    #[test]
+    fn gate_loaded_nodes_applies_the_amule_load_gate() {
+        // aMule filters nodes.dat contacts at LOAD (RoutingZone.cpp:195-199):
+        // Kad2-only, routable ip:port, user ipfilter, no legacy DNS-port node.
+        // A DOWNLOADED nodes.dat must not seed the table unfiltered.
+        let mk = |ip: u32, udp: u16, ver: u8| KadContact {
+            id: Kad128::from_hash(&[ver; 16]),
+            ip,
+            udp_port: udp,
+            tcp_port: 4662,
+            version: ver,
+            udp_key: 0,
+            udp_key_ip: 0,
+            verified: false,
+        };
+        let contacts = vec![
+            mk(0xC0A8_0105, 4672, 8), // 192.168.1.5 - private, dropped
+            mk(0x0808_0808, 53, 5),   // legacy node on the DNS port - dropped
+            mk(0x0808_0404, 53, 8),   // MODERN node on port 53 - kept (version-gated)
+            mk(0x0505_0505, 4672, 1), // Kad1 - dropped (aMule: contactVersion > 1)
+            mk(0x0102_0300, 4672, 8), // 1.2.3.0 - blocked by the user filter below
+            mk(0x2596_24FA, 4672, 8), // routable public v8 - kept
+        ];
+        let filter = mule_files::IpFilter::parse(
+            "001.002.003.000 - 001.002.003.255 , 000 , blocked range",
+            127,
+        );
+        let gated = gate_loaded_nodes(&contacts, Some(&filter));
+        let ips: Vec<u32> = gated.iter().map(|c| c.ip).collect();
+        assert_eq!(ips, vec![0x0808_0404, 0x2596_24FA]);
+    }
+
     fn tmp(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("padmule-engine-{tag}-{}", std::process::id()))
     }
@@ -3428,10 +3480,12 @@ mod tests {
         use mule_proto::Kad128;
         let dir = tmp("kad");
         let _ = std::fs::remove_dir_all(&dir);
+        // Routable public IPs: the reload path applies the aMule load gate, so
+        // private/unroutable fixture addresses would (correctly) be dropped.
         let contacts: Vec<KadContact> = (1..=3u8)
             .map(|i| KadContact {
                 id: Kad128::from_hash(&[i; 16]),
-                ip: 0x0A00_0000 | i as u32,
+                ip: 0x0808_0800 | i as u32,
                 udp_port: 4000 + i as u16,
                 tcp_port: 5000 + i as u16,
                 version: 8,
@@ -3773,12 +3827,14 @@ mod live {
     use super::*;
 
     /// The real thing, exactly as a FRESH iPad install experiences it: an empty
-    /// config dir with no server.met and no nodes.dat -> fetch both, log into a
-    /// live eD2k server, bootstrap Kad. Ignored by default (needs the network);
+    /// config dir with no server.met and no nodes.dat -> fetch both and
+    /// bootstrap Kad. Deliberately does NOT expect a server login: start() has
+    /// not auto-connected since the Servers screen landed (row 8x) - the user
+    /// picks a live server, like eMule. Ignored by default (needs the network);
     /// run with `--ignored`.
     #[tokio::test]
     #[ignore]
-    async fn fresh_install_goes_online_and_bootstraps_kad() {
+    async fn fresh_install_fetches_bootstrap_data_and_joins_kad() {
         let dir = std::env::temp_dir().join(format!("padmule-live-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let (mut engine, mut rx) = Engine::new(&dir).unwrap();
@@ -3790,8 +3846,9 @@ mod live {
         // It fetched the bootstrap data it had none of.
         assert!(dir.join("server.met").exists(), "server.met was fetched");
         assert!(dir.join("nodes.dat").exists(), "nodes.dat was fetched");
-        // It logged into a real server and bootstrapped Kad.
-        assert!(engine.is_online(), "a live server accepted our login");
+        // No auto-connect: the server link waits for the user's pick.
+        assert!(!engine.is_online(), "start() must not auto-connect");
+        // But Kad joined on its own.
         assert!(engine.kad_contacts() > 0, "Kad routing table is populated");
 
         let mut evs = Vec::new();
@@ -3802,9 +3859,11 @@ mod live {
         for e in &evs {
             println!("{e:?}");
         }
-        assert!(evs
-            .iter()
-            .any(|e| matches!(e, EngineEvent::Status(s) if s == "Connected")));
+        assert!(
+            evs.iter()
+                .any(|e| matches!(e, EngineEvent::Kad { contacts } if *contacts > 0)),
+            "a Kad event reported the populated table"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -43,7 +43,7 @@ fi
 # ---- inside the isolated namespace ----
 WORK="$(mktemp -d)"; CFG="$WORK/amuled"; ESRVDIR="$WORK/eserver"
 mkdir -p "$CFG/Incoming" "$CFG/Temp" "$ESRVDIR" "$WORK/shared"
-cleanup() { kill $(jobs -p) 2>/dev/null; rm -rf "$WORK"; }
+cleanup() { local j; j=$(jobs -p); [ -n "$j" ] && kill $j 2>/dev/null; rm -rf "$WORK"; }
 trap cleanup EXIT
 
 ip link set lo up
