@@ -119,13 +119,25 @@ scripts/amuled-reverse-oracle.sh    # PASS = amuled pulled the file byte-for-byt
 
 What it caught on day one: the **multipacket serve bug** ([[build-progress]] row
 8ad). padMule's HELLO advertised ext_multipacket, so amuled sent the bundled
-OP_MULTIPACKET_EXT (0xa4) request, which padMule's serve loop drops - transfer
+OP_MULTIPACKET_EXT (0xa4) request, which padMule's serve loop dropped - transfer
 died at 0 bytes. Every symmetric test missed it because padMule-as-downloader
-sends the INDIVIDUAL opcodes. Fix (commit 04d9116): stop advertising multipacket
-so real clients fall back to the individual OP_REQUESTFILENAME sequence padMule
-serves. With the fix the oracle PASSES - the FIRST validation of padMule's serve
-bytes (filename/status/hashset/accept/sending-part) against a genuine client. Set
-`SERVE_DEBUG=1` to trace the serve opcodes padMule receives.
+sends the INDIVIDUAL opcodes. 8ad's stopgap stopped advertising multipacket; row
+8ae then HONOURED it (padMule now answers OP_MULTIPACKET(_EXT) with
+OP_MULTIPACKETANSWER and re-advertises the capability). Set `SERVE_DEBUG=1` to
+trace the serve opcodes padMule receives (you will see `0xa4` when multipacket is
+on).
+
+IMPORTANT (row 8ae): the oracle now routes `serve-file` through the REAL
+production serve path - the inbound listener's `is_upload_request()` classifier
+gate plus `share::serve_shared` (the loop a real inbound peer hits on the device)
+- NOT the minimal `transfer_session::serve` demo shim it used at first. That shim
+bypassed the classifier, so the oracle originally could not see that
+`is_upload_request` failed to recognise the multipacket opener (a capable
+downloader LEADS with 0xa4 once we advertise the bit) and the listener silently
+dropped the connection. An adversarial code review caught that; the fix added the
+opcodes to `is_upload_request` AND pointed the oracle at the production path, so a
+regression there now FAILS the oracle. Lesson: an oracle only tests the code path
+it actually drives - aim it at production, not a demo path.
 
 ## Troubleshooting
 

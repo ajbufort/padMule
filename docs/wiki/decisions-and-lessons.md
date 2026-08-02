@@ -115,6 +115,20 @@ bullet each; Locked decisions newest first, Lessons in the order learned.
   where both peers are the code under test, or where your code only ever plays
   one role, cannot see a bug that lives in the other role's bytes. See
   [[emule-peer-oracle]] (reverse-direction oracle) and [[build-progress]] row 8ad.
+- 2026-08-02 **An oracle only validates the code PATH it actually drives - aim it
+  at production, not a demo shim.** When padMule started HONOURING serve-side
+  multipacket (build-progress 8ae) and re-advertised the bit, a capable downloader
+  began LEADING with OP_MULTIPACKET(_EXT). The inbound listener's
+  `is_upload_request()` classifier (engine.rs start_listener) did not recognise
+  0x92/0xa4, so the production upload path silently dropped the connection - yet the
+  reverse oracle ([[emule-peer-oracle]]) PASSED, because `serve-file` drove the
+  minimal `transfer_session::serve` path, which has no classifier gate. The real
+  device path (`is_upload_request` -> `serve_shared`) was never exercised. An
+  adversarial code review caught it; the fix added the opcodes to the classifier AND
+  re-pointed `serve-file` at the production path, so the oracle now fails if the
+  classifier regresses. Green oracle + green tests meant nothing for the code they
+  didn't touch. Ties [[verify-before-reporting]]: "validated against a real client"
+  is only true for the exact path the harness walks.
 - 2026-07-14 **Agent-derived constants are a HYPOTHESIS until a test pins them
   against real bytes.** The Wave-4d research pass reported the source-exchange
   record sizes as 14/30/31. They are 12/28/29 - upstream's own size checks are
