@@ -34,6 +34,30 @@ use tokio::time::{timeout, Instant};
 /// dropped (eMule caps the response at the requested count, Search.cpp:377).
 const KAD_REQUESTED_CONTACTS: usize = 11;
 
+/// Bind the Kad UDP socket with SO_REUSEADDR set.
+///
+/// padMule binds a FIXED Kad port, and `pause()` -> `resume()` closes and rebinds
+/// it on every background/foreground cycle - a HARD lifecycle requirement
+/// (docs/wiki/lifecycle-and-reactivation.md). aMule had to set this option for
+/// precisely that path (LibSocketAsio.cpp:1447-1456, PR #121: "without this Kad
+/// and the ed2k client UDP stay broken until the user restarts amule"), and
+/// tokio's `UdpSocket::bind` does NOT set it - its `TcpListener::bind` does,
+/// which is why only the Kad socket was exposed. A clean drop frees a UDP port
+/// anyway (there is no TIME_WAIT); what this covers is iPadOS reclaiming the
+/// socket WITHOUT a clean close, which is the state aMule's users hit.
+fn bind_kad_socket(addr: SocketAddr) -> Result<UdpSocket, KadError> {
+    let sock = socket2::Socket::new(
+        socket2::Domain::for_address(addr),
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    sock.set_reuse_address(true)?;
+    // tokio::net::UdpSocket::from_std requires a non-blocking socket.
+    sock.set_nonblocking(true)?;
+    sock.bind(&addr.into())?;
+    Ok(UdpSocket::from_std(sock.into())?)
+}
+
 /// A contact's host-order `ip` u32 to its socket address (big-endian view).
 fn contact_addr(ip: u32, port: u16) -> SocketAddr {
     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(ip), port))
@@ -133,7 +157,7 @@ impl KadNode {
         kad_id: Kad128,
         udp_key: u32,
     ) -> Result<Self, KadError> {
-        let socket = UdpSocket::bind(bind_addr).await?;
+        let socket = bind_kad_socket(bind_addr)?;
         let udp_port = socket.local_addr()?.port();
         Ok(KadNode {
             socket,
@@ -723,6 +747,33 @@ mod tests {
             udp_key_ip: 0,
             verified: false,
         }
+    }
+
+    #[tokio::test]
+    async fn the_kad_socket_sets_reuse_address_so_a_resume_can_rebind_its_fixed_port() {
+        // padMule binds a FIXED Kad UDP port; pause() drops the KadNode (closing
+        // the socket) and resume() rebinds that same port - a HARD lifecycle
+        // requirement. aMule had to set SO_REUSEADDR for exactly this
+        // (LibSocketAsio.cpp:1447-1456, PR #121: "without this Kad and the ed2k
+        // client UDP stay broken until the user restarts amule"), and tokio's
+        // UdpSocket::bind does NOT set it (its TcpListener::bind does, which is
+        // why only the Kad socket was exposed). A clean drop frees a UDP port
+        // anyway - the case this covers is iPadOS reclaiming the socket WITHOUT
+        // a clean close, which is what a background/foreground cycle can do.
+        let node = KadNode::bind_with_identity(
+            "127.0.0.1:0".parse().unwrap(),
+            4662,
+            Kad128::from_words([1, 1, 1, 1]),
+            0x1234,
+        )
+        .await
+        .unwrap();
+        assert!(
+            socket2::SockRef::from(&node.socket)
+                .reuse_address()
+                .unwrap(),
+            "the Kad UDP socket must set SO_REUSEADDR"
+        );
     }
 
     #[tokio::test]

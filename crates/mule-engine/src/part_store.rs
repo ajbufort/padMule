@@ -66,6 +66,45 @@ pub struct PartStore {
     pub priority: u8,
 }
 
+/// Free space we refuse to consume when preallocating, so a download can never
+/// fill the device to zero - iPadOS degrades badly there (and the user still has
+/// to be able to save the finished file out of Documents).
+pub const MIN_FREE_MARGIN: u64 = 256 * 1024 * 1024;
+
+/// Bytes currently available on the volume holding `dir`, or `None` if it cannot
+/// be determined (an unreadable path, an exotic filesystem).
+pub fn available_space(dir: &Path) -> Option<u64> {
+    let c_path = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).ok()?;
+    // SAFETY: c_path is a valid NUL-terminated string for the duration of the
+    // call, and statvfs only writes into the zeroed struct we hand it.
+    unsafe {
+        let mut st: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(c_path.as_ptr(), &mut st) != 0 {
+            return None;
+        }
+        // f_bavail is the count available to a NON-root user, which is what an
+        // app actually gets; f_bfree would overstate it by the reserved blocks.
+        (st.f_bavail as u64).checked_mul(st.f_frsize as u64)
+    }
+}
+
+/// Would preallocating `size` bytes leave less than [`MIN_FREE_MARGIN`] free?
+///
+/// FAILS OPEN on unknown availability: if the volume cannot be read we allow the
+/// download rather than block one the device may well have room for.
+pub fn would_exhaust_space(size: u64, available: Option<u64>) -> bool {
+    match available {
+        // A size that OVERFLOWS when the margin is added is absurd and cannot
+        // fit anything - refuse it. (saturating_add would silently stop
+        // enforcing the margin at the top of the range.)
+        Some(free) => match size.checked_add(MIN_FREE_MARGIN) {
+            Some(needed) => needed > free,
+            None => true,
+        },
+        None => false,
+    }
+}
+
 impl PartStore {
     /// Start a new download as `NNN.part` in `dir`.
     ///
@@ -78,6 +117,15 @@ impl PartStore {
         size: u64,
         name: &[u8],
     ) -> io::Result<Self> {
+        // Guard the volume BEFORE creating anything: a sparse `set_len` succeeds
+        // instantly even when the file cannot possibly fit, so without this the
+        // failure surfaces mid-transfer instead of at the click
+        // (docs/wiki/ipados-constraints.md requires this check).
+        if would_exhaust_space(size, available_space(dir)) {
+            return Err(io::Error::other(format!(
+                "not enough free space for {size} bytes (keeping {MIN_FREE_MARGIN} bytes free)"
+            )));
+        }
         let (part_path, met_path) = paths(dir, index);
         let file = OpenOptions::new()
             .read(true)
@@ -372,6 +420,49 @@ fn parse_corrupted(s: &[u8]) -> Vec<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_space_guard_refuses_only_what_would_exhaust_the_volume() {
+        // Pure predicate, so the policy is testable without a full disk.
+        // Unknown availability must FAIL OPEN: if we cannot read the volume we
+        // must not block a download the device may well have room for.
+        assert!(!would_exhaust_space(1_000, None));
+        // Comfortably fits.
+        assert!(!would_exhaust_space(1_000, Some(10 * MIN_FREE_MARGIN)));
+        // Fits on paper but would eat the safety margin - iPadOS misbehaves badly
+        // at zero free space, so leave headroom rather than fill the device.
+        assert!(would_exhaust_space(
+            MIN_FREE_MARGIN,
+            Some(MIN_FREE_MARGIN + 1_000)
+        ));
+        // Plainly larger than the volume.
+        assert!(would_exhaust_space(u64::MAX / 2, Some(1_000_000)));
+        // No overflow panic on a preposterous size.
+        assert!(would_exhaust_space(u64::MAX, Some(u64::MAX)));
+    }
+
+    #[test]
+    fn create_refuses_a_file_the_volume_cannot_hold() {
+        // The live path: a sparse set_len would SUCCEED instantly for a size the
+        // volume cannot hold, and the download would then die mid-transfer.
+        // docs/wiki/ipados-constraints.md requires guarding this.
+        let dir = std::env::temp_dir().join(format!("padmule-space-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = match PartStore::create(&dir, 1, [0xAB; 16], u64::MAX / 2, b"huge.bin") {
+            Err(e) => e,
+            Ok(_) => panic!("a file larger than the volume must be refused up front"),
+        };
+        assert!(
+            err.to_string().contains("free space"),
+            "the refusal must say WHY: {err}"
+        );
+        // ...and it must not leave a stray part file behind.
+        assert!(!dir.join("001.part").exists());
+        // A normal-sized file is unaffected.
+        PartStore::create(&dir, 2, [0xCD; 16], 4096, b"ok.bin").unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
     use mule_proto::{ed2k_hash, md4};
 
