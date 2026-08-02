@@ -952,7 +952,7 @@ async fn cmd_serve_file(port: u16, path: &str, eserver: Option<(String, u16)>) {
                 ServeSec::new(
                     SecureIdentSession::new(&identity),
                     Arc::clone(&identity),
-                    Box::new(|| println!("identity verified (secure-ident): true")),
+                    Box::new(|_| println!("identity verified (secure-ident): true")),
                 )
             });
             let (first, sec) = match classify_inbound(&mut fs, sec, Duration::from_secs(3)).await {
@@ -975,7 +975,7 @@ async fn cmd_serve_file(port: u16, path: &str, eserver: Option<(String, u16)>) {
                 rating: 0,
                 comment: String::new(),
             }];
-            match serve_shared(&mut fs, &shared, Some(first), None, 0, sec).await {
+            match serve_shared(&mut fs, &shared, Some(first), None, 0, sec, None).await {
                 Ok(()) => println!("  peer {peer} done"),
                 Err(e) => eprintln!("  serve ended: {e}"),
             }

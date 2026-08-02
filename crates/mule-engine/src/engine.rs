@@ -23,6 +23,7 @@
 use crate::bootstrap;
 use crate::catalog::{catalog, tag_str, tag_u64, RankedFile};
 use crate::connection::{ServerEvent, ServerState};
+use crate::credit_store::{now_secs, CreditStore};
 use crate::fetch::{download_file, ManagerConfig, PeerSource, SourceRegistry};
 use crate::framed::FramedStream;
 use crate::identity::NodeIdentity;
@@ -43,7 +44,8 @@ use crate::server_messages::{
     FILE_COMPLETE_PORT, OP_GLOBSERVSTATREQ, OP_GLOBSERVSTATRES, SERV_STAT_CHALLENGE,
 };
 use crate::share::{
-    classify_inbound, head_hash, serve_shared, InboundKind, ServeSec, SharedFile, UploadGate,
+    classify_inbound, head_hash, serve_shared, CreditCtx, InboundKind, ServeSec, SharedFile,
+    UploadGate,
 };
 use crate::transfer::build_file_req_ans_no_fil;
 use mule_files::{
@@ -281,6 +283,7 @@ fn unique_dest(dest: PathBuf) -> PathBuf {
 /// complete files we will re-serve after a restart. Lives in the config dir
 /// alongside the other `.met` files; the actual bytes are in the downloads dir.
 const KNOWN_MET: &str = "known.met";
+const CLIENTS_MET: &str = "clients.met";
 const FT_FILENAME: u8 = 0x01;
 const FT_FILESIZE: u8 = 0x02;
 const FT_FILERATING: u8 = 0xF7;
@@ -660,6 +663,7 @@ async fn finish_download(
 /// grants one immediately if free, or QUEUES the peer (OP_QUEUERANKING) and
 /// grants a freed slot in place. The permit is held inside serve_shared for the
 /// whole session.
+#[allow(clippy::too_many_arguments)]
 async fn serve_inbound<S>(
     fs: &mut FramedStream<S>,
     shared: &Arc<Mutex<Vec<SharedFile>>>,
@@ -668,6 +672,7 @@ async fn serve_inbound<S>(
     first: Packet,
     peer_accept_comment: u8,
     sec: Option<ServeSec>,
+    credit: Option<CreditCtx>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -686,6 +691,7 @@ async fn serve_inbound<S>(
         Some(gate),
         peer_accept_comment,
         sec,
+        credit,
     )
     .await;
 }
@@ -971,6 +977,10 @@ pub struct Engine {
     upload_gate: Arc<UploadGate>,
     /// Serializes known.met writes across concurrently-finishing downloads.
     known_met_lock: Arc<Mutex<()>>,
+    /// Per-peer credit history (bytes moved + verified key), keyed by userhash.
+    /// Loaded from `clients.met` on `new`, written back on `pause`. Shared with
+    /// the listener so it can accrue upload bytes + bind a verified leecher.
+    credit_store: Arc<CreditStore>,
     /// The live eD2k server link, once logged in.
     server: Option<ServerLink>,
     /// What that login yielded (server address + HighID/LowID), for the UI.
@@ -1008,6 +1018,12 @@ impl Engine {
         let identity = NodeIdentity::load_or_create(&config_dir)?;
         let (tx, rx) = mpsc::unbounded_channel();
         let routing = RoutingTable::new(identity.kad_id);
+        // Load the credit history, pruning entries expired past the 150-day
+        // window. We always hold a key pair, so the secure-ident gate is live.
+        let credit_store = Arc::new(match std::fs::read(config_dir.join(CLIENTS_MET)) {
+            Ok(bytes) => CreditStore::load(&bytes, now_secs(), true),
+            Err(_) => CreditStore::empty(true),
+        });
         let engine = Engine {
             identity,
             downloads_dir: config_dir.join("downloads"),
@@ -1024,6 +1040,7 @@ impl Engine {
                 UPLOAD_QUEUE_CAP,
             )),
             known_met_lock: Arc::new(Mutex::new(())),
+            credit_store,
             ip_filter: None,
             server: None,
             connection: None,
@@ -1301,6 +1318,7 @@ impl Engine {
             .with_crypt_supported()
             .with_secident();
         let identity = Arc::clone(&self.identity.rsa);
+        let credit_store = Arc::clone(&self.credit_store);
         let downloads = Arc::clone(&self.downloads);
         let shared = Arc::clone(&self.shared);
         let sharing = Arc::clone(&self.sharing);
@@ -1340,6 +1358,7 @@ impl Engine {
                 };
                 let me = me.clone();
                 let identity = Arc::clone(&identity);
+                let credit_store = Arc::clone(&credit_store);
                 let downloads = Arc::clone(&downloads);
                 let shared = Arc::clone(&shared);
                 let sharing = Arc::clone(&sharing);
@@ -1370,16 +1389,22 @@ impl Engine {
                     };
                     // A bare connect+close (the server's HighID probe) ends here:
                     // it never sends OP_HELLO, so the handshake errors and we bail.
-                    let (peer_accept_comment, peer_secident) =
+                    let (peer_hash, peer_accept_comment, peer_secident) =
                         match timeout(Duration::from_secs(8), peer_handshake_inbound(&mut fs, &me))
                             .await
                         {
-                            Ok(Ok(h)) => h
-                                .capabilities()
-                                .map(|c| (c.accept_comment, c.sec_ident))
-                                .unwrap_or((0, 0)),
+                            Ok(Ok(h)) => {
+                                let (ac, si) = h
+                                    .capabilities()
+                                    .map(|c| (c.accept_comment, c.sec_ident))
+                                    .unwrap_or((0, 0));
+                                (h.user_hash, ac, si)
+                            }
                             _ => return,
                         };
+                    // Record the contact so its credit record exists + last_seen is
+                    // fresh (mirrors eMule's GetCredit at hello).
+                    credit_store.touch(peer_hash, now_secs());
                     // Drop a blocklisted PEER now (after the handshake, so the
                     // server's bare-connect HighID probe - which never completes a
                     // handshake and already returned above - is never filtered and
@@ -1398,12 +1423,13 @@ impl Engine {
                     // support (mirrors eMule's m_bySupportSecIdent gate). Cancel-safe:
                     // classify_inbound times out per-read, never around a write.
                     let sec = (peer_secident > 0).then(|| {
+                        let cs = Arc::clone(&credit_store);
                         ServeSec::new(
                             SecureIdentSession::new(&identity),
                             Arc::clone(&identity),
-                            // The verified peer feeds the credit store in a later
-                            // batch; verification itself is what closes the gate row.
-                            Box::new(|| {}),
+                            // On verification, bind the peer's key to its userhash
+                            // (eMule Verified: first key-bind wipes prior credits).
+                            Box::new(move |pubkey| cs.bind_verified(peer_hash, pubkey, now_secs())),
                         )
                     });
                     match classify_inbound(&mut fs, sec, SERVE_PEEK).await {
@@ -1416,6 +1442,7 @@ impl Engine {
                                 first,
                                 peer_accept_comment,
                                 sec,
+                                Some((Arc::clone(&credit_store), peer_hash)),
                             )
                             .await;
                         }
@@ -2671,6 +2698,11 @@ impl Engine {
             contacts,
         };
         let _ = std::fs::write(self.config_dir.join("nodes.dat"), write_nodes_dat(&nd));
+        // Persist the credit history (clients.met). pause() is the only reliable
+        // iPadOS checkpoint, so credit deltas since the last pause are lost on a
+        // hard kill - acceptable for foreground-only v1, and eMule keeps its own
+        // wait-clock in RAM too.
+        let _ = std::fs::write(self.config_dir.join(CLIENTS_MET), self.credit_store.save());
     }
 
     /// Seed the routing table with Kad contacts (e.g. from a fresh nodes.dat or a
@@ -2809,7 +2841,17 @@ mod tests {
 
         let first = build_request_filename_ext(&hash);
         let srv = tokio::spawn(async move {
-            serve_inbound(&mut server_fs, &shared, &sharing, &gate, first, 0, None).await
+            serve_inbound(
+                &mut server_fs,
+                &shared,
+                &sharing,
+                &gate,
+                first,
+                0,
+                None,
+                None,
+            )
+            .await
         });
 
         let reply = client_fs.read_packet_unpacked().await.unwrap();
@@ -2849,7 +2891,7 @@ mod tests {
 
         let gate2 = Arc::clone(&gate);
         let srv = tokio::spawn(async move {
-            let _ = serve_shared(&mut server_fs, &shared, None, Some(&gate2), 0, None).await;
+            let _ = serve_shared(&mut server_fs, &shared, None, Some(&gate2), 0, None, None).await;
         });
 
         // Name the file, then ask to upload - the slot is taken, so we are queued.
@@ -2910,7 +2952,7 @@ mod tests {
 
         let gate2 = Arc::clone(&gate);
         let srv = tokio::spawn(async move {
-            let _ = serve_shared(&mut server_fs, &shared, None, Some(&gate2), 0, None).await;
+            let _ = serve_shared(&mut server_fs, &shared, None, Some(&gate2), 0, None, None).await;
         });
 
         client_fs
@@ -2971,7 +3013,17 @@ mod tests {
         let srv = tokio::spawn(async move {
             // The listener peeks the first packet before deciding; do the same.
             let first = server_fs.read_packet_unpacked().await.unwrap();
-            serve_inbound(&mut server_fs, &shared, &sharing, &gate, first, 0, None).await;
+            serve_inbound(
+                &mut server_fs,
+                &shared,
+                &sharing,
+                &gate,
+                first,
+                0,
+                None,
+                None,
+            )
+            .await;
         });
 
         let got = crate::transfer_session::download_file(&mut client_fs, &hash, data.len() as u64)
@@ -3652,8 +3704,13 @@ mod tests {
         let uh = engine.userhash();
         std::fs::remove_file(dir.join("preferences.dat")).unwrap();
         engine.start().await;
-        engine.pause().await; // checkpoint re-writes identity
+        engine.pause().await; // checkpoint re-writes identity + the credit store
         assert!(dir.join("preferences.dat").exists());
+        // The credit store is checkpointed alongside (clients.met, valid on read).
+        assert!(dir.join("clients.met").exists());
+        assert!(
+            mule_files::read_clients_met(&std::fs::read(dir.join("clients.met")).unwrap()).is_ok()
+        );
         let re =
             mule_files::read_preferences_dat(&std::fs::read(dir.join("preferences.dat")).unwrap())
                 .unwrap();
