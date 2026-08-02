@@ -37,11 +37,14 @@ use crate::search::{
     build_global_search_udp, parse_global_search_res, related_keyword, SearchParams,
     SearchResultFile, SearchResultPage, OP_GLOBSEARCHRES,
 };
+use crate::secure_ident::SecureIdentSession;
 use crate::server_messages::{
     parse_serv_stat_res, LoginRequest, OfferedFile, DEFAULT_SERVER_FLAGS, FILE_COMPLETE_ID,
     FILE_COMPLETE_PORT, OP_GLOBSERVSTATREQ, OP_GLOBSERVSTATRES, SERV_STAT_CHALLENGE,
 };
-use crate::share::{head_hash, is_upload_request, serve_shared, SharedFile, UploadGate};
+use crate::share::{
+    classify_inbound, head_hash, serve_shared, InboundKind, ServeSec, SharedFile, UploadGate,
+};
 use crate::transfer::build_file_req_ans_no_fil;
 use mule_files::{
     merge_server_met, read_nodes_dat, read_pins, read_server_met, write_nodes_dat, write_pins,
@@ -664,6 +667,7 @@ async fn serve_inbound<S>(
     gate: &Arc<UploadGate>,
     first: Packet,
     peer_accept_comment: u8,
+    sec: Option<ServeSec>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -675,7 +679,15 @@ async fn serve_inbound<S>(
         return;
     }
     let library = shared.lock().await.clone();
-    let _ = serve_shared(fs, &library, Some(first), Some(gate), peer_accept_comment).await;
+    let _ = serve_shared(
+        fs,
+        &library,
+        Some(first),
+        Some(gate),
+        peer_accept_comment,
+        sec,
+    )
+    .await;
 }
 
 /// What [`Engine::add_download`] did. Not an Error type: "no sources yet" is a
@@ -1281,10 +1293,14 @@ impl Engine {
             )));
             return;
         };
-        // Advertise crypt SUPPORTED so crypt-required peers can reach us; the accept
-        // loop below wires the matching inbound obf-accept (both halves land together).
+        // Advertise crypt SUPPORTED so crypt-required peers can reach us, and
+        // secure-ident so a leecher challenges us (the precondition for verifying
+        // IT - the exchange is mutual). The accept loop wires the matching inbound
+        // obf-accept and the secure-ident drain (all halves land together).
         let me = HelloInfo::baseline(self.identity.userhash, 0, TCP_PORT, KAD_UDP_PORT, "padMule")
-            .with_crypt_supported();
+            .with_crypt_supported()
+            .with_secident();
+        let identity = Arc::clone(&self.identity.rsa);
         let downloads = Arc::clone(&self.downloads);
         let shared = Arc::clone(&self.shared);
         let sharing = Arc::clone(&self.sharing);
@@ -1323,6 +1339,7 @@ impl Engine {
                     SocketAddr::V6(_) => None,
                 };
                 let me = me.clone();
+                let identity = Arc::clone(&identity);
                 let downloads = Arc::clone(&downloads);
                 let shared = Arc::clone(&shared);
                 let sharing = Arc::clone(&sharing);
@@ -1353,11 +1370,14 @@ impl Engine {
                     };
                     // A bare connect+close (the server's HighID probe) ends here:
                     // it never sends OP_HELLO, so the handshake errors and we bail.
-                    let peer_accept_comment =
+                    let (peer_accept_comment, peer_secident) =
                         match timeout(Duration::from_secs(8), peer_handshake_inbound(&mut fs, &me))
                             .await
                         {
-                            Ok(Ok(h)) => h.capabilities().map(|c| c.accept_comment).unwrap_or(0),
+                            Ok(Ok(h)) => h
+                                .capabilities()
+                                .map(|c| (c.accept_comment, c.sec_ident))
+                                .unwrap_or((0, 0)),
                             _ => return,
                         };
                     // Drop a blocklisted PEER now (after the handshake, so the
@@ -1369,28 +1389,42 @@ impl Engine {
                             return;
                         }
                     }
-                    // Peek who speaks first. Cancel-safe: a silent source buffers
-                    // no bytes, so a timeout here loses nothing and the download
-                    // path below reads cleanly (see framed::read_packet).
-                    match timeout(SERVE_PEEK, fs.read_packet_unpacked()).await {
-                        Ok(Ok(pkt)) if is_upload_request(pkt.opcode) => {
+                    // Classify who this is, draining any secure-ident prefix along
+                    // the way. Advertising secure-ident means a capable peer (a
+                    // leecher OR a called-back source) may LEAD with OP_SECIDENTSTATE,
+                    // so we can no longer classify on the first packet - the drain
+                    // re-applies the leecher-vs-source discriminator on what follows.
+                    // We run our half of the exchange only when the peer advertised
+                    // support (mirrors eMule's m_bySupportSecIdent gate). Cancel-safe:
+                    // classify_inbound times out per-read, never around a write.
+                    let sec = (peer_secident > 0).then(|| {
+                        ServeSec::new(
+                            SecureIdentSession::new(&identity),
+                            Arc::clone(&identity),
+                            // The verified peer feeds the credit store in a later
+                            // batch; verification itself is what closes the gate row.
+                            Box::new(|| {}),
+                        )
+                    });
+                    match classify_inbound(&mut fs, sec, SERVE_PEEK).await {
+                        InboundKind::Leecher { first, sec } => {
                             serve_inbound(
                                 &mut fs,
                                 &shared,
                                 &sharing,
                                 &gate,
-                                pkt,
+                                first,
                                 peer_accept_comment,
+                                sec,
                             )
                             .await;
                         }
-                        // Spoke, but not an upload request, or the link errored:
-                        // nothing we can do with it.
-                        Ok(_) => {}
+                        // Spoke, but not an upload request: nothing we can do.
+                        InboundKind::Other => {}
                         // Silent: a called-back source. Offer it every unfinished
                         // download and let it serve whichever it actually has.
                         // Do NOT hold the lock across the transfer.
-                        Err(_) => {
+                        InboundKind::Source => {
                             let pending: Vec<Arc<Download>> = downloads.lock().await.clone();
                             for dl in pending {
                                 if dl.is_complete().await {
@@ -2775,7 +2809,7 @@ mod tests {
 
         let first = build_request_filename_ext(&hash);
         let srv = tokio::spawn(async move {
-            serve_inbound(&mut server_fs, &shared, &sharing, &gate, first, 0).await
+            serve_inbound(&mut server_fs, &shared, &sharing, &gate, first, 0, None).await
         });
 
         let reply = client_fs.read_packet_unpacked().await.unwrap();
@@ -2815,7 +2849,7 @@ mod tests {
 
         let gate2 = Arc::clone(&gate);
         let srv = tokio::spawn(async move {
-            let _ = serve_shared(&mut server_fs, &shared, None, Some(&gate2), 0).await;
+            let _ = serve_shared(&mut server_fs, &shared, None, Some(&gate2), 0, None).await;
         });
 
         // Name the file, then ask to upload - the slot is taken, so we are queued.
@@ -2876,7 +2910,7 @@ mod tests {
 
         let gate2 = Arc::clone(&gate);
         let srv = tokio::spawn(async move {
-            let _ = serve_shared(&mut server_fs, &shared, None, Some(&gate2), 0).await;
+            let _ = serve_shared(&mut server_fs, &shared, None, Some(&gate2), 0, None).await;
         });
 
         client_fs
@@ -2937,7 +2971,7 @@ mod tests {
         let srv = tokio::spawn(async move {
             // The listener peeks the first packet before deciding; do the same.
             let first = server_fs.read_packet_unpacked().await.unwrap();
-            serve_inbound(&mut server_fs, &shared, &sharing, &gate, first, 0).await;
+            serve_inbound(&mut server_fs, &shared, &sharing, &gate, first, 0, None).await;
         });
 
         let got = crate::transfer_session::download_file(&mut client_fs, &hash, data.len() as u64)

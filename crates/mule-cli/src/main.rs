@@ -896,8 +896,14 @@ async fn cmd_serve_file(port: u16, path: &str, eserver: Option<(String, u16)>) {
         });
     }
 
-    use mule_engine::share::is_upload_request;
-    let me = HelloInfo::baseline(demo_user_hash(), 0, port, 4672, "padMule");
+    use mule_engine::share::{classify_inbound, InboundKind, ServeSec};
+    use mule_engine::{Identity, SecureIdentSession};
+    use std::sync::Arc;
+    use std::time::Duration;
+    // Advertise secure-ident so a downloader (real amuled) challenges us - the
+    // precondition for verifying it - and drive our half of the exchange.
+    let me = HelloInfo::baseline(demo_user_hash(), 0, port, 4672, "padMule").with_secident();
+    let identity = Arc::new(Identity::generate());
     let size = data.len() as u64;
     let path_buf = std::path::PathBuf::from(path);
     loop {
@@ -910,6 +916,7 @@ async fn cmd_serve_file(port: u16, path: &str, eserver: Option<(String, u16)>) {
         };
         println!("inbound peer {peer}");
         let me = me.clone();
+        let identity = Arc::clone(&identity);
         let phs = phs.clone();
         let name = name.clone();
         let path_buf = path_buf.clone();
@@ -930,29 +937,35 @@ async fn cmd_serve_file(port: u16, path: &str, eserver: Option<(String, u16)>) {
                     return;
                 }
             };
-            if let Err(e) = peer_handshake_inbound(&mut fs, &me).await {
-                eprintln!("  handshake failed: {e}");
-                return;
-            }
-            // Serve through the SAME production path a real inbound peer hits on
-            // the device: peek the opening packet, gate on is_upload_request, then
-            // serve_shared. This makes the reverse oracle exercise the real listener
-            // classifier + serve loop (including the multipacket opener), not a
-            // bespoke demo path - the gap the adversarial review exposed.
-            let first = match fs.read_packet_unpacked().await {
-                Ok(p) => p,
+            let peer_secident = match peer_handshake_inbound(&mut fs, &me).await {
+                Ok(h) => h.capabilities().map(|c| c.sec_ident).unwrap_or(0),
                 Err(e) => {
-                    eprintln!("  read failed: {e}");
+                    eprintln!("  handshake failed: {e}");
                     return;
                 }
             };
-            if !is_upload_request(first.opcode) {
-                eprintln!(
-                    "  peer {peer} opened with 0x{:02x} (not an upload request); closing",
-                    first.opcode
-                );
-                return;
-            }
+            // Serve through the SAME production path a real inbound peer hits on
+            // the device: classify_inbound (draining any secure-ident prefix) then
+            // serve_shared. This makes the reverse oracle exercise the real listener
+            // classifier + serve loop, not a bespoke demo path.
+            let sec = (peer_secident > 0).then(|| {
+                ServeSec::new(
+                    SecureIdentSession::new(&identity),
+                    Arc::clone(&identity),
+                    Box::new(|| println!("identity verified (secure-ident): true")),
+                )
+            });
+            let (first, sec) = match classify_inbound(&mut fs, sec, Duration::from_secs(3)).await {
+                InboundKind::Leecher { first, sec } => (first, sec),
+                InboundKind::Other => {
+                    eprintln!("  peer {peer} did not issue a file request; closing");
+                    return;
+                }
+                InboundKind::Source => {
+                    eprintln!("  peer {peer} stayed silent (a source, not a leecher); closing");
+                    return;
+                }
+            };
             let shared = vec![SharedFile {
                 hash,
                 size,
@@ -962,7 +975,7 @@ async fn cmd_serve_file(port: u16, path: &str, eserver: Option<(String, u16)>) {
                 rating: 0,
                 comment: String::new(),
             }];
-            match serve_shared(&mut fs, &shared, Some(first), None, 0).await {
+            match serve_shared(&mut fs, &shared, Some(first), None, 0, sec).await {
                 Ok(()) => println!("  peer {peer} done"),
                 Err(e) => eprintln!("  serve ended: {e}"),
             }
