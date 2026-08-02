@@ -12,19 +12,22 @@ off from most peers/servers).
 ## SCORECARD (security-completeness audit, 2026-07-20)
 
 A 26-measure adversarial audit (6 domain finders -> per-measure attacker ->
-synthesis, 33 agents). Tally as of 2026-08-01: **13 OPERATIONAL, 10 PARTIAL,
-3 MISSING** (the 2026-07-20 audit scored 11/12/3; B6 MOTD-flood + B8 SSRF
-closed since, commit 625df39). Full adversarial detail: workflow
-wf_231184f5-a1b transcript.
+synthesis, 33 agents). Tally as of 2026-08-01: **18 OPERATIONAL, 5 PARTIAL,
+3 MISSING**. History: the 2026-07-20 audit scored 11/12/3; B6 MOTD-flood + B8
+SSRF closed it to 13/10/3 (commit 625df39); the 2026-08-01 security-hardening
+batch (Kad receiver-key/verified-bit + ipfilter/sybil/answer-validation, per-part
+poison recovery, per-IP inbound cap, inbound TCP obfuscation, search availability
+cap) moved five more rows to OPERATIONAL. Each change was eMule-0.50a-grounded,
+test-first, and adversarially re-reviewed (4 confirmed findings on the batch, all
+fixed - see [[build-progress]] row 8ab).
 
-**BOTTOM LINE: NOT yet bulletproof.** BUT no failure delivers a corrupt file or
-RCE - whole-file ed2k MD4, ipfilter, hash-keyed transfers, and the OOM/parse
-hardening are genuinely OPERATIONAL + oracle-proven. The remaining gaps are
-anti-impersonation/anti-leech completeness + the inbound per-IP starvation DoS
-+ Kad routing-poison vectors (the MOTD-flood DoS and the SSRF source vector are
-CLOSED - B6/B8). Shortest path to yes = the Band A/B fixes (almost all LOW
-burden, ~a week) + convert code-only claims to oracle-proven; the credit system
-is the one larger item (build, or ship documented as not-yet-active).
+**BOTTOM LINE: NOT yet bulletproof, but close.** No failure delivers a corrupt
+file or RCE - the integrity core is OPERATIONAL + oracle-proven. The 5 remaining
+PARTIAL rows are anti-impersonation/anti-leech COMPLETENESS (serve-side
+secure-ident; Kad verified-bit not yet ENFORCED in routing; per-source corruption
+attribution; AICH block recovery) - none is an integrity or RCE hole. Shortest
+path to yes = serve-side secure-ident + Kad hard-verify + the credit system, all
+validated against the real-eMule/eserver oracles.
 
 | Measure | Status | Note |
 |---------|--------|------|
@@ -39,33 +42,35 @@ is the one larger item (build, or ship documented as not-yet-active).
 | Input safety: trapping casts | OPERATIONAL | Int64(clamping:) + widening/checked casts |
 | Input safety: no hostile-peer crash/OOM/hang | OPERATIONAL | bounds+timeout-checked parse paths (not fuzz-proven) |
 | Privacy: no public-IP/client-id leak | OPERATIONAL | id never Debug-formatted into UI (audit fix) |
-| Secure identification (RSA, both roles) | PARTIAL | download-side computes verified (crypto UNPROVEN vs independent impl); SERVE side does none - serves stolen-userhash peers |
-| TCP c2c obfuscation (RC4) | PARTIAL | outbound-initiator proven once; INBOUND obf absent + HELLO advertises crypt-unsupported -> crypt-required peers unreachable both ways |
-| Kad UDP verify/sender keys | PARTIAL | derivation proven; receive-side IP-verification absent (receiver_vk=0 always) -> forged-response window |
-| Kad node-ID/IP verification + 2^120 | PARTIAL | tolerance proven; per-contact IP-verified bit absent -> forged (KadID,IP) seeds lookups |
-| Kad anti-flood hardening | PARTIAL | per-IP//24 sybil cap wired; FloodTracker dead; caps looser than eMule |
-| AICH part-level + block RECOVERY | PARTIAL | master hash byte-valid but DEAD; no per-part MD4; recovery unimplemented; AICH bit advertised-then-dropped |
-| Poisoning defense (bad part re-fetchable) | PARTIAL | whole-file MD4 holds, but no per-part verify + no source attribution -> one bad source = full re-download loop / stall |
-| Search-result SPAM filter | PARTIAL | intra-hash heuristics only; eMule's cross-hash filename-repetition defense absent |
+| Secure identification (RSA, both roles) | PARTIAL | download-side computes verified (oracle-proven vs amuled + real eMule); SERVE side still does none - serves stolen-userhash peers at a normal queue position. TOP remaining Band-A item. Correct approach (agent-blueprinted, deferred to validate vs [[emule-peer-oracle]]): advertise sec-ident on the listener hello, run the SAME SecureIdentSession on serve, feed IdentState into the upload queue - REWEIGHT only, NEVER refuse (eMule never refuses on ident state, UploadClient.cpp:206) |
+| TCP c2c obfuscation (RC4) | OPERATIONAL (2026-08-01) | outbound proven vs amuled; INBOUND obf now wired (obf_accept auto-detect) + listener advertises crypt-SUPPORTED (never REQUIRED) -> crypt-required peers reachable. Plaintext byte-identical (differential passes); live inbound-obf vs real eMule dialing us pending [[emule-peer-oracle]] |
+| Kad UDP verify/sender keys | PARTIAL | RECEIVE side now computes bValidReceiverKey (== udp_verify_key(our_key, senderIP)) and sets the contact verified bit (2026-08-01); SEND side still emits receiver_vk=0 (no per-peer key store), so peers still see us unverified until we echo stored keys |
+| Kad node-ID/IP verification + 2^120 | PARTIAL | tolerance proven; verified bit now TRACKED + persisted + set from the receiver key + CLEARED on any ip change (2026-08-01); still not ENFORCED (unverified contacts are used in routing) - hard exclusion needs the HELLO_RES_ACK challenge machinery |
+| Kad anti-flood hardening | OPERATIONAL (2026-08-01) | sybil cap now 1/IP + 10//24 (matches eMule RoutingBin.cpp:56); a known id re-pointed to a new IP faces the cap (no free hijack). FloodTracker is N/A for a requests-only client (eMule exempts RESPONSE opcodes from its inbound flood limiter; padMule serves no inbound Kad requests) - documented, ready if a request-server is ever added |
+| AICH part-level + block RECOVERY | PARTIAL | per-part MD4 blame + targeted re-fetch now live (localize_corruption, 2026-08-01), so integrity is safe without AICH; AICH master hash byte-valid but the 180KB block-recovery protocol (OP_AICHREQUEST) is unimplemented (advertised-then-dropped - clear the bit or build it) |
+| Poisoning defense (bad part re-fetchable) | PARTIAL | whole-file MD4 holds AND a bad part is now blamed per-MD4 and re-fetched alone (2026-08-01, closes the full-re-download loop); per-SOURCE attribution + ban (eMule CorruptionBlackBox) still absent |
+| Search-result SPAM filter | OPERATIONAL (2026-08-01) | intra-hash heuristics + a spam-availability cap (Suspect rows ranked at min(sources,5), eMule SearchList.cpp:813). eMule's "cross-hash filename-repetition" is NOT a real 0.50a feature (audit correction); a padMule cross-hash score was built then REMOVED - it flagged legit files sharing a generic name (adversarial review finding) |
 | Server MOTD/result FLOOD rate-limit | OPERATIONAL (B6 fixed 625df39) | forwarder now rate-limits server events 30/10s (State exempt); MOTD attributed + 500-char capped |
 | Server-trust (source/IP sanity) | OPERATIONAL (B8 fixed 625df39) | PeerSource::from_found/from_kad now reject non-public IPv4 unconditionally (SSRF closed); LowID/port0 already rejected |
-| ipfilter Kad UDP coverage | PARTIAL | routing inserts + inbound Kad UDP NOT ipfiltered -> blocklisted ranges poison routing |
-| Input safety: bounded inbound listener | PARTIAL | 200-permit semaphore but no per-IP cap + no serve-session budget -> one IP starves all permits |
+| ipfilter Kad UDP coverage | OPERATIONAL (2026-08-01) | the user blocklist now gates every Kad routing insert (kad_live::add_contact, matches eMule RoutingZone.cpp:477); inbound Kad UDP is only ever a reply from an IP we queried (from the now-filtered routing table) |
+| Input safety: bounded inbound listener | OPERATIONAL (2026-08-01) | 200-permit global semaphore + a per-IP cap (16/IP, IpConnSlot) so one address cannot starve all permits; serve-session budget (60s idle / 120s queue) already present |
 | Credit system (clients.met, ident-gated) | MISSING | dead code: FIFO gate, no accounting, clients.met never used |
 | Server TCP obfuscation | MISSING | plaintext-only; OPT-IN anti-DPI, no server cut off (ship documented) |
 | Server UDP obfuscation | MISSING | cleartext port+4; OPT-IN; low-burden partial via OP_GETSOURCES_OBFU |
 
 ## Release blockers (fix before community release)
 
-Band A (HIGH): TCP c2c obf both-roles [LOW], secure-ident SERVE side [LOW-MED],
-per-part verify + poison recovery in the engine [LOW], AICH block recovery
-[per-part LOW / full HIGH, or clear the advertised bit], credit system [MED-HIGH
-or document as not-active]. Band B (MED, mostly LOW fix): inbound per-IP cap +
-serve-session budget, Kad node-ID/IP verified bit, Kad receiver-verify-key,
-ipfilter into the Kad path, cross-hash spam score [MED], tighten Kad sybil caps
-+ wire/delete FloodTracker. (CLOSED 2026-07-20, commit 625df39: server MOTD
-flood DoS [B6]; reserved/loopback/LAN source drop / SSRF [B8].) Band C (LOW,
-opt-in): server TCP/UDP obf - ship documented.
+REMAINING (after the 2026-08-01 batch): secure-ident SERVE side [LOW-MED, validate
+vs [[emule-peer-oracle]]]; Kad verified-bit ENFORCEMENT in routing [MED, needs the
+HELLO_RES_ACK challenge]; per-source corruption attribution + ban [MED]; AICH block
+recovery [full HIGH, or clear the advertised bit]; credit system [MED-HIGH, or ship
+documented as not-active]; server TCP/UDP obf [Band C, LOW-MED, opt-in - ship
+documented, never REQUIRE].
+
+CLOSED: server MOTD flood [B6, 625df39]; SSRF source drop [B8, 625df39]; TCP c2c
+obf both-roles, ipfilter-into-Kad, per-IP inbound cap, Kad sybil caps + IP-change
+hijack, Kad receiver-key -> verified bit, per-part poison recovery, search
+availability cap (all 2026-08-01, [[build-progress]] row 8ab).
 
 ## Interop-safe hardening backlog (all degrade gracefully)
 
