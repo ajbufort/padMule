@@ -1,7 +1,11 @@
-// padMule's main screen. eMule-style function icons live in the top toolbar and
-// switch a single content area between six screens (Search, Transfers, Servers,
-// Shared, Stats, Status), instead of one long scroll. The title is INLINE so it
-// never collapses out of view the way a large title does.
+// padMule's main screen. An eMule-style FUNCTION STRIP sits under the title and
+// switches a single content area between six screens (Search, Transfers,
+// Servers, Shared, Statistics, Status), instead of one long scroll. Each
+// function shows its icon ABOVE its name, the way eMule's toolbar does - but
+// sized and tinted for iOS rather than copied: a ~19pt hierarchical SF Symbol
+// over an 11pt caption, selection carried by the accent tint plus a soft rounded
+// fill, no borders or gradients. The title stays INLINE so it never collapses
+// out of view the way a large title does.
 //
 // The three HARD lifecycle requirements from docs/wiki/lifecycle-and-reactivation.md
 // survive the split: (1) an honest status notice (we do NOT transfer in the
@@ -26,20 +30,65 @@ enum Screen: String, CaseIterable, Identifiable {
         }
     }
 
-    /// SF Symbol for the toolbar (all available on the iOS 16 target). A `.fill`
-    /// variant reads as "selected" where one exists; elsewhere the accent tint
-    /// carries selection.
+    /// The name shown UNDER the icon in the function strip. Mostly `title`, but
+    /// "Statistics" is abbreviated so six labels sit comfortably side by side.
+    var shortTitle: String {
+        self == .stats ? "Stats" : title
+    }
+
+    /// SF Symbol for the function strip. All ship with iOS 16 (the deployment
+    /// target), so none silently renders as a blank square on the iPad. A `.fill`
+    /// variant reads as "selected" where the symbol has one; elsewhere the accent
+    /// tint alone carries selection.
+    ///
+    /// Chosen to say what the function DOES, taking eMule's toolbar as the cue:
+    /// its Transfers icon shows both directions (padMule uploads as well as
+    /// downloads), and its Status/"Server info" pane is about connectivity, which
+    /// `network` states more plainly than a bare gauge.
     func icon(selected: Bool) -> String {
         switch self {
         case .search: return "magnifyingglass"
-        case .transfers: return selected ? "arrow.down.circle.fill" : "arrow.down.circle"
+        case .transfers:
+            return selected ? "arrow.up.arrow.down.circle.fill" : "arrow.up.arrow.down.circle"
         case .servers: return "server.rack"
         case .shared: return selected ? "folder.fill" : "folder"
-        // No .fill variant exists for this symbol; the accent tint alone marks
-        // selection (same as Search/Servers/Status).
+        // No .fill variant exists for these; the accent tint marks selection.
         case .stats: return "chart.xyaxis.line"
-        case .status: return "gauge"
+        case .status: return "network"
         }
+    }
+}
+
+/// One function in the strip: icon above name, tapped to switch screens.
+private struct FunctionButton: View {
+    let screen: Screen
+    let selected: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 3) {
+                Image(systemName: screen.icon(selected: selected))
+                    .font(.system(size: 19, weight: .regular))
+                    .symbolRenderingMode(.hierarchical)
+                    .frame(height: 22)
+                Text(screen.shortTitle)
+                    .font(.caption2)
+                    .fontWeight(selected ? .semibold : .regular)
+                    .lineLimit(1)
+            }
+            .foregroundStyle(selected ? Color.accentColor : Color.secondary)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 6)
+            .background(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(selected ? Color.accentColor.opacity(0.12) : Color.clear)
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(screen.title)
+        .accessibilityAddTraits(selected ? [.isSelected] : [])
     }
 }
 
@@ -57,6 +106,11 @@ struct ContentView: View {
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
+                // The function strip: every screen is one tap away, named, always
+                // in the same place (eMule's toolbar habit, which is why its users
+                // never hunt for a feature).
+                functionStrip
+
                 // Global status banners - visible on every screen.
                 if model.reconnecting {
                     banner("Reconnecting...", systemImage: "arrow.clockwise", tint: .orange)
@@ -80,22 +134,6 @@ struct ContentView: View {
             }
             .navigationTitle("padMule")
             .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                // .navigationBarTrailing (not .topBarTrailing, which is iOS 17+)
-                // keeps the icon row valid on the iOS 16 deployment target.
-                ToolbarItemGroup(placement: .navigationBarTrailing) {
-                    ForEach(Screen.allCases) { s in
-                        Button {
-                            screen = s
-                        } label: {
-                            Image(systemName: s.icon(selected: screen == s))
-                                .symbolRenderingMode(.hierarchical)
-                                .foregroundStyle(screen == s ? Color.accentColor : .secondary)
-                        }
-                        .accessibilityLabel(s.title)
-                    }
-                }
-            }
             .sheet(item: $detail) { hit in
                 SearchDetailView(hit: hit).environmentObject(model)
             }
@@ -260,6 +298,27 @@ struct ContentView: View {
         default:
             EmptyView()
         }
+    }
+
+    // MARK: - Function strip
+
+    /// The six functions, icon over name, evenly spread across the width. Sits
+    /// directly under the navigation title and above the banners, so the app's
+    /// shape is visible at a glance on a screen with no window chrome.
+    private var functionStrip: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 4) {
+                ForEach(Screen.allCases) { s in
+                    FunctionButton(screen: s, selected: screen == s) {
+                        screen = s
+                    }
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            Divider()
+        }
+        .background(.bar)
     }
 
     // MARK: - Search screen
