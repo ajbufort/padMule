@@ -805,7 +805,9 @@ fn part_hashes(data: &[u8]) -> Vec<[u8; 16]> {
 
 /// Serve `path` to inbound peers on `port` (padMule as the UPLOADER). Used for
 /// the reverse differential test: a real amuled downloads this file from us.
-/// Serves every connection until killed.
+/// Serves every connection until killed. With the optional
+/// `<eserver-host> <eserver-port>` pair it also logs into that server and
+/// OP_OFFERFILES the file, so the server can relay us as a source.
 async fn cmd_serve_file(port: u16, path: &str, eserver: Option<(String, u16)>) {
     let data = match std::fs::read(path) {
         Ok(d) => d,
@@ -1468,9 +1470,11 @@ async fn read_until(
     }
 }
 
-/// Live end-to-end over a server: search a keyword, take the first matching
+/// Live end-to-end over a server: search a term, take the first matching
 /// result, get its sources, and download it - the eD2k-network counterpart of
-/// kad-fetch.
+/// kad-fetch. NB: the term is used BOTH as the search keyword AND as a
+/// file-extension filter (results must end in `.<term>`), so pass an
+/// extension-like token (`pdf`, `wav`, `txt`), not a free keyword.
 async fn cmd_search_download(met_path: &str, keyword: &str, out: &str) {
     // Cap the download so a test never pulls a huge file.
     const MAX_SIZE: u64 = 64 * 1024 * 1024;
@@ -1978,10 +1982,12 @@ async fn cmd_link(link: &str, out: Option<&str>) {
     }
 }
 
-/// Completion-optimized fetch: search a keyword, catalog + rank the results,
-/// then try SMALL trusted candidates (smallest first - a source serves a burst
-/// then queues us, so small files finish in one shot) until one downloads to
-/// completion and its ed2k hash verifies. Prints the file that completed.
+/// Completion-optimized fetch: search a term, catalog + rank the results, then
+/// try trusted candidates BEST-SOURCED first (size ascending as the tiebreak)
+/// until one downloads to completion and its ed2k hash verifies. Prints the
+/// file that completed. NB: like search-download, the term is used BOTH as the
+/// search keyword AND as a file-extension filter - pass `pdf`/`wav`/`txt`-style
+/// tokens.
 async fn cmd_fetch_complete(
     met_path: &str,
     keyword: &str,
@@ -2468,7 +2474,7 @@ async fn main() {
             eprintln!("  mule-cli login-any <server.met>");
             eprintln!("  mule-cli listen [port]");
             eprintln!("  mule-cli hash-file <path>");
-            eprintln!("  mule-cli serve-file <port> <path>");
+            eprintln!("  mule-cli serve-file <port> <path> [eserver-host eserver-port]");
             eprintln!("  mule-cli peer-download <host> <port> <hash> <size> <out> [obf-peer-hash]");
             eprintln!("  mule-cli peer-probe <host> <port> <hash>");
             eprintln!("  mule-cli sec-ident <host> <port> [obf-peer-hash]");
@@ -2483,9 +2489,9 @@ async fn main() {
             eprintln!("  mule-cli kad-keyword <nodes.dat> <keyword>");
             eprintln!("  mule-cli link <ed2k-or-magnet-link> [out]");
             eprintln!("  mule-cli ipfilter <ipfilter.dat|.p2p> [test-ip]");
-            eprintln!("  mule-cli search-download <server.met> <keyword> <out>");
+            eprintln!("  mule-cli search-download <server.met> <ext-keyword> <out>");
             eprintln!(
-                "  mule-cli fetch-complete <server.met> <keyword> <out> [max_size] [min_size]"
+                "  mule-cli fetch-complete <server.met> <ext-keyword> <out> [max_size] [min_size]"
             );
             eprintln!("  mule-cli upnp <port>");
             eprintln!(

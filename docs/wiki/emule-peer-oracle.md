@@ -1,6 +1,7 @@
 # eMule peer oracle (real eMule on the Windows host)
 
-Updated: 2026-08-01
+Updated: 2026-08-02 (covers the 8ae production-path reverse oracle + 8af
+serve-side secure-ident assertions)
 
 A SECOND, independent peer oracle for padMule's client-to-client protocol: a
 real **eMule running on the Windows host**, alongside the headless **amuled**
@@ -21,7 +22,7 @@ padMule (in WSL) then connects to it. Nothing here runs unattended.
 
 - **eMule 0.50a** (recommended): the wire/format authority padMule matches
   byte-for-byte. From emule-project.net. `refs/emule-0.50a` is its source.
-- **eMuleAI** (modern fork, active 2026, [[emule-ecosystem-refs]]) or the eMule
+- **eMuleAI** (modern fork, active 2026, [[ref-ecosystem]]) or the eMule
   0.70b community build also work as peer oracles; 0.50a is the cleanest match.
 
 ## Networking (already correct on this box)

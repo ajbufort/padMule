@@ -4,12 +4,11 @@
 //!
 //! This is local policy, not wire format. NOTE: the live serve path uses a
 //! SIMPLER queue than this module - `share.rs::UploadGate` queues a peer at
-//! capacity and sends it OP_QUEUERANKING, granting a freed slot in arrival
-//! (FIFO) order on the connection padMule holds open. This module's
-//! SCORE-ordered ranking (credits x file-priority x wait-time) is not wired in;
-//! reordering the queue by score is wire-neutral policy that can layer onto the
-//! gate later. The wait clock and clients.met persistence below are the pieces
-//! that upgrade would reuse.
+//! capacity and sends it OP_QUEUERANKING, granting a freed slot to the best
+//! CREDIT-scored waiter (the 8ah reweight; ties FIFO by arrival) on the
+//! connection padMule holds open. This module's FULLER eMule ranking
+//! (credits x file-priority x wait-time) is still not wired in; the wait clock
+//! and file-priority terms are the pieces a future upgrade would reuse.
 //!
 //! The wait clock is deliberately keyed to a peer's PERSISTED wait-start (which
 //! upstream stores in clients.met), so a peer that reconnects does not lose its

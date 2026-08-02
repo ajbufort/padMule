@@ -189,7 +189,7 @@ a UI event, and the login event embedded the client id, which ENCODES the public
 on HighID. Both removed - this screen gets screenshotted. See
 [[padmule-dev-box-networking]].
 
-## Two CI workflows (2026-07-20)
+## CI workflows (2026-07-20; a third, rust.yml, added 2026-08-01)
 
 - **`.github/workflows/ios-build.yml`** - the ACTIVE path above: builds the
   unsigned device `.ipa` (FFI for `aarch64-apple-ios`, staged to `ios/libs/`).

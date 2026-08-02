@@ -1,14 +1,19 @@
 # eMule 0.70b Feature Backlog (mined for padMule)
 
-Updated: 2026-07-19 (Tier-1 largely done incl. #9 global UDP search; codec+CLI, engine/app integration a follow-up)
+Updated: 2026-08-02 (reanalysis lint: DONE list completed - Tier 1 is ALL done,
+9 Tier-2 items landed incl. #11 CorruptionBlackBox as build-progress 8ai)
 
-**DONE so far:** #1 IP filter, #2 search history, #3 wire-side search filters,
-#4 verified badge (BOTH the encryption lock AND the identity checkmark - the
-secure-ident redo works inline with the download and verified a real aMule
-source), #5 categories, #6 ratings/comments (server rating + OP_FILEDESC comment
-READ), #7 per-download priority (Low/Normal/High; Auto deferred), #20 authoring
-your OWN rating/comment + serving it (OP_FILEDESC write), #21 per-source detail
-sheet, #8 (partial: per-file unshare). See [[build-progress]].
+**DONE so far:** Tier 1 COMPLETE - #1 IP filter, #2 search history, #3 wire-side
+search filters, #4 verified badge (BOTH the encryption lock AND the identity
+checkmark - the secure-ident redo works inline with the download and verified a
+real aMule source), #5 categories, #6 ratings/comments (server rating +
+OP_FILEDESC comment READ), #7 per-download priority (Low/Normal/High; Auto
+deferred), #8 (partial: per-file unshare), #9 global UDP search (engine/FFI/app
+included), #10 related search. Tier 2 landed: #11 corruption black box (8ai),
+#13 load-more, #14 statistics tab, #17 preview, #18 server manager, #19 status
+ping, #20 authoring your OWN rating/comment + serving it (OP_FILEDESC write),
+#21 per-source detail sheet, #30 boolean search, #32 search throttle. See
+[[build-progress]].
 
 A ranked proposal of features padMule could adopt from eMule 0.70b, from a
 4-surveyor + synthesis dive over `refs/emule-0.70b`. Scope: GUI/feature-level
@@ -85,17 +90,21 @@ parsing, Kad anti-abuse hardening, and the "Automatic" search method). Ranked by
    anti-spoof allow-list, dedupe by hash, zlib-packed reply handled. VALIDATED:
    SEND interoperates with the local isolated eserver ([[ed2k-server-oracle]]);
    full SEND+PARSE round-trip proven against LIVE public eservers (real
-   OP_GLOBSEARCHRES -> correct filenames+hashes). Engine/FFI/app integration +
-   OP_OFFERFILES (so the local eserver returns hits) are follow-ups.
-10. **Related-files search** (small, low risk). Long-press -> "Find related" via
-    a `related::`+md4(hash) query, gated by the server's RELATEDSEARCH flag;
-    degrade gracefully when absent.
+   OP_GLOBSEARCHRES -> correct filenames+hashes). [SUPERSEDED 2026-07-19+: the
+   follow-ups all landed - engine global_udp_search + FFI SearchFilters.global +
+   the app's "Search all servers" toggle, and OP_OFFERFILES shipped as
+   [[build-progress]] rows 8p/8q.]
+10. **Related-files search** - DONE (2026-07-19, commit 61166d8; [[build-progress]]
+    row 8r). The TRUE protocol: a normal OP_SEARCHREQUEST whose string is
+    `related::<UPPERHEXHASH>`, gated on SRV_TCPFLG_RELATEDSEARCH (0x40) from
+    OP_IDCHANGE; graceful keyword fallback when unsupported. Live-validated vs the
+    real Lugdunum eserver (flag read + query accepted).
 
 ## Tier 2 - do later (real value, bigger or nichey)
 
 | # | Feature | Effort | Wire risk |
 |---|---------|--------|-----------|
-| 11 | Corruption black box + dynamic client ban | med | none |
+| 11 | Corruption black box + dynamic client ban - DONE 2026-08-02 ([[build-progress]] row 8ai; per-source corruption attribution keyed by IP, sole-contributor-only blame so a good source is never false-banned, enforced on BOTH serve paths; per-download/transient like eMule's per-file CorruptionBlackBox) | med | none |
 | 12 | A4AF cross-download source reassignment | med | none |
 | 13 | "Load more results" paging (OP_QUERY_MORE_RESULT) - DONE 2026-07-20 (commit 9c37495; opcode 0x21 bodiless, trailing more-byte on 0x33, Engine::search_more continues the same query/connection via SearchSession, cap 5, SwiftUI "Load more" button) | small | low |
 | 14 | Statistics tab (Swift Charts: rate history, totals, ratios) - DONE 2026-07-19 (commit 81a58c6; engine keeps 2 global monotonic byte counters, UI samples + charts them; rate = delta/elapsed after a review found off-cadence sampling) | med | none |
@@ -120,7 +129,9 @@ parsing, Kad anti-abuse hardening, and the "Automatic" search method). Ranked by
 
 ## Tier 3 - skip (poor platform fit)
 
-- **32 Client-to-client chat (OP_MESSAGE):** foreground-only means missed
+- **32 Client-to-client chat (OP_MESSAGE)** [NB: duplicate number - the Tier-2
+  throttle row also carries #32; kept as-is since other entries cite both]:
+  foreground-only means missed
   messages + a spam funnel; only adopt for a concrete need, and only with a local
   spam layer.
 - **33 Dynamic upload throttling (USS):** the faithful design needs raw
@@ -135,7 +146,7 @@ The Tier-1 items that are safe AND make padMule feel complete on day one:
 and the **verified badge (#4)** - all small, three of four wire-neutral or
 low-risk, no format changes. Ratings-read (#6) and categories (#5) were the next
 step up in value. ALL of these have since shipped (this was the plan; kept for the
-rationale). Remaining Tier-1: #9 (global UDP search), #10 (related search).
+rationale). [SUPERSEDED 2026-07-19: #9 and #10 also landed - Tier 1 is complete.]
 
 ## Related
 

@@ -97,7 +97,7 @@ fn routing_to_nodes(rt: &RoutingTable) -> Vec<KadContact> {
             udp_key: c.udp_key,
             udp_key_ip: c.udp_key_ip,
             // Persist the IP-verified bit so a contact stays verified across
-            // restarts (eMule writes IsIpVerified() to nodes.dat, RoutingZone.cpp:381).
+            // restarts (eMule writes IsIpVerified() to nodes.dat, RoutingZone.cpp:332).
             verified: c.verified,
         })
         .collect()
@@ -487,14 +487,6 @@ fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
-/// Verify a finished download and move it into place.
-///
-/// The whole-file ed2k hash is checked FIRST, and this is not belt-and-braces:
-/// `download_file` never calls `verify_ready_parts`, and a file of one part has
-/// no part hash to verify against at all, so this is the ONLY thing standing
-/// between corrupt bytes and the user's Files app. We asked for hash X; we hand
-/// over hash X or nothing. It is computed part-by-part so a large file is never
-/// held in memory.
 /// The engine-side handles a finished download needs, bundled so the completion
 /// tail spawned in [`Engine::spawn_fetch`] can hand them off in one move.
 struct FinishCtx {
@@ -556,6 +548,14 @@ impl Drop for IpConnSlot {
     }
 }
 
+/// Verify a finished download and move it into place.
+///
+/// The whole-file ed2k hash is checked FIRST, and this is not belt-and-braces:
+/// `download_file` never calls `verify_ready_parts`, and a file of one part has
+/// no part hash to verify against at all, so this is the ONLY thing standing
+/// between corrupt bytes and the user's Files app. We asked for hash X; we hand
+/// over hash X or nothing. It is computed part-by-part so a large file is never
+/// held in memory.
 async fn finish_download(
     dl: Arc<Download>,
     ctx: FinishCtx,
@@ -897,14 +897,6 @@ pub enum EngineEvent {
     },
 }
 
-/// What the server told us at login. Kept because HighID-vs-LowID decides
-/// whether peers can reach us at all, and on a sideloaded iPad there is no
-/// debugger - this screen IS the diagnostic.
-///
-/// Deliberately does NOT carry the client id: a HighID id ENCODES our public
-/// IP, and this struct exists to be rendered on a screen that gets
-/// screenshotted. `low_id` is the whole answer; the id itself is not worth the
-/// leak.
 /// One row of the Servers screen: a server from `server.met`, enriched with a
 /// live UDP status probe. `alive` servers are selectable; the rest are shown
 /// greyed out. `users`/`files` are `None` until a probe answers.
@@ -920,6 +912,14 @@ pub struct ServerEntry {
     pub pinned: bool,
 }
 
+/// What the server told us at login. Kept because HighID-vs-LowID decides
+/// whether peers can reach us at all, and on a sideloaded iPad there is no
+/// debugger - this screen IS the diagnostic.
+///
+/// Deliberately does NOT carry the client id: a HighID id ENCODES our public
+/// IP, and this struct exists to be rendered on a screen that gets
+/// screenshotted. `low_id` is the whole answer; the id itself is not worth the
+/// leak.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerInfo {
     /// The server we are logged into ("ip:port").
@@ -1989,6 +1989,8 @@ impl Engine {
         // teardown and every other FFI call for that whole window. The server path
         // is bounded the same way. Kad keeps working incrementally on its socket
         // after, so a timed-out-but-partial bootstrap is still useful.
+        // NB: the wave-10 HELLO below adds its own 2s cap, so the lock-held
+        // worst case for start_kad is ~7s total, not 5.
         let boot = timeout(
             Duration::from_secs(5),
             node.bootstrap_any(&contacts, Duration::from_millis(1200), 40),

@@ -8,9 +8,12 @@ use std::time::{Duration, Instant};
 
 /// Is this contact IP a routable public address worth keeping? `ip` is the
 /// host-order value padMule uses (MSByte = first octet), so the dotted quad is
-/// `Ipv4Addr::from(ip)`. Rejects the unroutable ranges eMule's `IsGoodIP` drops:
-/// 0.x, loopback, link-local, private, multicast, and reserved. (LAN-only Kad
-/// would pass `allow_private = true`.)
+/// `Ipv4Addr::from(ip)`. Rejects the MAJOR unroutable ranges eMule's `IsGoodIP`
+/// drops: 0.x, loopback, link-local, private, multicast, and 240/4 reserved.
+/// NOT full parity with aMule's table-driven reserved_ranges
+/// (NetworkFunctions.cpp:133) - the exotic blocks (39/8, 128.0/16, 192.0.2/24,
+/// 198.18/15, ...) are not filtered here. (LAN-only Kad would pass
+/// `allow_private = true`.)
 pub fn is_acceptable_contact_ip(ip: u32, allow_private: bool) -> bool {
     if ip == 0 {
         return false;

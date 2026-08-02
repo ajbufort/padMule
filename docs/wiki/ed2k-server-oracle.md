@@ -1,6 +1,7 @@
 # eD2k server oracle (real Lugdunum eserver, sandboxed)
 
-Updated: 2026-07-19
+Updated: 2026-08-02 (date re-synced; content includes the 2026-07-20 search
+rate-limit correction and the 2026-08-01 reverse-oracle relay role)
 
 The SERVER-side oracle, completing the set: padMule can now be tested against the
 REAL software the whole eD2k network runs on - **Lugdunum eserver 17.15**, the

@@ -24,7 +24,10 @@ pub const CREDIT_FILE_VERSION: u8 = 0x12;
 pub const MAX_PUBKEY_SIZE: usize = 80;
 /// Every record is exactly this many bytes.
 pub const CREDIT_RECORD_LEN: usize = 119;
-/// Entries unseen for this long are dropped at load time (150 days).
+/// Entries unseen for this long (150 days) are expired. NB: `read_clients_met`
+/// itself keeps them (byte-faithful round-trips); the CALLER prunes via
+/// `CreditEntry::is_expired` - the engine's credit_store does so on load,
+/// mirroring aMule.
 pub const CREDIT_EXPIRE_SECS: u32 = 12_960_000;
 
 /// One peer's credit record.
@@ -67,7 +70,8 @@ impl CreditEntry {
     }
 
     /// True if `now` is at least `CREDIT_EXPIRE_SECS` past `last_seen`. aMule
-    /// drops such entries when loading.
+    /// drops such entries when loading; here the caller (the engine's
+    /// credit_store) applies this predicate - `read_clients_met` keeps them.
     pub fn is_expired(&self, now: u32) -> bool {
         now.saturating_sub(self.last_seen) >= CREDIT_EXPIRE_SECS
     }

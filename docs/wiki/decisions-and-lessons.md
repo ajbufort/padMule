@@ -1,6 +1,6 @@
 # Decisions and Lessons
 
-Updated: 2026-07-19
+Updated: 2026-08-02 (reanalysis lint: two superseded claims annotated in place)
 
 Locked decisions, rejected approaches, gotchas, measured facts. One dated
 bullet each; Locked decisions newest first, Lessons in the order learned.
@@ -80,6 +80,9 @@ bullet each; Locked decisions newest first, Lessons in the order learned.
   is in-process FFI, see [[build-progress]] wave 7. AICH recovery, IP filter,
   and categories did not make the shipped v1 either; they are open backlog,
   recorded here so the trim is explicit rather than silent.)
+  [SUPERSEDED in part: the IP filter landed 2026-07-18 (build-progress 8g) and
+  categories 2026-07-19 (8i); of the three, only AICH block recovery remains
+  open backlog.]
 
 - 2026-07-12 **Deploy path: no Mac.** Anthony has only the iPad (plus this
   Windows/WSL2 box). Plan is engine-first on Linux; the SwiftUI shell builds
@@ -239,6 +242,10 @@ bullet each; Locked decisions newest first, Lessons in the order learned.
   the connection and granting in place is faithful on the wire (correct opcode +
   12-byte payload) and fits the platform. Rank is FIFO; eMule's score-ordering
   ([[build-progress]] upload_queue.rs scoring) is wire-neutral policy for later.
+  [SUPERSEDED 2026-08-02: the 8ah credit reweight replaced the FIFO semaphore
+  with the score-ordered UploadGate - a freed slot now goes to the best
+  CREDIT-scored waiter (still never-refuse). upload_queue.rs's fuller eMule
+  score (wait-time x file-priority) remains unwired.]
 - 2026-07-18 **LESSON: re-review any change that reshapes a hot path; "moved the
   check" == "removed the check" until proven otherwise.** The same-day adversarial
   review of the code-fix round found 8 real bugs the 383-test suite AND the amuled

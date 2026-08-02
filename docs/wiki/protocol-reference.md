@@ -102,7 +102,9 @@ capability negotiation (MISCOPTIONS baselines byte-verified, Wave 3d), .met
 byte-verification (real-fixture round-trips + the amuled differential test).
 EC questions are MOOT (EC deferred entirely; the seam is FFI). STILL OPEN:
 AICH request/answer wire bodies (AICH exchange is not implemented; the tree
-itself is, row 1c) and AICH byte-validation vs a live eMule.
+itself is, row 1c). [RESOLVED 2026-07-19: AICH byte-validation landed vs REAL
+amuled - the master root matches known2_64.met bit-for-bit (build-progress 8u);
+a cross-check vs a live Windows eMule remains optional, not open.]
 
 ## Related
 

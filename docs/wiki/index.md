@@ -1,5 +1,7 @@
 # padMule Wiki - Index
 
+Updated: 2026-08-02
+
 AI-maintained knowledge base. Start here. See `/CLAUDE.md` for the schema and
 the Ingest / Query / Lint workflows.
 
@@ -27,15 +29,16 @@ the Ingest / Query / Lint workflows.
 - [[ed2k-protocol-archaeology]] - historical study materials (Gosling 2003 GIAC paper, dtool.pl, oldversion.com MetaMachine binaries); cross-confirm padMule's wire + leads for the Lugdunum project.
 - [[emule-peer-oracle]] - a SECOND live peer oracle: real eMule on the Windows host (mirrored-mode 127.0.0.1:4663), driven by scripts/emule-oracle.sh; complements the headless amuled differential test and is the faithful other-side for secure-ident (#32). Manual (Anthony launches eMule).
 - [[ed2k-server-oracle]] - the SERVER oracle: real Lugdunum eserver 17.15 run LOCALLY + fully ISOLATED (unshare -rn, zero egress), driven by scripts/eserver-oracle.sh. padMule logs in against real eserver; enables #9 global-UDP-search testing. Untrusted binary, gitignored, sha256-verified; i686 build (x86_64 hits the vsyscall trap).
+- [[kad-verify-oracle]] - the REVERSE-Kad oracle: a log-patched real amuled 3.0.1 (logging-only patch on a build copy; pristine tree untouched) that proves a real node marks padMule IP-VERIFIED via the v8 HELLO_RES_ACK handshake. The wave-10 send-side terminal proof (2026-08-02). scripts/kad-verify-oracle.sh.
 
 ## Process
 - [[decisions-and-lessons]] - locked decisions, rejected approaches, gotchas.
 - [[build-history]] - archive: the completed-milestone narratives (code-fix rounds, live milestones, differential-test history, wave notes) split verbatim out of [[build-progress]] on 2026-08-01.
-- [[build-progress]] - wave-by-wave build status. Engine complete through Kad + multi-source fetch; padMule RUNS on the iPad and does the full search->download->verify->save loop on-device; on-device feature round + search-panel parity + splash/icon DONE by 2026-07-18. Since then (2026-07-19): the 0.70b Tier-1 slices (IP filter, search history, wire filters, categories, ratings/comments read+author, per-source sheet, per-download priority, per-file unshare) and the verified-identity badge (secure-ident redo) landed, plus a real-peer/real-server ORACLE SET ([[emule-peer-oracle]], [[ed2k-server-oracle]]). Repo has LICENSE (GPL v2) + NOTICE + README.
+- [[build-progress]] - wave-by-wave build status. Engine complete through Kad + multi-source fetch; padMule RUNS on the iPad and does the full search->download->verify->save loop on-device; 0.70b Tier 1 COMPLETE + 9 Tier-2 items ([[emule-070b-features]]). Since 2026-07-20: the v1 readiness audit (8z), the reanalysis lint + Rust CI (8aa), the bulletproof security batch (8ab), the reverse peer oracle + multipacket serve (8ad/8ae), serve-side secure-ident + the full credit system (8af-8ah), the per-source corruption ban (8ai), and wave 10 Kad hard-verify (send-side keys + v8 handshake DONE and terminal-proven via [[kad-verify-oracle]]; Batch B enforcement pending). Repo has LICENSE (GPL v2) + NOTICE + README.
 
 ## Backlog / feature ideas
-- [[feature-server-hunter]] - discover + verify live eD2k servers (auto-update, health-check, server-graph crawl); NOT literal whole-net scanning. Future work.
-- [[emule-070b-features]] - ranked backlog of eMule 0.70b features to adopt (34 items). From the 2026-07-18 dive; Tier 1 is DONE (#1-8 landed, some partial; #9 global UDP search + #10 related search landed 2026-07-19). Tier 2+ remains open backlog.
+- [[feature-server-hunter]] - discover + verify live eD2k servers (auto-update, health-check, server-graph crawl); NOT literal whole-net scanning. Partially shipped (the auto-update/merge + prune landed as the 8y server manager; the status probe as the 8x Servers screen); the gossip crawl remains future work.
+- [[emule-070b-features]] - ranked backlog of eMule 0.70b features to adopt. From the 2026-07-18 dive; Tier 1 is COMPLETE (#1-10), and 9 Tier-2 items landed too (#11, 13, 14, 17-21, 30, 32-throttle); the rest of Tier 2+ is open backlog.
 
 ## Strategy
 (All the big forks are LOCKED and executed - Rust engine rewrite, no-Mac
@@ -46,7 +49,8 @@ gate - close the [[security-model]] scorecard (21 operational / 3 partial / 2
 documented opt-outs as of 2026-08-02). Serve-side secure-ident, the full credit
 system (store + reweight + accrual), and per-source corruption attribution + ban
 all landed 2026-08-02 ([[build-progress]] 8af-8ai); server-obf is a documented v1
-opt-out ([[obfuscation-posture]]). The last real protocol piece is the Kad
-hard-verify (verified-bit enforcement + send-side keys via HELLO_RES_ACK), a
-committed dedicated build ([[build-progress]] wave 10). Wave 9 seedbox mode is the
-open v1.1 item.)
+opt-out ([[obfuscation-posture]]). The Kad hard-verify send-side half is DONE and
+terminal-proven - a log-patched real amuled verifies padMule via the v8
+HELLO_RES_ACK handshake ([[kad-verify-oracle]]); remaining: Batch B verified-bit
+enforcement + the search-path key-capture gap ([[build-progress]] wave 10). Wave 9
+seedbox mode is the open v1.1 item.)

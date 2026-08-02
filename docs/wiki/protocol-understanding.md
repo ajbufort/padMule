@@ -76,8 +76,9 @@ byte[14]=111. HighID threshold 16,777,216.
 
 ## Kad parameters worth memorizing
 
-K=10 (bin size), ALPHA_QUERY=5 in this tree (classic 3; wire-neutral, either
-works), KADEMLIA_VERSION 0x08. REQ type byte = intent+count: FIND_NODE=11,
+K=10 (bin size), ALPHA_QUERY=5 in the vendored aMule tree (classic 3; padMule
+deliberately uses eMule's 3, mule-kad lookup.rs; wire-neutral, either works),
+KADEMLIA_VERSION 0x08. REQ type byte = intent+count: FIND_NODE=11,
 FIND_VALUE=2, STORE=4. Republish: sources 5h, keywords/notes 24h. Buddy target =
 complement of our KadID. Bootstrap RES returns up to 20 spread contacts;
 self-lookup within 3 min enables publishing.
