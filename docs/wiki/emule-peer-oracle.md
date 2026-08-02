@@ -139,6 +139,16 @@ opcodes to `is_upload_request` AND pointed the oracle at the production path, so
 regression there now FAILS the oracle. Lesson: an oracle only tests the code path
 it actually drives - aim it at production, not a demo path.
 
+It ALSO validates SERVE-SIDE secure identification (2026-08-02, build-progress
+8af): amuled advertises `sec_ident=3` by default (gated on CryptoAvailable, which
+the obfuscation-off `sed` block does NOT disable), so padMule's serve path issues
+its own OP_SECIDENTSTATE, amuled answers with its pubkey + signature, and padMule
+verifies it. cmd_serve_file prints `identity verified (secure-ident): true`, and
+the oracle's RESULT block `grep -q`s for that line ALONGSIDE the byte-for-byte
+`cmp` - so a serve-side verification regression fails the oracle. This is what the
+[[interop-test-fidelity]] rule demanded before shipping serve-side secure-ident: a
+real downloader proving padMule verifies it, not a mock in the wrong role.
+
 ## Troubleshooting
 
 - "cannot resolve" / connection refused: eMule not running, wrong port, or the

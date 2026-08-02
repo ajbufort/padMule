@@ -12,22 +12,25 @@ off from most peers/servers).
 ## SCORECARD (security-completeness audit, 2026-07-20)
 
 A 26-measure adversarial audit (6 domain finders -> per-measure attacker ->
-synthesis, 33 agents). Tally as of 2026-08-01: **18 OPERATIONAL, 5 PARTIAL,
+synthesis, 33 agents). Tally as of 2026-08-02: **19 OPERATIONAL, 4 PARTIAL,
 3 MISSING**. History: the 2026-07-20 audit scored 11/12/3; B6 MOTD-flood + B8
 SSRF closed it to 13/10/3 (commit 625df39); the 2026-08-01 security-hardening
 batch (Kad receiver-key/verified-bit + ipfilter/sybil/answer-validation, per-part
 poison recovery, per-IP inbound cap, inbound TCP obfuscation, search availability
-cap) moved five more rows to OPERATIONAL. Each change was eMule-0.50a-grounded,
-test-first, and adversarially re-reviewed (4 confirmed findings on the batch, all
-fixed - see [[build-progress]] row 8ab).
+cap) moved five more rows to OPERATIONAL (-> 18/5/3); the 2026-08-02 serve-side
+secure-ident (build-progress 8af, commit 4d874e5) closed the last identification
+gap - both roles now verify, oracle-proven (-> 19/4/3). Each change was
+eMule-0.50a-grounded, test-first, and adversarially re-reviewed - see
+[[build-progress]] rows 8ab / 8af.
 
 **BOTTOM LINE: NOT yet bulletproof, but close.** No failure delivers a corrupt
-file or RCE - the integrity core is OPERATIONAL + oracle-proven. The 5 remaining
-PARTIAL rows are anti-impersonation/anti-leech COMPLETENESS (serve-side
-secure-ident; Kad verified-bit not yet ENFORCED in routing; per-source corruption
-attribution; AICH block recovery) - none is an integrity or RCE hole. Shortest
-path to yes = serve-side secure-ident + Kad hard-verify + the credit system, all
-validated against the real-eMule/eserver oracles.
+file or RCE - the integrity core is OPERATIONAL + oracle-proven. The 4 remaining
+PARTIAL rows are anti-impersonation/anti-leech COMPLETENESS (Kad verified-bit not
+yet ENFORCED in routing; Kad send-side receiver keys; per-source corruption
+attribution; AICH block recovery) - none is an integrity or RCE hole. Serve-side
+secure-ident landed 2026-08-02 (8af). Shortest path to yes = the credit system
+(wire the verified identity, now available both roles, into an upload-queue
+reweight) + Kad hard-verify, all validated against the real-eMule/eserver oracles.
 
 | Measure | Status | Note |
 |---------|--------|------|
@@ -42,7 +45,7 @@ validated against the real-eMule/eserver oracles.
 | Input safety: trapping casts | OPERATIONAL | Int64(clamping:) + widening/checked casts |
 | Input safety: no hostile-peer crash/OOM/hang | OPERATIONAL | bounds+timeout-checked parse paths (not fuzz-proven) |
 | Privacy: no public-IP/client-id leak | OPERATIONAL | id never Debug-formatted into UI (audit fix) |
-| Secure identification (RSA, both roles) | PARTIAL | download-side computes verified (oracle-proven vs amuled + real eMule) and is now DoS-bounded (one RSA verify per connection, 2026-08-01). SERVE side still does none. INVESTIGATED + deferred 2026-08-01 (build-progress 8ac): serve-side secure-ident was implemented then REVERTED after adversarial review found it is more entangled than blueprinted - verifying a leecher requires the leecher to CHALLENGE us, which requires us to ADVERTISE sec-ident on the LISTENER hello, which makes sec-ident-capable peers LEAD with OP_SECIDENTSTATE and breaks the leecher-vs-source peek (dropping a leecher's upload AND a called-back source's download). So it needs THREE things together: (1) advertise on the listener, (2) a peek refactor that drains sec-ident before classifying, (3) the credit store (clients.met) for the reweight to bite - all REWEIGHT-only never-refuse, validated vs [[emule-peer-oracle]] (a real eMule DOWNLOADING from padMule, the reverse of the differential). Do NOT ship without the oracle (the [[interop-test-fidelity]] rule + the 8j revert lesson). |
+| Secure identification (RSA, both roles) | OPERATIONAL (2026-08-02) | BOTH roles now compute verified. Download side: oracle-proven vs amuled + real eMule, DoS-bounded (one RSA verify per connection). SERVE side (build-progress 8af, commit 4d874e5): padMule advertises sec-ident on the listener + drives the mutual exchange via `classify_inbound` (a bounded secure-ident DRAIN that re-applies the leecher-vs-source discriminator on the first NON-secident packet - the fix for the 8ac regression where a leading OP_SECIDENTSTATE broke the first-packet peek) + finishes verification interleaved with serving in `serve_shared`. Oracle-proven: the reverse oracle asserts padMule verified a REAL amuled 3.0.1 serve-side (byte-for-byte download + verified) - the [[interop-test-fidelity]] rule satisfied against a faithful other-side (a real downloader + a faithful mock LEECHER that INITIATES). NOTE: verification is currently OBSERVATIONAL - what padMule DOES with the verified identity (the credit reweight) is the separate "Credit system" row (still MISSING): serve-side verify feeds an on_verified sink that is a no-op in the engine today, to be wired to the credit store in the credits batch. Never-refuse holds: no ident outcome denies a slot or drops a connection. |
 | TCP c2c obfuscation (RC4) | OPERATIONAL (2026-08-01) | outbound proven vs amuled; INBOUND obf now wired (obf_accept auto-detect) + listener advertises crypt-SUPPORTED (never REQUIRED) -> crypt-required peers reachable. Plaintext byte-identical (differential passes); live inbound-obf vs real eMule dialing us pending [[emule-peer-oracle]] |
 | Kad UDP verify/sender keys | PARTIAL | RECEIVE side now computes bValidReceiverKey (== udp_verify_key(our_key, senderIP)) and sets the contact verified bit (2026-08-01); SEND side still emits receiver_vk=0 (no per-peer key store), so peers still see us unverified until we echo stored keys |
 | Kad node-ID/IP verification + 2^120 | PARTIAL | tolerance proven; verified bit now TRACKED + persisted + set from the receiver key + CLEARED on any ip change (2026-08-01); still not ENFORCED (unverified contacts are used in routing) - hard exclusion needs the HELLO_RES_ACK challenge machinery |
