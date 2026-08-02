@@ -92,8 +92,10 @@ fn routing_to_nodes(rt: &RoutingTable) -> Vec<KadContact> {
             udp_port: c.udp_port,
             tcp_port: c.tcp_port,
             version: c.version,
-            udp_key: 0,
-            udp_key_ip: 0,
+            // Persist the peer's verify key so we can echo it after a restart
+            // (eMule persists m_uUDPKey + its IP; a stable key keeps us verified).
+            udp_key: c.udp_key,
+            udp_key_ip: c.udp_key_ip,
             // Persist the IP-verified bit so a contact stays verified across
             // restarts (eMule writes IsIpVerified() to nodes.dat, RoutingZone.cpp:381).
             verified: c.verified,

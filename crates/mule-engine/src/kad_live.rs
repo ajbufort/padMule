@@ -100,6 +100,12 @@ pub struct KadNode {
     /// every Kad routing insert (RoutingZone.cpp:477); padMule threads the engine's
     /// filter in so a blocklisted range cannot poison the routing table.
     ip_filter: Option<std::sync::Arc<IpFilter>>,
+    /// Our current public IPv4 (the live equivalent of eMule's
+    /// `theApp.GetPublicIP`), learned from the UPnP/SSDP HighID path. A peer's
+    /// verify key is `udp_verify_key(peer_secret, THIS)`, so we only echo a stored
+    /// key while this still matches what it was minted against. 0 = unknown (echo
+    /// no key - byte-identical to the pre-hard-verify wire).
+    current_public_ip: u32,
 }
 
 impl KadNode {
@@ -137,7 +143,15 @@ impl KadNode {
             udp_port,
             routing: RoutingTable::new(kad_id),
             ip_filter: None,
+            current_public_ip: 0,
         })
+    }
+
+    /// Set our current public IPv4 (from the UPnP/SSDP HighID path), against which
+    /// stored verify keys are minted + gated. Changing it invalidates the echo of
+    /// keys minted for the old IP (they simply stop matching in `verify_key_for`).
+    pub fn set_public_ip(&mut self, ip: u32) {
+        self.current_public_ip = ip;
     }
 
     /// Install the user IP blocklist so blocklisted ranges are dropped from every
@@ -225,15 +239,24 @@ impl KadNode {
         frame: &[u8],
         expect: u8,
         wait: Duration,
-    ) -> Result<(Vec<u8>, bool), KadError> {
+    ) -> Result<(Vec<u8>, bool, u32), KadError> {
         let dest_ip = ip_u32(&dest);
         let sender_vk = mule_kad::udp_verify_key(self.udp_key, dest_ip);
+        // ECHO the verify key this contact previously handed us (send-side), so it
+        // verifies US - but only while it was minted against our current public IP.
+        // 0 for a genuine first contact / unknown / IP-mismatch, which is
+        // byte-identical to the pre-hard-verify wire. This is a FIELD flip only;
+        // the RC4 obfuscation stays NodeID-keyed, byte-faithful to eMule
+        // (EncryptedDatagramSocket.cpp: NodeID always wins when present).
+        let echo_vk = self
+            .routing
+            .verify_key_for(target_id, dest_ip, self.current_public_ip);
         let datagram = kad_obfuscate_request(
             frame,
             target_id,
             rand::random(), // random key seed
-            0,              // no receiver key on first contact
-            sender_vk,      // want this echoed to prove our IP
+            echo_vk,        // the peer's key we echo so IT can verify US
+            sender_vk,      // our key, want this echoed so WE can verify IT
             rand::random(), // marker randomness
         );
         self.socket.send_to(&datagram, dest).await?;
@@ -264,7 +287,9 @@ impl KadNode {
                 // sender key is exactly udp_verify_key(our_key, dest_ip), so the
                 // peer echoing it back means the key round-tripped.
                 let valid_receiver_key = dec.receiver_vk == sender_vk;
-                return Ok((payload, valid_receiver_key));
+                // dec.sender_vk is the key THIS peer wants us to echo next time; the
+                // caller stores it (note_verify_key) so a later request verifies us.
+                return Ok((payload, valid_receiver_key, dec.sender_vk));
             }
             // A different opcode from the same peer (e.g. HELLO_REQ) - keep waiting.
         }
@@ -280,7 +305,7 @@ impl KadNode {
         let (op, payload) = build_bootstrap_req();
         let frame = pack_kad(op, payload);
         let dest = contact_addr(contact.ip, contact.udp_port);
-        let (res_payload, verified) = self
+        let (res_payload, verified, sender_vk) = self
             .request(&contact.id, dest, &frame, OP_BOOTSTRAP_RES, wait)
             .await?;
         let res = parse_bootstrap_res(&res_payload)?;
@@ -296,6 +321,10 @@ impl KadNode {
             res.version,
             verified,
         );
+        // Store the verify key it handed us (bound to our current public IP) so a
+        // later request to it echoes the key and it verifies us in return.
+        self.routing
+            .note_verify_key(&res.id, contact.ip, sender_vk, self.current_public_ip);
         for c in &res.contacts {
             self.add_contact(c.id, c.ip, c.udp_port, c.tcp_port, c.version, false);
         }
@@ -328,7 +357,7 @@ impl KadNode {
             build_hello_req(&self.kad_id, self.tcp_port, Some(self.udp_port), Some(0x04));
         let frame = pack_kad(op, payload);
         let dest = contact_addr(contact.ip, contact.udp_port);
-        let (res_payload, _verified) = self
+        let (res_payload, _verified, _sender_vk) = self
             .request(&contact.id, dest, &frame, OP_HELLO_RES, wait)
             .await?;
         Ok(parse_hello(&res_payload)?)
@@ -341,11 +370,11 @@ impl KadNode {
         node: &WireContact,
         target: &Kad128,
         wait: Duration,
-    ) -> Result<(Vec<WireContact>, bool), KadError> {
+    ) -> Result<(Vec<WireContact>, bool, u32), KadError> {
         let (op, payload) = build_kad2_req(KAD_FIND_NODE, target, &node.id);
         let frame = pack_kad(op, payload);
         let dest = contact_addr(node.ip, node.udp_port);
-        let (res_payload, verified) = self
+        let (res_payload, verified, sender_vk) = self
             .request(&node.id, dest, &frame, OP_KAD2_RES, wait)
             .await?;
         let mut contacts = parse_kad2_res(&res_payload)?.contacts;
@@ -362,7 +391,7 @@ impl KadNode {
         let responder_ip = node.ip;
         let mut seen_ips = std::collections::HashSet::new();
         contacts.retain(|c| c.ip != responder_ip && seen_ips.insert(c.ip));
-        Ok((contacts, verified))
+        Ok((contacts, verified, sender_vk))
     }
 
     /// Ask one node (KADEMLIA2_SEARCH_SOURCE_REQ) for sources of `file_hash`,
@@ -377,7 +406,7 @@ impl KadNode {
         let (op, payload) = build_search_source_req(file_hash, 0, file_size);
         let frame = pack_kad(op, payload);
         let dest = contact_addr(node.ip, node.udp_port);
-        let (res_payload, _verified) = self
+        let (res_payload, _verified, _sender_vk) = self
             .request(&node.id, dest, &frame, OP_SEARCH_RES, wait)
             .await?;
         let res = parse_search_res(&res_payload)?;
@@ -422,7 +451,9 @@ impl KadNode {
             }
             for node in &batch {
                 out.nodes_queried += 1;
-                if let Ok((contacts, verified)) = self.find_node(node, file_hash, per_query).await {
+                if let Ok((contacts, verified, sender_vk)) =
+                    self.find_node(node, file_hash, per_query).await
+                {
                     out.find_node_responses += 1;
                     // The node that answered proved its IP iff the receiver key was
                     // valid; the contacts it named are unverified until they answer.
@@ -433,6 +464,12 @@ impl KadNode {
                         node.tcp_port,
                         node.version,
                         verified,
+                    );
+                    self.routing.note_verify_key(
+                        &node.id,
+                        node.ip,
+                        sender_vk,
+                        self.current_public_ip,
                     );
                     for c in &contacts {
                         self.add_contact(c.id, c.ip, c.udp_port, c.tcp_port, c.version, false);
@@ -483,7 +520,7 @@ impl KadNode {
         let (op, payload) = build_search_key_req(target, 0);
         let frame = pack_kad(op, payload);
         let dest = contact_addr(node.ip, node.udp_port);
-        let (res_payload, _verified) = self
+        let (res_payload, _verified, _sender_vk) = self
             .request(&node.id, dest, &frame, OP_SEARCH_RES, wait)
             .await?;
         let res = parse_search_res(&res_payload)?;
@@ -523,7 +560,9 @@ impl KadNode {
                 break;
             }
             for node in &batch {
-                if let Ok((contacts, verified)) = self.find_node(node, &target, per_query).await {
+                if let Ok((contacts, verified, sender_vk)) =
+                    self.find_node(node, &target, per_query).await
+                {
                     self.add_contact(
                         node.id,
                         node.ip,
@@ -531,6 +570,12 @@ impl KadNode {
                         node.tcp_port,
                         node.version,
                         verified,
+                    );
+                    self.routing.note_verify_key(
+                        &node.id,
+                        node.ip,
+                        sender_vk,
+                        self.current_public_ip,
                     );
                     for c in &contacts {
                         self.add_contact(c.id, c.ip, c.udp_port, c.tcp_port, c.version, false);
@@ -646,7 +691,7 @@ mod tests {
 
         let (op, payload) = build_bootstrap_req();
         let frame = pack_kad(op, payload);
-        let (_res, valid) = node
+        let (_res, valid, _sk) = node
             .request(
                 &peer_id,
                 peer_addr,
@@ -694,7 +739,7 @@ mod tests {
 
         let (op, payload) = build_bootstrap_req();
         let frame = pack_kad(op, payload);
-        let (_res, valid) = node
+        let (_res, valid, _sk) = node
             .request(
                 &peer_id,
                 peer_addr,
@@ -709,6 +754,71 @@ mod tests {
 
         // Silence the unused-import warning when only one test path uses it.
         let _ = udp_verify_key(our_key, 0);
+    }
+
+    #[tokio::test]
+    async fn request_echoes_a_stored_verify_key_ip_bound() {
+        // The send-side: once we hold the key a peer handed us (minted against our
+        // current public IP), the next request ECHOES it in receiver_vk so the peer
+        // can verify US. A faithful loopback peer reads back that field.
+        let our_id = Kad128::from_words([7, 7, 7, 7]);
+        let our_ip = 0x0A00_0001u32;
+        let mut node =
+            KadNode::bind_with_identity("127.0.0.1:0".parse().unwrap(), 4662, our_id, 0x1111)
+                .await
+                .unwrap();
+        node.set_public_ip(our_ip);
+
+        let peer_id = Kad128::from_hash(&[0x55; 16]);
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let peer_ip = ip_u32(&peer_addr);
+        let peer_vk = 0xCAFE_BABEu32;
+
+        // Inject the peer with the key it handed us, minted against OUR public IP.
+        node.routing
+            .add(peer_id, peer_ip, peer_addr.port(), 4662, 8, false);
+        node.routing
+            .note_verify_key(&peer_id, peer_ip, peer_vk, our_ip);
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<u32>();
+        let mock = tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            let (n, from) = peer.recv_from(&mut buf).await.unwrap();
+            let dec = kad_deobfuscate(&buf[..n], &peer_id, 0, ip_u32(&from)).unwrap();
+            let _ = tx.send(dec.receiver_vk); // what we echoed
+            let (rop, rpayload) = build_bootstrap_res(&peer_id, 4662, 8, &[]);
+            let dg =
+                kad_obfuscate_response(&pack_kad(rop, rpayload), 0x2468, dec.sender_vk, 0, 0x80);
+            peer.send_to(&dg, from).await.unwrap();
+        });
+
+        let (op, payload) = build_bootstrap_req();
+        let frame = pack_kad(op, payload);
+        let _ = node
+            .request(
+                &peer_id,
+                peer_addr,
+                &frame,
+                OP_BOOTSTRAP_RES,
+                Duration::from_secs(2),
+            )
+            .await;
+        assert_eq!(
+            rx.await.unwrap(),
+            peer_vk,
+            "the request echoed the peer's stored verify key so it can verify us"
+        );
+        mock.await.unwrap();
+
+        // IP-bound: after our public IP changes, the stored key no longer matches,
+        // so we fall back to echoing 0 (byte-identical to the pre-hard-verify wire).
+        node.set_public_ip(0x0B00_0002);
+        assert_eq!(
+            node.routing
+                .verify_key_for(&peer_id, peer_ip, node.current_public_ip),
+            0
+        );
     }
 
     #[tokio::test]
