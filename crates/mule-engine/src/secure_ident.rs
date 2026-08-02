@@ -285,6 +285,12 @@ impl SecureIdentSession {
         self.peer_verified
     }
 
+    /// The peer's public key, once received (empty until then). The credit store
+    /// binds this to the peer's userhash on a successful verification.
+    pub fn peer_pubkey(&self) -> &[u8] {
+        self.peer_pubkey.as_deref().unwrap_or(&[])
+    }
+
     /// Feed a received secure-ident packet; returns packets to send in response.
     /// Non-secure-ident opcodes yield nothing.
     pub fn on_packet(

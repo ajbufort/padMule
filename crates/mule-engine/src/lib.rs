@@ -7,6 +7,7 @@
 pub mod bootstrap;
 pub mod catalog;
 pub mod connection;
+pub mod credit_store;
 pub mod credits;
 pub mod crypt_policy;
 pub mod engine;

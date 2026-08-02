@@ -54,6 +54,7 @@ impl Drop for WaitTicket<'_> {
     }
 }
 
+use crate::credit_store::{now_secs, CreditStore};
 use crate::framed::{FrameError, FramedStream};
 use crate::secure_ident::{
     Identity, SecureIdentSession, OP_PUBLICKEY, OP_SECIDENTSTATE, OP_SIGNATURE,
@@ -154,6 +155,14 @@ fn is_secident(op: u8) -> bool {
     matches!(op, OP_SECIDENTSTATE | OP_PUBLICKEY | OP_SIGNATURE)
 }
 
+/// The credit-accounting context for a serve connection: the shared store plus the
+/// peer's userhash to accrue against. `None` on non-engine paths (tests / the CLI
+/// serve harness), which do not persist credits.
+pub type CreditCtx = (Arc<CreditStore>, [u8; 16]);
+
+/// Fired once with the peer's public key when its serve-side identity verifies.
+pub type VerifiedSink = Box<dyn FnMut(&[u8]) + Send>;
+
 /// Our secure-ident state for an inbound serve connection: the session, our RSA
 /// identity, and a sink fired ONCE when the peer proves it owns its userhash.
 ///
@@ -166,7 +175,9 @@ fn is_secident(op: u8) -> bool {
 pub struct ServeSec {
     session: SecureIdentSession,
     identity: Arc<Identity>,
-    on_verified: Box<dyn FnMut() + Send>,
+    /// Fired once with the peer's public key when its signature checks out (so the
+    /// caller can bind the key to the peer's userhash in the credit store).
+    on_verified: VerifiedSink,
     fired: bool,
 }
 
@@ -174,7 +185,7 @@ impl ServeSec {
     pub fn new(
         session: SecureIdentSession,
         identity: Arc<Identity>,
-        on_verified: Box<dyn FnMut() + Send>,
+        on_verified: VerifiedSink,
     ) -> Self {
         ServeSec {
             session,
@@ -202,7 +213,7 @@ impl ServeSec {
             }
             if self.session.peer_verified() && !self.fired {
                 self.fired = true;
-                (self.on_verified)();
+                (self.on_verified)(self.session.peer_pubkey());
             }
         }
         Ok(())
@@ -311,6 +322,10 @@ fn read_range(path: &Path, start: u64, end: u64) -> io::Result<Vec<u8>> {
 /// A request for a hash we do not hold is answered with OP_FILEREQANSNOFIL, so
 /// the peer moves on cleanly rather than hanging. Block ranges outside the file
 /// are dropped rather than trusted - the request came from the network.
+///
+/// `credit` is `Some((store, peer_userhash))` on the live engine path, so the
+/// bytes we upload are accrued against this peer's credit record.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_shared<S>(
     fs: &mut FramedStream<S>,
     library: &[SharedFile],
@@ -318,6 +333,7 @@ pub async fn serve_shared<S>(
     gate: Option<&UploadGate>,
     peer_accept_comment: u8,
     mut sec: Option<ServeSec>,
+    credit: Option<CreditCtx>,
 ) -> Result<(), FrameError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -497,6 +513,11 @@ where
                         fs.write_packet(&build_sending_part(&f.hash, s, e, &data))
                             .await?;
                         crate::stats::add_uploaded(data.len() as u64);
+                        // Accrue what we gave this peer against its credit record
+                        // (raises what it owes us, lowering its future queue score).
+                        if let Some((cs, uh)) = &credit {
+                            cs.add_uploaded(*uh, data.len() as u64, now_secs());
+                        }
                     }
                 }
             }
@@ -575,7 +596,7 @@ mod tests {
         let up = tokio::spawn(async move {
             let me = HelloInfo::baseline([0xBB; 16], 0, 4662, 4672, "seed");
             if let Ok((_p, mut fs)) = accept_peer(&listener, &me).await {
-                let _ = serve_shared(&mut fs, &shared, None, None, 0, None).await;
+                let _ = serve_shared(&mut fs, &shared, None, None, 0, None, None).await;
             }
         });
 
@@ -590,6 +611,60 @@ mod tests {
 
         drop(fs);
         up.await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn serving_a_file_accrues_uploaded_bytes_to_the_peers_credit() {
+        let dir = tmpdir("accrue");
+        let data: Vec<u8> = (0..400_000u32)
+            .map(|i| (i.wrapping_mul(31)) as u8)
+            .collect();
+        let hash = ed2k_hash(&data);
+        let path = dir.join("movie.bin");
+        std::fs::write(&path, &data).unwrap();
+        let shared = vec![SharedFile {
+            hash,
+            size: data.len() as u64,
+            name: b"movie.bin".to_vec(),
+            part_hashes: vec![],
+            path,
+            rating: 0,
+            comment: String::new(),
+        }];
+        let peer_hash = [0xCC; 16];
+        let store = Arc::new(CreditStore::empty(true));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let store2 = Arc::clone(&store);
+        let up = tokio::spawn(async move {
+            let me = HelloInfo::baseline([0xBB; 16], 0, 4662, 4672, "seed");
+            if let Ok((_p, mut fs)) = accept_peer(&listener, &me).await {
+                let credit = Some((store2, peer_hash));
+                let _ = serve_shared(&mut fs, &shared, None, None, 0, None, credit).await;
+            }
+        });
+
+        let me = HelloInfo::baseline([0xAA; 16], 0x0A00_0001, 4663, 4673, "dl");
+        let (_p, mut fs) = connect_peer(addr, &me).await.unwrap();
+        let got = download_file(&mut fs, &hash, data.len() as u64)
+            .await
+            .unwrap();
+        assert_eq!(got, data);
+        drop(fs);
+        up.await.unwrap();
+
+        // The bytes we served are accrued against the peer's credit record.
+        assert_eq!(store.score(&peer_hash, None, 0, false), 1.0); // no bonus, but tracked
+        let bytes = store.save();
+        let back = mule_files::read_clients_met(&bytes).unwrap();
+        let e = back
+            .entries
+            .iter()
+            .find(|e| e.user_hash == peer_hash)
+            .unwrap();
+        assert_eq!(e.uploaded, data.len() as u64, "served bytes were accrued");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -660,7 +735,7 @@ mod tests {
         let mut server_fs = FramedStream::plaintext_with_prefix(server, &[]);
         let mut client_fs = FramedStream::plaintext_with_prefix(client, &[]);
         let id = Arc::new(Identity::generate());
-        let sec = ServeSec::new(SecureIdentSession::new(&id), id, Box::new(|| {}));
+        let sec = ServeSec::new(SecureIdentSession::new(&id), id, Box::new(|_| {}));
         client_fs
             .write_packet(&build_sec_ident_state(IS_KEYANDSIGNEEDED, 0x1234_5678))
             .await
@@ -689,7 +764,7 @@ mod tests {
         let mut server_fs = FramedStream::plaintext_with_prefix(server, &[]);
         let mut client_fs = FramedStream::plaintext_with_prefix(client, &[]);
         let id = Arc::new(Identity::generate());
-        let sec = ServeSec::new(SecureIdentSession::new(&id), id, Box::new(|| {}));
+        let sec = ServeSec::new(SecureIdentSession::new(&id), id, Box::new(|_| {}));
         for i in 0..8u32 {
             client_fs
                 .write_packet(&build_sec_ident_state(IS_KEYANDSIGNEEDED, i | 1))
@@ -734,12 +809,13 @@ mod tests {
             let sec = ServeSec::new(
                 SecureIdentSession::new(&server_id),
                 Arc::clone(&server_id),
-                Box::new(move || v2.store(true, Ordering::SeqCst)),
+                Box::new(move |_| v2.store(true, Ordering::SeqCst)),
             );
             if let InboundKind::Leecher { first, sec } =
                 classify_inbound(&mut server_fs, Some(sec), Duration::from_millis(500)).await
             {
-                let _ = serve_shared(&mut server_fs, &shared, Some(first), None, 0, sec).await;
+                let _ =
+                    serve_shared(&mut server_fs, &shared, Some(first), None, 0, sec, None).await;
             }
         });
 
@@ -820,7 +896,7 @@ mod tests {
         });
 
         let id = Arc::new(Identity::generate());
-        let sec = ServeSec::new(SecureIdentSession::new(&id), id, Box::new(|| {}));
+        let sec = ServeSec::new(SecureIdentSession::new(&id), id, Box::new(|_| {}));
         match classify_inbound(&mut us_fs, Some(sec), Duration::from_millis(200)).await {
             InboundKind::Source => {}
             _ => panic!("a sec-ident-then-silent called-back source must classify as Source"),
@@ -858,7 +934,7 @@ mod tests {
         let up = tokio::spawn(async move {
             let me = HelloInfo::baseline([0xBB; 16], 0, 4662, 4672, "seed");
             if let Ok((_p, mut fs)) = accept_peer(&listener, &me).await {
-                let _ = serve_shared(&mut fs, &shared, None, None, 0, None).await;
+                let _ = serve_shared(&mut fs, &shared, None, None, 0, None, None).await;
             }
         });
 
@@ -905,7 +981,7 @@ mod tests {
             let me = HelloInfo::baseline([0xBB; 16], 0, 4662, 4672, "seed");
             if let Ok((_p, mut fs)) = accept_peer(&listener, &me).await {
                 // The peer advertised AcceptCommentVer=1.
-                let _ = serve_shared(&mut fs, &shared, None, None, 1, None).await;
+                let _ = serve_shared(&mut fs, &shared, None, None, 1, None, None).await;
             }
         });
 
@@ -948,7 +1024,7 @@ mod tests {
             let me = HelloInfo::baseline([0xBB; 16], 0, 4662, 4672, "seed");
             if let Ok((_p, mut fs)) = accept_peer(&listener, &me).await {
                 // The peer did NOT advertise AcceptCommentVer.
-                let _ = serve_shared(&mut fs, &shared, None, None, 0, None).await;
+                let _ = serve_shared(&mut fs, &shared, None, None, 0, None, None).await;
             }
         });
 
@@ -980,7 +1056,7 @@ mod tests {
         let up = tokio::spawn(async move {
             let me = HelloInfo::baseline([0xBB; 16], 0, 4662, 4672, "seed");
             if let Ok((_p, mut fs)) = accept_peer(&listener, &me).await {
-                let _ = serve_shared(&mut fs, &[], None, None, 0, None).await;
+                let _ = serve_shared(&mut fs, &[], None, None, 0, None, None).await;
             }
         });
 
@@ -1026,7 +1102,7 @@ mod tests {
         let up = tokio::spawn(async move {
             let me = HelloInfo::baseline([0xBB; 16], 0, 4662, 4672, "seed");
             if let Ok((_p, mut fs)) = accept_peer(&listener, &me).await {
-                let _ = serve_shared(&mut fs, &shared, None, None, 0, None).await;
+                let _ = serve_shared(&mut fs, &shared, None, None, 0, None, None).await;
             }
         });
 
