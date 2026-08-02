@@ -1989,14 +1989,32 @@ impl Engine {
         // teardown and every other FFI call for that whole window. The server path
         // is bounded the same way. Kad keeps working incrementally on its socket
         // after, so a timed-out-but-partial bootstrap is still useful.
-        let bootstrapped = matches!(
-            timeout(
-                Duration::from_secs(5),
-                node.bootstrap_any(&contacts, Duration::from_millis(1200), 40),
+        let boot = timeout(
+            Duration::from_secs(5),
+            node.bootstrap_any(&contacts, Duration::from_millis(1200), 40),
+        )
+        .await;
+        // The contact that answered, if any: we HELLO it next to complete the v8
+        // three-way handshake so a real node marks us IP-verified (see below).
+        let responder = match &boot {
+            Ok(Ok((i, _))) => contacts.get(*i).cloned(),
+            _ => None,
+        };
+        let bootstrapped = matches!(boot, Ok(Ok(_)));
+        // Complete a verification handshake with our entry node: HELLO it so it sends
+        // a HELLO_RES, then we ACK with its echoed key and it marks US IP-verified
+        // (eMule Process2HelloResponseAck). Being verified keeps us a first-class
+        // routing contact (returned in lookups, publishes accepted) instead of a
+        // deprioritized unverified one. Best-effort + bounded: a miss just leaves us
+        // unverified (the prior behavior), never blocks. Broader coverage (verifying
+        // more nodes, e.g. publish targets) is a follow-on.
+        if let Some(c) = responder {
+            let _ = timeout(
+                Duration::from_secs(2),
+                node.hello(&c, Duration::from_millis(1500)),
             )
-            .await,
-            Ok(Ok(_))
-        );
+            .await;
+        }
         // Fold whatever Kad learned into the persisted routing table (even a
         // timed-out bootstrap may have found contacts). Keep the node either way:
         // it owns a live UDP socket + our persisted identity, and downloads pull

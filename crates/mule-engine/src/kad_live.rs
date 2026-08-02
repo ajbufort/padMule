@@ -16,12 +16,12 @@
 
 use mule_files::{IpFilter, KadContact};
 use mule_kad::{
-    build_bootstrap_req, build_hello_req, build_kad2_req, build_search_key_req,
-    build_search_source_req, is_acceptable_contact, kad_deobfuscate, kad_keyword_target,
-    kad_obfuscate_request, pack_kad, parse_bootstrap_res, parse_hello, parse_kad2_res,
-    parse_search_res, unpack_kad, BootstrapRes, FileResult, Hello, Lookup, RoutingTable, Source,
-    WireContact, ALPHA_QUERY, K, KAD_FIND_NODE, OP_BOOTSTRAP_RES, OP_HELLO_RES, OP_KAD2_RES,
-    OP_SEARCH_RES,
+    build_bootstrap_req, build_hello_req, build_hello_res_ack, build_kad2_req,
+    build_search_key_req, build_search_source_req, is_acceptable_contact, kad_deobfuscate,
+    kad_keyword_target, kad_obfuscate_request, pack_kad, parse_bootstrap_res, parse_hello,
+    parse_kad2_res, parse_search_res, unpack_kad, BootstrapRes, FileResult, Hello, Lookup,
+    RoutingTable, Source, WireContact, ALPHA_QUERY, K, KAD_FIND_NODE, OP_BOOTSTRAP_RES,
+    OP_HELLO_RES, OP_KAD2_RES, OP_SEARCH_RES,
 };
 use mule_proto::Kad128;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -349,18 +349,59 @@ impl KadNode {
         Err(last)
     }
 
-    /// Send a HELLO_REQ to a contact (requesting a HELLO_RES_ACK) and parse the
-    /// HELLO_RES.
+    /// Send a HELLO_REQ, parse the HELLO_RES, and COMPLETE the Kad2 v8 three-way
+    /// handshake: store the sender key the peer hands us and, if it asks for an ACK
+    /// (misc-option 0x04), reply with a HELLO_RES_ACK echoing that key. The echoed
+    /// key == the peer's GetUDPVerifyKey(our IP), so it marks US IP-verified (eMule
+    /// Process2HelloResponseAck -> VerifyContact). Without the ACK a v8 node keeps
+    /// us UNVERIFIED and deprioritizes/drops us from its routing table.
     pub async fn hello(&mut self, contact: &KadContact, wait: Duration) -> Result<Hello, KadError> {
-        // misc_options bit 0x04 requests a HELLO_RES_ACK (v>=8).
-        let (op, payload) =
-            build_hello_req(&self.kad_id, self.tcp_port, Some(self.udp_port), Some(0x04));
+        // A HELLO_REQ carries NO misc-option 0x04: that bit means "send me a
+        // HELLO_RES_ACK" and is the RESPONDER's to set in its HELLO_RES (eMule
+        // SendMyDetails, KademliaUDPListener.cpp:139). Setting it on a REQUEST is
+        // wrong (it trips aMule's AddContact2 wxFAIL) and earns nothing.
+        let (op, payload) = build_hello_req(&self.kad_id, self.tcp_port, Some(self.udp_port), None);
         let frame = pack_kad(op, payload);
         let dest = contact_addr(contact.ip, contact.udp_port);
-        let (res_payload, _verified, _sender_vk) = self
+        let (res_payload, _verified, peer_vk) = self
             .request(&contact.id, dest, &frame, OP_HELLO_RES, wait)
             .await?;
-        Ok(parse_hello(&res_payload)?)
+        let hello = parse_hello(&res_payload)?;
+        // Store the sender key the peer just handed us (bound to our current public
+        // IP) so later requests to it echo the key and it keeps verifying us.
+        self.routing
+            .note_verify_key(&contact.id, contact.ip, peer_vk, self.current_public_ip);
+        // Third leg: if the HELLO_RES requested an ACK, send it, echoing peer_vk.
+        if hello.misc_options.is_some_and(|m| m & 0x04 != 0) {
+            self.send_hello_res_ack(&contact.id, dest, peer_vk).await?;
+        }
+        Ok(hello)
+    }
+
+    /// Send a HELLO_RES_ACK to `dest`, echoing `peer_vk` (the sender key the peer
+    /// issued us in its HELLO_RES) as our receiver key - the third leg of the Kad2
+    /// v8 IP-verification handshake. The peer checks the echoed key against
+    /// GetUDPVerifyKey(our IP) and, on a match, marks us IP-verified. Fire-and-
+    /// forget: eMule sends the ACK and expects no reply.
+    async fn send_hello_res_ack(
+        &self,
+        target_id: &Kad128,
+        dest: SocketAddr,
+        peer_vk: u32,
+    ) -> Result<(), KadError> {
+        let (op, payload) = build_hello_res_ack(&self.kad_id);
+        let frame = pack_kad(op, payload);
+        let sender_vk = mule_kad::udp_verify_key(self.udp_key, ip_u32(&dest));
+        let datagram = kad_obfuscate_request(
+            &frame,
+            target_id,
+            rand::random(), // random key seed
+            peer_vk,        // echo the peer's key -> its bValidReceiverKey -> verifies us
+            sender_vk,      // our key, so it keeps verifying our future packets
+            rand::random(), // marker randomness
+        );
+        self.socket.send_to(&datagram, dest).await?;
+        Ok(())
     }
 
     /// Ask one node (KADEMLIA2_REQ, FIND_NODE) for the contacts it knows closest
@@ -660,7 +701,24 @@ mod tests {
 
     // Faithful mock-peer helpers for the receiver-key tests: they play the real
     // responder role (interop-test-fidelity), not a same-role echo.
-    use mule_kad::{build_bootstrap_res, kad_obfuscate_response, udp_verify_key};
+    use mule_kad::{
+        build_bootstrap_res, build_hello_res, kad_obfuscate_response, udp_verify_key,
+        OP_HELLO_RES_ACK,
+    };
+
+    /// A test KadContact addressed at a mock peer.
+    fn test_contact(id: Kad128, addr: SocketAddr) -> KadContact {
+        KadContact {
+            id,
+            ip: ip_u32(&addr),
+            udp_port: addr.port(),
+            tcp_port: 4662,
+            version: 8,
+            udp_key: 0,
+            udp_key_ip: 0,
+            verified: false,
+        }
+    }
 
     #[tokio::test]
     async fn request_reports_a_valid_receiver_key_when_the_peer_echoes_our_sender_key() {
@@ -819,6 +877,122 @@ mod tests {
                 .verify_key_for(&peer_id, peer_ip, node.current_public_ip),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn hello_completes_the_three_way_handshake_with_a_res_ack() {
+        // A v8 responder that requests an ACK (misc-option 0x04 in its HELLO_RES)
+        // must receive a HELLO_RES_ACK from us that echoes the sender key it issued
+        // -> its bValidReceiverKey is true and it marks US IP-verified (eMule
+        // Process2HelloResponseAck -> VerifyContact). Also: our HELLO_REQ must NOT
+        // set 0x04 - that bit is the RESPONDER's (eMule SendMyDetails).
+        let our_id = Kad128::from_words([7, 7, 7, 7]);
+        let mut node =
+            KadNode::bind_with_identity("127.0.0.1:0".parse().unwrap(), 4662, our_id, 0x1111)
+                .await
+                .unwrap();
+        node.set_public_ip(0x0A00_0001);
+
+        let peer_id = Kad128::from_hash(&[0x55; 16]);
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let peer_issued_vk = 0xABCD_1234u32; // the key the peer hands us to echo
+
+        #[allow(clippy::type_complexity)]
+        let (tx, rx) = tokio::sync::oneshot::channel::<(Option<(u8, u32)>, Option<u8>)>();
+        let mock = tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            // 1) receive our HELLO_REQ, capture its misc options
+            let (n, from) = peer.recv_from(&mut buf).await.unwrap();
+            let dec = kad_deobfuscate(&buf[..n], &peer_id, 0, ip_u32(&from)).unwrap();
+            let (_rop, rpayload) = unpack_kad(&dec.payload).unwrap();
+            let req = parse_hello(&rpayload).unwrap();
+            // 2) send a HELLO_RES that REQUESTS an ACK (0x04). The RC4 key is the
+            // sender key WE echo (dec.sender_vk = the key padMule issued us, which it
+            // can reproduce to decrypt); peer_issued_vk rides the sender_vk FIELD as
+            // the key padMule must echo back in its ACK.
+            let (hop, hpayload) = build_hello_res(&peer_id, 4662, Some(4662), Some(0x04));
+            let dg = kad_obfuscate_response(
+                &pack_kad(hop, hpayload),
+                0x2468,
+                dec.sender_vk,
+                peer_issued_vk,
+                0x80,
+            );
+            peer.send_to(&dg, from).await.unwrap();
+            // 3) receive the HELLO_RES_ACK (bounded, so a missing ACK fails cleanly)
+            let ack = match timeout(Duration::from_millis(500), peer.recv_from(&mut buf)).await {
+                Ok(Ok((n2, from2))) => {
+                    let dec2 = kad_deobfuscate(&buf[..n2], &peer_id, 0, ip_u32(&from2)).unwrap();
+                    let (aop, _ap) = unpack_kad(&dec2.payload).unwrap();
+                    Some((aop, dec2.receiver_vk))
+                }
+                _ => None,
+            };
+            let _ = tx.send((ack, req.misc_options));
+        });
+
+        let contact = test_contact(peer_id, peer_addr);
+        node.hello(&contact, Duration::from_secs(2)).await.unwrap();
+
+        let (ack, req_misc) = rx.await.unwrap();
+        let (ack_op, echoed) = ack.expect("we complete the handshake with a HELLO_RES_ACK");
+        assert_eq!(
+            ack_op, OP_HELLO_RES_ACK,
+            "we complete the handshake with an ACK"
+        );
+        assert_eq!(
+            echoed, peer_issued_vk,
+            "the ACK echoes the peer's issued sender key"
+        );
+        assert!(
+            req_misc.is_none_or(|m| m & 0x04 == 0),
+            "our HELLO_REQ must not set the responder's 0x04 ack-request bit"
+        );
+        mock.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn hello_sends_no_ack_when_the_res_does_not_request_one() {
+        // If the HELLO_RES does not set 0x04 (the peer already verified us, or does
+        // not need an ACK), we must NOT send a HELLO_RES_ACK - a real node sends the
+        // ACK only in response to the request, and an unsolicited ACK is noise.
+        let our_id = Kad128::from_words([3, 3, 3, 3]);
+        let mut node =
+            KadNode::bind_with_identity("127.0.0.1:0".parse().unwrap(), 4662, our_id, 0x2222)
+                .await
+                .unwrap();
+        node.set_public_ip(0x0A00_0001);
+
+        let peer_id = Kad128::from_hash(&[0x77; 16]);
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+        let mock = tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            let (n, from) = peer.recv_from(&mut buf).await.unwrap();
+            let dec = kad_deobfuscate(&buf[..n], &peer_id, 0, ip_u32(&from)).unwrap();
+            // HELLO_RES with NO ack request (misc options absent); keyed on the
+            // sender key padMule issued us so it can decrypt.
+            let (hop, hpayload) = build_hello_res(&peer_id, 4662, Some(4662), None);
+            let dg =
+                kad_obfuscate_response(&pack_kad(hop, hpayload), 0x2468, dec.sender_vk, 0, 0x80);
+            peer.send_to(&dg, from).await.unwrap();
+            // A second packet (an ACK) would be a bug: expect a timeout.
+            let got_ack = timeout(Duration::from_millis(400), peer.recv_from(&mut buf))
+                .await
+                .is_ok();
+            let _ = tx.send(got_ack);
+        });
+
+        let contact = test_contact(peer_id, peer_addr);
+        node.hello(&contact, Duration::from_secs(2)).await.unwrap();
+        assert!(
+            !rx.await.unwrap(),
+            "no ACK must be sent when the HELLO_RES does not request one"
+        );
+        mock.await.unwrap();
     }
 
     #[tokio::test]
