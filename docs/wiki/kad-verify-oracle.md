@@ -58,12 +58,31 @@ this is the faithful other-side the send-side claim needed.
   secure-ident success (BaseClient.cpp:2207); the reverse peer oracle asserts
   them by enabling verbose logging.
 
-## Known harness flakiness (NOT a padMule bug)
+## The "flakiness" was a harness bug, not a port problem (2026-08-02)
 
-amuled's client/Kad UDP socket occasionally binds an EPHEMERAL port instead of
-the configured UDPPort, which defeats the fixed one-contact nodes.dat. The
-runner has a readiness gate (checks the socket landed on 4672) and WARNs when
-it did not; re-running usually clears it. Stabilization is ongoing.
+This oracle was first recorded with "KNOWN harness flakiness: amuled's Kad UDP
+socket occasionally binds an ephemeral port". That diagnosis was WRONG. amuled
+always bound 4672. Two defects in the runner made it blind:
+
+1. `LOGS()` read only the stdout redirect, but this build writes its log lines
+   to `$CFG/logfile` and leaves stdout nearly empty - so the harness could not
+   see "Kad started", the UDP-socket line, or its own PADMULE-ORACLE-VERIFIED
+   success line.
+2. The port check grepped `Client UDP socket (extended eMule) at`, a string
+   aMule 3.0.1 never emits; it logs `Created Client UDP-Socket at port N`. The
+   resulting WARN was always false.
+
+Both fixed (row 8ak): `LOGS()` reads BOTH sinks and the grep matches the real
+string. The oracle now passes 3/3 on the FIRST attempt, no retries, no WARN.
+
+LESSON (a [[verify-before-reporting]] case): a harness that cannot observe
+success will invent a plausible-sounding cause for the failure. "Known
+flakiness" is a claim that deserves the same evidence bar as a passing test -
+here, reading amuled's actual log text refuted it in one run.
+
+Separate real prereq worth knowing: amuled REFUSES to start with
+`AcceptExternalConnections=0` ("aMule daemon cannot be used when external
+connections are disabled"), which is why the runner sets it plus an ECPassword.
 
 ## Related
 

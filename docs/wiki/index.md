@@ -34,7 +34,7 @@ the Ingest / Query / Lint workflows.
 ## Process
 - [[decisions-and-lessons]] - locked decisions, rejected approaches, gotchas.
 - [[build-history]] - archive: the completed-milestone narratives (code-fix rounds, live milestones, differential-test history, wave notes) split verbatim out of [[build-progress]] on 2026-08-01.
-- [[build-progress]] - wave-by-wave build status. Engine complete through Kad + multi-source fetch; padMule RUNS on the iPad and does the full search->download->verify->save loop on-device; 0.70b Tier 1 COMPLETE + 9 Tier-2 items ([[emule-070b-features]]). Since 2026-07-20: the v1 readiness audit (8z), the reanalysis lint + Rust CI (8aa), the bulletproof security batch (8ab), the reverse peer oracle + multipacket serve (8ad/8ae), serve-side secure-ident + the full credit system (8af-8ah), the per-source corruption ban (8ai), and wave 10 Kad hard-verify (send-side keys + v8 handshake DONE and terminal-proven via [[kad-verify-oracle]]; Batch B enforcement pending). Repo has LICENSE (GPL v2) + NOTICE + README.
+- [[build-progress]] - wave-by-wave build status. Engine complete through Kad + multi-source fetch; padMule RUNS on the iPad and does the full search->download->verify->save loop on-device; 0.70b Tier 1 COMPLETE + 9 Tier-2 items ([[emule-070b-features]]). Since 2026-07-20: the v1 readiness audit (8z), the reanalysis lint + Rust CI (8aa), the bulletproof security batch (8ab), the reverse peer oracle + multipacket serve (8ad/8ae), serve-side secure-ident + the full credit system (8af-8ah), the per-source corruption ban (8ai), and wave 10 Kad hard-verify (send-side keys + v8 handshake DONE and terminal-proven via [[kad-verify-oracle]]; Batch B enforcement pending), plus the 8aj/8ak reanalysis lint + fix round (doc drift, Kad key capture, nodes.dat v3, load gate, serve-path faithfulness, harness). Repo has LICENSE (GPL v2) + NOTICE + README.
 
 ## Backlog / feature ideas
 - [[feature-server-hunter]] - discover + verify live eD2k servers (auto-update, health-check, server-graph crawl); NOT literal whole-net scanning. Partially shipped (the auto-update/merge + prune landed as the 8y server manager; the status probe as the 8x Servers screen); the gossip crawl remains future work.
@@ -45,12 +45,13 @@ the Ingest / Query / Lint workflows.
 CI+Sideloadly deploy path, foreground-only v1 - see [[decisions-and-lessons]];
 the app is shipped and on-device, and 0.70b Tier-1 parity is done
 ([[emule-070b-features]]). Current direction: the BULLETPROOF security release
-gate - close the [[security-model]] scorecard (21 operational / 3 partial / 2
+gate - close the [[security-model]] scorecard (22 operational / 2 partial / 2
 documented opt-outs as of 2026-08-02). Serve-side secure-ident, the full credit
 system (store + reweight + accrual), and per-source corruption attribution + ban
 all landed 2026-08-02 ([[build-progress]] 8af-8ai); server-obf is a documented v1
-opt-out ([[obfuscation-posture]]). The Kad hard-verify send-side half is DONE and
-terminal-proven - a log-patched real amuled verifies padMule via the v8
-HELLO_RES_ACK handshake ([[kad-verify-oracle]]); remaining: Batch B verified-bit
-enforcement + the search-path key-capture gap ([[build-progress]] wave 10). Wave 9
-seedbox mode is the open v1.1 item.)
+opt-out ([[obfuscation-posture]]). The Kad hard-verify send-side is DONE,
+terminal-proven (a log-patched real amuled verifies padMule via the v8
+HELLO_RES_ACK handshake, [[kad-verify-oracle]]) and now key-capture-complete
+(8ak). The ONLY protocol item left for the gate is wave-10 Batch B: verified-bit
+ENFORCEMENT in routing, flag-gated and offline-provable. Wave 9 seedbox mode is
+the open v1.1 item.)
