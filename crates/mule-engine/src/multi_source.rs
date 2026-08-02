@@ -31,6 +31,10 @@ use crate::secure_ident::{
     Identity, SecureIdentSession, OP_PUBLICKEY, OP_SECIDENTSTATE, OP_SIGNATURE,
 };
 use crate::share::CreditCtx;
+use crate::sources::{
+    build_request_sources2, parse_answer_sources, Source as SxSource, OP_ANSWERSOURCES,
+    OP_ANSWERSOURCES2, SOURCE_EXCHANGE_VERSION,
+};
 use crate::transfer::{
     build_hashset_request, build_request_filename_ext, build_request_parts, build_set_req_file_id,
     build_start_upload_req, parse_file_desc, parse_file_status, parse_hashset_answer,
@@ -46,6 +50,20 @@ use mule_proto::{Packet, PARTSIZE};
 pub struct SecIdentCtx {
     pub identity: Arc<Identity>,
     pub peer_supports: bool,
+}
+
+/// The optional extras one download connection can carry, bundled so the
+/// transfer functions keep a readable arity: the secure-ident context, the
+/// credit sink for bytes this source gives us, and whether to ask this peer for
+/// more sources (source exchange).
+#[derive(Default)]
+pub struct PeerSession {
+    pub sec: Option<SecIdentCtx>,
+    pub credit: Option<CreditCtx>,
+    /// Ask this peer for other sources of the file. The caller decides, since
+    /// it knows both the peer's advertised SX support and whether we already
+    /// asked this IP ([`Download::mark_asked_sources`]).
+    pub ask_sources: bool,
 }
 
 /// What we learned about one source we connected to, for the per-source UI.
@@ -104,6 +122,16 @@ pub struct Download {
     /// part (eMule's CorruptionBlackBox, per-file). BOTH the outbound fetch sweep
     /// AND the inbound called-back-source path skip them.
     banned: StdMutex<HashSet<IpAddr>>,
+    /// Sources peers handed us via source exchange (OP_ANSWERSOURCES), waiting
+    /// for the fetch manager to drain and dial them. Collected off the async
+    /// transfer lock, like the two sets above.
+    sx_sources: StdMutex<Vec<SxSource>>,
+    /// Peer IPs we have already asked for sources on this download. eMule
+    /// rate-limits the same exchange per client (SOURCECLIENTREASKS = 40 min,
+    /// x MINCOMMONPENALTY=4 for a non-rare file); a padMule download is a
+    /// foreground, bounded affair, so asking each peer AT MOST ONCE per download
+    /// is simpler and never more aggressive than upstream.
+    asked_sources: StdMutex<HashSet<IpAddr>>,
 }
 
 struct Inner {
@@ -139,7 +167,30 @@ impl Download {
             fetching: AtomicBool::new(false),
             part_sources: StdMutex::new(HashMap::new()),
             banned: StdMutex::new(HashSet::new()),
+            sx_sources: StdMutex::new(Vec::new()),
+            asked_sources: StdMutex::new(HashSet::new()),
         })
+    }
+
+    /// Record sources a peer handed us via source exchange. They are dialed only
+    /// after the fetch manager drains them, so nothing here touches the network.
+    pub fn note_sx_sources(&self, sources: Vec<SxSource>) {
+        if sources.is_empty() {
+            return;
+        }
+        self.sx_sources.lock().unwrap().extend(sources);
+    }
+
+    /// Take the source-exchange sources learned since the last call. Destructive:
+    /// the fetch manager folds each into its dial queue exactly once.
+    pub fn take_sx_sources(&self) -> Vec<SxSource> {
+        std::mem::take(&mut *self.sx_sources.lock().unwrap())
+    }
+
+    /// Claim the right to ask `ip` for sources on this download. `true` only the
+    /// FIRST time, so one peer is never asked twice (see `asked_sources`).
+    pub fn mark_asked_sources(&self, ip: IpAddr) -> bool {
+        self.asked_sources.lock().unwrap().insert(ip)
     }
 
     /// Claim the single in-flight fetch slot. The FIRST caller gets `true` and must
@@ -649,7 +700,7 @@ pub async fn download_from_peer<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    download_from_peer_at(fs, dl, bail_on_queue, None, None, None).await
+    download_from_peer_at(fs, dl, bail_on_queue, None, PeerSession::default()).await
 }
 
 /// As [`download_from_peer`], but `peer` names the source address (so a rating +
@@ -657,20 +708,18 @@ where
 /// against it) and `sec` carries the secure-ident context (our RSA identity +
 /// whether the peer advertised support), enabling mutual secure-identification
 /// inline with the transfer. `sec = None` disables it (plain download).
-#[allow(clippy::too_many_arguments)]
 pub async fn download_from_peer_at<S>(
     fs: &mut FramedStream<S>,
     dl: &Download,
     bail_on_queue: bool,
     peer: Option<SocketAddr>,
-    sec: Option<SecIdentCtx>,
-    credit: Option<CreditCtx>,
+    session: PeerSession,
 ) -> Result<u64, TransferError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut held: Vec<(u64, u64)> = Vec::new();
-    let r = run_peer(fs, dl, &mut held, bail_on_queue, peer, sec, credit).await;
+    let r = run_peer(fs, dl, &mut held, bail_on_queue, peer, session).await;
     // Whatever happened, do not strand blocks nobody else will be offered.
     dl.release(&held).await;
     r
@@ -705,6 +754,19 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     note_comment_if_desc(pkt, dl, peer).await;
+    // A peer's answer to our source request. Unsolicited answers are fine to
+    // accept too (aMule likewise just processes what arrives); every source is
+    // re-validated by the fetch manager before it is ever dialed, so a hostile
+    // list can at worst waste our own connection attempts.
+    if matches!(pkt.opcode, OP_ANSWERSOURCES | OP_ANSWERSOURCES2) {
+        let sx2 = pkt.opcode == OP_ANSWERSOURCES2;
+        if let Ok((h, sources)) = parse_answer_sources(&pkt.payload, sx2, SOURCE_EXCHANGE_VERSION) {
+            // Only for the file this connection is about.
+            if h == dl.hash().await {
+                dl.note_sx_sources(sources);
+            }
+        }
+    }
     if matches!(pkt.opcode, OP_SECIDENTSTATE | OP_PUBLICKEY | OP_SIGNATURE) {
         if let Some((session, id)) = sec.as_mut() {
             // A malformed secure-ident packet is dropped (Err ignored), never
@@ -731,13 +793,17 @@ async fn run_peer<S>(
     held: &mut Vec<(u64, u64)>,
     bail_on_queue: bool,
     peer: Option<SocketAddr>,
-    sec: Option<SecIdentCtx>,
-    credit: Option<CreditCtx>,
+    session: PeerSession,
 ) -> Result<u64, TransferError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let hash = dl.hash().await;
+    let PeerSession {
+        sec,
+        credit,
+        ask_sources,
+    } = session;
 
     // Secure-ident, when enabled: build our session and - if the peer advertised
     // support - proactively ask it to prove it owns its userhash, exactly as a
@@ -759,6 +825,15 @@ where
     // Ask what this peer has.
     fs.write_packet(&build_request_filename_ext(&hash)).await?;
     fs.write_packet(&build_set_req_file_id(&hash)).await?;
+    // ...and, in the same breath, ask it who ELSE has the file (source exchange).
+    // aMule asks here too - bundled into its multipacket file request, or sent
+    // standalone (DownloadClient.cpp:249-258 / :305-320) - gated by
+    // IsSourceRequestAllowed(). The answer is folded in by handle_aux_packet; we
+    // never wait for it, so a peer that stays silent costs us nothing.
+    if ask_sources {
+        fs.write_packet(&build_request_sources2(&hash, SOURCE_EXCHANGE_VERSION))
+            .await?;
+    }
     let status = loop {
         let pkt = fs.read_packet_unpacked().await?;
         match pkt.opcode {
@@ -858,6 +933,113 @@ mod tests {
     use mule_proto::{ed2k_hash, md4, PARTSIZE};
     use std::path::PathBuf;
     use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn we_ask_a_peer_for_sources_and_collect_its_answer() {
+        // Source exchange, ask side. A faithful other-side: an uploader that
+        // answers OP_REQUESTSOURCES2 with an OP_ANSWERSOURCES2 record set,
+        // exactly as aMule's CreateSrcInfoPacket does for a peer in its upload
+        // list. padMule must SEND the request during its file-request sequence
+        // (aMule bundles/sends it there, DownloadClient.cpp:249-258) and hand
+        // the parsed sources to the Download for the fetch manager to dial.
+        use crate::sources::{
+            build_answer_sources, parse_request_sources2, Source, OP_REQUESTSOURCES2,
+        };
+        use crate::transfer::{
+            build_accept_upload, build_file_status_complete, build_sending_part,
+            parse_request_parts, OP_REQUESTFILENAME, OP_REQUESTPARTS, OP_STARTUPLOADREQ,
+        };
+        let dir = tmpdir("sx-ask");
+        let data: Vec<u8> = (0..40_000u32).map(|i| (i.wrapping_mul(7)) as u8).collect();
+        let hash = ed2k_hash(&data);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let served = data.clone();
+        let server = tokio::spawn(async move {
+            let me = HelloInfo::baseline([0xBB; 16], 0, 4662, 4672, "server");
+            let (_p, mut fs) = accept_peer(&listener, &me).await.unwrap();
+            let mut asked = false;
+            while let Ok(pkt) = fs.read_packet_unpacked().await {
+                match pkt.opcode {
+                    OP_REQUESTSOURCES2 => {
+                        // Answer with one usable source, SX v4 (userhash+crypt).
+                        let (ver, h) = parse_request_sources2(&pkt.payload).unwrap();
+                        assert_eq!(ver, SOURCE_EXCHANGE_VERSION, "we request the newest SX");
+                        assert_eq!(h, hash);
+                        asked = true;
+                        let srcs = vec![Source {
+                            ip: 0x8602_0102,
+                            port: 4662,
+                            server_ip: 0,
+                            server_port: 0,
+                            user_hash: Some([0xEE; 16]),
+                            crypt: Some(0x01),
+                        }];
+                        let p = build_answer_sources(&hash, &srcs, SOURCE_EXCHANGE_VERSION, true)
+                            .unwrap();
+                        let _ = fs.write_packet(&p).await;
+                    }
+                    OP_REQUESTFILENAME => {
+                        let _ = fs.write_packet(&build_file_status_complete(&hash)).await;
+                    }
+                    OP_STARTUPLOADREQ => {
+                        let _ = fs.write_packet(&build_accept_upload()).await;
+                    }
+                    OP_REQUESTPARTS => {
+                        if let Ok((_h, blocks)) = parse_request_parts(&pkt.payload, false) {
+                            for (s, e) in blocks {
+                                if s <= e && (e as usize) <= served.len() {
+                                    let _ = fs
+                                        .write_packet(&build_sending_part(
+                                            &hash,
+                                            s,
+                                            e,
+                                            &served[s as usize..e as usize],
+                                        ))
+                                        .await;
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            asked
+        });
+
+        let store = PartStore::create(&dir, 1, hash, data.len() as u64, b"sx.bin").unwrap();
+        let dl = Download::new(store);
+        let me = HelloInfo::baseline([0xAA; 16], 0x0A00_0001, 4663, 4673, "dl");
+        let (_p, mut fs) = connect_peer(addr, &me).await.unwrap();
+        let session = PeerSession {
+            ask_sources: true,
+            ..Default::default()
+        };
+        let got = download_from_peer_at(&mut fs, &dl, false, Some(addr), session)
+            .await
+            .unwrap();
+        assert_eq!(got, data.len() as u64, "the transfer still completes");
+
+        let learned = dl.take_sx_sources();
+        assert_eq!(learned.len(), 1, "the peer's sources reached the Download");
+        assert_eq!(learned[0].user_hash, Some([0xEE; 16]));
+        assert_eq!(learned[0].crypt, Some(0x01));
+        // Draining is destructive: the fetch manager consumes each source once.
+        assert!(dl.take_sx_sources().is_empty());
+        // The once-per-peer gate is the CALLER's claim (fetch_one asks only if it
+        // wins it), so exercise that primitive directly: eMule rate-limits the
+        // same exchange per client at SOURCECLIENTREASKS = 40 min.
+        assert!(dl.mark_asked_sources(addr.ip()), "first claim wins");
+        assert!(
+            !dl.mark_asked_sources(addr.ip()),
+            "a second ask is suppressed"
+        );
+
+        drop(fs);
+        let _ = server.await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn tmpdir(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("padmule-ms-{tag}-{}", std::process::id()));
@@ -1095,7 +1277,14 @@ mod tests {
                 .unwrap();
         });
 
-        let r = download_from_peer_at(&mut client_fs, &dl, false, Some(addr), None, None).await;
+        let r = download_from_peer_at(
+            &mut client_fs,
+            &dl,
+            false,
+            Some(addr),
+            PeerSession::default(),
+        )
+        .await;
         assert!(matches!(r, Err(TransferError::NoFile)));
         let _ = src.await;
 
@@ -1167,9 +1356,18 @@ mod tests {
         let me = HelloInfo::baseline([0xAA; 16], 0x0A00_0001, 4663, 4673, "dl");
         let (_p, mut fs) = connect_peer(addr, &me).await.unwrap();
         let credit = Some((Arc::clone(&credits), src_hash));
-        let got = download_from_peer_at(&mut fs, &dl, false, Some(addr), None, credit)
-            .await
-            .unwrap();
+        let got = download_from_peer_at(
+            &mut fs,
+            &dl,
+            false,
+            Some(addr),
+            PeerSession {
+                credit,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(got, data.len() as u64, "the whole file transferred");
 
         // The source is credited with what it GAVE us (byte-compat via clients.met).
@@ -1356,9 +1554,18 @@ mod tests {
             identity: Arc::new(Identity::generate()),
             peer_supports: true,
         });
-        let got = download_from_peer_at(&mut fs, &dl, false, Some(addr), sec, None)
-            .await
-            .unwrap();
+        let got = download_from_peer_at(
+            &mut fs,
+            &dl,
+            false,
+            Some(addr),
+            PeerSession {
+                sec,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
 
         assert_eq!(got, data.len() as u64, "the whole file transferred");
         assert!(dl.is_complete().await, "download completed");

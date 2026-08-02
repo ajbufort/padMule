@@ -12,8 +12,10 @@
 //! a later step - it needs range reads out of a live `.part` under the download's
 //! lock and a real per-part availability bitfield.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -33,6 +35,10 @@ use crate::credit_store::{now_secs, CreditStore};
 use crate::framed::{FrameError, FramedStream};
 use crate::secure_ident::{
     Identity, SecureIdentSession, OP_PUBLICKEY, OP_SECIDENTSTATE, OP_SIGNATURE,
+};
+use crate::sources::{
+    build_answer_sources, parse_request_sources, parse_request_sources2, Source as SxSource,
+    OP_REQUESTSOURCES, OP_REQUESTSOURCES2, SOURCE_EXCHANGE_VERSION,
 };
 use crate::transfer::{
     build_accept_upload, build_file_desc, build_file_req_ans_no_fil, build_file_status_complete,
@@ -63,6 +69,21 @@ pub struct UploadGate {
     /// waiter re-checks whether IT is now the best with a slot to take.
     notify: tokio::sync::Notify,
     queue_cap: usize,
+    /// Who we are serving/queueing, per file hash. Read to answer a source
+    /// request; a separate lock so it never contends the slot bookkeeping.
+    served: std::sync::Mutex<HashMap<[u8; 16], Vec<ServedPeer>>>,
+}
+
+/// A peer we are currently uploading to / holding queued for one file - aMule's
+/// `m_ClientUploadList`, which is exactly the set its source-exchange answer is
+/// built from (`CKnownFile::CreateSrcInfoPacket`).
+#[derive(Clone)]
+pub struct ServedPeer {
+    pub addr: SocketAddr,
+    pub user_hash: Option<[u8; 16]>,
+    /// The peer's obfuscation connect-options byte, so a source we hand out can
+    /// be dialed obfuscated by the receiver (SX v4 carries it).
+    pub crypt: Option<u8>,
 }
 
 struct GateInner {
@@ -83,7 +104,65 @@ impl UploadGate {
             }),
             notify: tokio::sync::Notify::new(),
             queue_cap,
+            served: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Remember that `peer` is being served (or is queued) for `hash`, so a
+    /// source-exchange request for that file can name it - the padMule
+    /// equivalent of aMule adding a client to a file's upload list.
+    pub fn note_serving(&self, hash: [u8; 16], peer: ServedPeer) {
+        let mut g = self.served.lock().unwrap();
+        let v = g.entry(hash).or_default();
+        if !v.iter().any(|p| p.addr == peer.addr) {
+            v.push(peer);
+        }
+    }
+
+    /// Forget a peer once its serve session ends (always paired with
+    /// `note_serving` by `ServedGuard`, so a dropped connection never leaves a
+    /// stale source we would hand to others).
+    pub fn stop_serving(&self, hash: &[u8; 16], addr: SocketAddr) {
+        let mut g = self.served.lock().unwrap();
+        if let Some(v) = g.get_mut(hash) {
+            v.retain(|p| p.addr != addr);
+            if v.is_empty() {
+                g.remove(hash);
+            }
+        }
+    }
+
+    /// The source records to answer a source-exchange request for `hash` with.
+    /// Skips the asker itself and any peer we cannot name usefully (no port),
+    /// matching aMule's own skips (`cur_src == forClient`, LowID).
+    pub fn sources_for(&self, hash: &[u8; 16], exclude: Option<SocketAddr>) -> Vec<SxSource> {
+        let g = self.served.lock().unwrap();
+        let Some(v) = g.get(hash) else {
+            return Vec::new();
+        };
+        v.iter()
+            .filter(|p| Some(p.addr) != exclude)
+            .filter_map(|p| {
+                // Only a HighID peer on a routable address is worth handing out;
+                // a LowID one is unreachable without a callback (aMule skips it).
+                let SocketAddr::V4(v4) = p.addr else {
+                    return None;
+                };
+                if !crate::fetch::is_routable_public_v4(*v4.ip()) {
+                    return None;
+                }
+                let o = v4.ip().octets();
+                Some(SxSource {
+                    // eD2k convention: first octet in the LOW byte.
+                    ip: u32::from_le_bytes(o),
+                    port: v4.port(),
+                    server_ip: 0,
+                    server_port: 0,
+                    user_hash: p.user_hash,
+                    crypt: p.crypt,
+                })
+            })
+            .collect()
     }
 
     /// Currently-waiting (queued, not yet granted) peers. For tests/telemetry.
@@ -428,18 +507,60 @@ fn read_range(path: &Path, start: u64, end: u64) -> io::Result<Vec<u8>> {
 /// `credit` is `Some((store, peer_userhash))` on the live engine path, so the
 /// bytes we upload are accrued against this peer's credit record.
 #[allow(clippy::too_many_arguments)]
+/// The optional extras one SERVE connection carries, bundled to keep the arity
+/// readable (the mirror of `PeerSession` on the download side).
+#[derive(Default)]
+pub struct ServeSession {
+    /// Our serve-side secure-ident session (verify the leecher's identity).
+    pub sec: Option<ServeSec>,
+    /// Credit sink: bytes we upload are accrued against this peer.
+    pub credit: Option<CreditCtx>,
+    /// The peer's address, so it can be named to OTHER peers in a
+    /// source-exchange answer (and excluded from its own).
+    pub peer: Option<SocketAddr>,
+    /// The peer's obfuscation connect-options byte, derived from its hello, so
+    /// an SX v4 record we emit tells the receiver it can dial obfuscated.
+    pub peer_crypt: Option<u8>,
+    /// The peer's announced SX1 version (hello MISCOPTIONS1). An SX1 request
+    /// carries no version, so upstream answers with the version the ASKER
+    /// announced; 0 means "no SX1" and such a request goes unanswered.
+    pub peer_sx1: u8,
+}
+
+/// Keeps the file's served-peer list honest: registered on latch, removed on
+/// EVERY exit (drop), so a disconnect never leaves us handing out a dead source.
+struct ServedGuard {
+    gate: Arc<UploadGate>,
+    hash: [u8; 16],
+    addr: SocketAddr,
+}
+
+impl Drop for ServedGuard {
+    fn drop(&mut self) {
+        self.gate.stop_serving(&self.hash, self.addr);
+    }
+}
+
 pub async fn serve_shared<S>(
     fs: &mut FramedStream<S>,
     library: &[SharedFile],
     first: Option<Packet>,
     gate: Option<&Arc<UploadGate>>,
     peer_accept_comment: u8,
-    mut sec: Option<ServeSec>,
-    credit: Option<CreditCtx>,
+    session: ServeSession,
 ) -> Result<(), FrameError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let ServeSession {
+        mut sec,
+        credit,
+        peer,
+        peer_crypt,
+        peer_sx1,
+    } = session;
+    // Unregisters this peer from the file's served list on EVERY exit path.
+    let mut served: Option<ServedGuard> = None;
     let lookup = |payload: &[u8]| {
         head_hash(payload).and_then(|h| library.iter().find(|f| f.hash == h).cloned())
     };
@@ -450,6 +571,30 @@ where
     // frees the slot for the next waiter.
     let mut permit: Option<SlotGuard> = None;
     let mut pending = first;
+    // Register the peer against the file it is after, so OTHER peers asking us
+    // for sources can be told about it (and so it is excluded from its own
+    // answer). Re-run after each latch point; the guard removes it on exit.
+    macro_rules! register_served {
+        () => {
+            if let (Some(f), Some(g), Some(addr)) = (&file, gate, peer) {
+                if served.as_ref().map(|s: &ServedGuard| s.hash) != Some(f.hash) {
+                    g.note_serving(
+                        f.hash,
+                        ServedPeer {
+                            addr,
+                            user_hash: credit.as_ref().map(|(_, uh)| *uh),
+                            crypt: peer_crypt,
+                        },
+                    );
+                    served = Some(ServedGuard {
+                        gate: Arc::clone(g),
+                        hash: f.hash,
+                        addr,
+                    });
+                }
+            }
+        };
+    }
     loop {
         let pkt = match pending.take() {
             Some(p) => p,
@@ -486,6 +631,7 @@ where
                             .await?;
                     }
                     file = Some(f);
+                    register_served!();
                 }
                 // An UNKNOWN hash draws SILENCE, not FNF: both authorities just
                 // break (eMule 0.50a ListenSocket.cpp:374-380, which additionally
@@ -506,6 +652,7 @@ where
                         fs.write_packet(&build_file_status_complete(&f.hash))
                             .await?;
                         file = Some(f);
+                        register_served!();
                     }
                     None => {
                         if let Some(h) = head_hash(&pkt.payload) {
@@ -529,6 +676,7 @@ where
                         // Latch it so a following OP_STARTUPLOADREQ/OP_REQUESTPARTS
                         // knows which file this peer is after.
                         file = Some(f);
+                        register_served!();
                     }
                     // Unknown hash: send FNF but do NOT clear a file already latched
                     // for THIS connection - a peer may serve-request several files
@@ -537,6 +685,35 @@ where
                     None => {
                         if let Some(h) = head_hash(&pkt.payload) {
                             fs.write_packet(&build_file_req_ans_no_fil(&h)).await?;
+                        }
+                    }
+                }
+            }
+            // Source exchange, answer side: name the peers we are currently
+            // serving/queueing for this file, exactly as aMule answers from a
+            // file's upload list (CreateSrcInfoPacket) - never a general
+            // "everyone we ever saw" list. Silence when we know nobody, which is
+            // also what upstream does (it returns NULL and sends nothing).
+            OP_REQUESTSOURCES | OP_REQUESTSOURCES2 => {
+                let sx2 = pkt.opcode == OP_REQUESTSOURCES2;
+                // SX2 states its version; SX1 carries none, so upstream answers
+                // with the version the ASKER announced in its hello.
+                let want = if sx2 {
+                    parse_request_sources2(&pkt.payload)
+                        .ok()
+                        .map(|(v, h)| (v.min(SOURCE_EXCHANGE_VERSION), h))
+                } else {
+                    parse_request_sources(&pkt.payload)
+                        .ok()
+                        .map(|h| (peer_sx1, h))
+                };
+                if let (Some((version, want_hash)), Some(g)) = (want, gate) {
+                    if version > 0 && library.iter().any(|f| f.hash == want_hash) {
+                        let srcs = g.sources_for(&want_hash, peer);
+                        if !srcs.is_empty() {
+                            if let Some(p) = build_answer_sources(&want_hash, &srcs, version, sx2) {
+                                fs.write_packet(&p).await?;
+                            }
                         }
                     }
                 }
@@ -735,7 +912,7 @@ mod tests {
         let up = tokio::spawn(async move {
             let me = HelloInfo::baseline([0xBB; 16], 0, 4662, 4672, "seed");
             if let Ok((_p, mut fs)) = accept_peer(&listener, &me).await {
-                let _ = serve_shared(&mut fs, &shared, None, None, 0, None, None).await;
+                let _ = serve_shared(&mut fs, &shared, None, None, 0, Default::default()).await;
             }
         });
 
@@ -781,7 +958,18 @@ mod tests {
             let me = HelloInfo::baseline([0xBB; 16], 0, 4662, 4672, "seed");
             if let Ok((_p, mut fs)) = accept_peer(&listener, &me).await {
                 let credit = Some((store2, peer_hash));
-                let _ = serve_shared(&mut fs, &shared, None, None, 0, None, credit).await;
+                let _ = serve_shared(
+                    &mut fs,
+                    &shared,
+                    None,
+                    None,
+                    0,
+                    ServeSession {
+                        credit,
+                        ..Default::default()
+                    },
+                )
+                .await;
             }
         });
 
@@ -867,8 +1055,18 @@ mod tests {
                     let credit = Some((Arc::clone(&store), peer.user_hash));
                     let (shared, gate) = (Arc::clone(&shared), Arc::clone(&gate));
                     tokio::spawn(async move {
-                        let _ = serve_shared(&mut fs, &shared, None, Some(&gate), 0, None, credit)
-                            .await;
+                        let _ = serve_shared(
+                            &mut fs,
+                            &shared,
+                            None,
+                            Some(&gate),
+                            0,
+                            ServeSession {
+                                credit,
+                                ..Default::default()
+                            },
+                        )
+                        .await;
                     });
                 }
             })
@@ -1073,8 +1271,18 @@ mod tests {
             if let InboundKind::Leecher { first, sec } =
                 classify_inbound(&mut server_fs, Some(sec), Duration::from_millis(500)).await
             {
-                let _ =
-                    serve_shared(&mut server_fs, &shared, Some(first), None, 0, sec, None).await;
+                let _ = serve_shared(
+                    &mut server_fs,
+                    &shared,
+                    Some(first),
+                    None,
+                    0,
+                    ServeSession {
+                        sec,
+                        ..Default::default()
+                    },
+                )
+                .await;
             }
         });
 
@@ -1193,7 +1401,7 @@ mod tests {
         let up = tokio::spawn(async move {
             let me = HelloInfo::baseline([0xBB; 16], 0, 4662, 4672, "seed");
             if let Ok((_p, mut fs)) = accept_peer(&listener, &me).await {
-                let _ = serve_shared(&mut fs, &shared, None, None, 0, None, None).await;
+                let _ = serve_shared(&mut fs, &shared, None, None, 0, Default::default()).await;
             }
         });
 
@@ -1213,6 +1421,94 @@ mod tests {
         assert_eq!(ans.opcode, OP_MULTIPACKETANSWER);
         assert_eq!(&ans.payload[..16], &hash);
         assert_eq!(ans.payload[16], OP_REQFILENAMEANSWER);
+
+        drop(fs);
+        up.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn we_answer_a_source_request_with_the_peers_we_are_serving() {
+        // Source exchange, answer side. aMule answers from the file's UPLOAD
+        // list (CreateSrcInfoPacket over m_ClientUploadList) - the peers it is
+        // uploading to or holding queued - never a general "every peer we saw"
+        // list. So: register a peer as served, then have a DIFFERENT peer ask,
+        // and it must be named back (and the asker must never be named to
+        // itself). Silence when we know nobody, exactly as upstream.
+        use crate::sources::{
+            build_request_sources2, parse_answer_sources, OP_ANSWERSOURCES2,
+            SOURCE_EXCHANGE_VERSION,
+        };
+        let hash = [0x6C; 16];
+        let shared = vec![SharedFile {
+            hash,
+            size: 100,
+            name: b"sx.bin".to_vec(),
+            part_hashes: vec![],
+            path: PathBuf::from("/does/not/matter"),
+            rating: 0,
+            comment: String::new(),
+        }];
+        let gate = Arc::new(UploadGate::new(4, 8));
+
+        // A peer we are already serving for this file (HighID, routable).
+        let other: SocketAddr = "45.45.0.9:4662".parse().unwrap();
+        gate.note_serving(
+            hash,
+            ServedPeer {
+                addr: other,
+                user_hash: Some([0xAB; 16]),
+                crypt: Some(0x01),
+            },
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let g2 = Arc::clone(&gate);
+        let asker: SocketAddr = "77.77.0.7:4662".parse().unwrap();
+        let up = tokio::spawn(async move {
+            let me = HelloInfo::baseline([0xBB; 16], 0, 4662, 4672, "seed");
+            if let Ok((_p, mut fs)) = accept_peer(&listener, &me).await {
+                let _ = serve_shared(
+                    &mut fs,
+                    &shared,
+                    None,
+                    Some(&g2),
+                    0,
+                    ServeSession {
+                        peer: Some(asker),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            }
+        });
+
+        let me = HelloInfo::baseline([0xAA; 16], 0x0A00_0001, 4663, 4673, "dl");
+        let (_p, mut fs) = connect_peer(addr, &me).await.unwrap();
+        fs.write_packet(&build_request_sources2(&hash, SOURCE_EXCHANGE_VERSION))
+            .await
+            .unwrap();
+        let ans = fs.read_packet_unpacked().await.unwrap();
+        assert_eq!(ans.opcode, OP_ANSWERSOURCES2);
+        let (h, srcs) = parse_answer_sources(&ans.payload, true, SOURCE_EXCHANGE_VERSION).unwrap();
+        assert_eq!(h, hash);
+        assert_eq!(srcs.len(), 1, "the served peer is named");
+        assert_eq!(srcs[0].port, 4662);
+        assert_eq!(srcs[0].user_hash, Some([0xAB; 16]));
+        assert_eq!(srcs[0].crypt, Some(0x01), "SX v4 carries the crypt byte");
+
+        // The asker is never named to itself, so once IT is the only peer we
+        // serve, a request draws silence rather than a self-referential answer.
+        gate.stop_serving(&hash, other);
+        gate.note_serving(
+            hash,
+            ServedPeer {
+                addr: asker,
+                user_hash: None,
+                crypt: None,
+            },
+        );
+        assert!(gate.sources_for(&hash, Some(asker)).is_empty());
 
         drop(fs);
         up.await.unwrap();
@@ -1246,7 +1542,7 @@ mod tests {
         let up = tokio::spawn(async move {
             let me = HelloInfo::baseline([0xBB; 16], 0, 4662, 4672, "seed");
             if let Ok((_p, mut fs)) = accept_peer(&listener, &me).await {
-                let _ = serve_shared(&mut fs, &shared, None, None, 0, None, None).await;
+                let _ = serve_shared(&mut fs, &shared, None, None, 0, Default::default()).await;
             }
         });
 
@@ -1309,7 +1605,7 @@ mod tests {
             let me = HelloInfo::baseline([0xBB; 16], 0, 4662, 4672, "seed");
             if let Ok((_p, mut fs)) = accept_peer(&listener, &me).await {
                 // The peer advertised AcceptCommentVer=1.
-                let _ = serve_shared(&mut fs, &shared, None, None, 1, None, None).await;
+                let _ = serve_shared(&mut fs, &shared, None, None, 1, Default::default()).await;
             }
         });
 
@@ -1352,7 +1648,7 @@ mod tests {
             let me = HelloInfo::baseline([0xBB; 16], 0, 4662, 4672, "seed");
             if let Ok((_p, mut fs)) = accept_peer(&listener, &me).await {
                 // The peer did NOT advertise AcceptCommentVer.
-                let _ = serve_shared(&mut fs, &shared, None, None, 0, None, None).await;
+                let _ = serve_shared(&mut fs, &shared, None, None, 0, Default::default()).await;
             }
         });
 
@@ -1384,7 +1680,7 @@ mod tests {
         let up = tokio::spawn(async move {
             let me = HelloInfo::baseline([0xBB; 16], 0, 4662, 4672, "seed");
             if let Ok((_p, mut fs)) = accept_peer(&listener, &me).await {
-                let _ = serve_shared(&mut fs, &[], None, None, 0, None, None).await;
+                let _ = serve_shared(&mut fs, &[], None, None, 0, Default::default()).await;
             }
         });
 
@@ -1430,7 +1726,7 @@ mod tests {
         let up = tokio::spawn(async move {
             let me = HelloInfo::baseline([0xBB; 16], 0, 4662, 4672, "seed");
             if let Ok((_p, mut fs)) = accept_peer(&listener, &me).await {
-                let _ = serve_shared(&mut fs, &shared, None, None, 0, None, None).await;
+                let _ = serve_shared(&mut fs, &shared, None, None, 0, Default::default()).await;
             }
         });
 
