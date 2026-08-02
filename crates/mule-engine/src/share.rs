@@ -55,6 +55,9 @@ impl Drop for WaitTicket<'_> {
 }
 
 use crate::framed::{FrameError, FramedStream};
+use crate::secure_ident::{
+    Identity, SecureIdentSession, OP_PUBLICKEY, OP_SECIDENTSTATE, OP_SIGNATURE,
+};
 use crate::transfer::{
     build_accept_upload, build_file_desc, build_file_req_ans_no_fil, build_file_status_complete,
     build_hashset_answer, build_multipacket_answer, build_queue_ranking, build_req_filename_answer,
@@ -147,6 +150,149 @@ pub fn head_hash(payload: &[u8]) -> Option<[u8; 16]> {
     })
 }
 
+fn is_secident(op: u8) -> bool {
+    matches!(op, OP_SECIDENTSTATE | OP_PUBLICKEY | OP_SIGNATURE)
+}
+
+/// Our secure-ident state for an inbound serve connection: the session, our RSA
+/// identity, and a sink fired ONCE when the peer proves it owns its userhash.
+///
+/// A serving peer's OP_PUBLICKEY/OP_SIGNATURE (the bytes that verify IT) may
+/// arrive either during the classify drain OR interleaved with serving (a real
+/// leecher sends its file request between challenging us and answering our
+/// challenge), so this is threaded through both [`classify_inbound`] and
+/// [`serve_shared`] and drives the exchange on whichever packets arrive - NEVER
+/// blocking the transfer, exactly like the download-side `handle_aux_packet`.
+pub struct ServeSec {
+    session: SecureIdentSession,
+    identity: Arc<Identity>,
+    on_verified: Box<dyn FnMut() + Send>,
+    fired: bool,
+}
+
+impl ServeSec {
+    pub fn new(
+        session: SecureIdentSession,
+        identity: Arc<Identity>,
+        on_verified: Box<dyn FnMut() + Send>,
+    ) -> Self {
+        ServeSec {
+            session,
+            identity,
+            on_verified,
+            fired: false,
+        }
+    }
+
+    /// Feed one secure-ident packet, write any replies, and fire the verified
+    /// sink the first time the peer's signature checks out. A malformed packet is
+    /// dropped (never fatal). Returns Err only on a write failure.
+    async fn drive<S>(
+        &mut self,
+        fs: &mut FramedStream<S>,
+        opcode: u8,
+        payload: &[u8],
+    ) -> Result<(), FrameError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        if let Ok(replies) = self.session.on_packet(&self.identity, opcode, payload) {
+            for reply in replies {
+                fs.write_packet(&reply).await?;
+            }
+            if self.session.peer_verified() && !self.fired {
+                self.fired = true;
+                (self.on_verified)();
+            }
+        }
+        Ok(())
+    }
+
+    pub fn verified(&self) -> bool {
+        self.session.peer_verified()
+    }
+}
+
+/// How an inbound peer classified itself after the hello.
+pub enum InboundKind {
+    /// A leecher issued a file request (`first`). `sec` carries the in-flight
+    /// secure-ident session so verification can finish DURING serving.
+    Leecher {
+        first: Packet,
+        sec: Option<ServeSec>,
+    },
+    /// Silent (after any secure-ident): a called-back LowID source. Drive the
+    /// download of one of OUR files from it.
+    Source,
+    /// Spoke something that is neither secure-ident nor a file request; drop it.
+    Other,
+}
+
+/// Classify an inbound peer as a leecher vs a called-back source, running OUR side
+/// of secure identification along the way when `sec` is `Some`.
+///
+/// This replaces the single first-packet peek: once we ADVERTISE secure-ident,
+/// BOTH a capable leecher AND a called-back source LEAD with OP_SECIDENTSTATE
+/// (eMule's SendSecIdentStatePacket fires whenever the peer we hello'd advertised
+/// support), so classifying on the first packet would drop both. Instead we DRAIN
+/// the secure-ident prefix (feeding it into the session) and re-apply the
+/// discriminator on what FOLLOWS: the first upload-request opcode => leecher; a
+/// read timeout (silence) => source. `sec = None` reproduces the old plain peek.
+///
+/// Cancel-safety: the timeout is on each individual READ, never around a write
+/// (write_packet awaits a whole frame), so a stream is always at a clean packet
+/// boundary between operations and the drain cannot corrupt it. A hostile peer
+/// streaming OP_SECIDENTSTATE is bounded by `MAX_SECIDENT_PKTS`.
+pub async fn classify_inbound<S>(
+    fs: &mut FramedStream<S>,
+    mut sec: Option<ServeSec>,
+    peek: Duration,
+) -> InboundKind
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    // Symmetric with eMule: if we verify this peer, open with our own challenge.
+    if let Some(s) = sec.as_ref() {
+        if fs.write_packet(&s.session.start()).await.is_err() {
+            return InboundKind::Other;
+        }
+    }
+    // The honest exchange is at most challenge + pubkey + signature (+ a possible
+    // second state); anything past this before a file request is a flood.
+    const MAX_SECIDENT_PKTS: usize = 6;
+    // A real secure-ident packet is tiny: state = 5 B, pubkey ~= 120 B, signature
+    // ~= 50 B. Reject an oversized one immediately rather than drain up to
+    // MAX_SECIDENT_PKTS of them at the 2 MB frame ceiling (hardening: the count
+    // bound alone would let a peer push ~6 large payloads before we classify).
+    const MAX_SECIDENT_PAYLOAD: usize = 512;
+    let mut drained = 0usize;
+    loop {
+        match timeout(peek, fs.read_packet_unpacked()).await {
+            Ok(Ok(pkt)) if is_upload_request(pkt.opcode) => {
+                return InboundKind::Leecher { first: pkt, sec };
+            }
+            Ok(Ok(pkt)) if is_secident(pkt.opcode) => {
+                if pkt.payload.len() > MAX_SECIDENT_PAYLOAD {
+                    return InboundKind::Other;
+                }
+                if let Some(s) = sec.as_mut() {
+                    if s.drive(fs, pkt.opcode, &pkt.payload).await.is_err() {
+                        return InboundKind::Other;
+                    }
+                }
+                drained += 1;
+                if drained > MAX_SECIDENT_PKTS {
+                    return InboundKind::Other;
+                }
+            }
+            // Spoke something else, or the link errored: nothing to serve.
+            Ok(_) => return InboundKind::Other,
+            // Silent: a called-back source waiting for us to drive the download.
+            Err(_) => return InboundKind::Source,
+        }
+    }
+}
+
 /// Read a byte range off a finished file. Opened per request batch: simple, and
 /// it keeps only one block (~180 KB) in memory at a time.
 fn read_range(path: &Path, start: u64, end: u64) -> io::Result<Vec<u8>> {
@@ -171,6 +317,7 @@ pub async fn serve_shared<S>(
     first: Option<Packet>,
     gate: Option<&UploadGate>,
     peer_accept_comment: u8,
+    mut sec: Option<ServeSec>,
 ) -> Result<(), FrameError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -353,6 +500,15 @@ where
                     }
                 }
             }
+            // The leecher's OP_PUBLICKEY/OP_SIGNATURE (answering the challenge we
+            // issued in classify_inbound) arrive AFTER its file request, so finish
+            // verification here - interleaved with serving, never blocking it. A
+            // peer that never answers just stays unverified.
+            op if is_secident(op) => {
+                if let Some(s) = sec.as_mut() {
+                    s.drive(fs, op, &pkt.payload).await?;
+                }
+            }
             _ => {}
         }
     }
@@ -419,7 +575,7 @@ mod tests {
         let up = tokio::spawn(async move {
             let me = HelloInfo::baseline([0xBB; 16], 0, 4662, 4672, "seed");
             if let Ok((_p, mut fs)) = accept_peer(&listener, &me).await {
-                let _ = serve_shared(&mut fs, &shared, None, None, 0).await;
+                let _ = serve_shared(&mut fs, &shared, None, None, 0, None).await;
             }
         });
 
@@ -462,6 +618,225 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn classify_plain_leecher_vs_silent_source() {
+        use crate::transfer::build_request_filename_ext;
+        use tokio::io::duplex;
+
+        // No secure-ident: a leecher leads with a file request.
+        let (client, server) = duplex(8192);
+        let mut server_fs = FramedStream::plaintext_with_prefix(server, &[]);
+        let mut client_fs = FramedStream::plaintext_with_prefix(client, &[]);
+        client_fs
+            .write_packet(&build_request_filename_ext(&[7u8; 16]))
+            .await
+            .unwrap();
+        match classify_inbound(&mut server_fs, None, Duration::from_millis(200)).await {
+            InboundKind::Leecher { first, sec } => {
+                assert_eq!(first.opcode, OP_REQUESTFILENAME);
+                assert!(sec.is_none());
+            }
+            _ => panic!("expected a leecher"),
+        }
+
+        // A called-back source stays silent -> Source (keep the client end alive so
+        // the read TIMES OUT rather than hitting EOF).
+        let (_client2, server2) = duplex(8192);
+        let mut server2_fs = FramedStream::plaintext_with_prefix(server2, &[]);
+        assert!(matches!(
+            classify_inbound(&mut server2_fs, None, Duration::from_millis(100)).await,
+            InboundKind::Source
+        ));
+    }
+
+    #[tokio::test]
+    async fn classify_drains_a_secident_prefix_then_classifies() {
+        use crate::secure_ident::{build_sec_ident_state, IS_KEYANDSIGNEEDED};
+        use crate::transfer::build_request_filename_ext;
+        use tokio::io::duplex;
+
+        // A capable leecher LEADS with OP_SECIDENTSTATE, then the file request: the
+        // drain must not misread the sec-ident prefix as the classification packet.
+        let (client, server) = duplex(8192);
+        let mut server_fs = FramedStream::plaintext_with_prefix(server, &[]);
+        let mut client_fs = FramedStream::plaintext_with_prefix(client, &[]);
+        let id = Arc::new(Identity::generate());
+        let sec = ServeSec::new(SecureIdentSession::new(&id), id, Box::new(|| {}));
+        client_fs
+            .write_packet(&build_sec_ident_state(IS_KEYANDSIGNEEDED, 0x1234_5678))
+            .await
+            .unwrap();
+        client_fs
+            .write_packet(&build_request_filename_ext(&[7u8; 16]))
+            .await
+            .unwrap();
+        match classify_inbound(&mut server_fs, Some(sec), Duration::from_millis(300)).await {
+            InboundKind::Leecher { first, sec } => {
+                assert_eq!(first.opcode, OP_REQUESTFILENAME);
+                assert!(sec.is_some());
+            }
+            _ => panic!("expected a leecher after draining the sec-ident prefix"),
+        }
+    }
+
+    #[tokio::test]
+    async fn classify_bounds_a_secident_flood() {
+        use crate::secure_ident::{build_sec_ident_state, IS_KEYANDSIGNEEDED};
+        use tokio::io::duplex;
+
+        // A hostile peer streaming OP_SECIDENTSTATE with no file request must be cut
+        // off by the packet-count bound, not spin holding the task/fd.
+        let (client, server) = duplex(64 * 1024);
+        let mut server_fs = FramedStream::plaintext_with_prefix(server, &[]);
+        let mut client_fs = FramedStream::plaintext_with_prefix(client, &[]);
+        let id = Arc::new(Identity::generate());
+        let sec = ServeSec::new(SecureIdentSession::new(&id), id, Box::new(|| {}));
+        for i in 0..8u32 {
+            client_fs
+                .write_packet(&build_sec_ident_state(IS_KEYANDSIGNEEDED, i | 1))
+                .await
+                .unwrap();
+        }
+        assert!(matches!(
+            classify_inbound(&mut server_fs, Some(sec), Duration::from_millis(300)).await,
+            InboundKind::Other
+        ));
+    }
+
+    #[tokio::test]
+    async fn serve_verifies_a_faithful_mock_leecher() {
+        // The faithful other-side per [[interop-test-fidelity]]: a mock playing the
+        // REAL downloader role - it INITIATES its own OP_SECIDENTSTATE, requests the
+        // file, and answers padMule's challenge. NOT both-serve, NOT responder-only.
+        use crate::transfer::build_request_filename_ext;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::duplex;
+
+        let hash = [0x5A; 16];
+        let shared = vec![SharedFile {
+            hash,
+            size: 100,
+            name: b"verify.bin".to_vec(),
+            part_hashes: vec![],
+            path: PathBuf::from("/does/not/matter"),
+            rating: 0,
+            comment: String::new(),
+        }];
+
+        let (client, server) = duplex(64 * 1024);
+        let mut server_fs = FramedStream::plaintext_with_prefix(server, &[]);
+        let mut client_fs = FramedStream::plaintext_with_prefix(client, &[]);
+
+        let server_id = Arc::new(Identity::generate());
+        let verified = Arc::new(AtomicBool::new(false));
+        let v2 = Arc::clone(&verified);
+
+        let server_task = tokio::spawn(async move {
+            let sec = ServeSec::new(
+                SecureIdentSession::new(&server_id),
+                Arc::clone(&server_id),
+                Box::new(move || v2.store(true, Ordering::SeqCst)),
+            );
+            if let InboundKind::Leecher { first, sec } =
+                classify_inbound(&mut server_fs, Some(sec), Duration::from_millis(500)).await
+            {
+                let _ = serve_shared(&mut server_fs, &shared, Some(first), None, 0, sec).await;
+            }
+        });
+
+        let mock_id = Identity::generate();
+        let mut mock = SecureIdentSession::new(&mock_id);
+        client_fs.write_packet(&mock.start()).await.unwrap(); // INITIATE (the real role)
+        client_fs
+            .write_packet(&build_request_filename_ext(&hash))
+            .await
+            .unwrap(); // -> classified a leecher
+        while !mock.is_complete() {
+            let pkt = match tokio::time::timeout(
+                Duration::from_secs(2),
+                client_fs.read_packet_unpacked(),
+            )
+            .await
+            {
+                Ok(Ok(p)) => p,
+                _ => break,
+            };
+            if is_secident(pkt.opcode) {
+                for reply in mock.on_packet(&mock_id, pkt.opcode, &pkt.payload).unwrap() {
+                    client_fs.write_packet(&reply).await.unwrap();
+                }
+            }
+        }
+        // Our signature is now sent (and buffered); close so serve_shared drains it
+        // and returns.
+        drop(client_fs);
+        let _ = tokio::time::timeout(Duration::from_secs(2), server_task).await;
+        assert!(
+            verified.load(Ordering::SeqCst),
+            "padMule must verify the mock leecher serve-side"
+        );
+        assert!(
+            mock.peer_verified(),
+            "the mock must also verify padMule (mutual)"
+        );
+    }
+
+    #[tokio::test]
+    async fn classify_drains_secident_then_routes_a_silent_source_to_download() {
+        // The 8ac-regression guard, end to end: a called-back source that (having
+        // seen our advertised secure-ident) LEADS with OP_SECIDENTSTATE then stays
+        // silent about files must STILL classify as Source, AND the post-drain
+        // stream must be clean for download_from_peer.
+        use crate::secure_ident::{build_sec_ident_state, IS_KEYANDSIGNEEDED};
+        use crate::transfer::{build_file_req_ans_no_fil, OP_SETREQFILEID};
+        use tokio::io::duplex;
+
+        let dir = tmpdir("srcdrain");
+        let hash = [0x33; 16];
+        let store = PartStore::create(&dir, 1, hash, 400_000, b"s.bin").unwrap();
+        let dl = Download::new(store);
+
+        let (client, server) = duplex(64 * 1024);
+        let mut us_fs = FramedStream::plaintext_with_prefix(server, &[]); // padMule listener side
+        let mut src_fs = FramedStream::plaintext_with_prefix(client, &[]); // the called-back source
+
+        // The source: issue OUR-facing OP_SECIDENTSTATE, then stay silent about
+        // files; when download_from_peer requests the file, decline it (NoFile) so
+        // the session ends cleanly - proving the post-drain stream is intact.
+        let src = tokio::spawn(async move {
+            src_fs
+                .write_packet(&build_sec_ident_state(IS_KEYANDSIGNEEDED, 0xABCD_0001))
+                .await
+                .unwrap();
+            loop {
+                let pkt = src_fs.read_packet_unpacked().await.unwrap();
+                if pkt.opcode == OP_SETREQFILEID {
+                    break;
+                }
+            }
+            src_fs
+                .write_packet(&build_file_req_ans_no_fil(&hash))
+                .await
+                .unwrap();
+        });
+
+        let id = Arc::new(Identity::generate());
+        let sec = ServeSec::new(SecureIdentSession::new(&id), id, Box::new(|| {}));
+        match classify_inbound(&mut us_fs, Some(sec), Duration::from_millis(200)).await {
+            InboundKind::Source => {}
+            _ => panic!("a sec-ident-then-silent called-back source must classify as Source"),
+        }
+        // The handoff: download_from_peer speaks first and reads the FILEREQANSNOFIL
+        // cleanly -> NoFile. A corrupted/misframed stream would error or hang.
+        let r = download_from_peer(&mut us_fs, &dl, false).await;
+        assert!(
+            matches!(r, Err(TransferError::NoFile)),
+            "post-drain stream must be usable by download_from_peer"
+        );
+        let _ = src.await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn serve_shared_answers_a_multipacket_with_name_and_status() {
         use crate::transfer::{
             OP_MULTIPACKETANSWER, OP_MULTIPACKET_EXT, OP_REQFILENAMEANSWER, OP_REQUESTFILENAME,
@@ -483,7 +858,7 @@ mod tests {
         let up = tokio::spawn(async move {
             let me = HelloInfo::baseline([0xBB; 16], 0, 4662, 4672, "seed");
             if let Ok((_p, mut fs)) = accept_peer(&listener, &me).await {
-                let _ = serve_shared(&mut fs, &shared, None, None, 0).await;
+                let _ = serve_shared(&mut fs, &shared, None, None, 0, None).await;
             }
         });
 
@@ -530,7 +905,7 @@ mod tests {
             let me = HelloInfo::baseline([0xBB; 16], 0, 4662, 4672, "seed");
             if let Ok((_p, mut fs)) = accept_peer(&listener, &me).await {
                 // The peer advertised AcceptCommentVer=1.
-                let _ = serve_shared(&mut fs, &shared, None, None, 1).await;
+                let _ = serve_shared(&mut fs, &shared, None, None, 1, None).await;
             }
         });
 
@@ -573,7 +948,7 @@ mod tests {
             let me = HelloInfo::baseline([0xBB; 16], 0, 4662, 4672, "seed");
             if let Ok((_p, mut fs)) = accept_peer(&listener, &me).await {
                 // The peer did NOT advertise AcceptCommentVer.
-                let _ = serve_shared(&mut fs, &shared, None, None, 0).await;
+                let _ = serve_shared(&mut fs, &shared, None, None, 0, None).await;
             }
         });
 
@@ -605,7 +980,7 @@ mod tests {
         let up = tokio::spawn(async move {
             let me = HelloInfo::baseline([0xBB; 16], 0, 4662, 4672, "seed");
             if let Ok((_p, mut fs)) = accept_peer(&listener, &me).await {
-                let _ = serve_shared(&mut fs, &[], None, None, 0).await;
+                let _ = serve_shared(&mut fs, &[], None, None, 0, None).await;
             }
         });
 
@@ -651,7 +1026,7 @@ mod tests {
         let up = tokio::spawn(async move {
             let me = HelloInfo::baseline([0xBB; 16], 0, 4662, 4672, "seed");
             if let Ok((_p, mut fs)) = accept_peer(&listener, &me).await {
-                let _ = serve_shared(&mut fs, &shared, None, None, 0).await;
+                let _ = serve_shared(&mut fs, &shared, None, None, 0, None).await;
             }
         });
 

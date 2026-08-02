@@ -109,6 +109,16 @@ done
 echo; echo "===== RESULT ====="
 if [ "$DONE" = 1 ]; then
   echo "PASS: real amuled 3.0.1 downloaded revtest.bin FROM padMule (via the eserver), byte-for-byte."
+  # Serve-side secure identification: padMule issues its own OP_SECIDENTSTATE, amuled
+  # (sec_ident=3 by default, gated only on CryptoAvailable - obfuscation being off is
+  # orthogonal) answers with its pubkey+signature, and padMule verifies it.
+  if grep -q 'identity verified (secure-ident): true' "$WORK/serve.log"; then
+    echo "PASS: padMule VERIFIED amuled's secure identity serve-side."
+  else
+    echo "FAIL: padMule did NOT verify amuled's identity serve-side."
+    echo "--- serve.log (secure-ident) ---"; grep -iE 'verified|secure|serve <-' "$WORK/serve.log" | tail -12
+    DONE=0
+  fi
 else
   echo "FAIL/INCOMPLETE: Incoming=$(stat -c%s "$CFG/Incoming/revtest.bin" 2>/dev/null || echo 0) bytes"
   echo "--- padMule serve.log ---"; tail -12 "$WORK/serve.log"
