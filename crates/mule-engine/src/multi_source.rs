@@ -22,12 +22,14 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Mutex;
 
+use crate::credit_store::now_secs;
 use crate::framed::FramedStream;
 use crate::part_file::data_part_count;
 use crate::part_store::PartStore;
 use crate::secure_ident::{
     Identity, SecureIdentSession, OP_PUBLICKEY, OP_SECIDENTSTATE, OP_SIGNATURE,
 };
+use crate::share::CreditCtx;
 use crate::transfer::{
     build_hashset_request, build_request_filename_ext, build_request_parts, build_set_req_file_id,
     build_start_upload_req, parse_file_desc, parse_file_status, parse_hashset_answer,
@@ -594,7 +596,7 @@ pub async fn download_from_peer<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    download_from_peer_at(fs, dl, bail_on_queue, None, None).await
+    download_from_peer_at(fs, dl, bail_on_queue, None, None, None).await
 }
 
 /// As [`download_from_peer`], but `peer` names the source address (so a rating +
@@ -602,18 +604,20 @@ where
 /// against it) and `sec` carries the secure-ident context (our RSA identity +
 /// whether the peer advertised support), enabling mutual secure-identification
 /// inline with the transfer. `sec = None` disables it (plain download).
+#[allow(clippy::too_many_arguments)]
 pub async fn download_from_peer_at<S>(
     fs: &mut FramedStream<S>,
     dl: &Download,
     bail_on_queue: bool,
     peer: Option<SocketAddr>,
     sec: Option<SecIdentCtx>,
+    credit: Option<CreditCtx>,
 ) -> Result<u64, TransferError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut held: Vec<(u64, u64)> = Vec::new();
-    let r = run_peer(fs, dl, &mut held, bail_on_queue, peer, sec).await;
+    let r = run_peer(fs, dl, &mut held, bail_on_queue, peer, sec, credit).await;
     // Whatever happened, do not strand blocks nobody else will be offered.
     dl.release(&held).await;
     r
@@ -667,6 +671,7 @@ where
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_peer<S>(
     fs: &mut FramedStream<S>,
     dl: &Download,
@@ -674,6 +679,7 @@ async fn run_peer<S>(
     bail_on_queue: bool,
     peer: Option<SocketAddr>,
     sec: Option<SecIdentCtx>,
+    credit: Option<CreditCtx>,
 ) -> Result<u64, TransferError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -773,6 +779,11 @@ where
             for w in rx.accept(pkt.opcode, &pkt.payload)? {
                 delivered += w.data.len() as u64;
                 crate::stats::add_downloaded(w.data.len() as u64);
+                // Accrue what this source GAVE us against its credit record - this
+                // is what earns a peer a better place in OUR upload queue later.
+                if let Some((cs, uh)) = &credit {
+                    cs.add_downloaded(*uh, w.data.len() as u64, now_secs());
+                }
                 dl.commit(w.offset, &w.data)
                     .await
                     .map_err(TransferError::Io)?;
@@ -970,7 +981,7 @@ mod tests {
                 .unwrap();
         });
 
-        let r = download_from_peer_at(&mut client_fs, &dl, false, Some(addr), None).await;
+        let r = download_from_peer_at(&mut client_fs, &dl, false, Some(addr), None, None).await;
         assert!(matches!(r, Err(TransferError::NoFile)));
         let _ = src.await;
 
@@ -979,6 +990,91 @@ mod tests {
         assert_eq!(s.rating, 5);
         assert_eq!(s.comment, "verified good rip");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn downloading_from_a_source_accrues_its_credit() {
+        use crate::credit_store::CreditStore;
+        use crate::peer_conn::{accept_peer, connect_peer};
+        use crate::transfer::{
+            build_accept_upload, build_file_status_complete, build_sending_part,
+            parse_request_parts, OP_REQUESTFILENAME, OP_REQUESTPARTS, OP_STARTUPLOADREQ,
+        };
+        use mule_proto::ed2k_hash;
+        use tokio::net::TcpListener;
+
+        let dir = tmpdir("dlaccrue");
+        let data: Vec<u8> = (0..300_000u32)
+            .map(|i| (i.wrapping_mul(17)) as u8)
+            .collect();
+        let hash = ed2k_hash(&data);
+        let src_hash = [0xBB; 16];
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_data = data.clone();
+        let server = tokio::spawn(async move {
+            let me = HelloInfo::baseline(src_hash, 0, 4662, 4672, "src");
+            let Ok((_p, mut fs)) = accept_peer(&listener, &me).await else {
+                return;
+            };
+            while let Ok(pkt) = fs.read_packet_unpacked().await {
+                match pkt.opcode {
+                    OP_REQUESTFILENAME => {
+                        let _ = fs.write_packet(&build_file_status_complete(&hash)).await;
+                    }
+                    OP_STARTUPLOADREQ => {
+                        let _ = fs.write_packet(&build_accept_upload()).await;
+                    }
+                    OP_REQUESTPARTS => {
+                        if let Ok((_h, blocks)) = parse_request_parts(&pkt.payload, false) {
+                            for (s, e) in blocks {
+                                if s <= e && (e as usize) <= server_data.len() {
+                                    let _ = fs
+                                        .write_packet(&build_sending_part(
+                                            &hash,
+                                            s,
+                                            e,
+                                            &server_data[s as usize..e as usize],
+                                        ))
+                                        .await;
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let store_pf = PartStore::create(&dir, 1, hash, data.len() as u64, b"s.bin").unwrap();
+        let dl = Download::new(store_pf);
+        let credits = Arc::new(CreditStore::empty(true));
+        let me = HelloInfo::baseline([0xAA; 16], 0x0A00_0001, 4663, 4673, "dl");
+        let (_p, mut fs) = connect_peer(addr, &me).await.unwrap();
+        let credit = Some((Arc::clone(&credits), src_hash));
+        let got = download_from_peer_at(&mut fs, &dl, false, Some(addr), None, credit)
+            .await
+            .unwrap();
+        assert_eq!(got, data.len() as u64, "the whole file transferred");
+
+        // The source is credited with what it GAVE us (byte-compat via clients.met).
+        let bytes = credits.save();
+        let back = mule_files::read_clients_met(&bytes).unwrap();
+        let e = back
+            .entries
+            .iter()
+            .find(|e| e.user_hash == src_hash)
+            .expect("the source has a credit record");
+        assert_eq!(
+            e.downloaded,
+            data.len() as u64,
+            "the source earned credit for the bytes it gave us"
+        );
+
+        drop(fs);
+        let _ = server.await;
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
@@ -1146,7 +1242,7 @@ mod tests {
             identity: Arc::new(Identity::generate()),
             peer_supports: true,
         });
-        let got = download_from_peer_at(&mut fs, &dl, false, Some(addr), sec)
+        let got = download_from_peer_at(&mut fs, &dl, false, Some(addr), sec, None)
             .await
             .unwrap();
 

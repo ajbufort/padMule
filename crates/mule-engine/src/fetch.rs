@@ -11,10 +11,12 @@
 //!   - Server / peer-exchange sources use the eD2k convention: the first octet
 //!     is the LOW byte (`Ipv4Addr::new(ip, ip>>8, ip>>16, ip>>24)`).
 
+use crate::credit_store::CreditStore;
 use crate::multi_source::{download_from_peer_at, Download, SecIdentCtx};
 use crate::peer::HelloInfo;
 use crate::peer_conn::{connect_peer, connect_peer_obf};
 use crate::secure_ident::Identity;
+use crate::share::CreditCtx;
 use crate::sources::FoundSource;
 use std::collections::VecDeque;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -200,6 +202,7 @@ async fn fetch_one(
     me: &HelloInfo,
     per_peer: Duration,
     identity: Option<&Arc<Identity>>,
+    credit_store: Option<&Arc<CreditStore>>,
 ) -> Result<u64, ()> {
     let connect = async {
         match src.user_hash {
@@ -235,12 +238,15 @@ async fn fetch_one(
             peer_supports,
         }
     });
+    // Credit what this source gives us against ITS userhash (from the handshake),
+    // so it earns a better place in our upload queue later.
+    let credit: Option<CreditCtx> = credit_store.map(|cs| (Arc::clone(cs), peer.user_hash));
     // Multi-source manager: bail the instant this peer queues us and try another
     // source rather than burning `per_peer` in its queue. Pass the addr so a
     // rating/comment (OP_FILEDESC) the source sends is recorded against it.
     match timeout(
         per_peer,
-        download_from_peer_at(&mut fs, dl, true, Some(src.addr), sec),
+        download_from_peer_at(&mut fs, dl, true, Some(src.addr), sec, credit),
     )
     .await
     {
@@ -307,7 +313,11 @@ pub async fn fetch_from_sources(
             break;
         }
         out.sources_tried += 1;
-        if fetch_one(dl, src, me, per_peer, identity).await.is_ok() {
+        // The CLI harness does not persist credits, so no accrual here.
+        if fetch_one(dl, src, me, per_peer, identity, None)
+            .await
+            .is_ok()
+        {
             out.peers_connected += 1;
         }
     }
@@ -397,6 +407,7 @@ pub async fn download_file(
     me: &HelloInfo,
     config: ManagerConfig,
     identity: Option<Arc<Identity>>,
+    credit_store: Option<Arc<CreditStore>>,
 ) -> FetchOutcome {
     let mut out = FetchOutcome::default();
     // Learned across rounds: which sources actually delivered.
@@ -430,6 +441,7 @@ pub async fn download_file(
             let scoreboard = Arc::clone(&scoreboard);
             let per = config.per_peer();
             let identity = identity.clone();
+            let credit_store = credit_store.clone();
             handles.push(tokio::spawn(async move {
                 // (sources_tried, peers_connected) for this worker.
                 let mut tried = 0usize;
@@ -442,7 +454,16 @@ pub async fn download_file(
                         break;
                     };
                     tried += 1;
-                    match fetch_one(&dl, &src, &me, per, identity.as_ref()).await {
+                    match fetch_one(
+                        &dl,
+                        &src,
+                        &me,
+                        per,
+                        identity.as_ref(),
+                        credit_store.as_ref(),
+                    )
+                    .await
+                    {
                         Ok(bytes) => {
                             connected += 1;
                             scoreboard.lock().await.record(src.addr, bytes);

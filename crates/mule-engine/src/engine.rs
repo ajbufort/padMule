@@ -29,7 +29,7 @@ use crate::framed::FramedStream;
 use crate::identity::NodeIdentity;
 use crate::kad_live::KadNode;
 use crate::link::ServerLink;
-use crate::multi_source::{download_from_peer, resume_downloads, Download};
+use crate::multi_source::{download_from_peer_at, resume_downloads, Download};
 use crate::obf_handshake::{obf_accept, ObfDetect};
 use crate::part_store::PartStore;
 use crate::peer::HelloInfo;
@@ -1035,10 +1035,7 @@ impl Engine {
             shared: Arc::new(Mutex::new(Vec::new())),
             shared_dirty: Arc::new(AtomicBool::new(false)),
             sharing: Arc::new(AtomicBool::new(true)),
-            upload_gate: Arc::new(UploadGate::new(
-                Arc::new(Semaphore::new(MAX_UPLOAD_SLOTS)),
-                UPLOAD_QUEUE_CAP,
-            )),
+            upload_gate: Arc::new(UploadGate::new(MAX_UPLOAD_SLOTS, UPLOAD_QUEUE_CAP)),
             known_met_lock: Arc::new(Mutex::new(())),
             credit_store,
             ip_filter: None,
@@ -1457,9 +1454,18 @@ impl Engine {
                                 if dl.is_complete().await {
                                     continue;
                                 }
+                                // Credit this called-back source for what it gives us.
+                                let credit = Some((Arc::clone(&credit_store), peer_hash));
                                 match timeout(
                                     Duration::from_secs(120),
-                                    download_from_peer(&mut fs, &dl, false),
+                                    download_from_peer_at(
+                                        &mut fs,
+                                        &dl,
+                                        false,
+                                        Some(peer),
+                                        None,
+                                        credit,
+                                    ),
                                 )
                                 .await
                                 {
@@ -2354,6 +2360,7 @@ impl Engine {
         let me = HelloInfo::baseline(self.identity.userhash, 0, TCP_PORT, KAD_UDP_PORT, "padMule")
             .with_secident();
         let identity = Arc::clone(&self.identity.rsa);
+        let credit_store = Arc::clone(&self.credit_store);
         let dest = self.downloads_dir.join(safe_filename(name));
         let events = self.events.clone();
         let ctx = FinishCtx {
@@ -2373,7 +2380,15 @@ impl Engine {
             let cfg = ManagerConfig::ByPriority {
                 per_peer: Duration::from_secs(45),
             };
-            download_file(&dl_task, &sources, &me, cfg, Some(identity)).await;
+            download_file(
+                &dl_task,
+                &sources,
+                &me,
+                cfg,
+                Some(identity),
+                Some(credit_store),
+            )
+            .await;
             // Cancelled while in flight: the engine already removed it and deleted
             // the .part. Do NOT finish or emit - there is nothing to save.
             if dl_task.is_cancelled() {
@@ -2830,10 +2845,7 @@ mod tests {
             comment: String::new(),
         }]));
         let sharing = Arc::new(AtomicBool::new(false)); // Leech Mode
-        let gate = Arc::new(UploadGate::new(
-            Arc::new(Semaphore::new(MAX_UPLOAD_SLOTS)),
-            UPLOAD_QUEUE_CAP,
-        ));
+        let gate = Arc::new(UploadGate::new(MAX_UPLOAD_SLOTS, UPLOAD_QUEUE_CAP));
 
         let (client, server) = tokio::io::duplex(8192);
         let mut server_fs = FramedStream::new(server);
@@ -2868,11 +2880,10 @@ mod tests {
             build_request_filename_ext, build_start_upload_req, parse_queue_ranking,
             OP_ACCEPTUPLOADREQ, OP_QUEUERANKING,
         };
-        // One slot, already occupied by a held permit, so the next requester must
+        // One slot, already occupied by a held grant, so the next requester must
         // queue instead of being served or refused.
-        let sem = Arc::new(Semaphore::new(1));
-        let held = Arc::clone(&sem).try_acquire_owned().unwrap();
-        let gate = Arc::new(UploadGate::new(Arc::clone(&sem), UPLOAD_QUEUE_CAP));
+        let gate = Arc::new(UploadGate::new(1, UPLOAD_QUEUE_CAP));
+        let held = gate.try_grant().unwrap();
 
         let hash = [0x7C; 16];
         let shared = vec![SharedFile {
@@ -2941,10 +2952,7 @@ mod tests {
             rating: 0,
             comment: String::new(),
         }];
-        let gate = Arc::new(UploadGate::new(
-            Arc::new(Semaphore::new(MAX_UPLOAD_SLOTS)),
-            UPLOAD_QUEUE_CAP,
-        ));
+        let gate = Arc::new(UploadGate::new(MAX_UPLOAD_SLOTS, UPLOAD_QUEUE_CAP));
 
         let (client, server) = tokio::io::duplex(8192);
         let mut server_fs = FramedStream::new(server);
@@ -3001,10 +3009,7 @@ mod tests {
             comment: String::new(),
         }]));
         let sharing = Arc::new(AtomicBool::new(true));
-        let gate = Arc::new(UploadGate::new(
-            Arc::new(Semaphore::new(MAX_UPLOAD_SLOTS)),
-            UPLOAD_QUEUE_CAP,
-        ));
+        let gate = Arc::new(UploadGate::new(MAX_UPLOAD_SLOTS, UPLOAD_QUEUE_CAP));
 
         let (client, server) = tokio::io::duplex(128 * 1024);
         let mut server_fs = FramedStream::new(server);
