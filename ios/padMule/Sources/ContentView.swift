@@ -1,7 +1,7 @@
 // padMule's main screen. eMule-style function icons live in the top toolbar and
-// switch a single content area between four screens (Search, Transfers, Shared,
-// Status), instead of one long scroll. The title is INLINE so it never collapses
-// out of view the way a large title does.
+// switch a single content area between six screens (Search, Transfers, Servers,
+// Shared, Stats, Status), instead of one long scroll. The title is INLINE so it
+// never collapses out of view the way a large title does.
 //
 // The three HARD lifecycle requirements from docs/wiki/lifecycle-and-reactivation.md
 // survive the split: (1) an honest status notice (we do NOT transfer in the

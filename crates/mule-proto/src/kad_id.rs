@@ -112,9 +112,12 @@ impl Kad128 {
         ((self.words[word] >> shift) & 1) as u8
     }
 
-    /// True if this DISTANCE lies within the self/tolerance region: the top 32
-    /// bits (chunk 0) are <= 0x0100_0000, i.e. the distance is under 2^120
-    /// (eMule's `distance.Get32BitChunk(0) <= SELF_TOLERANCE`).
+    /// True if this DISTANCE passes eMule's search plausibility check: the top
+    /// 32 bits (chunk 0) are <= 0x0100_0000. The exact complement of upstream's
+    /// `distance.Get32BitChunk(0) > SEARCHTOLERANCE -> reject` (Defines.h:
+    /// SEARCHTOLERANCE = 16777216; Search.cpp:464). NB the boundary is
+    /// INCLUSIVE: chunk0 == 0x0100_0000 admits distances slightly ABOVE 2^120
+    /// (up to 2^120 + 2^96 - 1), faithfully to eMule - the unit test pins it.
     pub fn within_tolerance(&self) -> bool {
         self.words[0] <= 0x0100_0000
     }

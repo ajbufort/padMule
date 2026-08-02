@@ -78,7 +78,7 @@ Details and what is portable from them: `docs/wiki/ref-ecosystem.md`.
 source "$HOME/.cargo/env"              # cargo is NOT on the default PATH
 
 cargo build --workspace
-cargo test --workspace                 # the unit gate (~450 tests, offline)
+cargo test --workspace                 # the unit gate (~490 tests, offline)
 cargo clippy --workspace --all-targets # must be warning-free
 cargo fmt --all -- --check
 

@@ -324,10 +324,6 @@ impl std::fmt::Display for FfiError {
 
 impl std::error::Error for FfiError {}
 
-/// Map engine `RankedFile`s to FFI `SearchHit`s, tagging each with its
-/// have/fetching/new status. Shared by `search` and `related_search`. `g` is
-/// borrowed immutably, so call it AFTER the `&mut self` search has returned its
-/// owned Vec - the borrows never overlap.
 /// Map the engine's search outcome to the FFI one, converting ranked files to
 /// hits (which needs `&g` for hit status) and carrying the throttle/more flags.
 async fn search_outcome_to_ffi(g: &Engine, outcome: EngineSearchOutcome) -> SearchOutcome {
@@ -343,6 +339,10 @@ async fn search_outcome_to_ffi(g: &Engine, outcome: EngineSearchOutcome) -> Sear
     }
 }
 
+/// Map engine `RankedFile`s to FFI `SearchHit`s, tagging each with its
+/// have/fetching/new status. Shared by `search` and `related_search`. `g` is
+/// borrowed immutably, so call it AFTER the `&mut self` search has returned its
+/// owned Vec - the borrows never overlap.
 async fn ranked_to_hits(g: &Engine, ranked: Vec<RankedFile>) -> Vec<SearchHit> {
     let mut out = Vec::with_capacity(ranked.len());
     for r in ranked {

@@ -60,7 +60,9 @@ pub const SRVCAP_REQUESTCRYPT: u32 = 0x0400;
 pub const SRVCAP_REQUIRECRYPT: u32 = 0x0800;
 
 /// The v1 baseline capability set: zlib, aux port, new tags, unicode, large
-/// files. Crypt is OFF until obfuscation lands (Wave 5). Value 0x011D.
+/// files. Crypt is OFF on the SERVER leg by design - server TCP/UDP
+/// obfuscation is a documented v1 opt-out (docs/wiki/obfuscation-posture.md);
+/// the c2c and Kad legs ARE obfuscated. Value 0x011D.
 pub const DEFAULT_SERVER_FLAGS: u32 =
     SRVCAP_ZLIB | SRVCAP_AUXPORT | SRVCAP_NEWTAGS | SRVCAP_UNICODE | SRVCAP_LARGEFILES;
 

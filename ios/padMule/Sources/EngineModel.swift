@@ -120,14 +120,14 @@ final class EngineModel: ObservableObject {
     private var timer: Timer?
     private let work = DispatchQueue(label: "us.ajbconsulting.padMule.engine")
 
+    private var booting = false
+
     /// Create the engine and start it. Idempotent - safe to call from onAppear.
     ///
     /// Two directories, deliberately: working state (identity, part files, Kad
     /// contacts) lives in Application Support, which is invisible to the user
     /// and excluded from their view; FINISHED files land in Documents, which the
     /// Files app can see. A download the user cannot open is not a download.
-    private var booting = false
-
     func boot() {
         // Retry on a later call (foreground) after a transient init failure - do
         // NOT latch on bootError, or one bad launch bricks the app forever. The

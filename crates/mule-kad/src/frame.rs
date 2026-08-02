@@ -7,7 +7,8 @@
 //! [0] = 0xE4 (OP_KADEMLIAHEADER)   |  [1] = opcode  |  [2..] = payload
 //! ```
 //!
-//! If the whole frame would exceed 200 bytes it is zlib-packed: the header
+//! If the PAYLOAD exceeds 200 bytes (opcode and header excluded - a 199-byte
+//! payload, i.e. a 201-byte frame, stays plain) it is zlib-packed: the header
 //! becomes 0xE5 (OP_KADEMLIAPACKEDPROT) and ONLY the payload after the opcode
 //! is compressed (the opcode byte is copied verbatim). eMule
 //! `KademliaUDPListener.cpp:2050-2090`; receive path `ClientUDPSocket.cpp:103`.

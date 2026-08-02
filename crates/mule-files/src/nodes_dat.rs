@@ -11,7 +11,9 @@ use mule_proto::{IoError, Kad128, Reader, Writer};
 
 /// nodes.dat file version this codec writes.
 pub const NODES_DAT_VERSION: u32 = 2;
-/// aMule caps a written nodes.dat at this many contacts.
+/// Contacts per written nodes.dat. Matches what aMule writes in practice: its
+/// hard cap is CONTACT_FILE_LIMIT=500 (RoutingZone.cpp:76), but the writer only
+/// ever collects 200 bootstrap contacts (GetBootstrapContacts, RoutingZone.cpp:301).
 pub const MAX_NODES: usize = 200;
 
 /// One Kad contact.

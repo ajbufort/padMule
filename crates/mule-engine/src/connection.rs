@@ -2,7 +2,7 @@
 //! connection-state events. This is the seam the iPad UI observes (see
 //! docs/wiki/lifecycle-and-reactivation.md): the engine reports state as an
 //! EVENT STREAM so the UI is never stale, and the handshake is idempotent so
-//! `resume()` (a future 3c-2 layer) can simply re-run it after a pause.
+//! `ServerLink::resume()` can simply re-run it after a pause.
 
 use crate::framed::{FrameError, FramedStream};
 use crate::server_messages::{

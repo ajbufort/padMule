@@ -332,8 +332,10 @@ fn build_my_details(
 }
 
 /// KADEMLIA2_HELLO_REQ. `source_udp_port` is our real UDP port (omit only when
-/// using an external Kad port); `misc_options` carries firewall/ack bits (set
-/// bit 0x04 to request a HELLO_RES_ACK, v>=8 only).
+/// using an external Kad port); `misc_options` carries firewall bits. Do NOT
+/// set bit 0x04 on a REQUEST: "send me a HELLO_RES_ACK" is the RESPONDER's bit,
+/// set in its HELLO_RES (eMule SendMyDetails requestAckPacket); on a request it
+/// trips aMule's AddContact2 wxFAIL and earns nothing (wave 10, commit 65a186b).
 pub fn build_hello_req(
     id: &Kad128,
     tcp_port: u16,

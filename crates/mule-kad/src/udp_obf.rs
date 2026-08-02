@@ -29,8 +29,10 @@ use mule_proto::{Kad128, Rc4};
 /// `C1 2E 5F 39`.
 pub const MAGICVALUE_UDP_SYNC_CLIENT: u32 = 0x395F_2EC1;
 
-/// Datagrams this short cannot be obfuscated (header alone is 8+ bytes); passed
-/// through as plaintext (eMule `DecryptReceivedClient`).
+/// Datagrams at or under this length cannot be obfuscated and pass through as
+/// plaintext (eMule `DecryptReceivedClient`). This is aMule's
+/// CRYPT_HEADER_WITHOUTPADDING minimum-size gate, NOT the full Kad crypt
+/// header (which is 16 bytes: 3 plaintext + 13 RC4).
 const MIN_OBFUSCATED_LEN: usize = 8;
 
 /// Protocol header bytes that mark a PLAINTEXT datagram; a marker byte equal to
