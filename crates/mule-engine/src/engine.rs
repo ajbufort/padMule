@@ -1451,7 +1451,12 @@ impl Engine {
                         InboundKind::Source => {
                             let pending: Vec<Arc<Download>> = downloads.lock().await.clone();
                             for dl in pending {
-                                if dl.is_complete().await {
+                                // Skip a download this source is BANNED from (it
+                                // fed us a corrupt part before). Without this a LowID
+                                // poisoner - which only ever reaches us by callback -
+                                // could re-poison indefinitely; the outbound sweep's
+                                // guard alone never sees it.
+                                if dl.is_complete().await || dl.is_banned(&peer) {
                                     continue;
                                 }
                                 // Credit this called-back source for what it gives us.
