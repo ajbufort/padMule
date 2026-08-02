@@ -8,11 +8,13 @@ use mule_proto::Kad128;
 
 /// Contacts per leaf bin.
 pub const K: usize = 10;
-/// Sybil/poisoning defense (eMule CRoutingBin): a single host must not flood the
-/// table with fake node IDs. Cap how many contacts may share one IP / one /24.
-/// Interop-safe: the global Kad network is IP-diverse, so a legitimate peer is
-/// never rejected - only an attacker packing many IDs behind one address is.
-pub const MAX_CONTACTS_PER_IP: usize = 2;
+/// Sybil/poisoning defense (eMule CRoutingBin, RoutingBin.cpp:56-57): a single
+/// host must not flood the table with fake node IDs. Cap how many contacts may
+/// share one IP / one /24. Interop-safe: the global Kad network is IP-diverse, so
+/// a legitimate peer is never rejected - only an attacker packing many IDs behind
+/// one address is (eMule's own comment: multiple KAD clients behind one IP still
+/// index/search fine; they just are not all kept in the routing table).
+pub const MAX_CONTACTS_PER_IP: usize = 1;
 pub const MAX_CONTACTS_PER_SUBNET: usize = 10;
 /// A full bin below this level always splits (fine resolution shallow in the tree).
 pub const KBASE: u8 = 4;
@@ -29,6 +31,11 @@ pub struct Contact {
     pub udp_port: u16,
     pub tcp_port: u16,
     pub version: u8,
+    /// Whether this contact's (KadID, IP) has been UDP-verified (eMule
+    /// `CContact::IsIpVerified`): true once a receiver-key-valid reply arrived
+    /// from this IP, or as read from a nodes.dat that recorded it. Monotonic
+    /// (promoted false->true, never regresses); persisted across restarts.
+    pub verified: bool,
     /// self_id XOR id - fixed once we know our own ID, so kept here.
     distance: Kad128,
 }
@@ -41,6 +48,7 @@ impl Contact {
         udp_port: u16,
         tcp_port: u16,
         version: u8,
+        verified: bool,
     ) -> Self {
         Contact {
             distance: self_id.distance(&id),
@@ -49,6 +57,7 @@ impl Contact {
             udp_port,
             tcp_port,
             version,
+            verified,
         }
     }
 
@@ -98,7 +107,17 @@ impl Zone {
         if let Node::Leaf(bin) = &mut self.node {
             // Already known? Move to back (most-recently-seen).
             if let Some(pos) = bin.iter().position(|c| c.id == contact.id) {
-                bin.remove(pos);
+                let old = bin.remove(pos);
+                let mut contact = contact;
+                // The verified bit is monotonic ONLY while the IP is unchanged
+                // (eMule Contact.cpp:175-178 clears IsIpVerified on ANY ip change).
+                // A verified (id, ip) proves nothing at a DIFFERENT ip, and a
+                // KadID is semi-public - so an attacker must not inherit the bit by
+                // re-pointing a known verified id to their own ip. Same ip = a
+                // genuine refresh, keep the bit.
+                if old.ip == contact.ip {
+                    contact.verified |= old.verified;
+                }
                 bin.push(contact);
                 return;
             }
@@ -169,11 +188,19 @@ impl RoutingTable {
     /// Add (or refresh) a contact. Ignores our own ID. The anti-sybil per-IP//24
     /// cap is enforced one layer up (kad_live::add_contact, a LIVE-layer concern -
     /// see the lookup.rs module note), so this stays a pure routing primitive.
-    pub fn add(&mut self, id: Kad128, ip: u32, udp_port: u16, tcp_port: u16, version: u8) {
+    pub fn add(
+        &mut self,
+        id: Kad128,
+        ip: u32,
+        udp_port: u16,
+        tcp_port: u16,
+        version: u8,
+        verified: bool,
+    ) {
         if id == self.self_id {
             return;
         }
-        let c = Contact::new(&self.self_id, id, ip, udp_port, tcp_port, version);
+        let c = Contact::new(&self.self_id, id, ip, udp_port, tcp_port, version, verified);
         self.root.add(c);
     }
 
@@ -182,6 +209,15 @@ impl RoutingTable {
         let mut all: Vec<&Contact> = Vec::new();
         self.root.collect(&mut all);
         all.iter().any(|c| c.id == *id)
+    }
+
+    /// The IP currently stored for `id`, if the table holds it. Lets the live
+    /// layer tell a genuine refresh (same id, same IP) from an id being re-pointed
+    /// to a new IP (a hijack attempt that must face the anti-sybil cap).
+    pub fn ip_of(&self, id: &Kad128) -> Option<u32> {
+        let mut all: Vec<&Contact> = Vec::new();
+        self.root.collect(&mut all);
+        all.iter().find(|c| c.id == *id).map(|c| c.ip)
     }
 
     /// (contacts sharing this exact IP, contacts sharing its /24 subnet). Used by
@@ -207,7 +243,7 @@ impl RoutingTable {
     /// Load every contact from a parsed nodes.dat.
     pub fn load_nodes(&mut self, contacts: &[KadContact]) {
         for c in contacts {
-            self.add(c.id, c.ip, c.udp_port, c.tcp_port, c.version);
+            self.add(c.id, c.ip, c.udp_port, c.tcp_port, c.version, c.verified);
         }
     }
 
@@ -254,18 +290,66 @@ mod tests {
     #[test]
     fn adds_and_counts_contacts() {
         let mut rt = RoutingTable::new(id(0));
-        rt.add(id(1), 0x0101_0101, 1, 2, 8);
-        rt.add(id(2), 0x0202_0202, 3, 4, 8);
+        rt.add(id(1), 0x0101_0101, 1, 2, 8, false);
+        rt.add(id(2), 0x0202_0202, 3, 4, 8, false);
         assert_eq!(rt.len(), 2);
         // Re-adding the same id refreshes, does not duplicate.
-        rt.add(id(1), 0x0101_0101, 1, 2, 8);
+        rt.add(id(1), 0x0101_0101, 1, 2, 8, false);
         assert_eq!(rt.len(), 2);
+    }
+
+    fn find(rt: &RoutingTable, want: Kad128) -> Contact {
+        rt.contacts().into_iter().find(|c| c.id == want).unwrap()
+    }
+
+    #[test]
+    fn verified_flag_is_sticky_matching_emule() {
+        // eMule RoutingZone.cpp:585-587: an existing contact's verified bit is
+        // monotonic - it can be promoted false->true but never regresses to false.
+        let mut rt = RoutingTable::new(id(0));
+        rt.add(id(1), 0x0101_0101, 1, 2, 8, false);
+        assert!(!find(&rt, id(1)).verified, "starts unverified");
+        rt.add(id(1), 0x0101_0101, 1, 2, 8, true);
+        assert!(find(&rt, id(1)).verified, "promoted to verified");
+        rt.add(id(1), 0x0101_0101, 1, 2, 8, false);
+        assert!(find(&rt, id(1)).verified, "stays verified (sticky)");
+    }
+
+    #[test]
+    fn verified_clears_when_a_known_id_moves_to_a_new_ip() {
+        // A semi-public KadID must not carry its verified bit to a DIFFERENT IP
+        // (eMule Contact.cpp:175-178 clears IsIpVerified on any ip change), or an
+        // attacker could inherit trust by re-pointing a known id to their own IP.
+        let mut rt = RoutingTable::new(id(0));
+        rt.add(id(1), 0x0101_0101, 1, 2, 8, true);
+        assert!(find(&rt, id(1)).verified);
+        // Same id at a NEW ip (hijack shape) -> verified cleared.
+        rt.add(id(1), 0x0202_0202, 1, 2, 8, false);
+        let c = find(&rt, id(1));
+        assert_eq!(c.ip, 0x0202_0202);
+        assert!(!c.verified, "verified dropped on the ip change");
+        // A genuine refresh (same id, SAME ip) still keeps it.
+        rt.add(id(1), 0x0202_0202, 1, 2, 8, true);
+        assert!(find(&rt, id(1)).verified);
+    }
+
+    #[test]
+    fn verified_flag_survives_a_split() {
+        // A contact keeps its verified bit when its full bin splits.
+        let mut rt = RoutingTable::new(id(0));
+        for i in 1..=12u8 {
+            rt.add(id(i), i as u32, 1, 2, 8, i == 5);
+        }
+        assert!(
+            find(&rt, id(5)).verified,
+            "the verified one survived the split"
+        );
     }
 
     #[test]
     fn ignores_our_own_id() {
         let mut rt = RoutingTable::new(id(7));
-        rt.add(id(7), 0, 0, 0, 8);
+        rt.add(id(7), 0, 0, 0, 8, false);
         assert!(rt.is_empty());
     }
 
@@ -295,7 +379,7 @@ mod tests {
         let mut rt = RoutingTable::new(id(0));
         let ids: Vec<Kad128> = (1..=15u8).map(id).collect();
         for (i, cid) in ids.iter().enumerate() {
-            rt.add(*cid, i as u32, 1, 2, 8);
+            rt.add(*cid, i as u32, 1, 2, 8, false);
         }
         assert_eq!(rt.len(), 15);
 
@@ -333,7 +417,7 @@ mod tests {
         for i in 0..50u32 {
             let mut w = [0xF000_0000u32, 0, 0, i];
             w[1] = i.wrapping_mul(2654435761);
-            rt.add(Kad128::from_words(w), i, 1, 2, 8);
+            rt.add(Kad128::from_words(w), i, 1, 2, 8, false);
         }
         // The table holds contacts but far fewer than 50 (far bins capped at K per
         // leaf, limited leaves because far zones stop splitting).

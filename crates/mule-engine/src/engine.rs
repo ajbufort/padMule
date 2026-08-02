@@ -29,6 +29,7 @@ use crate::identity::NodeIdentity;
 use crate::kad_live::KadNode;
 use crate::link::ServerLink;
 use crate::multi_source::{download_from_peer, resume_downloads, Download};
+use crate::obf_handshake::{obf_accept, ObfDetect};
 use crate::part_store::PartStore;
 use crate::peer::HelloInfo;
 use crate::peer_conn::peer_handshake_inbound;
@@ -88,7 +89,9 @@ fn routing_to_nodes(rt: &RoutingTable) -> Vec<KadContact> {
             version: c.version,
             udp_key: 0,
             udp_key_ip: 0,
-            verified: false,
+            // Persist the IP-verified bit so a contact stays verified across
+            // restarts (eMule writes IsIpVerified() to nodes.dat, RoutingZone.cpp:381).
+            verified: c.verified,
         })
         .collect()
 }
@@ -192,6 +195,12 @@ const UPLOAD_QUEUE_CAP: usize = 32;
 /// hostile peer opening thousands would otherwise exhaust file descriptors + task
 /// memory; excess connections are dropped (the peer can retry).
 const MAX_INBOUND_CONNS: usize = 200;
+/// Cap on CONCURRENT inbound connections from a SINGLE IP, so one hostile source
+/// cannot grab all `MAX_INBOUND_CONNS` permits and starve every other peer.
+/// Generous on purpose: a NAT/CGNAT address legitimately fronts several peers, and
+/// an honest peer opens only a handful of sockets to us, so this never cuts off a
+/// real client - and a rejected connection is retryable.
+const MAX_INBOUND_PER_IP: u32 = 16;
 /// Total wall-clock budget for the resume-fetch pass in `start()`, and the
 /// per-download cap on source-finding within it. Small so a batch of dead
 /// downloads cannot stall startup (which holds the FFI engine lock).
@@ -501,6 +510,44 @@ impl Drop for FetchGuard {
     }
 }
 
+/// Per-IP inbound-connection counter shared by the listener.
+type PerIpConns = Arc<std::sync::Mutex<std::collections::HashMap<Ipv4Addr, u32>>>;
+
+/// RAII slot for one inbound connection from `ip`: decrements the per-IP count on
+/// drop (i.e. when the connection task ends). `try_acquire` returns `None` when the
+/// IP is already at [`MAX_INBOUND_PER_IP`].
+struct IpConnSlot {
+    map: PerIpConns,
+    ip: Ipv4Addr,
+}
+
+impl IpConnSlot {
+    fn try_acquire(map: &PerIpConns, ip: Ipv4Addr) -> Option<Self> {
+        let mut m = map.lock().unwrap();
+        let n = m.entry(ip).or_insert(0);
+        if *n >= MAX_INBOUND_PER_IP {
+            return None;
+        }
+        *n += 1;
+        Some(IpConnSlot {
+            map: Arc::clone(map),
+            ip,
+        })
+    }
+}
+
+impl Drop for IpConnSlot {
+    fn drop(&mut self) {
+        let mut m = self.map.lock().unwrap();
+        if let Some(n) = m.get_mut(&self.ip) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                m.remove(&self.ip);
+            }
+        }
+    }
+}
+
 async fn finish_download(
     dl: Arc<Download>,
     ctx: FinishCtx,
@@ -519,13 +566,15 @@ async fn finish_download(
     let name = dl.name().await;
     let verified = dl.verify_whole_file(size, hash).await;
     if !verified {
-        // Re-open the WHOLE file so it re-downloads instead of stranding at 100%.
-        // (We could localize with verify_ready_parts, but that re-hashes every part
-        // UNDER the download lock - stalling the heartbeat and pause() - and a
-        // whole-file failure after every part individually verified is near
-        // impossible, so a full re-fetch is the simpler, lock-cheap recovery.) The
-        // download STAYS registered; the next resume re-drives it.
-        dl.reset_all_gaps().await;
+        // Blame the individual corrupt part(s) against the hashset and re-open only
+        // those, so one bad source does not force re-downloading the WHOLE file
+        // (localize_corruption hashes off the download lock, so it never stalls the
+        // heartbeat). Fall back to a full re-open only when no part can be blamed
+        // (a single-part file, or a spoofed hashset). Either way the download STAYS
+        // registered and the next resume re-drives it - never stranded at 100%.
+        if !dl.localize_corruption().await {
+            dl.reset_all_gaps().await;
+        }
         dl.reset_finalize();
         let _ = events.send(EngineEvent::Server(format!(
             "'{name}' failed verification - will re-fetch on the next resume"
@@ -1232,13 +1281,17 @@ impl Engine {
             )));
             return;
         };
-        let me = HelloInfo::baseline(self.identity.userhash, 0, TCP_PORT, KAD_UDP_PORT, "padMule");
+        // Advertise crypt SUPPORTED so crypt-required peers can reach us; the accept
+        // loop below wires the matching inbound obf-accept (both halves land together).
+        let me = HelloInfo::baseline(self.identity.userhash, 0, TCP_PORT, KAD_UDP_PORT, "padMule")
+            .with_crypt_supported();
         let downloads = Arc::clone(&self.downloads);
         let shared = Arc::clone(&self.shared);
         let sharing = Arc::clone(&self.sharing);
         let gate = Arc::clone(&self.upload_gate);
         let ip_filter = self.ip_filter.clone();
         let inbound = Arc::new(Semaphore::new(MAX_INBOUND_CONNS));
+        let per_ip: PerIpConns = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         let handle = tokio::spawn(async move {
             loop {
                 let (stream, peer) = match listener.accept().await {
@@ -1258,6 +1311,17 @@ impl Engine {
                     drop(stream);
                     continue;
                 };
+                // Per-IP cap: one IP must not hold all the permits (starving others).
+                let ip_slot = match peer {
+                    SocketAddr::V4(v4) => match IpConnSlot::try_acquire(&per_ip, *v4.ip()) {
+                        Some(slot) => Some(slot),
+                        None => {
+                            drop(stream);
+                            continue;
+                        }
+                    },
+                    SocketAddr::V6(_) => None,
+                };
                 let me = me.clone();
                 let downloads = Arc::clone(&downloads);
                 let shared = Arc::clone(&shared);
@@ -1266,7 +1330,27 @@ impl Engine {
                 let ip_filter = ip_filter.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    let mut fs = FramedStream::new(stream);
+                    let _ip_slot = ip_slot;
+                    let mut stream = stream;
+                    // Auto-detect obfuscation on the first byte (eMule
+                    // EncryptedStreamSocket.cpp:214): a plaintext eD2k marker stays
+                    // plaintext (byte-identical to the old path); anything else runs
+                    // the RC4 responder keyed on OUR userhash. This is what advertising
+                    // crypt-SUPPORTED obligates. A bare connect+close (the server's
+                    // HighID probe) reads no first byte, errors here, and bails - the
+                    // accept already succeeded, so HighID is unaffected.
+                    let detect = timeout(
+                        Duration::from_secs(8),
+                        obf_accept(&mut stream, &me.user_hash),
+                    )
+                    .await;
+                    let mut fs = match detect {
+                        Ok(Ok(ObfDetect::Obfuscated(c))) => FramedStream::obfuscated(stream, *c),
+                        Ok(Ok(ObfDetect::Plaintext { first })) => {
+                            FramedStream::plaintext_with_prefix(stream, &[first])
+                        }
+                        _ => return,
+                    };
                     // A bare connect+close (the server's HighID probe) ends here:
                     // it never sends OP_HELLO, so the handshake errors and we bail.
                     let peer_accept_comment =
@@ -1805,6 +1889,9 @@ impl Engine {
             self.emit(EngineEvent::Server("Kad UDP port unavailable".into()));
             return;
         };
+        // Thread the user blocklist into Kad so it gates routing inserts (eMule
+        // filters every Kad contact, RoutingZone.cpp:477), matching the eD2k path.
+        node.set_ip_filter(self.ip_filter.clone());
         // Cap the OVERALL bootstrap: 40 contacts * 1200ms is ~48s worst case, and
         // start_kad runs while the single shared engine lock is held (start/resume
         // via the FFI), so an uncapped bootstrap would block pause()'s socket

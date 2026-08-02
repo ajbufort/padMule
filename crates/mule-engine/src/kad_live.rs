@@ -14,7 +14,7 @@
 //! same u32 feeds `udp_verify_key`, so the key we issue on send matches the one
 //! we recompute on receive (same peer, same convention both directions).
 
-use mule_files::KadContact;
+use mule_files::{IpFilter, KadContact};
 use mule_kad::{
     build_bootstrap_req, build_hello_req, build_kad2_req, build_search_key_req,
     build_search_source_req, is_acceptable_contact, kad_deobfuscate, kad_keyword_target,
@@ -28,6 +28,11 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::time::{timeout, Instant};
+
+/// The contact count padMule requests in a KADEMLIA2_REQ (KAD_FIND_NODE = 0x0B).
+/// A KADEMLIA2_RES with more than this is a malicious over-long answer and is
+/// dropped (eMule caps the response at the requested count, Search.cpp:377).
+const KAD_REQUESTED_CONTACTS: usize = 11;
 
 /// A contact's host-order `ip` u32 to its socket address (big-endian view).
 fn contact_addr(ip: u32, port: u16) -> SocketAddr {
@@ -91,6 +96,10 @@ pub struct KadNode {
     tcp_port: u16,
     udp_port: u16,
     routing: RoutingTable,
+    /// The user IP blocklist (ipfilter.dat/.p2p), if loaded. eMule consults it on
+    /// every Kad routing insert (RoutingZone.cpp:477); padMule threads the engine's
+    /// filter in so a blocklisted range cannot poison the routing table.
+    ip_filter: Option<std::sync::Arc<IpFilter>>,
 }
 
 impl KadNode {
@@ -127,7 +136,14 @@ impl KadNode {
             tcp_port,
             udp_port,
             routing: RoutingTable::new(kad_id),
+            ip_filter: None,
         })
+    }
+
+    /// Install the user IP blocklist so blocklisted ranges are dropped from every
+    /// routing insert (matching eMule). `None` = no filter (fail-open).
+    pub fn set_ip_filter(&mut self, filter: Option<std::sync::Arc<IpFilter>>) {
+        self.ip_filter = filter;
     }
 
     pub fn kad_id(&self) -> Kad128 {
@@ -143,15 +159,43 @@ impl KadNode {
     /// Add a contact to the routing table only if its IP:port is a routable
     /// public address with a usable UDP port (eMule 0.70b hardening) - junk /
     /// unroutable / port-0 contacts never enter the table.
-    fn add_contact(&mut self, id: Kad128, ip: u32, udp_port: u16, tcp_port: u16, version: u8) {
+    fn add_contact(
+        &mut self,
+        id: Kad128,
+        ip: u32,
+        udp_port: u16,
+        tcp_port: u16,
+        version: u8,
+        verified: bool,
+    ) {
         if !is_acceptable_contact(ip, udp_port, /*allow_private=*/ false) {
             return;
         }
+        // Drop a DNS-port contact from a LEGACY node (anti-reflection: a nodes.dat
+        // naming `victim:53` would spray Kad requests at a DNS server). eMule gates
+        // this on version <= KADEMLIA_VERSION5_48a (0x05), keeping modern nodes, so
+        // match that exactly rather than a blanket reject (which is stricter than
+        // eMule - it would drop a node eMule keeps).
+        if udp_port == 53 && version <= 5 {
+            return;
+        }
+        // The user blocklist gates Kad inserts exactly as it gates eD2k sources
+        // (eMule RoutingZone.cpp:477): a range the user chose to block never enters
+        // the routing table. Fail-open when no filter is loaded.
+        if let Some(f) = &self.ip_filter {
+            if f.is_blocked_u32(ip) {
+                return;
+            }
+        }
         // Anti-sybil (live-layer): cap how many contacts share one IP / /24, so a
         // hostile node cannot flood our routing table with fake IDs behind one
-        // address. Refreshing an id we already hold is always allowed. Interop-safe:
-        // the real Kad network is IP-diverse, so a legitimate peer is never dropped.
-        if ip != 0 && !self.routing.contains(&id) {
+        // address. Skip the cap ONLY for a genuine refresh (same id, SAME ip); a
+        // known id arriving at a DIFFERENT ip is a hijack attempt (KadIDs are
+        // semi-public) and faces the cap on the new ip like a new contact (Zone::add
+        // also clears its verified bit on the ip change). Interop-safe: the real Kad
+        // network is IP-diverse, so a legitimate peer is never dropped.
+        let refresh = self.routing.ip_of(&id) == Some(ip);
+        if ip != 0 && !refresh {
             let (same_ip, same_subnet) = self.routing.ip_counts(ip);
             if same_ip >= mule_kad::MAX_CONTACTS_PER_IP
                 || same_subnet >= mule_kad::MAX_CONTACTS_PER_SUBNET
@@ -159,13 +203,21 @@ impl KadNode {
                 return;
             }
         }
-        self.routing.add(id, ip, udp_port, tcp_port, version);
+        self.routing
+            .add(id, ip, udp_port, tcp_port, version, verified);
     }
 
     /// Send an obfuscated Kad request (NodeID-keyed on `target_id`, our
     /// senderVerifyKey issued for `dest`) and wait for a decryptable reply with
     /// opcode `expect` FROM `dest`, ignoring interleaved/stray datagrams (other
     /// nodes' pings, a HELLO from the peer) until the deadline.
+    /// Returns `(payload, valid_receiver_key)`. `valid_receiver_key` is eMule's
+    /// `bValidReceiverKey`: the reply echoed back the verify key we issue for
+    /// `dest` (`udp_verify_key(our_key, dest_ip)`), proving it came from a node
+    /// that actually received our packet at that IP (anti-spoof). It NEVER causes
+    /// a drop here - matching eMule, which only hard-drops HELLO_RES_ACK on an
+    /// invalid receiver key; for every other opcode it just marks the contact
+    /// unverified. The caller uses it to set the contact's `verified` bit.
     async fn request(
         &self,
         target_id: &Kad128,
@@ -173,7 +225,7 @@ impl KadNode {
         frame: &[u8],
         expect: u8,
         wait: Duration,
-    ) -> Result<Vec<u8>, KadError> {
+    ) -> Result<(Vec<u8>, bool), KadError> {
         let dest_ip = ip_u32(&dest);
         let sender_vk = mule_kad::udp_verify_key(self.udp_key, dest_ip);
         let datagram = kad_obfuscate_request(
@@ -207,7 +259,12 @@ impl KadNode {
                 continue;
             };
             if op == expect {
-                return Ok(payload);
+                // bValidReceiverKey = GetUDPVerifyKey(senderIP) == packet receiver
+                // key (eMule ClientUDPSocket.cpp:127). The value we issued as our
+                // sender key is exactly udp_verify_key(our_key, dest_ip), so the
+                // peer echoing it back means the key round-tripped.
+                let valid_receiver_key = dec.receiver_vk == sender_vk;
+                return Ok((payload, valid_receiver_key));
             }
             // A different opcode from the same peer (e.g. HELLO_REQ) - keep waiting.
         }
@@ -223,20 +280,24 @@ impl KadNode {
         let (op, payload) = build_bootstrap_req();
         let frame = pack_kad(op, payload);
         let dest = contact_addr(contact.ip, contact.udp_port);
-        let res_payload = self
+        let (res_payload, verified) = self
             .request(&contact.id, dest, &frame, OP_BOOTSTRAP_RES, wait)
             .await?;
         let res = parse_bootstrap_res(&res_payload)?;
-        // The responder itself (at the address we reached), then every listed contact.
+        // The responder itself (at the address we reached) is IP-verified iff its
+        // reply echoed our verify key; the listed contacts are always unverified
+        // until they prove their own IP (eMule KademliaUDPListener.cpp:567 vs the
+        // payload contacts added unverified).
         self.add_contact(
             res.id,
             contact.ip,
             contact.udp_port,
             res.tcp_port,
             res.version,
+            verified,
         );
         for c in &res.contacts {
-            self.add_contact(c.id, c.ip, c.udp_port, c.tcp_port, c.version);
+            self.add_contact(c.id, c.ip, c.udp_port, c.tcp_port, c.version, false);
         }
         Ok(res)
     }
@@ -267,7 +328,7 @@ impl KadNode {
             build_hello_req(&self.kad_id, self.tcp_port, Some(self.udp_port), Some(0x04));
         let frame = pack_kad(op, payload);
         let dest = contact_addr(contact.ip, contact.udp_port);
-        let res_payload = self
+        let (res_payload, _verified) = self
             .request(&contact.id, dest, &frame, OP_HELLO_RES, wait)
             .await?;
         Ok(parse_hello(&res_payload)?)
@@ -280,14 +341,28 @@ impl KadNode {
         node: &WireContact,
         target: &Kad128,
         wait: Duration,
-    ) -> Result<Vec<WireContact>, KadError> {
+    ) -> Result<(Vec<WireContact>, bool), KadError> {
         let (op, payload) = build_kad2_req(KAD_FIND_NODE, target, &node.id);
         let frame = pack_kad(op, payload);
         let dest = contact_addr(node.ip, node.udp_port);
-        let res_payload = self
+        let (res_payload, verified) = self
             .request(&node.id, dest, &frame, OP_KAD2_RES, wait)
             .await?;
-        Ok(parse_kad2_res(&res_payload)?.contacts)
+        let mut contacts = parse_kad2_res(&res_payload)?.contacts;
+        // Drop a malicious over-long answer: padMule requests KAD_FIND_NODE, whose
+        // count field caps at what we asked for (11); a compliant node never
+        // exceeds it, a hostile one may pad up to 255 fabricated contacts (eMule
+        // Search.cpp:377 rejects the same way).
+        if contacts.len() > KAD_REQUESTED_CONTACTS {
+            return Err(KadError::Unexpected(OP_KAD2_RES));
+        }
+        // A node may not answer with itself, and may not list many IDs on one IP:
+        // keep at most one contact per source IP within a single answer (eMule
+        // Search.cpp:423/449 - honest nodes never do either).
+        let responder_ip = node.ip;
+        let mut seen_ips = std::collections::HashSet::new();
+        contacts.retain(|c| c.ip != responder_ip && seen_ips.insert(c.ip));
+        Ok((contacts, verified))
     }
 
     /// Ask one node (KADEMLIA2_SEARCH_SOURCE_REQ) for sources of `file_hash`,
@@ -302,7 +377,7 @@ impl KadNode {
         let (op, payload) = build_search_source_req(file_hash, 0, file_size);
         let frame = pack_kad(op, payload);
         let dest = contact_addr(node.ip, node.udp_port);
-        let res_payload = self
+        let (res_payload, _verified) = self
             .request(&node.id, dest, &frame, OP_SEARCH_RES, wait)
             .await?;
         let res = parse_search_res(&res_payload)?;
@@ -347,10 +422,20 @@ impl KadNode {
             }
             for node in &batch {
                 out.nodes_queried += 1;
-                if let Ok(contacts) = self.find_node(node, file_hash, per_query).await {
+                if let Ok((contacts, verified)) = self.find_node(node, file_hash, per_query).await {
                     out.find_node_responses += 1;
+                    // The node that answered proved its IP iff the receiver key was
+                    // valid; the contacts it named are unverified until they answer.
+                    self.add_contact(
+                        node.id,
+                        node.ip,
+                        node.udp_port,
+                        node.tcp_port,
+                        node.version,
+                        verified,
+                    );
                     for c in &contacts {
-                        self.add_contact(c.id, c.ip, c.udp_port, c.tcp_port, c.version);
+                        self.add_contact(c.id, c.ip, c.udp_port, c.tcp_port, c.version, false);
                     }
                     lookup.on_response(contacts);
                 }
@@ -398,7 +483,7 @@ impl KadNode {
         let (op, payload) = build_search_key_req(target, 0);
         let frame = pack_kad(op, payload);
         let dest = contact_addr(node.ip, node.udp_port);
-        let res_payload = self
+        let (res_payload, _verified) = self
             .request(&node.id, dest, &frame, OP_SEARCH_RES, wait)
             .await?;
         let res = parse_search_res(&res_payload)?;
@@ -438,9 +523,17 @@ impl KadNode {
                 break;
             }
             for node in &batch {
-                if let Ok(contacts) = self.find_node(node, &target, per_query).await {
+                if let Ok((contacts, verified)) = self.find_node(node, &target, per_query).await {
+                    self.add_contact(
+                        node.id,
+                        node.ip,
+                        node.udp_port,
+                        node.tcp_port,
+                        node.version,
+                        verified,
+                    );
                     for c in &contacts {
-                        self.add_contact(c.id, c.ip, c.udp_port, c.tcp_port, c.version);
+                        self.add_contact(c.id, c.ip, c.udp_port, c.tcp_port, c.version, false);
                     }
                     lookup.on_response(contacts);
                 }
@@ -518,6 +611,204 @@ mod tests {
     fn ip_u32_round_trips_an_arbitrary_v4() {
         let addr: SocketAddr = "203.0.113.7:1234".parse().unwrap();
         assert_eq!(contact_addr(ip_u32(&addr), 1234), addr);
+    }
+
+    // Faithful mock-peer helpers for the receiver-key tests: they play the real
+    // responder role (interop-test-fidelity), not a same-role echo.
+    use mule_kad::{build_bootstrap_res, kad_obfuscate_response, udp_verify_key};
+
+    #[tokio::test]
+    async fn request_reports_a_valid_receiver_key_when_the_peer_echoes_our_sender_key() {
+        // A real v2 node decrypts our request, reads the sender verify key we
+        // issued for its IP, and echoes it back as the receiver key of a
+        // receiver-keyed response. request() must report bValidReceiverKey = true.
+        let our_key = 0x1234_5678u32;
+        let our_id = Kad128::from_words([9, 9, 9, 9]);
+        let node =
+            KadNode::bind_with_identity("127.0.0.1:0".parse().unwrap(), 4662, our_id, our_key)
+                .await
+                .unwrap();
+        let peer_id = Kad128::from_hash(&[0x55; 16]);
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+
+        let mock = tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            let (n, from) = peer.recv_from(&mut buf).await.unwrap();
+            // The peer decrypts our request keyed on its OWN id, learning our
+            // sender verify key, then echoes it in a receiver-keyed response.
+            let dec = kad_deobfuscate(&buf[..n], &peer_id, 0, ip_u32(&from)).unwrap();
+            let (rop, rpayload) = build_bootstrap_res(&peer_id, 4662, 8, &[]);
+            let rframe = pack_kad(rop, rpayload);
+            let dg = kad_obfuscate_response(&rframe, 0x2468, dec.sender_vk, 0, 0x80);
+            peer.send_to(&dg, from).await.unwrap();
+        });
+
+        let (op, payload) = build_bootstrap_req();
+        let frame = pack_kad(op, payload);
+        let (_res, valid) = node
+            .request(
+                &peer_id,
+                peer_addr,
+                &frame,
+                OP_BOOTSTRAP_RES,
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        assert!(
+            valid,
+            "the peer echoed our sender key -> receiver key is valid"
+        );
+        mock.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_reports_an_invalid_receiver_key_for_a_nodeid_path_forgery() {
+        // An off-path attacker who knows only our (semi-public) KadID can craft a
+        // response that decrypts via the NodeID path, but cannot know the verify
+        // key derived from our secret UDP key - so its receiver key is wrong and
+        // request() must report bValidReceiverKey = false (the contact will be
+        // recorded UNVERIFIED, matching eMule - the packet is still processed).
+        let our_key = 0xDEAD_BEEFu32;
+        let our_id = Kad128::from_words([1, 2, 3, 4]);
+        let node =
+            KadNode::bind_with_identity("127.0.0.1:0".parse().unwrap(), 4662, our_id, our_key)
+                .await
+                .unwrap();
+        let peer_id = Kad128::from_hash(&[0x66; 16]);
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+
+        let mock = tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            let (_n, from) = peer.recv_from(&mut buf).await.unwrap();
+            // Forge a NodeID-path response keyed on our KadID with a bogus
+            // receiver key (the attacker cannot derive the real one).
+            let (rop, rpayload) = build_bootstrap_res(&peer_id, 4662, 8, &[]);
+            let rframe = pack_kad(rop, rpayload);
+            let dg =
+                mule_kad::kad_obfuscate_request(&rframe, &our_id, 0x1111, 0xBADD_0000, 0, 0x40);
+            peer.send_to(&dg, from).await.unwrap();
+        });
+
+        let (op, payload) = build_bootstrap_req();
+        let frame = pack_kad(op, payload);
+        let (_res, valid) = node
+            .request(
+                &peer_id,
+                peer_addr,
+                &frame,
+                OP_BOOTSTRAP_RES,
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        assert!(!valid, "a NodeID-path forgery has no valid receiver key");
+        mock.await.unwrap();
+
+        // Silence the unused-import warning when only one test path uses it.
+        let _ = udp_verify_key(our_key, 0);
+    }
+
+    #[tokio::test]
+    async fn add_contact_drops_ipfiltered_ranges() {
+        use mule_files::{IpFilter, DEFAULT_IPFILTER_LEVEL};
+        use std::sync::Arc;
+        let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut node = KadNode::bind(bind, 4662).await.unwrap();
+        node.set_ip_filter(Some(Arc::new(IpFilter::parse(
+            "9.9.9.0 - 9.9.9.255 , 0 , blocked\n",
+            DEFAULT_IPFILTER_LEVEL,
+        ))));
+        // A user-blocklisted public IP never enters the routing table...
+        node.add_contact(
+            Kad128::from_hash(&[1; 16]),
+            0x0909_0909,
+            4672,
+            4662,
+            8,
+            false,
+        );
+        assert_eq!(node.contacts_known(), 0, "blocklisted contact dropped");
+        // ...but an allowed public IP does.
+        node.add_contact(
+            Kad128::from_hash(&[2; 16]),
+            0x0808_0808,
+            4672,
+            4662,
+            8,
+            false,
+        );
+        assert_eq!(node.contacts_known(), 1, "allowed contact kept");
+    }
+
+    #[tokio::test]
+    async fn add_contact_version_gates_the_port_53_guard() {
+        let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut node = KadNode::bind(bind, 4662).await.unwrap();
+        // A LEGACY node (version <= 5) on DNS port 53 is dropped (anti-reflection)...
+        node.add_contact(Kad128::from_hash(&[1; 16]), 0x0808_0808, 53, 4662, 5, false);
+        assert_eq!(node.contacts_known(), 0, "legacy port-53 contact dropped");
+        // ...but a MODERN node on 53 is KEPT - eMule keeps it, so we must not be
+        // stricter (that would drop a peer eMule accepts).
+        node.add_contact(Kad128::from_hash(&[2; 16]), 0x0909_0909, 53, 4662, 8, false);
+        assert_eq!(
+            node.contacts_known(),
+            1,
+            "modern port-53 contact kept (faithful)"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_known_id_repointed_to_a_full_ip_is_refused() {
+        // A known KadID re-pointed to a DIFFERENT ip is a hijack attempt and faces
+        // the anti-sybil cap on the new ip - it is not a free refresh past the cap.
+        let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut node = KadNode::bind(bind, 4662).await.unwrap();
+        let id1 = Kad128::from_hash(&[1; 16]);
+        node.add_contact(id1, 0x0808_0808, 4672, 4662, 8, false);
+        node.add_contact(
+            Kad128::from_hash(&[2; 16]),
+            0x0808_0809,
+            4672,
+            4662,
+            8,
+            false,
+        );
+        // The attacker's ip (0x0808_0809) is already at the 1-per-IP cap, so
+        // re-pointing id1 onto it is refused; id1 stays at its original ip.
+        node.add_contact(id1, 0x0808_0809, 4672, 4662, 8, false);
+        assert_eq!(
+            node.routing().ip_of(&id1),
+            Some(0x0808_0808),
+            "hijack to a full IP refused; id stays put"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_contact_enforces_one_id_per_ip() {
+        // eMule MAX_CONTACTS_IP = 1: a second KadID behind one IP is refused (the
+        // cheapest sybil primitive).
+        let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut node = KadNode::bind(bind, 4662).await.unwrap();
+        node.add_contact(
+            Kad128::from_hash(&[1; 16]),
+            0x0808_0808,
+            4672,
+            4662,
+            8,
+            false,
+        );
+        node.add_contact(
+            Kad128::from_hash(&[2; 16]),
+            0x0808_0808,
+            4672,
+            4662,
+            8,
+            false,
+        );
+        assert_eq!(node.contacts_known(), 1, "second id on the same IP refused");
     }
 
     #[tokio::test]

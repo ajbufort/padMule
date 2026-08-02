@@ -259,16 +259,32 @@ pub fn catalog(files: &[SearchResultFile]) -> Vec<RankedFile> {
         })
         .collect();
 
-    // Ok before Suspect, then most available first, then a stable name order.
+    // Ok before Suspect, then most available first, then a stable name order. A
+    // file ALREADY flagged Suspect (by the intra-hash signals above: size
+    // disagreement, no size, rated fake, many-names-no-sources) has its availability
+    // capped for ranking, mirroring eMule (SearchList.cpp:813 caps a spam row's
+    // shown source count at 5), so a fake cannot float up on an inflated count. This
+    // only reorders already-suspect rows and never touches a trusted file, so it has
+    // no false-positive risk. (A cross-hash filename-repetition score was considered
+    // and dropped: it is not an eMule 0.50a feature and flagged legitimate files that
+    // merely share a generic name - see the security-model entry.)
+    let ranked_sources = |f: &RankedFile| match f.trust {
+        Trust::Ok => f.sources,
+        Trust::Suspect(_) => f.sources.min(SPAM_AVAIL_CAP),
+    };
     out.sort_by(|a, b| {
         let ta = matches!(a.trust, Trust::Ok);
         let tb = matches!(b.trust, Trust::Ok);
         tb.cmp(&ta)
-            .then(b.sources.cmp(&a.sources))
+            .then(ranked_sources(b).cmp(&ranked_sources(a)))
             .then(a.name.cmp(&b.name))
     });
     out
 }
+
+/// A Suspect file's availability is capped at this for ranking (eMule caps a spam
+/// row's shown count the same way).
+const SPAM_AVAIL_CAP: u32 = 5;
 
 impl RankedFile {
     /// True if this file looks safe enough to auto-download.
@@ -415,6 +431,44 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[test]
+    fn legit_files_sharing_a_generic_name_stay_trusted() {
+        // Distinct real files that merely share a common P2P filename must NOT be
+        // flagged (the removed cross-hash heuristic wrongly did this). Each has a
+        // valid size and some sources, so all stay Trust::Ok and downloadable.
+        let mut files = Vec::new();
+        for i in 0..8u8 {
+            files.push(result(
+                [i; 16],
+                "sample.avi",
+                5_000_000 + i as u64,
+                1 + i as u32,
+            ));
+        }
+        let cat = catalog(&files);
+        assert_eq!(cat.len(), 8);
+        assert!(
+            cat.iter().all(|f| matches!(f.trust, Trust::Ok)),
+            "generic-name collisions are not treated as spam"
+        );
+    }
+
+    #[test]
+    fn a_suspect_files_availability_is_capped_in_ranking() {
+        // A rated-fake file with a huge source count must not out-rank a clean,
+        // well-sourced file - a Suspect row's availability is capped at 5 for
+        // ranking (and Ok always sorts before Suspect anyway).
+        let clean = result([1u8; 16], "clean.bin", 1000, 30);
+        let mut fake = result([2u8; 16], "fake.bin", 1000, 100_000);
+        fake.tags.push(Tag {
+            name: TagName::Id(FT_FILERATING),
+            value: TagValue::U32(3), // raw 3 -> decode_rating 1 = Fake -> Suspect
+        });
+        let cat = catalog(&[fake, clean]);
+        assert_eq!(cat[0].name, "clean.bin", "the clean file ranks first");
+        assert!(matches!(cat[1].trust, Trust::Suspect(_)));
     }
 
     #[test]

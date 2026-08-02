@@ -27,7 +27,9 @@ pub fn is_acceptable_contact_ip(ip: u32, allow_private: bool) -> bool {
     }
 }
 
-/// A contact must also have a usable UDP port.
+/// A contact must also have a usable UDP port. (The DNS-port-53 anti-reflection
+/// guard is applied at the live layer, `kad_live::add_contact`, where the contact
+/// version is known - eMule drops port 53 only for legacy nodes, version <= 5.)
 pub fn is_acceptable_contact(ip: u32, udp_port: u16, allow_private: bool) -> bool {
     udp_port != 0 && is_acceptable_contact_ip(ip, allow_private)
 }
@@ -156,7 +158,7 @@ mod tests {
     }
 
     #[test]
-    fn contact_needs_a_udp_port() {
+    fn contact_needs_a_usable_udp_port() {
         assert!(is_acceptable_contact(ip(95, 236, 36, 250), 4672, false));
         assert!(!is_acceptable_contact(ip(95, 236, 36, 250), 0, false));
     }

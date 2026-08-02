@@ -428,6 +428,66 @@ impl Download {
         Ok(())
     }
 
+    /// After a whole-file hash failure, blame the individual corrupt part(s)
+    /// against the peer hashset and re-open ONLY those, so one bad source does not
+    /// force re-downloading the whole file (eMule verifies each part as it
+    /// completes; padMule does it here, still per-part). Returns true if it
+    /// localized the damage (re-opened >=1 blamed part); false if it cannot - no
+    /// hashset yet, or every part hashes fine so the hashset itself is suspect -
+    /// in which case the caller falls back to re-opening the whole file.
+    ///
+    /// Off the download lock, mirroring [`verify_whole_file`]: snapshot under a
+    /// brief lock, hash each complete part in `spawn_blocking`, then re-gap the
+    /// bad ones under a brief lock - so a large file never stalls the heartbeat.
+    pub async fn localize_corruption(&self) -> bool {
+        let (path, size, part_hashes, complete) = {
+            let g = self.inner.lock().await;
+            let pf = &g.store.pf;
+            if pf.part_hashes.is_empty() {
+                return false; // no hashset -> cannot blame a single part
+            }
+            let n = data_part_count(pf.size);
+            let complete: Vec<u64> = (0..n).filter(|&p| pf.is_part_complete(p)).collect();
+            (
+                g.store.part_path().to_path_buf(),
+                pf.size,
+                pf.part_hashes.clone(),
+                complete,
+            )
+        };
+        let bad = tokio::task::spawn_blocking(move || {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut f = std::fs::File::open(&path)?;
+            let mut bad = Vec::new();
+            for p in complete {
+                let Some(&expected) = part_hashes.get(p as usize) else {
+                    continue;
+                };
+                let len = crate::part_file::part_size(p, size) as usize;
+                let mut buf = vec![0u8; len];
+                f.seek(SeekFrom::Start(p * PARTSIZE))?;
+                f.read_exact(&mut buf)?;
+                if mule_proto::md4(&buf) != expected {
+                    bad.push(p);
+                }
+            }
+            io::Result::Ok(bad)
+        })
+        .await;
+        let bad = match bad {
+            Ok(Ok(b)) if !b.is_empty() => b,
+            // Read error, or no part could be blamed (spoofed hashset) -> let the
+            // caller re-open the whole file.
+            _ => return false,
+        };
+        let mut g = self.inner.lock().await;
+        for p in &bad {
+            g.store.pf.mark_corrupt(*p);
+        }
+        let _ = g.store.save_met();
+        true
+    }
+
     /// Recompute the whole-file ed2k hash from the bytes actually on disk and
     /// compare it to `want`.
     ///
@@ -740,6 +800,65 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[tokio::test]
+    async fn localize_corruption_re_opens_only_the_bad_part() {
+        // One bad source delivering one corrupt part must NOT force re-downloading
+        // the whole file: localize_corruption blames the individual part against
+        // the hashset and re-opens only it.
+        let dir = tmpdir("localize");
+        let size = (PARTSIZE + 300_000) as usize;
+        let good: Vec<u8> = (0..size as u32)
+            .map(|i| (i.wrapping_mul(17)) as u8)
+            .collect();
+        let hash = ed2k_hash(&good);
+        let ph = vec![
+            md4(&good[..PARTSIZE as usize]),
+            md4(&good[PARTSIZE as usize..]),
+        ];
+        let store = PartStore::create(&dir, 1, hash, size as u64, b"loc.bin").unwrap();
+        let dl = Download::new(store);
+        dl.set_hashset(ph).await;
+
+        // Part 0 arrives intact; part 1 arrives corrupted (but "complete").
+        dl.commit(0, &good[..PARTSIZE as usize]).await.unwrap();
+        let mut bad = good[PARTSIZE as usize..].to_vec();
+        bad[0] ^= 0xFF;
+        dl.commit(PARTSIZE, &bad).await.unwrap();
+        assert!(dl.is_complete().await, "all bytes present");
+        assert!(
+            !dl.verify_whole_file(size as u64, hash).await,
+            "the corrupt part fails the whole-file hash"
+        );
+
+        assert!(dl.localize_corruption().await, "localized the bad part");
+        assert!(!dl.is_complete().await, "part 1 re-opened");
+        assert_eq!(
+            dl.missing().await,
+            crate::part_file::part_size(1, size as u64),
+            "ONLY part 1 was re-opened, not the whole file"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn localize_corruption_declines_without_a_hashset() {
+        // A single-part file (no hashset) cannot blame a part - the caller must
+        // fall back to re-opening the whole file.
+        let dir = tmpdir("localize-none");
+        let file: Vec<u8> = (0..400_000u32)
+            .map(|i| (i.wrapping_mul(13)) as u8)
+            .collect();
+        let hash = ed2k_hash(&file);
+        let store = PartStore::create(&dir, 1, hash, file.len() as u64, b"one.bin").unwrap();
+        let dl = Download::new(store);
+        dl.commit(0, &file).await.unwrap();
+        assert!(
+            !dl.localize_corruption().await,
+            "no hashset -> cannot localize"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
