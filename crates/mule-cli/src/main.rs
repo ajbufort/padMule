@@ -806,7 +806,7 @@ fn part_hashes(data: &[u8]) -> Vec<[u8; 16]> {
 /// Serve `path` to inbound peers on `port` (padMule as the UPLOADER). Used for
 /// the reverse differential test: a real amuled downloads this file from us.
 /// Serves every connection until killed.
-async fn cmd_serve_file(port: u16, path: &str) {
+async fn cmd_serve_file(port: u16, path: &str, eserver: Option<(String, u16)>) {
     let data = match std::fs::read(path) {
         Ok(d) => d,
         Err(e) => {
@@ -846,6 +846,55 @@ async fn cmd_serve_file(port: u16, path: &str) {
         data.len(),
         hex16(&hash)
     );
+
+    // Optionally log into a server and OFFER this file, advertising our serve
+    // port, so a downloader connected to the same server discovers us as a
+    // source and dials us (the reliable server-relayed path, vs a flaky
+    // link-embedded source). The offer is held for the life of the process.
+    if let Some((esrv_host, esrv_port)) = eserver {
+        use mule_engine::server_messages::{OfferedFile, FILE_COMPLETE_ID, FILE_COMPLETE_PORT};
+        let name = name.clone();
+        let size = data.len() as u64;
+        let mut login = demo_login();
+        login.tcp_port = port; // advertise our SERVE port (HighID callback + index)
+        tokio::spawn(async move {
+            let esrv = format!("{esrv_host}:{esrv_port}");
+            let Some(addr) = esrv.to_socket_addrs().ok().and_then(|mut i| i.next()) else {
+                eprintln!("cannot resolve eserver {esrv}");
+                return;
+            };
+            let (tx, rx) = mpsc::channel(64);
+            let printer = spawn_event_printer(rx);
+            let mut link = ServerLink::new(addr, login, tx);
+            match link.connect().await {
+                Ok(ServerState::Connected { id, low_id, .. }) => {
+                    println!("logged into eserver {esrv} (id={id:#x}, low_id={low_id})");
+                }
+                other => {
+                    eprintln!("eserver login failed: {other:?}");
+                    return;
+                }
+            }
+            let offer = OfferedFile {
+                hash,
+                name: &name,
+                size,
+            };
+            if let Err(e) = link
+                .offer_files(&[offer], FILE_COMPLETE_ID, FILE_COMPLETE_PORT)
+                .await
+            {
+                eprintln!("offer failed: {e}");
+                return;
+            }
+            println!(
+                "offered '{name}' (hash {}) to the eserver; holding",
+                hex16(&hash)
+            );
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            printer.abort();
+        });
+    }
 
     let me = HelloInfo::baseline(demo_user_hash(), 0, port, 4672, "padMule");
     loop {
@@ -2260,8 +2309,22 @@ async fn main() {
             }
         }
         Some("hash-file") if args.len() == 3 => cmd_hash_file(&args[2]),
-        Some("serve-file") if args.len() == 4 => match args[2].parse::<u16>() {
-            Ok(port) => cmd_serve_file(port, &args[3]).await,
+        Some("serve-file") if args.len() == 4 || args.len() == 6 => match args[2].parse::<u16>() {
+            Ok(port) => {
+                // Optional [eserver-host eserver-port]: also log in + offer the file.
+                let eserver = if args.len() == 6 {
+                    match args[5].parse::<u16>() {
+                        Ok(ep) => Some((args[4].clone(), ep)),
+                        Err(_) => {
+                            eprintln!("bad eserver port: {}", args[5]);
+                            return;
+                        }
+                    }
+                } else {
+                    None
+                };
+                cmd_serve_file(port, &args[3], eserver).await
+            }
             Err(_) => eprintln!("bad port: {}", args[2]),
         },
         Some("peer-probe") if args.len() == 5 => {
