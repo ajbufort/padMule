@@ -240,6 +240,11 @@ pub struct SecureIdentSession {
     sent_our_key: bool,
     sent_our_sig: bool,
     peer_verified: bool,
+    /// One RSA signature verify per connection (the real exchange sends exactly
+    /// one). Bounds a hostile peer that streams OP_SIGNATURE packets to force
+    /// repeated public-key verifies (eMule self-throttles the same way,
+    /// BaseClient.cpp m_dwLastSignatureIP).
+    verify_attempted: bool,
 }
 
 impl SecureIdentSession {
@@ -259,6 +264,7 @@ impl SecureIdentSession {
             sent_our_key: false,
             sent_our_sig: false,
             peer_verified: false,
+            verify_attempted: false,
         }
     }
 
@@ -334,9 +340,17 @@ impl SecureIdentSession {
         }
     }
 
-    /// Verify the peer's signature over `our_pubkey || our_challenge`.
+    /// Verify the peer's signature over `our_pubkey || our_challenge`. At most one
+    /// real RSA verify per connection: the honest exchange sends one signature, so
+    /// a peer streaming OP_SIGNATURE cannot force repeated public-key verifies. The
+    /// attempt is only consumed once we actually hold the peer's key (an early
+    /// signature that arrives before the key is a no-op, not the one attempt).
     fn try_verify(&mut self, sig: &[u8]) {
+        if self.peer_verified || self.verify_attempted {
+            return;
+        }
         if let Some(peer_pubkey) = &self.peer_pubkey {
+            self.verify_attempted = true;
             if self.our_challenge != 0
                 && verify_v1(peer_pubkey, &self.our_pubkey, self.our_challenge, sig)
             {
@@ -445,6 +459,33 @@ mod tests {
         a.on_packet(&a_id, sig_pkt.opcode, &sig_pkt.payload)
             .unwrap();
         assert!(!a.peer_verified(), "a forged signature must not verify");
+    }
+
+    #[test]
+    fn at_most_one_signature_verify_per_connection() {
+        // A hostile peer that streams OP_SIGNATURE cannot force repeated RSA
+        // verifies: the single verify attempt is spent on the first signature.
+        // Here a bogus signature arrives first (consuming the attempt), so even the
+        // correct one that follows is ignored - an honest peer sends exactly one.
+        let a_id = Identity::generate();
+        let b = Identity::generate();
+        let challenge = 0x5151_5151;
+        let mut a = SecureIdentSession::with_challenge(&a_id, challenge);
+        // A learns B's real public key.
+        let pk = build_public_key(b.public_key_der());
+        a.on_packet(&a_id, pk.opcode, &pk.payload).unwrap();
+        // First (garbage) signature spends the one attempt.
+        let garbage = build_signature(&[0u8; 48]);
+        a.on_packet(&a_id, garbage.opcode, &garbage.payload)
+            .unwrap();
+        assert!(!a.peer_verified());
+        // The correct signature now arrives but is NOT re-verified.
+        let valid = build_signature(&b.sign_v1(a.our_pubkey.as_slice(), challenge));
+        a.on_packet(&a_id, valid.opcode, &valid.payload).unwrap();
+        assert!(
+            !a.peer_verified(),
+            "the verify attempt is spent; the second signature is ignored"
+        );
     }
 
     #[test]
