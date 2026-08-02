@@ -143,6 +143,13 @@ where
             Err(FrameError::Closed) => return Ok(()),
             Err(e) => return Err(e),
         };
+        if std::env::var_os("SERVE_DEBUG").is_some() {
+            eprintln!(
+                "  serve <- opcode 0x{:02x} ({} bytes)",
+                pkt.opcode,
+                pkt.payload.len()
+            );
+        }
         match pkt.opcode {
             OP_REQUESTFILENAME => {
                 fs.write_packet(&build_req_filename_answer(&f.hash, f.name))
