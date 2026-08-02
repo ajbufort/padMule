@@ -472,34 +472,40 @@ where
         }
         match pkt.opcode {
             OP_REQUESTFILENAME => {
-                file = lookup(&pkt.payload);
-                match &file {
-                    Some(f) => {
-                        fs.write_packet(&build_req_filename_answer(&f.hash, &f.name))
+                // Only latch a file we actually found: a miss must not clear a
+                // file already named on this connection (aMule sets UploadFileID
+                // only when found, ClientTCPSocket.cpp:396).
+                if let Some(f) = lookup(&pkt.payload) {
+                    fs.write_packet(&build_req_filename_answer(&f.hash, &f.name))
+                        .await?;
+                    // Push our rating/comment right after the name, exactly as
+                    // eMule does (SendCommentInfo) - but only if we have one and
+                    // the peer advertised it accepts comments.
+                    if peer_accept_comment >= 1 && (f.rating != 0 || !f.comment.is_empty()) {
+                        fs.write_packet(&build_file_desc(f.rating, &f.comment))
                             .await?;
-                        // Push our rating/comment right after the name, exactly as
-                        // eMule does (SendCommentInfo) - but only if we have one and
-                        // the peer advertised it accepts comments.
-                        if peer_accept_comment >= 1 && (f.rating != 0 || !f.comment.is_empty()) {
-                            fs.write_packet(&build_file_desc(f.rating, &f.comment))
-                                .await?;
-                        }
                     }
-                    None => {
-                        if let Some(h) = head_hash(&pkt.payload) {
-                            fs.write_packet(&build_file_req_ans_no_fil(&h)).await?;
-                        }
-                    }
+                    file = Some(f);
                 }
+                // An UNKNOWN hash draws SILENCE, not FNF: both authorities just
+                // break (eMule 0.50a ListenSocket.cpp:374-380, which additionally
+                // tracks repeat askers via CheckFailedFileIdReqs; aMule
+                // ClientTCPSocket.cpp:381-385). OP_FILEREQANSNOFIL belongs to
+                // OP_SETREQFILEID and the multipackets - sending it here would
+                // also assert "I do not have that file" about a file we may hold.
             }
             OP_SETREQFILEID => {
-                if file.is_none() {
-                    file = lookup(&pkt.payload);
-                }
-                match &file {
+                // Always answer about the hash in THIS packet, like aMule
+                // (GetFileByID(fileID) on every request, ClientTCPSocket.cpp:440):
+                // a peer may switch files on one connection, so a previously
+                // latched file must not answer for a different hash. A miss gets
+                // FNF - this opcode is where FNF genuinely belongs - and does NOT
+                // clear the latch (aMule breaks before SetUploadFileID).
+                match lookup(&pkt.payload) {
                     Some(f) => {
                         fs.write_packet(&build_file_status_complete(&f.hash))
-                            .await?
+                            .await?;
+                        file = Some(f);
                     }
                     None => {
                         if let Some(h) = head_hash(&pkt.payload) {
@@ -542,7 +548,11 @@ where
                 }
             }
             OP_STARTUPLOADREQ => {
-                let Some(f) = file.clone() else { continue };
+                // Only queue a peer that has named a file we serve (aMule ignores
+                // the request unless GetFileByID found one, ClientTCPSocket.cpp:546).
+                if file.is_none() {
+                    continue;
+                }
                 // Already holding a slot (e.g. the peer re-asks): re-accept.
                 if permit.is_some() {
                     fs.write_packet(&build_accept_upload()).await?;
@@ -564,9 +574,14 @@ where
                             None => {
                                 let score_key = leecher_score_key(&credit, &sec);
                                 let Some(waiter) = g.enqueue(score_key) else {
-                                    // Queue full - identity-independent refusal; the
-                                    // peer moves on and may reconnect.
-                                    fs.write_packet(&build_file_req_ans_no_fil(&f.hash)).await?;
+                                    // Queue full - identity-independent refusal,
+                                    // answered with SILENCE like upstream: aMule's
+                                    // AddClientToQueue simply returns when
+                                    // m_waitinglist is at QueueSize
+                                    // (UploadQueue.cpp:508-510), sending no packet.
+                                    // (padMule additionally closes here rather than
+                                    // holding an unqueued socket open - foreground
+                                    // -only, so an idle serve task is not free.)
                                     return Ok(());
                                 };
                                 let rank = (waiter.rank).min(u16::MAX as usize) as u16;
@@ -1198,6 +1213,75 @@ mod tests {
         assert_eq!(ans.opcode, OP_MULTIPACKETANSWER);
         assert_eq!(&ans.payload[..16], &hash);
         assert_eq!(ans.payload[16], OP_REQFILENAMEANSWER);
+
+        drop(fs);
+        up.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_unknown_file_request_is_answered_with_silence_not_fnf() {
+        // BOTH authorities stay SILENT on an unknown-hash OP_REQUESTFILENAME:
+        // eMule 0.50a ListenSocket.cpp:374-380 (CheckFailedFileIdReqs then
+        // break, no packet - it even tracks repeat askers for banning) and aMule
+        // ClientTCPSocket.cpp:381-385 (plain break). FNF (OP_FILEREQANSNOFIL) is
+        // reserved for OP_SETREQFILEID / the multipackets. Answering it here also
+        // asserts "I do not have that file" about a file we may well have.
+        use crate::transfer::{
+            build_request_filename_ext, OP_FILEREQANSNOFIL, OP_REQFILENAMEANSWER, OP_SETREQFILEID,
+        };
+        let known = [0x5A; 16];
+        let unknown = [0x5B; 16];
+        let shared = vec![SharedFile {
+            hash: known,
+            size: 100,
+            name: b"known.bin".to_vec(),
+            part_hashes: vec![],
+            path: PathBuf::from("/does/not/matter"),
+            rating: 0,
+            comment: String::new(),
+        }];
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let up = tokio::spawn(async move {
+            let me = HelloInfo::baseline([0xBB; 16], 0, 4662, 4672, "seed");
+            if let Ok((_p, mut fs)) = accept_peer(&listener, &me).await {
+                let _ = serve_shared(&mut fs, &shared, None, None, 0, None, None).await;
+            }
+        });
+
+        let me = HelloInfo::baseline([0xAA; 16], 0x0A00_0001, 4663, 4673, "dl");
+        let (_p, mut fs) = connect_peer(addr, &me).await.unwrap();
+
+        // Ask by NAME for a hash we do not serve -> silence.
+        fs.write_packet(&build_request_filename_ext(&unknown))
+            .await
+            .unwrap();
+        // Then ask for a file we DO serve: its answer must be the next packet,
+        // proving nothing was emitted for the unknown one.
+        fs.write_packet(&build_request_filename_ext(&known))
+            .await
+            .unwrap();
+        let ans = fs.read_packet().await.unwrap();
+        assert_eq!(
+            ans.opcode, OP_REQFILENAMEANSWER,
+            "an unknown OP_REQUESTFILENAME must draw NO packet at all"
+        );
+        assert_eq!(&ans.payload[..16], &known);
+
+        // OP_SETREQFILEID is the opcode that DOES get FNF (both authorities).
+        fs.write_packet(&mule_proto::Packet::new(
+            mule_proto::PROT_EMULE,
+            OP_SETREQFILEID,
+            unknown.to_vec(),
+        ))
+        .await
+        .unwrap();
+        let ans = fs.read_packet().await.unwrap();
+        assert_eq!(
+            ans.opcode, OP_FILEREQANSNOFIL,
+            "OP_SETREQFILEID keeps its FNF answer"
+        );
 
         drop(fs);
         up.await.unwrap();
