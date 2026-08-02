@@ -6,12 +6,13 @@
 
 use crate::framed::{FrameError, FramedStream};
 use crate::transfer::{
-    build_accept_upload, build_file_status, build_file_status_complete, build_hashset_answer,
-    build_req_filename_answer, build_request_filename_ext, build_request_parts, build_sending_part,
-    build_set_req_file_id, build_start_upload_req, parse_file_status, parse_request_parts,
+    build_accept_upload, build_file_req_ans_no_fil, build_file_status, build_file_status_complete,
+    build_hashset_answer, build_multipacket_answer, build_req_filename_answer,
+    build_request_filename_ext, build_request_parts, build_sending_part, build_set_req_file_id,
+    build_start_upload_req, parse_file_status, parse_multipacket_hash, parse_request_parts,
     BlockReceiver, EMBLOCKSIZE, OP_ACCEPTUPLOADREQ, OP_FILEREQANSNOFIL, OP_FILESTATUS,
-    OP_HASHSETREQUEST, OP_REQUESTFILENAME, OP_REQUESTPARTS, OP_REQUESTPARTS_I64, OP_SETREQFILEID,
-    OP_STARTUPLOADREQ, STANDARD_BLOCKS_REQUEST,
+    OP_HASHSETREQUEST, OP_MULTIPACKET, OP_MULTIPACKET_EXT, OP_REQUESTFILENAME, OP_REQUESTPARTS,
+    OP_REQUESTPARTS_I64, OP_SETREQFILEID, OP_STARTUPLOADREQ, STANDARD_BLOCKS_REQUEST,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -162,6 +163,20 @@ where
                 };
                 fs.write_packet(&p).await?;
             }
+            OP_MULTIPACKET | OP_MULTIPACKET_EXT => {
+                // A capable downloader bundles the whole file request into one
+                // packet. Answer with the name + status pair (build_multipacket_answer
+                // documents why the bundled sub-requests need no parsing); an unknown
+                // hash gets OP_FILEREQANSNOFIL, exactly as the individual path would.
+                match parse_multipacket_hash(&pkt.payload) {
+                    Ok(h) if h == f.hash => {
+                        fs.write_packet(&build_multipacket_answer(&f.hash, f.name, f.available))
+                            .await?;
+                    }
+                    Ok(h) => fs.write_packet(&build_file_req_ans_no_fil(&h)).await?,
+                    Err(_) => {} // malformed multipacket - ignore
+                }
+            }
             OP_HASHSETREQUEST => {
                 fs.write_packet(&build_hashset_answer(&f.hash, f.part_hashes))
                     .await?;
@@ -259,6 +274,53 @@ mod tests {
         assert_eq!(ed2k_hash(&got), hash);
 
         drop(fs); // closes the connection so the uploader returns
+        uploader.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn serve_answers_a_multipacket_with_name_and_status() {
+        use crate::transfer::{OP_MULTIPACKETANSWER, OP_MULTIPACKET_EXT, OP_REQFILENAMEANSWER};
+        use mule_proto::{Packet, PROT_EMULE};
+
+        let data = vec![0xABu8; 1000];
+        let hash = ed2k_hash(&data);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let up_data = data.clone();
+        let up_hash = hash;
+        let uploader = tokio::spawn(async move {
+            let bob = HelloInfo::baseline([0xBB; 16], 0, 4662, 4672, "bob");
+            let (_peer, mut fs) = accept_peer(&listener, &bob).await.unwrap();
+            serve_file(&mut fs, &up_hash, b"clip.bin", &up_data)
+                .await
+                .unwrap();
+        });
+
+        let alice = HelloInfo::baseline([0xAA; 16], 0x0A00_0001, 4663, 4673, "alice");
+        let (_peer, mut fs) = connect_peer(addr, &alice).await.unwrap();
+
+        // A downloader that supports multipacket bundles the whole file request:
+        // <hash><u64 size><0x58 OP_REQUESTFILENAME + extended info>...
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&hash);
+        payload.extend_from_slice(&(data.len() as u64).to_le_bytes());
+        payload.push(OP_REQUESTFILENAME); // a bundled sub-request; serve ignores the body
+        fs.write_packet(&Packet::new(PROT_EMULE, OP_MULTIPACKET_EXT, payload))
+            .await
+            .unwrap();
+
+        let ans =
+            tokio::time::timeout(std::time::Duration::from_secs(2), fs.read_packet_unpacked())
+                .await
+                .expect("serve must answer the multipacket")
+                .unwrap();
+        assert_eq!(ans.opcode, OP_MULTIPACKETANSWER);
+        assert_eq!(&ans.payload[..16], &hash); // hash first
+        assert_eq!(ans.payload[16], OP_REQFILENAMEANSWER); // then the name sub-answer
+
+        drop(fs);
         uploader.await.unwrap();
     }
 

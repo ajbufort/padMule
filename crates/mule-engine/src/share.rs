@@ -57,9 +57,9 @@ impl Drop for WaitTicket<'_> {
 use crate::framed::{FrameError, FramedStream};
 use crate::transfer::{
     build_accept_upload, build_file_desc, build_file_req_ans_no_fil, build_file_status_complete,
-    build_hashset_answer, build_queue_ranking, build_req_filename_answer, build_sending_part,
-    parse_request_parts, OP_HASHSETREQUEST, OP_REQUESTFILENAME, OP_REQUESTPARTS,
-    OP_REQUESTPARTS_I64, OP_SETREQFILEID, OP_STARTUPLOADREQ,
+    build_hashset_answer, build_multipacket_answer, build_queue_ranking, build_req_filename_answer,
+    build_sending_part, parse_request_parts, OP_HASHSETREQUEST, OP_MULTIPACKET, OP_MULTIPACKET_EXT,
+    OP_REQUESTFILENAME, OP_REQUESTPARTS, OP_REQUESTPARTS_I64, OP_SETREQFILEID, OP_STARTUPLOADREQ,
 };
 
 /// A bounded upload gate: `slots` concurrent uploads plus a wait queue. When
@@ -121,8 +121,20 @@ pub struct SharedFile {
 /// inbound listener uses this to tell a leecher (which talks first) from a
 /// called-back LowID source (which stays silent, waiting for us to drive the
 /// download of one of OUR files).
+///
+/// Includes OP_MULTIPACKET(_EXT): a capable downloader that saw our advertised
+/// multipacket bit LEADS with the bundled request instead of a bare
+/// OP_REQUESTFILENAME (aMule DownloadClient.cpp:214 SendFileRequest), so the
+/// listener must recognise it as the opening upload request too.
 pub fn is_upload_request(op: u8) -> bool {
-    matches!(op, OP_REQUESTFILENAME | OP_SETREQFILEID | OP_STARTUPLOADREQ)
+    matches!(
+        op,
+        OP_REQUESTFILENAME
+            | OP_SETREQFILEID
+            | OP_STARTUPLOADREQ
+            | OP_MULTIPACKET
+            | OP_MULTIPACKET_EXT
+    )
 }
 
 /// The 16-byte file hash at the head of an upload-request payload, if present.
@@ -186,6 +198,13 @@ where
                 Err(_) => return Ok(()), // idle timeout
             },
         };
+        if std::env::var_os("SERVE_DEBUG").is_some() {
+            eprintln!(
+                "  serve <- opcode 0x{:02x} ({} bytes)",
+                pkt.opcode,
+                pkt.payload.len()
+            );
+        }
         match pkt.opcode {
             OP_REQUESTFILENAME => {
                 file = lookup(&pkt.payload);
@@ -217,6 +236,33 @@ where
                         fs.write_packet(&build_file_status_complete(&f.hash))
                             .await?
                     }
+                    None => {
+                        if let Some(h) = head_hash(&pkt.payload) {
+                            fs.write_packet(&build_file_req_ans_no_fil(&h)).await?;
+                        }
+                    }
+                }
+            }
+            OP_MULTIPACKET | OP_MULTIPACKET_EXT => {
+                // A capable downloader bundles its whole file request into one
+                // packet. Answer name + status in one OP_MULTIPACKETANSWER (see
+                // build_multipacket_answer). We serve complete files only, so the
+                // status is a 0 part count; the comment is NOT bundled - eMule/aMule
+                // never put OP_FILEDESC in a multipacket answer, and the downloader's
+                // reader would desync on it (ClientTCPSocket.cpp:1258 handles only
+                // name/status/AICH).
+                match lookup(&pkt.payload) {
+                    Some(f) => {
+                        fs.write_packet(&build_multipacket_answer(&f.hash, &f.name, None))
+                            .await?;
+                        // Latch it so a following OP_STARTUPLOADREQ/OP_REQUESTPARTS
+                        // knows which file this peer is after.
+                        file = Some(f);
+                    }
+                    // Unknown hash: send FNF but do NOT clear a file already latched
+                    // for THIS connection - a peer may serve-request several files
+                    // over one connection (aMule sets UploadFileID only when found,
+                    // ClientTCPSocket.cpp:1120).
                     None => {
                         if let Some(h) = head_hash(&pkt.payload) {
                             fs.write_packet(&build_file_req_ans_no_fil(&h)).await?;
@@ -389,6 +435,77 @@ mod tests {
         drop(fs);
         up.await.unwrap();
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn is_upload_request_recognises_the_opening_opcodes() {
+        use crate::transfer::{
+            OP_MULTIPACKET, OP_MULTIPACKET_EXT, OP_REQUESTFILENAME, OP_SETREQFILEID,
+            OP_STARTUPLOADREQ,
+        };
+        // A multipacket-capable leecher LEADS with OP_MULTIPACKET(_EXT); the
+        // listener gate must admit it, or the connection is dropped unanswered.
+        for op in [
+            OP_REQUESTFILENAME,
+            OP_SETREQFILEID,
+            OP_STARTUPLOADREQ,
+            OP_MULTIPACKET,
+            OP_MULTIPACKET_EXT,
+        ] {
+            assert!(
+                is_upload_request(op),
+                "opcode 0x{op:02x} must open a serve session"
+            );
+        }
+        // A called-back source stays silent; a data opcode is not an opener.
+        assert!(!is_upload_request(0x46)); // OP_SENDINGPART
+    }
+
+    #[tokio::test]
+    async fn serve_shared_answers_a_multipacket_with_name_and_status() {
+        use crate::transfer::{
+            OP_MULTIPACKETANSWER, OP_MULTIPACKET_EXT, OP_REQFILENAMEANSWER, OP_REQUESTFILENAME,
+        };
+        use mule_proto::{Packet, PROT_EMULE};
+        let hash = [0x79; 16];
+        let shared = vec![SharedFile {
+            hash,
+            size: 100,
+            name: b"multi.bin".to_vec(),
+            part_hashes: vec![],
+            path: PathBuf::from("/does/not/matter"),
+            rating: 0,
+            comment: String::new(),
+        }];
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let up = tokio::spawn(async move {
+            let me = HelloInfo::baseline([0xBB; 16], 0, 4662, 4672, "seed");
+            if let Ok((_p, mut fs)) = accept_peer(&listener, &me).await {
+                let _ = serve_shared(&mut fs, &shared, None, None, 0).await;
+            }
+        });
+
+        let me = HelloInfo::baseline([0xAA; 16], 0x0A00_0001, 4663, 4673, "dl");
+        let (_p, mut fs) = connect_peer(addr, &me).await.unwrap();
+
+        // OP_MULTIPACKET_EXT for the shared file: <hash><u64 size><0x58 ...>.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&hash);
+        payload.extend_from_slice(&100u64.to_le_bytes());
+        payload.push(OP_REQUESTFILENAME);
+        fs.write_packet(&Packet::new(PROT_EMULE, OP_MULTIPACKET_EXT, payload))
+            .await
+            .unwrap();
+
+        let ans = fs.read_packet().await.unwrap();
+        assert_eq!(ans.opcode, OP_MULTIPACKETANSWER);
+        assert_eq!(&ans.payload[..16], &hash);
+        assert_eq!(ans.payload[16], OP_REQFILENAMEANSWER);
+
+        drop(fs);
+        up.await.unwrap();
     }
 
     #[tokio::test]

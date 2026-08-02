@@ -23,8 +23,8 @@ use mule_engine::sources::{build_callback_request, build_get_sources, parse_foun
 use mule_engine::{
     catalog, connect_peer, connect_peer_obf, connect_server, download_file, download_from_peer,
     download_from_peer_at, fetch_from_sources, login_handshake, obf_accept, peer_handshake_inbound,
-    serve, Download, FramedStream, Identity, KadNode, ManagerConfig, ObfDetect, PartStore,
-    SecIdentCtx, ServedFile, ServerEvent, ServerLink, ServerState, SourceRegistry,
+    serve_shared, Download, FramedStream, Identity, KadNode, ManagerConfig, ObfDetect, PartStore,
+    SecIdentCtx, ServerEvent, ServerLink, ServerState, SharedFile, SourceRegistry,
 };
 use mule_files::{read_nodes_dat, read_server_met};
 use mule_proto::{ed2k_hash, Kad128};
@@ -896,7 +896,10 @@ async fn cmd_serve_file(port: u16, path: &str, eserver: Option<(String, u16)>) {
         });
     }
 
+    use mule_engine::share::is_upload_request;
     let me = HelloInfo::baseline(demo_user_hash(), 0, port, 4672, "padMule");
+    let size = data.len() as u64;
+    let path_buf = std::path::PathBuf::from(path);
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(v) => v,
@@ -908,8 +911,8 @@ async fn cmd_serve_file(port: u16, path: &str, eserver: Option<(String, u16)>) {
         println!("inbound peer {peer}");
         let me = me.clone();
         let phs = phs.clone();
-        let data = data.clone();
         let name = name.clone();
+        let path_buf = path_buf.clone();
         tokio::spawn(async move {
             let mut stream = stream;
             // Auto-detect obfuscation (real aMule requests it by default) keyed
@@ -931,14 +934,35 @@ async fn cmd_serve_file(port: u16, path: &str, eserver: Option<(String, u16)>) {
                 eprintln!("  handshake failed: {e}");
                 return;
             }
-            let f = ServedFile {
-                hash,
-                name: name.as_bytes(),
-                data: &data,
-                part_hashes: &phs,
-                available: None,
+            // Serve through the SAME production path a real inbound peer hits on
+            // the device: peek the opening packet, gate on is_upload_request, then
+            // serve_shared. This makes the reverse oracle exercise the real listener
+            // classifier + serve loop (including the multipacket opener), not a
+            // bespoke demo path - the gap the adversarial review exposed.
+            let first = match fs.read_packet_unpacked().await {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("  read failed: {e}");
+                    return;
+                }
             };
-            match serve(&mut fs, &f).await {
+            if !is_upload_request(first.opcode) {
+                eprintln!(
+                    "  peer {peer} opened with 0x{:02x} (not an upload request); closing",
+                    first.opcode
+                );
+                return;
+            }
+            let shared = vec![SharedFile {
+                hash,
+                size,
+                name: name.into_bytes(),
+                part_hashes: phs,
+                path: path_buf,
+                rating: 0,
+                comment: String::new(),
+            }];
+            match serve_shared(&mut fs, &shared, Some(first), None, 0).await {
                 Ok(()) => println!("  peer {peer} done"),
                 Err(e) => eprintln!("  serve ended: {e}"),
             }
