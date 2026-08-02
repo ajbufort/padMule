@@ -15,12 +15,10 @@
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use mule_proto::Packet;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::{timeout, Duration};
 
 /// Drop a serve connection that goes silent this long between packets. Bounds
@@ -30,29 +28,6 @@ const SERVE_IDLE: Duration = Duration::from_secs(60);
 /// Longest a queued peer waits in place for a slot before we close its
 /// connection (it can reconnect). Bounds how long a waiter ties up a task/fd.
 const QUEUE_WAIT: Duration = Duration::from_secs(120);
-
-/// Undoes an `UploadGate` wait-count increment on drop, so a peer that
-/// disconnects while queued (a write error, or the serve future being dropped
-/// mid-await) can never leak queue capacity. Without this, `waiting` would
-/// ratchet up until `queue_cap` is reached and no peer is ever queued again.
-struct WaitTicket<'a> {
-    gate: &'a UploadGate,
-}
-
-impl<'a> WaitTicket<'a> {
-    /// Take a queue ticket. Returns the guard plus how many peers were already
-    /// waiting ahead (the caller's 0-based position).
-    fn enter(gate: &'a UploadGate) -> (Self, usize) {
-        let ahead = gate.waiting.fetch_add(1, Ordering::AcqRel);
-        (WaitTicket { gate }, ahead)
-    }
-}
-
-impl Drop for WaitTicket<'_> {
-    fn drop(&mut self) {
-        self.gate.waiting.fetch_sub(1, Ordering::AcqRel);
-    }
-}
 
 use crate::credit_store::{now_secs, CreditStore};
 use crate::framed::{FrameError, FramedStream};
@@ -66,42 +41,149 @@ use crate::transfer::{
     OP_REQUESTFILENAME, OP_REQUESTPARTS, OP_REQUESTPARTS_I64, OP_SETREQFILEID, OP_STARTUPLOADREQ,
 };
 
-/// A bounded upload gate: `slots` concurrent uploads plus a wait queue. When
-/// every slot is busy, a new requester is queued and told its 1-based place
-/// (OP_QUEUERANKING), then granted a slot IN PLACE on the connection we already
-/// hold open the moment one frees.
+/// A bounded upload gate: `slots_total` concurrent uploads plus a wait queue
+/// ordered by CREDIT SCORE. When every slot is busy a new requester is queued and
+/// told its 1-based place (OP_QUEUERANKING), then granted a slot IN PLACE on the
+/// connection we already hold open the moment one frees - the BEST-scored waiter
+/// first (eMule's score-ordered queue, ClientCredits/UploadQueue).
 ///
-/// Deliberately scoped to that held connection: no cross-connection queue
-/// persistence, no slot-grant dial-out to an idled peer, and no UDP
-/// OP_REASKFILEPING handling. Those are the always-on desktop-seedbox parts of
-/// eMule's design; padMule is foreground-only (sockets die on background), so a
-/// long-lived queue would be dishonest here. Rank is arrival-order (FIFO); the
-/// wire number is truthful for that ordering, and eMule's score-ordered queue
-/// is wire-neutral local policy we can layer on later.
+/// REWEIGHT-ONLY / NEVER-REFUSE: the score only reorders the queue. No peer is
+/// ever denied a slot on its score (score is clamped >= 1.0); a low-credit peer
+/// just waits longer, bounded by QUEUE_WAIT, and may reconnect. Admission is
+/// refused ONLY when the queue is at `queue_cap` - independent of identity/score.
 ///
-/// The announced rank is a BEST-EFFORT snapshot taken when the peer is queued,
-/// not a promise: a slot that frees while the peer is still writing its rank can
-/// be taken by a peer already parked in `acquire_owned` or by a newcomer's
-/// `try_acquire_owned`, so actual grant order is only approximately FIFO. eMule
-/// ranks are likewise advisory (recomputed on demand, not a reservation).
+/// Deliberately scoped to the held connection: no cross-connection queue
+/// persistence, no slot-grant dial-out to an idled peer, no UDP OP_REASKFILEPING.
+/// Those are the always-on desktop-seedbox parts of eMule's design; padMule is
+/// foreground-only. The announced rank is a BEST-EFFORT snapshot at queue time;
+/// a later-arriving higher-credit peer can outrank it, as in eMule.
 pub struct UploadGate {
-    slots: Arc<Semaphore>,
-    waiting: AtomicUsize,
+    inner: std::sync::Mutex<GateInner>,
+    /// Woken (all waiters) whenever a slot frees or a waiter leaves; each parked
+    /// waiter re-checks whether IT is now the best with a slot to take.
+    notify: tokio::sync::Notify,
     queue_cap: usize,
 }
 
+struct GateInner {
+    slots_free: usize,
+    /// Waiters BEST-FIRST: `(Reverse(score_key), seq)`. Higher score sorts first;
+    /// `seq` breaks ties in arrival (FIFO) order.
+    waiters: std::collections::BTreeSet<(std::cmp::Reverse<u32>, u64)>,
+    next_seq: u64,
+}
+
 impl UploadGate {
-    pub fn new(slots: Arc<Semaphore>, queue_cap: usize) -> Self {
+    pub fn new(slots_total: usize, queue_cap: usize) -> Self {
         UploadGate {
-            slots,
-            waiting: AtomicUsize::new(0),
+            inner: std::sync::Mutex::new(GateInner {
+                slots_free: slots_total,
+                waiters: std::collections::BTreeSet::new(),
+                next_seq: 0,
+            }),
+            notify: tokio::sync::Notify::new(),
             queue_cap,
         }
     }
 
     /// Currently-waiting (queued, not yet granted) peers. For tests/telemetry.
     pub fn waiting(&self) -> usize {
-        self.waiting.load(Ordering::Acquire)
+        self.inner.lock().unwrap().waiters.len()
+    }
+
+    /// Grant a slot immediately IFF one is free AND nobody is queued - a newcomer
+    /// must never jump ahead of waiting peers. Returns a guard that frees the slot
+    /// (and wakes the best waiter) on drop.
+    pub fn try_grant(self: &Arc<Self>) -> Option<SlotGuard> {
+        let mut g = self.inner.lock().unwrap();
+        if g.slots_free > 0 && g.waiters.is_empty() {
+            g.slots_free -= 1;
+            Some(SlotGuard {
+                gate: Arc::clone(self),
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Enqueue a waiter with `score_key` (higher = better). Returns its 1-based
+    /// rank snapshot + a handle to await a slot, or `None` if the queue is full
+    /// (the only refusal, and it is identity-independent).
+    pub fn enqueue(self: &Arc<Self>, score_key: u32) -> Option<QueueWaiter> {
+        let mut g = self.inner.lock().unwrap();
+        if g.waiters.len() >= self.queue_cap {
+            return None;
+        }
+        let seq = g.next_seq;
+        g.next_seq += 1;
+        let key = (std::cmp::Reverse(score_key), seq);
+        // Rank = how many already-queued waiters outrank me, + 1.
+        let rank = g.waiters.range(..key).count() + 1;
+        g.waiters.insert(key);
+        Some(QueueWaiter {
+            gate: Arc::clone(self),
+            key,
+            rank,
+            done: false,
+        })
+    }
+}
+
+/// Holds one upload slot; frees it (and wakes the best waiter) on drop.
+pub struct SlotGuard {
+    gate: Arc<UploadGate>,
+}
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        self.gate.inner.lock().unwrap().slots_free += 1;
+        // Wake all parked waiters; the best-scored one re-checks and takes it.
+        self.gate.notify.notify_waiters();
+    }
+}
+
+/// A queued waiter. Await [`QueueWaiter::granted`] for a slot; DROPPING it before
+/// then (a disconnect or a QUEUE_WAIT timeout) removes it from the queue so it can
+/// never block the peers behind it - the leak-proofing the old WaitTicket gave.
+pub struct QueueWaiter {
+    gate: Arc<UploadGate>,
+    key: (std::cmp::Reverse<u32>, u64),
+    pub rank: usize,
+    done: bool,
+}
+
+impl QueueWaiter {
+    /// Wait until this waiter is the BEST queued AND a slot is free, then take it.
+    pub async fn granted(mut self) -> SlotGuard {
+        loop {
+            // Arm the wake BEFORE checking, so a slot freed between the check and
+            // the await is captured (notify_waiters does not store a permit).
+            let notified = self.gate.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let mut g = self.gate.inner.lock().unwrap();
+                if g.slots_free > 0 && g.waiters.iter().next() == Some(&self.key) {
+                    g.slots_free -= 1;
+                    g.waiters.remove(&self.key);
+                    self.done = true; // taken: Drop must not re-remove or re-notify
+                    return SlotGuard {
+                        gate: Arc::clone(&self.gate),
+                    };
+                }
+            }
+            notified.await;
+        }
+    }
+}
+
+impl Drop for QueueWaiter {
+    fn drop(&mut self) {
+        if !self.done {
+            self.gate.inner.lock().unwrap().waiters.remove(&self.key);
+            // Our departure may make a slot claimable by the next-best waiter.
+            self.gate.notify.notify_waiters();
+        }
     }
 }
 
@@ -162,6 +244,26 @@ pub type CreditCtx = (Arc<CreditStore>, [u8; 16]);
 
 /// Fired once with the peer's public key when its serve-side identity verifies.
 pub type VerifiedSink = Box<dyn FnMut(&[u8]) + Send>;
+
+/// The upload-queue score KEY (higher = better) for the leecher on this connection:
+/// its stored credit ratio, gated by whether it has verified its identity THIS
+/// session. `None` credit (tests / CLI) or an unknown peer yields the floor. The
+/// `[1.0, 10.0]` ratio is scaled to an integer key for the queue ordering.
+fn leecher_score_key(credit: &Option<CreditCtx>, sec: &Option<ServeSec>) -> u32 {
+    let ratio = match credit {
+        Some((store, uh)) => {
+            // Transient per-connection verified IP: a peer that proved its identity
+            // this session is treated as Identified (we do not track the IP here, so
+            // verified_ip == current_ip == 0). Verification may still be pending (the
+            // signature can arrive after this request), in which case it scores as an
+            // unverified key-bearer for THIS admission - conservative, and fine.
+            let verified_ip = sec.as_ref().filter(|s| s.verified()).map(|_| 0u32);
+            store.score(uh, verified_ip, 0, false)
+        }
+        None => 1.0,
+    };
+    (ratio * 1000.0) as u32
+}
 
 /// Our secure-ident state for an inbound serve connection: the session, our RSA
 /// identity, and a sink fired ONCE when the peer proves it owns its userhash.
@@ -330,7 +432,7 @@ pub async fn serve_shared<S>(
     fs: &mut FramedStream<S>,
     library: &[SharedFile],
     first: Option<Packet>,
-    gate: Option<&UploadGate>,
+    gate: Option<&Arc<UploadGate>>,
     peer_accept_comment: u8,
     mut sec: Option<ServeSec>,
     credit: Option<CreditCtx>,
@@ -346,7 +448,7 @@ where
     // The upload slot, held for the whole session once granted (immediately if a
     // slot is free, or after queueing). Kept alive here so dropping it on return
     // frees the slot for the next waiter.
-    let mut permit: Option<OwnedSemaphorePermit> = None;
+    let mut permit: Option<SlotGuard> = None;
     let mut pending = first;
     loop {
         let pkt = match pending.take() {
@@ -450,42 +552,36 @@ where
                     // Ungated (tests / the differential serve path): grant freely.
                     None => fs.write_packet(&build_accept_upload()).await?,
                     Some(g) => {
-                        match Arc::clone(&g.slots).try_acquire_owned() {
-                            // A slot was free - grant it right away.
-                            Ok(p) => {
-                                permit = Some(p);
+                        match g.try_grant() {
+                            // A slot was free (and nobody queued) - grant it now.
+                            Some(guard) => {
+                                permit = Some(guard);
                                 fs.write_packet(&build_accept_upload()).await?;
                             }
-                            // At capacity: queue this peer (bounded) and send its
-                            // 1-based rank, then wait in place for a slot. The
-                            // ticket decrements `waiting` on EVERY exit (a write
-                            // error or a dropped future included), so the count
-                            // cannot leak.
-                            Err(_) => {
-                                let (ticket, ahead) = WaitTicket::enter(g);
-                                if ahead >= g.queue_cap {
-                                    drop(ticket);
+                            // At capacity: queue this peer by its CREDIT SCORE and
+                            // send its 1-based rank, then wait for a slot (the best
+                            // waiter first), bounded so it cannot tie up forever.
+                            None => {
+                                let score_key = leecher_score_key(&credit, &sec);
+                                let Some(waiter) = g.enqueue(score_key) else {
+                                    // Queue full - identity-independent refusal; the
+                                    // peer moves on and may reconnect.
                                     fs.write_packet(&build_file_req_ans_no_fil(&f.hash)).await?;
                                     return Ok(());
-                                }
-                                let rank = ahead.saturating_add(1).min(u16::MAX as usize) as u16;
+                                };
+                                let rank = (waiter.rank).min(u16::MAX as usize) as u16;
                                 // eMule bans a peer that receives an UNSOLICITED
                                 // rank; only ever send it in reply to this ask.
                                 fs.write_packet(&build_queue_ranking(rank)).await?;
-                                // Wait in place for a freed slot (the fair
-                                // semaphore favours the longest waiter), bounded so
-                                // a waiter cannot tie up the connection forever.
-                                let granted =
-                                    timeout(QUEUE_WAIT, Arc::clone(&g.slots).acquire_owned()).await;
-                                drop(ticket); // no longer waiting, however this went
-                                match granted {
-                                    Ok(Ok(p)) => {
-                                        permit = Some(p);
+                                match timeout(QUEUE_WAIT, waiter.granted()).await {
+                                    Ok(guard) => {
+                                        permit = Some(guard);
                                         fs.write_packet(&build_accept_upload()).await?;
                                     }
-                                    // Timed out, or the gate closed: close the
-                                    // connection; the peer may reconnect.
-                                    _ => return Ok(()),
+                                    // Timed out: the waiter is dropped here, which
+                                    // removes it from the queue. Close; peer may
+                                    // reconnect.
+                                    Err(_) => return Ok(()),
                                 }
                             }
                         }
@@ -546,22 +642,50 @@ mod tests {
     use mule_proto::{ed2k_hash, md4, PARTSIZE};
     use tokio::net::TcpListener;
 
+    #[tokio::test]
+    async fn queue_grants_the_highest_credit_waiter_first() {
+        // The reweight: with one slot held, a LOW-credit peer queues first and a
+        // HIGH-credit peer second - the high one must still be granted first.
+        let gate = Arc::new(UploadGate::new(1, 32));
+        let held = gate.try_grant().unwrap();
+        let low = gate.enqueue(1_000).unwrap(); // score 1.0
+        let high = gate.enqueue(9_000).unwrap(); // score 9.0
+        assert_eq!(gate.waiting(), 2);
+        assert_eq!(high.rank, 1, "the higher-credit waiter is ranked ahead");
+        assert_eq!(low.rank, 1, "low's rank was 1 when it alone was queued");
+        drop(held); // free the only slot; the BEST waiter wins, not the earliest
+        let winner = tokio::select! {
+            _ = high.granted() => "high",
+            _ = low.granted() => "low",
+        };
+        assert_eq!(winner, "high", "credit outranks arrival order");
+    }
+
     #[test]
-    fn wait_ticket_increments_on_enter_and_decrements_on_drop() {
-        // The RAII guard is what keeps a disconnect-while-queued from leaking
-        // queue capacity: whatever exit path the serve loop takes, the ticket's
-        // Drop runs and undoes the increment.
-        let gate = UploadGate::new(std::sync::Arc::new(Semaphore::new(1)), 32);
-        assert_eq!(gate.waiting(), 0);
-        {
-            let (_t, ahead) = WaitTicket::enter(&gate);
-            assert_eq!(ahead, 0, "first waiter sees nobody ahead");
-            assert_eq!(gate.waiting(), 1);
-            let (_t2, ahead2) = WaitTicket::enter(&gate);
-            assert_eq!(ahead2, 1, "second waiter sees one ahead");
-            assert_eq!(gate.waiting(), 2);
-        } // both tickets drop here (as they would on any serve-loop exit)
-        assert_eq!(gate.waiting(), 0, "the count is fully released on drop");
+    fn a_dropped_waiter_leaves_the_queue() {
+        // Leak-proofing: a peer that disconnects (or times out) while queued is
+        // removed, so it can never block the peers behind it.
+        let gate = Arc::new(UploadGate::new(1, 32));
+        let _held = gate.try_grant().unwrap();
+        let w = gate.enqueue(5_000).unwrap();
+        assert_eq!(gate.waiting(), 1);
+        drop(w);
+        assert_eq!(gate.waiting(), 0, "a dropped waiter is removed");
+    }
+
+    #[test]
+    fn the_queue_refuses_only_at_capacity_never_on_score() {
+        // never-refuse-on-identity: even a floor-score (1.0) peer is admitted while
+        // there is room; the ONLY refusal is a full queue, independent of score.
+        let gate = Arc::new(UploadGate::new(1, 2));
+        let _held = gate.try_grant().unwrap();
+        let _w1 = gate.enqueue(1_000).unwrap(); // floor score, admitted
+        let _w2 = gate.enqueue(10_000).unwrap();
+        assert!(
+            gate.enqueue(10_000).is_none(),
+            "a 3rd is refused for CAPACITY, not its score"
+        );
+        assert_eq!(gate.waiting(), 2);
     }
 
     fn tmpdir(tag: &str) -> PathBuf {
@@ -665,6 +789,126 @@ mod tests {
             .find(|e| e.user_hash == peer_hash)
             .unwrap();
         assert_eq!(e.uploaded, data.len() as u64, "served bytes were accrued");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_high_credit_leecher_is_served_before_a_fresh_one_end_to_end() {
+        // The reweight, proven through the FULL serve path (not just the gate): one
+        // upload slot, held; a LOW-credit leecher queues FIRST, then a HIGH-credit
+        // one queues SECOND. When the slot frees, HIGH must win - which a FIFO queue
+        // could never do. This is the client-simulation the reward behavior needs.
+        use crate::peer_conn::{accept_peer, connect_peer};
+        use crate::transfer::{
+            build_request_filename_ext, build_start_upload_req, parse_queue_ranking,
+            OP_ACCEPTUPLOADREQ, OP_QUEUERANKING,
+        };
+
+        let dir = tmpdir("reweight");
+        let data: Vec<u8> = (0..400_000u32)
+            .map(|i| (i.wrapping_mul(31)) as u8)
+            .collect();
+        let hash = ed2k_hash(&data);
+        let path = dir.join("m.bin");
+        std::fs::write(&path, &data).unwrap();
+        let shared = Arc::new(vec![SharedFile {
+            hash,
+            size: data.len() as u64,
+            name: b"m.bin".to_vec(),
+            part_hashes: vec![],
+            path,
+            rating: 0,
+            comment: String::new(),
+        }]);
+
+        let high_hash = [0x91; 16];
+        let low_hash = [0x1a; 16];
+        let store = Arc::new(CreditStore::empty(true));
+        // HIGH earned a rich history (gave us 30 MiB); LOW is a stranger.
+        store.add_downloaded(high_hash, 30 * 1_048_576, now_secs());
+
+        let gate = Arc::new(UploadGate::new(1, 32));
+        let held = gate.try_grant().unwrap(); // occupy the only slot
+
+        let listener = Arc::new(TcpListener::bind("127.0.0.1:0").await.unwrap());
+        let addr = listener.local_addr().unwrap();
+
+        // Serve two accepted connections, each with ITS leecher's credit context
+        // (built from the userhash the handshake reveals) - exactly as the engine's
+        // accept task does.
+        let serve = {
+            let (shared, store, gate, listener) = (
+                Arc::clone(&shared),
+                Arc::clone(&store),
+                Arc::clone(&gate),
+                Arc::clone(&listener),
+            );
+            tokio::spawn(async move {
+                for _ in 0..2 {
+                    let me = HelloInfo::baseline([0xBB; 16], 0, 4662, 4672, "seed");
+                    let Ok((peer, mut fs)) = accept_peer(&listener, &me).await else {
+                        return;
+                    };
+                    let credit = Some((Arc::clone(&store), peer.user_hash));
+                    let (shared, gate) = (Arc::clone(&shared), Arc::clone(&gate));
+                    tokio::spawn(async move {
+                        let _ = serve_shared(&mut fs, &shared, None, Some(&gate), 0, None, credit)
+                            .await;
+                    });
+                }
+            })
+        };
+
+        // A leecher: connect, name the file, ask to upload -> read its rank.
+        async fn queue_up(
+            addr: std::net::SocketAddr,
+            user_hash: [u8; 16],
+            hash: [u8; 16],
+        ) -> (crate::framed::FramedStream<tokio::net::TcpStream>, u16) {
+            let me = HelloInfo::baseline(user_hash, 0x0A00_0001, 4663, 4673, "leech");
+            let (_p, mut fs) = connect_peer(addr, &me).await.unwrap();
+            fs.write_packet(&build_request_filename_ext(&hash))
+                .await
+                .unwrap();
+            let _ = fs.read_packet_unpacked().await.unwrap(); // filename answer
+            fs.write_packet(&build_start_upload_req(&hash))
+                .await
+                .unwrap();
+            let r = fs.read_packet_unpacked().await.unwrap();
+            assert_eq!(r.opcode, OP_QUEUERANKING, "slot held -> queued");
+            (fs, parse_queue_ranking(&r.payload).unwrap())
+        }
+
+        // LOW queues FIRST.
+        let (_low_fs, _low_rank) = queue_up(addr, low_hash, hash).await;
+        while gate.waiting() < 1 {
+            tokio::task::yield_now().await;
+        }
+        // HIGH queues SECOND but is ranked ahead of the earlier LOW.
+        let (mut high_fs, high_rank) = queue_up(addr, high_hash, hash).await;
+        assert_eq!(
+            high_rank, 1,
+            "the high-credit leecher outranks the earlier low one"
+        );
+        while gate.waiting() < 2 {
+            tokio::task::yield_now().await;
+        }
+
+        // Free the slot: HIGH wins, though LOW queued first - the reweight in action.
+        drop(held);
+        let granted = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            high_fs.read_packet_unpacked(),
+        )
+        .await
+        .expect("HIGH must be granted the freed slot")
+        .unwrap();
+        assert_eq!(
+            granted.opcode, OP_ACCEPTUPLOADREQ,
+            "the high-credit leecher is served first, not the earlier low-credit one"
+        );
+
+        serve.abort();
         std::fs::remove_dir_all(&dir).ok();
     }
 
