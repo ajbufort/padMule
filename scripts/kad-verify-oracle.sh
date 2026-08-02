@@ -44,7 +44,7 @@ fi
 # ---- inside the isolated namespace ----
 WORK="$(mktemp -d)"; CFG="$WORK/amuled"
 mkdir -p "$CFG/Incoming" "$CFG/Temp"
-cleanup() { kill $(jobs -p) 2>/dev/null; rm -rf "$WORK"; }
+cleanup() { local j; j=$(jobs -p); [ -n "$j" ] && kill $j 2>/dev/null; rm -rf "$WORK"; }
 trap cleanup EXIT
 
 ip link set lo up
@@ -107,9 +107,12 @@ rm -f "$CFG/logfile"
 "$AMULED" -c "$CFG" -o -i > "$WORK/amuled.log" 2>&1 &
 AM=$!
 echo "== instrumented amuled starting (Kad on $AM_IP:$AM_UDP, id $KADID_HEX)..."
-# `-o` sends the full log (incl. our critical PADMULE-ORACLE line) to stdout, so
-# the redirected amuled.log is authoritative on its own.
-LOGS() { cat "$WORK/amuled.log" 2>/dev/null; }
+# Read BOTH sinks: despite `-o`, this build writes its log lines to $CFG/logfile
+# and leaves stdout nearly empty, so reading only the stdout redirect made the
+# harness blind to "Kad started", to the UDP-socket line, AND to the oracle's own
+# verify line (which is what the 2026-08-02 "ephemeral port" flakiness actually
+# was - a false WARN plus an unobservable PASS, not a port problem).
+LOGS() { cat "$WORK/amuled.log" "$CFG/logfile" 2>/dev/null; }
 
 # Wait until Kad is actually up (its listener rides the CLIENT UDP socket) before
 # driving padMule - otherwise early attempts hit a not-yet-listening node.
@@ -118,12 +121,13 @@ for _ in $(seq 1 30); do
   LOGS | grep -q "Kad started" && break
   sleep 0.5
 done
-# Diagnostic: the client UDP socket MUST be on $AM_UDP. If a port collision forced
-# an ephemeral fallback, padMule can never reach Kad - surface it plainly.
-CUDP="$(LOGS | grep -oE 'Client UDP socket \(extended eMule\) at [0-9.]+:[0-9]+' | tail -1)"
-echo "== $CUDP (need :$AM_UDP)"
+# Diagnostic: the client UDP socket (which Kad rides) MUST be on $AM_UDP. If a
+# port collision forced an ephemeral fallback, padMule can never reach Kad -
+# surface it plainly. aMule 3.0.1 logs "Created Client UDP-Socket at port N".
+CUDP="$(LOGS | grep -oE 'Client UDP-Socket at port [0-9]+' | tail -1)"
+echo "== ${CUDP:-<no client UDP socket line>} (need port $AM_UDP)"
 case "$CUDP" in
-  *":$AM_UDP") : ;;
+  *" $AM_UDP") : ;;
   *) echo "WARN: client/Kad UDP is NOT on $AM_UDP - padMule cannot reach it"; ;;
 esac
 

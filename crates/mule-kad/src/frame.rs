@@ -13,9 +13,7 @@
 //! is compressed (the opcode byte is copied verbatim). eMule
 //! `KademliaUDPListener.cpp:2050-2090`; receive path `ClientUDPSocket.cpp:103`.
 
-use mule_proto::{
-    compress, decompress, IoError, Packet, MAX_PACKET_SIZE, PROT_KAD, PROT_KAD_PACKED,
-};
+use mule_proto::{compress, decompress, IoError, Packet, PROT_KAD, PROT_KAD_PACKED};
 
 /// eMule/aMule packs a Kad datagram only when the PAYLOAD (the bytes after the
 /// 0xE4/opcode header) exceeds this. `CKademliaUDPListener::SendPacket` tests
@@ -58,7 +56,10 @@ pub fn unpack_kad(frame: &[u8]) -> Result<(u8, Vec<u8>), IoError> {
         PROT_KAD => Ok((opcode, body)),
         PROT_KAD_PACKED => {
             let packed = Packet::new(PROT_KAD_PACKED, opcode, body);
-            let un = decompress(&packed, MAX_PACKET_SIZE)?;
+            // Bound inflation like aMule: packetLen * 10 + 300
+            // (ClientUDPSocket.cpp:109), NOT the 2MB TCP packet cap - a hostile
+            // ~1.4KB datagram must not balloon to megabytes.
+            let un = decompress(&packed, frame.len() * 10 + 300)?;
             Ok((opcode, un.payload))
         }
         _ => Err(IoError::BadHeader(protocol)),
@@ -77,6 +78,28 @@ mod tests {
         assert_eq!(frame[1], 0x21);
         assert_eq!(&frame[2..], &payload[..]);
         assert_eq!(unpack_kad(&frame).unwrap(), (0x21, payload));
+    }
+
+    #[test]
+    fn unpack_rejects_a_zlib_bomb_beyond_the_amule_inflation_bound() {
+        // aMule bounds Kad UDP decompression to packetLen * 10 + 300
+        // (ClientUDPSocket.cpp:109); a ~150KB-of-zeros payload packs to a tiny
+        // datagram whose inflation blows that bound and must be REJECTED, not
+        // ballooned to MAX_PACKET_SIZE.
+        let frame = pack_kad(0x2B, vec![0u8; 150_000]);
+        assert_eq!(frame[0], PROT_KAD_PACKED, "sanity: the bomb packed");
+        assert!(frame.len() < 2_000, "sanity: it compressed massively");
+        assert!(unpack_kad(&frame).is_err());
+    }
+
+    #[test]
+    fn unpack_accepts_a_packed_frame_within_the_inflation_bound() {
+        // A legitimately compressible payload whose inflation stays under
+        // packetLen * 10 + 300 still unpacks fine.
+        let payload = vec![0u8; 250];
+        let frame = pack_kad(0x2B, payload.clone());
+        assert_eq!(frame[0], PROT_KAD_PACKED);
+        assert_eq!(unpack_kad(&frame).unwrap(), (0x2B, payload));
     }
 
     #[test]

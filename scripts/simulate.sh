@@ -20,9 +20,15 @@ KEYWORD="${1:-test}"
 
 if [ "${SIM_IN_NS:-}" != "1" ]; then
   [ -x "$BIN" ] || { echo "run scripts/eserver-oracle.sh once first (eserver not obtained)"; exit 1; }
-  # Build the simulate example AND mule-cli (the index seeder, below).
-  ( cd "$REPO" && cargo build --release -p mule-ffi --example simulate -p mule-cli >/dev/null 2>&1 ) \
-    || { echo "failed to build the simulate example / mule-cli"; exit 1; }
+  # Build the simulate example AND mule-cli (the index seeder, below). Two
+  # invocations on purpose: cargo's --example flag filters targets across ALL
+  # named packages, so one combined command would silently skip mule-cli's bin.
+  ( cd "$REPO" && cargo build --release -p mule-ffi --example simulate >/dev/null 2>&1 ) \
+    || { echo "failed to build the simulate example"; exit 1; }
+  ( cd "$REPO" && cargo build --release -p mule-cli >/dev/null 2>&1 ) \
+    || { echo "failed to build mule-cli"; exit 1; }
+  [ -x "$SIM" ] || { echo "simulate example missing at $SIM"; exit 1; }
+  [ -x "$CLI" ] || { echo "mule-cli missing at $CLI"; exit 1; }
   export SIM_IN_NS=1 REPO BIN SIM CLI PORT KEYWORD
   exec unshare -rn bash "$0"
 fi

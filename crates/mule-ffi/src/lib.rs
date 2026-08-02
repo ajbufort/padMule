@@ -891,7 +891,9 @@ mod tests {
     fn sharing_setting_round_trips_via_the_facade() {
         let dir = tmp("sharing");
         let _ = std::fs::remove_dir_all(&dir);
-        let eng = MuleEngine::new(dir.clone(), format!("{dir}-dl")).unwrap();
+        // offline_engine, not MuleEngine::new: keep the test hermetic even if a
+        // future edit adds a start() (the exact drift the 8aa lint fixed once).
+        let eng = offline_engine(&dir, &format!("{dir}-dl"));
         assert!(eng.is_sharing(), "sharing defaults ON");
         eng.set_sharing(false);
         assert!(!eng.is_sharing(), "Leech Mode: sharing OFF");

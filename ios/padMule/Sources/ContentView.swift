@@ -35,7 +35,9 @@ enum Screen: String, CaseIterable, Identifiable {
         case .transfers: return selected ? "arrow.down.circle.fill" : "arrow.down.circle"
         case .servers: return "server.rack"
         case .shared: return selected ? "folder.fill" : "folder"
-        case .stats: return selected ? "chart.xyaxis.line" : "chart.xyaxis.line"
+        // No .fill variant exists for this symbol; the accent tint alone marks
+        // selection (same as Search/Servers/Status).
+        case .stats: return "chart.xyaxis.line"
         case .status: return "gauge"
         }
     }

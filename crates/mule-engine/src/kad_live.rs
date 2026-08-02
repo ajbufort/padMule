@@ -221,6 +221,19 @@ impl KadNode {
             .add(id, ip, udp_port, tcp_port, version, verified);
     }
 
+    /// Record a RESPONDING node in one move: insert/refresh it (through the
+    /// `add_contact` gates) with its receiver-key verdict as the verified bit,
+    /// and store the sender key it handed us (IP-bound) so future requests echo
+    /// it and the peer keeps verifying US. Every request/response path that
+    /// hears back from a node must call this, or that node's key is lost to the
+    /// send-side echo (the 2026-08-02 reanalysis found the two search paths
+    /// dropping it).
+    fn note_responder(&mut self, c: &WireContact, verified: bool, sender_vk: u32) {
+        self.add_contact(c.id, c.ip, c.udp_port, c.tcp_port, c.version, verified);
+        self.routing
+            .note_verify_key(&c.id, c.ip, sender_vk, self.current_public_ip);
+    }
+
     /// Send an obfuscated Kad request (NodeID-keyed on `target_id`, our
     /// senderVerifyKey issued for `dest`) and wait for a decryptable reply with
     /// opcode `expect` FROM `dest`, ignoring interleaved/stray datagrams (other
@@ -363,14 +376,25 @@ impl KadNode {
         let (op, payload) = build_hello_req(&self.kad_id, self.tcp_port, Some(self.udp_port), None);
         let frame = pack_kad(op, payload);
         let dest = contact_addr(contact.ip, contact.udp_port);
-        let (res_payload, _verified, peer_vk) = self
+        let (res_payload, verified, peer_vk) = self
             .request(&contact.id, dest, &frame, OP_HELLO_RES, wait)
             .await?;
         let hello = parse_hello(&res_payload)?;
-        // Store the sender key the peer just handed us (bound to our current public
-        // IP) so later requests to it echo the key and it keeps verifying us.
-        self.routing
-            .note_verify_key(&contact.id, contact.ip, peer_vk, self.current_public_ip);
+        // Record the responder like every other answered request: insert/refresh
+        // it with the receiver-key verdict (eMule Process2HelloResponse ->
+        // AddContact2 does the same) and store the sender key it handed us so
+        // later requests echo it and it keeps verifying us.
+        self.note_responder(
+            &WireContact {
+                id: contact.id,
+                ip: contact.ip,
+                udp_port: contact.udp_port,
+                tcp_port: hello.tcp_port,
+                version: hello.version,
+            },
+            verified,
+            peer_vk,
+        );
         // Third leg: if the HELLO_RES requested an ACK, send it, echoing peer_vk.
         if hello.misc_options.is_some_and(|m| m & 0x04 != 0) {
             self.send_hello_res_ack(&contact.id, dest, peer_vk).await?;
@@ -438,7 +462,7 @@ impl KadNode {
     /// Ask one node (KADEMLIA2_SEARCH_SOURCE_REQ) for sources of `file_hash`,
     /// returning the accepted sources from its KADEMLIA2_SEARCH_RES.
     async fn search_source(
-        &self,
+        &mut self,
         node: &WireContact,
         file_hash: &Kad128,
         file_size: u64,
@@ -447,9 +471,10 @@ impl KadNode {
         let (op, payload) = build_search_source_req(file_hash, 0, file_size);
         let frame = pack_kad(op, payload);
         let dest = contact_addr(node.ip, node.udp_port);
-        let (res_payload, _verified, _sender_vk) = self
+        let (res_payload, verified, sender_vk) = self
             .request(&node.id, dest, &frame, OP_SEARCH_RES, wait)
             .await?;
+        self.note_responder(node, verified, sender_vk);
         let res = parse_search_res(&res_payload)?;
         Ok(res.results.iter().filter_map(|r| r.as_source()).collect())
     }
@@ -498,20 +523,7 @@ impl KadNode {
                     out.find_node_responses += 1;
                     // The node that answered proved its IP iff the receiver key was
                     // valid; the contacts it named are unverified until they answer.
-                    self.add_contact(
-                        node.id,
-                        node.ip,
-                        node.udp_port,
-                        node.tcp_port,
-                        node.version,
-                        verified,
-                    );
-                    self.routing.note_verify_key(
-                        &node.id,
-                        node.ip,
-                        sender_vk,
-                        self.current_public_ip,
-                    );
+                    self.note_responder(node, verified, sender_vk);
                     for c in &contacts {
                         self.add_contact(c.id, c.ip, c.udp_port, c.tcp_port, c.version, false);
                     }
@@ -553,7 +565,7 @@ impl KadNode {
     /// Ask one node for keyword matches (KADEMLIA2_SEARCH_KEY_REQ) and distil the
     /// file results from its KADEMLIA2_SEARCH_RES.
     async fn search_keyword_node(
-        &self,
+        &mut self,
         node: &WireContact,
         target: &Kad128,
         wait: Duration,
@@ -561,9 +573,10 @@ impl KadNode {
         let (op, payload) = build_search_key_req(target, 0);
         let frame = pack_kad(op, payload);
         let dest = contact_addr(node.ip, node.udp_port);
-        let (res_payload, _verified, _sender_vk) = self
+        let (res_payload, verified, sender_vk) = self
             .request(&node.id, dest, &frame, OP_SEARCH_RES, wait)
             .await?;
+        self.note_responder(node, verified, sender_vk);
         let res = parse_search_res(&res_payload)?;
         Ok(res.results.iter().filter_map(|r| r.as_file()).collect())
     }
@@ -604,20 +617,7 @@ impl KadNode {
                 if let Ok((contacts, verified, sender_vk)) =
                     self.find_node(node, &target, per_query).await
                 {
-                    self.add_contact(
-                        node.id,
-                        node.ip,
-                        node.udp_port,
-                        node.tcp_port,
-                        node.version,
-                        verified,
-                    );
-                    self.routing.note_verify_key(
-                        &node.id,
-                        node.ip,
-                        sender_vk,
-                        self.current_public_ip,
-                    );
+                    self.note_responder(node, verified, sender_vk);
                     for c in &contacts {
                         self.add_contact(c.id, c.ip, c.udp_port, c.tcp_port, c.version, false);
                     }
@@ -812,6 +812,108 @@ mod tests {
 
         // Silence the unused-import warning when only one test path uses it.
         let _ = udp_verify_key(our_key, 0);
+    }
+
+    /// Shared shape for the search key-capture tests: a faithful mock node that
+    /// answers a search request with an (empty) SEARCH_RES carrying ITS sender
+    /// verify key, which the search path must store for the send-side echo.
+    const MOCK_SENDER_VK: u32 = 0xFEED_F00D;
+
+    fn spawn_search_res_mock(
+        peer: UdpSocket,
+        peer_id: Kad128,
+        target: Kad128,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            let (n, from) = peer.recv_from(&mut buf).await.unwrap();
+            let dec = kad_deobfuscate(&buf[..n], &peer_id, 0, ip_u32(&from)).unwrap();
+            let (rop, rpayload) = mule_kad::build_search_res(&peer_id, &target, &[]);
+            let dg = kad_obfuscate_response(
+                &pack_kad(rop, rpayload),
+                0x2468,
+                dec.sender_vk,
+                MOCK_SENDER_VK,
+                0x80,
+            );
+            peer.send_to(&dg, from).await.unwrap();
+        })
+    }
+
+    #[tokio::test]
+    async fn search_source_stores_the_responders_sender_key() {
+        // A node we only ever SEARCH must still get its sender key captured, or
+        // the send-side echo never fires for it (2026-08-02 reanalysis gap c-1).
+        let our_id = Kad128::from_words([3, 3, 3, 3]);
+        let our_ip = 0x0A00_0001u32;
+        let mut node =
+            KadNode::bind_with_identity("127.0.0.1:0".parse().unwrap(), 4662, our_id, 0x2222)
+                .await
+                .unwrap();
+        node.set_public_ip(our_ip);
+        let peer_id = Kad128::from_hash(&[0x77; 16]);
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let peer_ip = ip_u32(&peer_addr);
+        let target = Kad128::from_hash(&[0x44; 16]);
+        // The searched node is already in the table (a lookup put it there).
+        node.routing
+            .add(peer_id, peer_ip, peer_addr.port(), 4662, 8, false);
+        let mock = spawn_search_res_mock(peer, peer_id, target);
+
+        let wc = WireContact {
+            id: peer_id,
+            ip: peer_ip,
+            udp_port: peer_addr.port(),
+            tcp_port: 4662,
+            version: 8,
+        };
+        node.search_source(&wc, &target, 1000, Duration::from_secs(2))
+            .await
+            .unwrap();
+        mock.await.unwrap();
+        assert_eq!(
+            node.routing.verify_key_for(&peer_id, peer_ip, our_ip),
+            MOCK_SENDER_VK,
+            "search_source stored the responder's sender key"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_keyword_node_stores_the_responders_sender_key() {
+        // The keyword twin of the gap above.
+        let our_id = Kad128::from_words([4, 4, 4, 4]);
+        let our_ip = 0x0A00_0001u32;
+        let mut node =
+            KadNode::bind_with_identity("127.0.0.1:0".parse().unwrap(), 4662, our_id, 0x3333)
+                .await
+                .unwrap();
+        node.set_public_ip(our_ip);
+        let peer_id = Kad128::from_hash(&[0x88; 16]);
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let peer_ip = ip_u32(&peer_addr);
+        let target = Kad128::from_hash(&[0x55; 16]);
+        node.routing
+            .add(peer_id, peer_ip, peer_addr.port(), 4662, 8, false);
+        let mock = spawn_search_res_mock(peer, peer_id, target);
+
+        let wc = WireContact {
+            id: peer_id,
+            ip: peer_ip,
+            udp_port: peer_addr.port(),
+            tcp_port: 4662,
+            version: 8,
+        };
+        node.search_keyword_node(&wc, &target, Duration::from_secs(2))
+            .await
+            .unwrap();
+        mock.await.unwrap();
+        assert_eq!(
+            node.routing.verify_key_for(&peer_id, peer_ip, our_ip),
+            MOCK_SENDER_VK,
+            "search_keyword_node stored the responder's sender key"
+        );
     }
 
     #[tokio::test]

@@ -47,13 +47,20 @@ pub fn read_nodes_dat(bytes: &[u8]) -> Result<NodesDat, IoError> {
     let mut r = Reader::new(bytes);
     let first = r.read_u32()?;
     // Modern files lead with 0; a nonzero first dword is a v0 file whose value is
-    // the contact count (with 25-byte records, no version field).
-    let (version, count) = if first == 0 {
+    // the contact count (with 25-byte records, no version field). aMule accepts
+    // fileVersion 1..=3 (RoutingZone.cpp:165); v3 carries an extra
+    // bootstrapEdition dword BEFORE the count, and edition 1 switches the records
+    // to the v1-style 25-byte bootstrap form (ReadBootstrapNodesDat).
+    let (version, count, bootstrap) = if first == 0 {
         let version = r.read_u32()?;
+        if version > 3 {
+            return Err(IoError::BadHeader(version.min(u8::MAX as u32) as u8));
+        }
+        let bootstrap = version == 3 && r.read_u32()? == 1;
         let count = r.read_u32()?;
-        (version, count)
+        (version, count, bootstrap)
     } else {
-        (0, first)
+        (0, first, false)
     };
 
     let mut contacts = Vec::new(); // untrusted count; records are fixed-size
@@ -65,11 +72,12 @@ pub fn read_nodes_dat(bytes: &[u8]) -> Result<NodesDat, IoError> {
         let udp_port = r.read_u16()?;
         let tcp_port = r.read_u16()?;
         // v0 stores a "type" byte here that we do not use; v1+ store the contact
-        // version. The UDP key + verified flag exist only from v2.
+        // version. The UDP key + verified flag exist only from v2, and a v3
+        // BOOTSTRAP-edition record is the v1 25-byte form (no key/verified).
         let (cver, udp_key, udp_key_ip, verified) = if version == 0 {
             let _byte_type = r.read_u8()?;
             (0, 0, 0, false)
-        } else if version == 1 {
+        } else if version == 1 || bootstrap {
             (r.read_u8()?, 0, 0, false)
         } else {
             let cver = r.read_u8()?;
@@ -162,6 +170,72 @@ mod tests {
             (c.version, c.udp_key, c.udp_key_ip, c.verified),
             (0, 0, 0, false)
         );
+    }
+
+    #[test]
+    fn reads_a_v3_regular_file_with_the_extra_edition_dword() {
+        // v3 non-bootstrap: aMule reads a bootstrapEdition dword (0) BEFORE the
+        // count (RoutingZone.cpp:156-166); records are the v2 34-byte form.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&3u32.to_le_bytes()); // file version
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // bootstrapEdition = 0
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // count
+        bytes.extend_from_slice(&Kad128::from_hash(&[0x11; 16]).to_wire());
+        bytes.extend_from_slice(&0x0102_0304u32.to_le_bytes()); // ip
+        bytes.extend_from_slice(&4672u16.to_le_bytes()); // udp
+        bytes.extend_from_slice(&4662u16.to_le_bytes()); // tcp
+        bytes.push(8); // contact version
+        bytes.extend_from_slice(&0xDEAD_BEEFu32.to_le_bytes()); // udp_key
+        bytes.extend_from_slice(&0x0A00_0001u32.to_le_bytes()); // udp_key_ip
+        bytes.push(1); // verified
+        let n = read_nodes_dat(&bytes).unwrap();
+        assert_eq!(n.version, 3);
+        assert_eq!(n.contacts.len(), 1);
+        let c = &n.contacts[0];
+        assert_eq!(c.ip, 0x0102_0304);
+        assert_eq!((c.udp_port, c.tcp_port), (4672, 4662));
+        assert_eq!(
+            (c.version, c.udp_key, c.udp_key_ip, c.verified),
+            (8, 0xDEAD_BEEF, 0x0A00_0001, true)
+        );
+    }
+
+    #[test]
+    fn reads_a_v3_bootstrap_edition_file_with_25_byte_records() {
+        // v3 bootstrapEdition=1: v1-style 25-byte records (ReadBootstrapNodesDat),
+        // no key/verified fields.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&3u32.to_le_bytes()); // file version
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // bootstrapEdition = 1
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // count
+        bytes.extend_from_slice(&Kad128::from_hash(&[0x22; 16]).to_wire());
+        bytes.extend_from_slice(&0x0506_0708u32.to_le_bytes()); // ip
+        bytes.extend_from_slice(&4672u16.to_le_bytes()); // udp
+        bytes.extend_from_slice(&4662u16.to_le_bytes()); // tcp
+        bytes.push(9); // contact version
+        let n = read_nodes_dat(&bytes).unwrap();
+        assert_eq!(n.version, 3);
+        assert_eq!(n.contacts.len(), 1);
+        let c = &n.contacts[0];
+        assert_eq!(c.ip, 0x0506_0708);
+        assert_eq!(
+            (c.version, c.udp_key, c.udp_key_ip, c.verified),
+            (9, 0, 0, false)
+        );
+    }
+
+    #[test]
+    fn rejects_an_unknown_future_version() {
+        // aMule accepts fileVersion 1..=3 only (RoutingZone.cpp:165); a future
+        // version must ERROR, not silently misparse the stream as contacts.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&4u32.to_le_bytes()); // unknown version
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 34]);
+        assert!(read_nodes_dat(&bytes).is_err());
     }
 
     #[test]
