@@ -36,11 +36,21 @@ pub struct Contact {
     /// from this IP, or as read from a nodes.dat that recorded it. Monotonic
     /// (promoted false->true, never regresses); persisted across restarts.
     pub verified: bool,
+    /// The verify key this peer handed us (its `senderVerifyKey`), which we echo
+    /// as our `receiverVerifyKey` on future requests so IT can verify US. Bound to
+    /// OUR public IP at capture time (`udp_key_ip`), since the key is
+    /// `udp_verify_key(peer_secret, OUR_ip)` - stale if our IP changes. 0 = none
+    /// yet (echo 0, first-contact-safe). eMule `CContact::SetReceiverKey`.
+    pub udp_key: u32,
+    /// Our public IP when `udp_key` was minted; the key is only echoed while this
+    /// still matches our current public IP (mirrors `CKadUDPKey::GetKeyValue`).
+    pub udp_key_ip: u32,
     /// self_id XOR id - fixed once we know our own ID, so kept here.
     distance: Kad128,
 }
 
 impl Contact {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         self_id: &Kad128,
         id: Kad128,
@@ -49,6 +59,8 @@ impl Contact {
         tcp_port: u16,
         version: u8,
         verified: bool,
+        udp_key: u32,
+        udp_key_ip: u32,
     ) -> Self {
         Contact {
             distance: self_id.distance(&id),
@@ -58,6 +70,8 @@ impl Contact {
             tcp_port,
             version,
             verified,
+            udp_key,
+            udp_key_ip,
         }
     }
 
@@ -117,6 +131,14 @@ impl Zone {
                 // genuine refresh, keep the bit.
                 if old.ip == contact.ip {
                     contact.verified |= old.verified;
+                    // Keep the peer's stored verify key on a refresh that carries
+                    // none (a RES-payload refresh has no key; a direct-response
+                    // refresh brings a fresh one, which wins). Dropped on an IP
+                    // change, like the verified bit - a new IP re-learns its key.
+                    if contact.udp_key == 0 {
+                        contact.udp_key = old.udp_key;
+                        contact.udp_key_ip = old.udp_key_ip;
+                    }
                 }
                 bin.push(contact);
                 return;
@@ -168,6 +190,15 @@ impl Zone {
             }
         }
     }
+
+    /// Find a contact by id for mutation. Full traversal (called rarely - once per
+    /// reply to stash a verify key - so simplicity beats a distance descent).
+    fn find_mut(&mut self, id: &Kad128) -> Option<&mut Contact> {
+        match &mut self.node {
+            Node::Leaf(bin) => bin.iter_mut().find(|c| c.id == *id),
+            Node::Internal(zero, one) => zero.find_mut(id).or_else(|| one.find_mut(id)),
+        }
+    }
 }
 
 /// The Kad routing table, rooted at our own Kad ID.
@@ -200,8 +231,47 @@ impl RoutingTable {
         if id == self.self_id {
             return;
         }
-        let c = Contact::new(&self.self_id, id, ip, udp_port, tcp_port, version, verified);
+        let c = Contact::new(
+            &self.self_id,
+            id,
+            ip,
+            udp_port,
+            tcp_port,
+            version,
+            verified,
+            0,
+            0,
+        );
         self.root.add(c);
+    }
+
+    /// Record the verify key `key` (minted against OUR IP `key_ip`) that the peer
+    /// `id` at `ip` handed us, so we can echo it back and be verified. A no-op if
+    /// the contact is absent or at a different IP (a key is IP-bound). Kept a
+    /// separate call so `add`'s many callers stay untouched.
+    pub fn note_verify_key(&mut self, id: &Kad128, ip: u32, key: u32, key_ip: u32) {
+        if let Some(c) = self.root.find_mut(id) {
+            if c.ip == ip {
+                c.udp_key = key;
+                c.udp_key_ip = key_ip;
+            }
+        }
+    }
+
+    /// The verify key to ECHO to contact `id` at `ip` so it can verify US - the
+    /// key it handed us, but ONLY while it was minted against our CURRENT public IP
+    /// (`our_ip`), since the key is `udp_verify_key(peer_secret, our_ip)` and a
+    /// changed IP makes it stale. Returns 0 (send no key - first-contact-safe) if
+    /// the contact is absent, at a different IP, keyless, or IP-mismatched. This is
+    /// the entire send-side gate (eMule `CKadUDPKey::GetKeyValue`).
+    pub fn verify_key_for(&self, id: &Kad128, ip: u32, our_ip: u32) -> u32 {
+        let mut all: Vec<&Contact> = Vec::new();
+        self.root.collect(&mut all);
+        all.iter()
+            .find(|c| c.id == *id && c.ip == ip)
+            .filter(|c| c.udp_key != 0 && c.udp_key_ip == our_ip && our_ip != 0)
+            .map(|c| c.udp_key)
+            .unwrap_or(0)
     }
 
     /// True if a contact with this id is already in the table.
@@ -244,6 +314,9 @@ impl RoutingTable {
     pub fn load_nodes(&mut self, contacts: &[KadContact]) {
         for c in contacts {
             self.add(c.id, c.ip, c.udp_port, c.tcp_port, c.version, c.verified);
+            if c.udp_key != 0 {
+                self.note_verify_key(&c.id, c.ip, c.udp_key, c.udp_key_ip);
+            }
         }
     }
 
@@ -300,6 +373,31 @@ mod tests {
 
     fn find(rt: &RoutingTable, want: Kad128) -> Contact {
         rt.contacts().into_iter().find(|c| c.id == want).unwrap()
+    }
+
+    #[test]
+    fn a_peers_verify_key_is_stored_ip_bound_and_kept_across_a_refresh() {
+        let mut rt = RoutingTable::new(id(0));
+        rt.add(id(1), 0x0101_0101, 1, 2, 8, false);
+        // The key the peer handed us (minted against OUR IP 0x0A00_0001) is stored.
+        rt.note_verify_key(&id(1), 0x0101_0101, 0xDEAD_BEEF, 0x0A00_0001);
+        let c = find(&rt, id(1));
+        assert_eq!(c.udp_key, 0xDEAD_BEEF);
+        assert_eq!(c.udp_key_ip, 0x0A00_0001);
+        // A keyless refresh (a RES-payload sighting) keeps the stored key.
+        rt.add(id(1), 0x0101_0101, 1, 2, 8, false);
+        assert_eq!(
+            find(&rt, id(1)).udp_key,
+            0xDEAD_BEEF,
+            "refresh keeps the key"
+        );
+        // note_verify_key at a DIFFERENT ip is a no-op (a key is IP-bound).
+        rt.note_verify_key(&id(1), 0x0202_0202, 0x1234, 0x0A00_0001);
+        assert_eq!(
+            find(&rt, id(1)).udp_key,
+            0xDEAD_BEEF,
+            "wrong-ip key ignored"
+        );
     }
 
     #[test]
