@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use mule_engine::peer::HelloInfo;
 use mule_engine::{
-    download_file, fetch_from_sources, peer_handshake_inbound, serve_file, Download, FramedStream,
-    ManagerConfig, PartStore, PeerSource, SourceOrigin,
+    accept_peer, download_file, fetch_from_sources, peer_handshake_inbound, serve_file, Download,
+    FramedStream, ManagerConfig, PartStore, PeerSource, SourceOrigin,
 };
 use mule_proto::ed2k_hash;
 use tokio::net::TcpListener;
@@ -58,6 +58,7 @@ async fn fetch_downloads_a_file_from_a_discovered_source() {
     let sources = vec![PeerSource {
         addr: server_addr,
         user_hash: None,
+        crypt: None,
         origin: SourceOrigin::PeerExchange,
     }];
     let me = HelloInfo::baseline(user_hash(), 0, 4662, 4672, "padMule");
@@ -82,6 +83,111 @@ async fn fetch_downloads_a_file_from_a_discovered_source() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Serve `data` to one inbound peer, auto-detecting obfuscation on the first
+/// byte exactly as the production listener does (`accept_peer`), and report
+/// whether the connection that arrived was in fact obfuscated.
+async fn spawn_obf_aware_server(
+    data: Vec<u8>,
+    name: Vec<u8>,
+    served_hash: [u8; 16],
+) -> (SocketAddr, tokio::sync::oneshot::Receiver<bool>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let hash = ed2k_hash(&data);
+    let me = HelloInfo::baseline(served_hash, 0, addr.port(), 4672, "server");
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        if let Ok((_peer, mut fs)) = accept_peer(&listener, &me).await {
+            let _ = tx.send(fs.is_obfuscated());
+            let _ = serve_file(&mut fs, &hash, &name, &data).await;
+        }
+    });
+    (addr, rx)
+}
+
+#[tokio::test]
+async fn a_source_advertising_crypt_is_fetched_over_an_obfuscated_stream() {
+    // The live crypt-dial policy, end to end: a source whose discovery record
+    // carried connect-options 0x01 (crypt supported) must be dialed with the RC4
+    // handshake, and the transfer must complete through it. The RC4 stream
+    // itself is separately proven against real amuled (Wave 5a); what this pins
+    // is that the POLICY routes to it and the download still verifies.
+    let data: Vec<u8> = (0..90_000u32)
+        .map(|i| (i.wrapping_mul(2246822519) >> 11) as u8)
+        .collect();
+    let hash = ed2k_hash(&data);
+    // The server's OWN userhash seeds the RC4 key, so the source record must
+    // carry that same hash for the handshake to key up.
+    let server_hash = user_hash();
+    let (server_addr, obf_rx) =
+        spawn_obf_aware_server(data.clone(), b"obf.bin".to_vec(), server_hash).await;
+
+    let dir = std::env::temp_dir().join(format!("padmule-fetch-obf-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = PartStore::create(&dir, 1, hash, data.len() as u64, b"obf.bin").unwrap();
+    let dl = Download::new(store);
+
+    let sources = vec![PeerSource {
+        addr: server_addr,
+        user_hash: Some(server_hash),
+        crypt: Some(0x01), // "I support obfuscation"
+        origin: SourceOrigin::Kad,
+    }];
+    let me = HelloInfo::baseline([0x77; 16], 0, 4662, 4672, "padMule");
+    let outcome = fetch_from_sources(&dl, &sources, &me, Duration::from_secs(20), None).await;
+
+    assert!(
+        obf_rx.await.unwrap(),
+        "the source advertised crypt -> the dial must be OBFUSCATED"
+    );
+    assert!(outcome.completed, "the obfuscated transfer must complete");
+    drop(dl);
+    let got = std::fs::read(dir.join("001.part")).unwrap();
+    assert_eq!(ed2k_hash(&got), hash, "bytes verify through the RC4 stream");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_source_that_never_advertised_crypt_is_fetched_in_plaintext() {
+    // The regression this whole change exists to prevent: knowing a source's
+    // userhash used to be enough to dial obfuscated, which a crypt-DISABLED peer
+    // cannot answer (and nothing retries in plaintext). With no advertised
+    // support the dial must stay plaintext even though we hold the hash.
+    let data: Vec<u8> = (0..70_000u32)
+        .map(|i| (i.wrapping_mul(40503) >> 7) as u8)
+        .collect();
+    let hash = ed2k_hash(&data);
+    let server_hash = user_hash();
+    let (server_addr, obf_rx) =
+        spawn_obf_aware_server(data.clone(), b"plain.bin".to_vec(), server_hash).await;
+
+    let dir = std::env::temp_dir().join(format!("padmule-fetch-plain-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = PartStore::create(&dir, 1, hash, data.len() as u64, b"plain.bin").unwrap();
+    let dl = Download::new(store);
+
+    let sources = vec![PeerSource {
+        addr: server_addr,
+        user_hash: Some(server_hash), // hash KNOWN...
+        crypt: None,                  // ...but the peer never said it speaks crypt
+        origin: SourceOrigin::Kad,
+    }];
+    let me = HelloInfo::baseline([0x77; 16], 0, 4662, 4672, "padMule");
+    let outcome = fetch_from_sources(&dl, &sources, &me, Duration::from_secs(20), None).await;
+
+    assert!(
+        !obf_rx.await.unwrap(),
+        "no advertised crypt -> the dial must be PLAINTEXT despite the known hash"
+    );
+    assert!(outcome.completed);
+    drop(dl);
+    let got = std::fs::read(dir.join("001.part")).unwrap();
+    assert_eq!(ed2k_hash(&got), hash);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::test]
 async fn download_manager_completes_from_multiple_parallel_peers() {
     // Three peers each hold the file; the manager runs them concurrently against
@@ -97,6 +203,7 @@ async fn download_manager_completes_from_multiple_parallel_peers() {
         sources.push(PeerSource {
             addr,
             user_hash: None,
+            crypt: None,
             origin: SourceOrigin::PeerExchange,
         });
     }
@@ -143,6 +250,7 @@ async fn fetch_skips_a_dead_source_and_reports_no_completion() {
     let sources = vec![PeerSource {
         addr: dead,
         user_hash: None,
+        crypt: None,
         origin: SourceOrigin::Server,
     }];
     let me = HelloInfo::baseline(user_hash(), 0, 4662, 4672, "padMule");
