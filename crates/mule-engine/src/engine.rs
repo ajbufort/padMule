@@ -2223,6 +2223,10 @@ impl Engine {
             Ok(b) => read_nodes_dat(&b).map(|n| n.contacts).unwrap_or_default(),
             Err(_) => Vec::new(),
         };
+        // The dial list gets the same gate as the table load: the ipfilter means
+        // NO CONTACT, not merely no routing entry, and a poisoned nodes.dat must
+        // not aim the bootstrap sweep at loopback/LAN/DNS-port/Kad1 addresses.
+        let contacts = gate_loaded_nodes(&contacts, self.ip_filter.as_deref());
         if contacts.is_empty() {
             self.emit(EngineEvent::Server("no Kad contacts to bootstrap".into()));
             return;
@@ -3251,6 +3255,54 @@ mod tests {
             out.push(e);
         }
         out
+    }
+
+    /// `start_kad` hands the RAW nodes.dat contacts to `bootstrap_any`, bypassing
+    /// the same load gate `start()` applies to the routing-table load. A poisoned
+    /// nodes.dat (ipfilter-blocked, unroutable, or Kad1 contacts) must not aim the
+    /// bootstrap dial sweep at them - it must gate to empty and say so, not dial.
+    #[tokio::test]
+    async fn start_kad_gates_the_dial_list_not_just_the_routing_table_load() {
+        let dir = tmp("start-kad-gate");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mk = |ip: u32, udp: u16, ver: u8| KadContact {
+            id: Kad128::from_hash(&[ver; 16]),
+            ip,
+            udp_port: udp,
+            tcp_port: 4662,
+            version: ver,
+            udp_key: 0,
+            udp_key_ip: 0,
+            verified: false,
+        };
+        let contacts = vec![
+            mk(0x7F00_0001, 4672, 8), // 127.0.0.1 - loopback, unroutable
+            mk(0xC0A8_0105, 4672, 8), // 192.168.1.5 - private LAN
+            mk(0x0808_0808, 4672, 1), // Kad1 - the protocol can't even talk to it
+        ];
+        std::fs::write(
+            dir.join("nodes.dat"),
+            write_nodes_dat(&NodesDat {
+                version: 2,
+                contacts,
+            }),
+        )
+        .unwrap();
+
+        let (mut engine, mut rx) = Engine::new(&dir).unwrap();
+        engine.start_kad().await;
+
+        let evs = drain(&mut rx).await;
+        assert!(
+            evs.iter().any(
+                |e| matches!(e, EngineEvent::Server(s) if s == "no Kad contacts to bootstrap")
+            ),
+            "an all-unacceptable nodes.dat must gate the dial list to empty, not dial it; got {evs:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A checkpoint must persist what the LIVE Kad node learned this session, not
