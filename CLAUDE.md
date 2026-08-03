@@ -90,7 +90,7 @@ Details and what is portable from them: `docs/wiki/ref-ecosystem.md`.
 source "$HOME/.cargo/env"              # cargo is NOT on the default PATH
 
 cargo build --workspace
-cargo test --workspace                 # the unit gate (~518 tests, offline)
+cargo test --workspace                 # the unit gate (~532 tests, offline)
 cargo clippy --workspace --all-targets # must be warning-free
 cargo fmt --all -- --check
 
@@ -98,7 +98,7 @@ cargo fmt --all -- --check
 scripts/build-amuled-oracle.sh         # one-time build into build-oracle/
 scripts/differential-test.sh           # padMule downloads from real amuled, byte-for-byte
 
-# CI: push to main (or workflow_dispatch) triggers
+# CI: push to main, pull requests, or workflow_dispatch trigger
 #   .github/workflows/rust.yml      - the unit gate above (test+clippy+fmt) on ubuntu
 #   .github/workflows/ios-build.yml - unsigned padMule.ipa artifact (macOS runner)
 #   .github/workflows/ios-test.yml  - Swift unit tests on an iPad simulator

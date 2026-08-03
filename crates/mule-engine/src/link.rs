@@ -278,8 +278,9 @@ impl ServerLink {
 
     /// Announce our shared files to the server (OP_OFFERFILES) so it indexes them
     /// for keyword search and can hand us out as a source. Fire-and-forget (no
-    /// reply). `client_id`/`client_port` are our real ID + port when HighID, else
-    /// the FILE_COMPLETE_ID/PORT markers (all our shares are complete).
+    /// reply). padMule always passes the FILE_COMPLETE_ID/PORT markers for
+    /// `client_id`/`client_port` - even on HighID - so our public IP never
+    /// enters the server's search index (see `Engine::offer_shared_to`).
     pub async fn offer_files(
         &mut self,
         files: &[crate::server_messages::OfferedFile<'_>],

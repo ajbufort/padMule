@@ -576,9 +576,10 @@ impl MuleEngine {
 
     /// Snapshots of every in-progress download. This is ALSO the engine's
     /// heartbeat: each call drains pending share re-announces, finalizes
-    /// downloads that completed outside a fetch task, and detects a server
-    /// drop/kick. The UI's 1s poll must keep calling it - if this ever stops,
-    /// those three background duties silently stop with it.
+    /// downloads that completed outside a fetch task, detects a server
+    /// drop/kick, runs the periodic checkpoint, and merges gossip-harvested
+    /// servers into server.met. The UI's 1s poll must keep calling it - if this
+    /// ever stops, those five background duties silently stop with it.
     pub fn downloads(&self) -> Vec<DownloadInfo> {
         self.rt.block_on(async {
             let mut g = self.inner.lock().await;
