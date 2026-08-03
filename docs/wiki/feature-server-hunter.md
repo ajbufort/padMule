@@ -16,12 +16,13 @@ lists + the part-3 gossip crawl QUEUED (next after the Settings slice).
   verified in `mule-files/src/server_met.rs`, which accepts headers 0xE0 AND the
   legacy 0x0E).
 - **Part 2 (verify/health-check) SHIPPED** as the 8x Servers screen UDP probe.
-- **QUEUED NEXT - gzip/zip-wrapped lists**: several popular lists are served
-  gzipped, and `server_met.rs`'s doc explicitly defers archive unwrapping to "a
-  higher layer" that does not exist yet, so those lists are currently REJECTED as
-  not-a-server.met. A small decompress step in the fetch path
-  (`bootstrap::http_get_bytes` / `update_server_list`) closes it. Without it
-  "comprehensive" silently excludes some of the best sources.
+- **gzip/zip-wrapped lists SHIPPED (2026-08-03)**: `bootstrap::maybe_decompress`
+  runs inside `http_get_bytes`, so EVERY fetched list (and nodes.dat) is
+  transparently unwrapped before parsing - gzip (`server.met.gz`, the common
+  case) and single-entry ZIP (stored + deflate). Bounded to 32 MiB out to refuse
+  a decompression bomb from a user-entered URL; anything unrecognised or malformed
+  falls through to the raw bytes, which the validator then rejects cleanly. So a
+  gzipped list is no longer silently excluded from "comprehensive".
 - **QUEUED - part 3 gossip crawl** (below): the real answer to Anthony's
   "war dialer for hidden servers" question (2026-08-03). Reuses `OP_SERVERLIST`,
   which padMule already parses. Follow-up after the Settings slice lands.
