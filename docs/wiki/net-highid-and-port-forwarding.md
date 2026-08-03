@@ -142,8 +142,14 @@ recover the case its own code comment names.** The chain:
 3. `upnp.rs` map_port/map_port_unicast do `soap_delete_mapping` then
    `soap_add_mapping`. The DELETE is refused: **`Action not authorized`**
    (UPnP error 606) - reproduced from the dev box (.32), also a non-owner, via
-   `mule-cli upnp-unmap 4662`. This gateway only lets the OWNING internal host
-   delete a mapping.
+   `mule-cli upnp-unmap 4662`.
+   **The refusal is OWNERSHIP-based, not a blanket ban on deletes - proven with
+   a positive control:** the dev box mapped :4663 (`mule-cli upnp 4663`) and then
+   deleted that same mapping successfully (`mule-cli upnp-unmap 4663`, confirmed
+   gone by a follow-up query). So a client CAN clean up after itself while its
+   address is stable, and CANNOT once its address changes. That is exactly why
+   the **finite-lease fix is the load-bearing one**: it is the only remedy that
+   survives an address change without a human.
 4. The add then fails **`ConflictInMappingEntry`** (error 718), and the delete's
    real reason never surfaces because the call site swallows it (`let _ =`).
 5. LowID follows, and then a second-order failure: **eMule Sunrise KICKS LowID
@@ -152,9 +158,21 @@ recover the case its own code comment names.** The chain:
    "Not connected" even though the MOTD had arrived.
 
 So a permanent lease (padMule asks for `lease_secs = 0`) plus any address change
-= **permanent LowID that padMule cannot fix by itself**; it needs a human in the
-router UI (TP-Link: Advanced -> NAT Forwarding -> **UPnP**, not Port Forwarding,
-which lists only STATIC rules and was empty). Cleared manually 2026-08-02.
+= **permanent LowID that padMule cannot fix by itself**.
+
+CLEARING IT IS HARDER THAN EXPECTED: the BE9700's UPnP page (Advanced -> NAT
+Forwarding -> **UPnP**; NOT Port Forwarding, which lists only STATIC rules and is
+empty) is **display-only - it has no delete control**. Confirmed 2026-08-02, entry
+still present at end of session. The ways out, best first:
+
+1. **DHCP-reserve the iPad at its OLD address (.182) and reconnect.** Then
+   padMule OWNS the mapping again, and its existing delete-then-add self-heals on
+   the next launch - no router surgery, and the reservation is the durable fix
+   that stops the drift recurring. (This is the reservation this entry already
+   recommended on 2026-07-17 and which was never made.)
+2. **Toggle UPnP off -> Save -> on -> Save**, which flushes the mapping table on
+   most TP-Link firmware. Brief interruption for other UPnP clients.
+3. Reboot the router (blunt; disrupts everything).
 
 FIXES WORTH MAKING (none shipped yet, queued as tasks):
 - **Finite lease + renew** instead of `lease_secs = 0`, so a stale mapping
