@@ -531,6 +531,16 @@ impl MuleEngine {
             .block_on(async { self.inner.lock().await.prune_dead_servers().await })
     }
 
+    /// Recursively crawl known servers for the OTHER servers they know (asking
+    /// up to `rounds`, clamped to 3), merging the safe survivors into
+    /// server.met. Returns how many NEW servers were added. Silence from most
+    /// servers is normal - few answer this request. Blocks for several
+    /// seconds, like a search; off the UI thread.
+    pub fn crawl_servers(&self, rounds: u32) -> u32 {
+        self.rt
+            .block_on(async { self.inner.lock().await.crawl_servers(rounds).await })
+    }
+
     /// Connect to the server at `addr` ("ip:port"). Returns false if the address
     /// is malformed or the login was refused/timed out. Blocks up to ~12s.
     pub fn connect_to_server(&self, addr: String) -> bool {

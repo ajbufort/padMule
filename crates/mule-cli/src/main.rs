@@ -1909,6 +1909,67 @@ async fn cmd_upnp_unicast(port: u16) {
     }
 }
 
+/// server-crawl <server.met> [rounds]: run the RECURSIVE UDP server crawl - ask
+/// the servers in the list for the servers THEY know (OP_SERVER_LIST_REQ2),
+/// then ask those, for `rounds` hops - and merge the safe survivors back into
+/// the list. The live harness for the Server Hunter discovery engine.
+///
+/// Copies the .met into a scratch config dir so a harness run never edits the
+/// file you point it at; prints the before/after count and where the result is.
+/// Most servers do NOT implement the request and simply stay silent - that is
+/// normal, not a failure.
+async fn cmd_server_crawl(met_path: &str, rounds: u32) {
+    let bytes = match std::fs::read(met_path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("cannot read {met_path}: {e}");
+            return;
+        }
+    };
+    let before = match mule_files::read_server_met(&bytes) {
+        Ok(m) => m.servers.len(),
+        Err(e) => {
+            eprintln!("not a server.met: {e:?}");
+            return;
+        }
+    };
+    let dir = std::env::temp_dir().join(format!("padmule-crawl-{}", std::process::id()));
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("cannot create {}: {e}", dir.display());
+        return;
+    }
+    if let Err(e) = std::fs::write(dir.join("server.met"), &bytes) {
+        eprintln!("cannot seed the scratch dir: {e}");
+        return;
+    }
+    let (mut engine, mut rx) = match mule_engine::Engine::new(&dir) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("engine: {e}");
+            return;
+        }
+    };
+    let printer = tokio::spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            if let mule_engine::EngineEvent::Server(t) = ev {
+                println!("  [server] {t}");
+            }
+        }
+    });
+
+    println!("crawling from {before} known server(s), {rounds} round(s) ...");
+    let added = engine.crawl_servers(rounds).await;
+    let after = std::fs::read(dir.join("server.met"))
+        .ok()
+        .and_then(|b| mule_files::read_server_met(&b).ok())
+        .map(|m| m.servers.len())
+        .unwrap_or(before);
+    println!("added {added} new server(s): {before} -> {after}");
+    println!("result: {}", dir.join("server.met").display());
+    drop(engine);
+    let _ = tokio::time::timeout(Duration::from_millis(200), printer).await;
+}
+
 /// Load an ipfilter.dat/.p2p list, report how many ranges block, and optionally
 /// test whether a given IP is blocked.
 fn cmd_ipfilter(path: &str, test_ip: Option<&str>) {
@@ -2468,6 +2529,10 @@ async fn main() {
         Some("ipfilter") if args.len() == 3 || args.len() == 4 => {
             cmd_ipfilter(&args[2], args.get(3).map(String::as_str))
         }
+        Some("server-crawl") if args.len() == 3 || args.len() == 4 => {
+            let rounds = args.get(3).and_then(|r| r.parse::<u32>().ok()).unwrap_or(2);
+            cmd_server_crawl(&args[2], rounds).await
+        }
         Some("upnp") if args.len() == 3 => match args[2].parse::<u16>() {
             Ok(port) => cmd_upnp(port).await,
             Err(_) => eprintln!("bad port: {}", args[2]),
@@ -2527,6 +2592,9 @@ async fn main() {
             eprintln!("  mule-cli kad-keyword <nodes.dat> <keyword>");
             eprintln!("  mule-cli link <ed2k-or-magnet-link> [out]");
             eprintln!("  mule-cli ipfilter <ipfilter.dat|.p2p> [test-ip]");
+            eprintln!(
+                "  mule-cli server-crawl <server.met> [rounds]   (recursive UDP server discovery)"
+            );
             eprintln!("  mule-cli search-download <server.met> <ext-keyword> <out>");
             eprintln!(
                 "  mule-cli fetch-complete <server.met> <ext-keyword> <out> [max_size] [min_size]"

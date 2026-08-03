@@ -28,6 +28,25 @@ pub const OP_OFFERFILES: u8 = 0x15;
 /// so this send is what makes the gossip harvest live.
 pub const OP_GETSERVERLIST: u8 = 0x14;
 
+/// Ask a server, over UDP, for the servers IT knows: `OP_SERVER_LIST_REQ2`
+/// (0xA4, bodiless), sent to the server's UDP port (TCP + 4). The answer is
+/// [`OP_SERVER_LIST_RES`], whose payload is byte-identical to TCP
+/// [`OP_SERVERLIST`] - so [`parse_server_list`] reads both.
+///
+/// DELIBERATE DEVIATION: no CLIENT authority sends this. eMule 0.50a
+/// (opcodes.h:205) and aMule (UDP.h:46, both 3.0.1 and master) DEFINE the pair
+/// but never send or parse it; on this socket they send the status ping (0x96)
+/// and description request (0xA2). padMule sends it because many SERVERS answer
+/// it - measured 2026-08-03: one live server returned 32 servers and a first
+/// crawl had 28 of 33 answer, while the vendored Lugdunum eserver 17.15 oracle,
+/// `ed2k-rust` and eMule Sunrise all stay SILENT (each answering 0x96 and 0xA2
+/// in the same burst, so the silence is real). Support is implementation-
+/// specific; SILENCE IS NORMAL, never an error or a liveness verdict.
+pub const OP_SERVER_LIST_REQ2: u8 = 0xA4;
+/// A server's answer to [`OP_SERVER_LIST_REQ2`]: same payload shape as
+/// [`OP_SERVERLIST`] (eMule opcodes.h:202).
+pub const OP_SERVER_LIST_RES: u8 = 0xA1;
+
 /// Server TCP-capability bit (in the OP_IDCHANGE flags word) meaning the server
 /// answers "related files" searches - a keyword query whose string is
 /// `related::<HEXHASH>`. eMule `server.h:39` SRV_TCPFLG_RELATEDSEARCH; gates
@@ -325,6 +344,24 @@ mod tests {
         );
         // Exact wire bytes: proto, u32 size (opcode only = 1), opcode.
         assert_eq!(write_packet(&pkt), vec![0xE3, 0x01, 0x00, 0x00, 0x00, 0x14]);
+    }
+
+    /// OP_SERVER_LIST_RES (0xA1, the UDP crawl answer) carries the SAME payload
+    /// as TCP OP_SERVERLIST, which is why the crawl reuses parse_server_list
+    /// rather than adding a second parser. Bytes taken from the shape in
+    /// eMule opcodes.h:202 - `<count 1>(<ip 4><port 2>)[count]`.
+    #[test]
+    fn the_udp_crawl_answer_shares_the_serverlist_payload() {
+        // count=2, then 85.17.116.222:4242 and 77.42.68.79:4232.
+        let payload = [2, 85, 17, 116, 222, 0x92, 0x10, 77, 42, 68, 79, 0x88, 0x10];
+        let got = parse_server_list(&payload).unwrap();
+        assert_eq!(
+            got,
+            vec![
+                (u32::from_le_bytes([85, 17, 116, 222]), 4242),
+                (u32::from_le_bytes([77, 42, 68, 79]), 4232),
+            ]
+        );
     }
 
     #[test]
