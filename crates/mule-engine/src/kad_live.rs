@@ -190,6 +190,15 @@ impl KadNode {
     pub fn routing(&self) -> &RoutingTable {
         &self.routing
     }
+    /// Mutable access to the live table. TEST-ONLY: it exists so the engine's
+    /// lifecycle tests can seed a node the way a real session would fill it
+    /// (lookups + `note_responder`), which is the only way to drive the
+    /// checkpoint path with a table that actually differs from the persisted one.
+    /// Production code must reach the table through the gated `add_contact`.
+    #[cfg(test)]
+    pub(crate) fn routing_mut(&mut self) -> &mut RoutingTable {
+        &mut self.routing
+    }
     pub fn contacts_known(&self) -> usize {
         self.routing.len()
     }

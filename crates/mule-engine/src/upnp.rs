@@ -615,6 +615,22 @@ pub async fn refresh_mapping(
     Ok(RefreshOutcome::Remapped)
 }
 
+/// Discover the gateway (multicast, then unicast) and DELETE our `port` mapping.
+///
+/// The exit-time counterpart of [`map_port`], and the piece padMule was missing:
+/// eMule deletes its ports on exit when `CloseUPnPOnExit` is set, which DEFAULTS
+/// TO TRUE (`Preferences.cpp:2501`), and aMule deletes unconditionally
+/// (`amule.cpp:1747-1751`). Because a mapping can only be removed by the internal
+/// address that owns it, releasing it while we still ARE that address is the only
+/// moment cleanup is possible at all.
+pub async fn unmap_port(port: u16) -> Result<(), UpnpError> {
+    let (svc, _gw) = match discover(Duration::from_secs(3)).await {
+        Ok(v) => v,
+        Err(_) => discover_unicast(&unicast_candidates().await, Duration::from_secs(2)).await?,
+    };
+    soap_delete_mapping(&svc, port, Proto::Tcp).await
+}
+
 /// Discover the gateway, then run [`refresh_mapping`] against it.
 ///
 /// The lease stays PERMANENT (0), matching every authority: eMule 0.50a's

@@ -2737,6 +2737,13 @@ impl Engine {
         if let Some(s) = &mut self.server {
             s.pause().await;
         }
+        // Fold what the live node learned into the persisted table BEFORE
+        // dropping it. `checkpoint()` below reads `self.kad` to build the union,
+        // and by then it would be None - so without this the checkpoint writes
+        // the stale bootstrap-time snapshot and every contact and verify key
+        // learned this session is lost, which is the whole bug this is meant to
+        // fix. Ordering is preserved deliberately: sockets still go first.
+        self.absorb_kad_routing();
         self.kad = None; // dropping the KadNode closes its UDP socket
         if let Some(h) = self.listener.take() {
             h.abort(); // release TCP 4662; resume() rebinds it
@@ -2850,11 +2857,66 @@ impl Engine {
         });
     }
 
-    /// Final checkpoint and stop. Safe from any state.
+    /// A DELIBERATE stop: disconnect, release every socket, flush, give the port
+    /// back to the gateway, and land in `Stopped`. Safe from any state, and
+    /// restartable in place with `start()`.
+    ///
+    /// This is the closest honest analogue of eMule's Exit. iOS has no app-quit
+    /// the app may invoke, so the user still closes padMule from the app
+    /// switcher - but doing it AFTER this leaves nothing behind.
+    ///
+    /// It used to checkpoint and set the state while leaving TCP 4662 bound, the
+    /// Kad UDP socket open and the port mapping in place, which is not a stop in
+    /// any sense the user would recognise.
     pub async fn shutdown(&mut self) {
+        if let Some(mut link) = self.server.take() {
+            link.disconnect().await;
+        }
+        self.connection = None;
+        self.search_session = None;
+        // Same ordering rule as pause(): fold the live table in BEFORE the node
+        // is dropped, or the checkpoint below writes a stale snapshot.
+        self.absorb_kad_routing();
+        self.kad = None;
+        if let Some(h) = self.listener.take() {
+            h.abort();
+        }
         self.persist_downloads().await;
         self.checkpoint();
+        self.release_port_mapping().await;
+        self.emit(EngineEvent::Status("Stopped".into()));
         self.set_state(EngineState::Stopped);
+    }
+
+    /// Hand the forwarded port back on a deliberate stop.
+    ///
+    /// BOTH authorities do this and padMule never did: eMule deletes its ports on
+    /// exit when `CloseUPnPOnExit` is set, which DEFAULTS TO TRUE
+    /// (`Preferences.cpp:2501`, `emuleDlg.cpp:1817-1819`), and aMule deletes
+    /// unconditionally (`amule.cpp:1747-1751`). Leaving a PERMANENT mapping behind
+    /// is exactly how one outlived this device's DHCP address and stranded the
+    /// port until a human cleared it by hand - a mapping can only be deleted by
+    /// the address that owns it, so the moment our address changes it is too late.
+    ///
+    /// Awaited rather than spawned: the user asked to stop, so it is honest to
+    /// finish the work (and report a failure) before saying we did.
+    async fn release_port_mapping(&mut self) {
+        if self.offline || self.public_ip.is_none() {
+            return;
+        }
+        match crate::upnp::unmap_port(TCP_PORT).await {
+            Ok(()) => {
+                self.public_ip = None;
+                self.emit(EngineEvent::Server(format!(
+                    "UPnP: released port {TCP_PORT}"
+                )));
+            }
+            // Non-fatal: the stop itself still succeeded, and saying so is more
+            // useful than silence - a mapping left behind is what strands a port.
+            Err(e) => self.emit(EngineEvent::Server(format!(
+                "UPnP: could not release port {TCP_PORT} ({e})"
+            ))),
+        }
     }
 
     /// Flush every active download's `.part.met` (its gap list) so the progress
@@ -2868,6 +2930,20 @@ impl Engine {
         let dls: Vec<Arc<Download>> = self.downloads.lock().await.clone();
         for dl in dls {
             dl.persist().await;
+        }
+    }
+
+    /// Copy the LIVE Kad node's table into the persisted one.
+    ///
+    /// Must run before any path that drops the node and then checkpoints -
+    /// `checkpoint_contacts` can only union in a node that still exists. Cheap
+    /// and idempotent: `load_nodes` merges, so calling it twice changes nothing.
+    fn absorb_kad_routing(&mut self) {
+        // Bind the conversion first so the borrow of `self.kad` ends before
+        // `self.routing` is borrowed mutably.
+        let learned = self.kad.as_ref().map(|n| routing_to_nodes(n.routing()));
+        if let Some(learned) = learned {
+            self.routing.load_nodes(&learned);
         }
     }
 
@@ -3003,6 +3079,127 @@ mod tests {
         let only = checkpoint_contacts(&persisted, None);
         assert_eq!(only.len(), 1);
         assert_eq!(only[0].udp_key, 0, "no live node, no invented state");
+    }
+
+    /// A deliberate STOP must actually stop: release the sockets (the old
+    /// `shutdown` checkpointed and set the state while leaving TCP 4662 bound and
+    /// Kad's UDP socket open), persist what the session learned, and leave the
+    /// engine restartable without relaunching the app.
+    #[tokio::test]
+    async fn stop_releases_sockets_persists_and_can_restart() {
+        use crate::kad_live::KadNode;
+        use mule_files::read_nodes_dat;
+
+        let dir = tmp("stop-clean");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut engine, mut rx) = Engine::new(&dir).unwrap();
+        engine.set_offline(true);
+
+        let learned = KadContact {
+            id: Kad128::from_hash(&[0xD4; 16]),
+            ip: 0x0C0C_0C0C,
+            udp_port: 4672,
+            tcp_port: 4662,
+            version: 8,
+            udp_key: 0xFEED_FACE,
+            udp_key_ip: 0x0303_0303,
+            verified: true,
+        };
+        let mut node = KadNode::bind("127.0.0.1:0".parse().unwrap(), 4662)
+            .await
+            .unwrap();
+        node.routing_mut()
+            .load_nodes(std::slice::from_ref(&learned));
+        engine.kad = Some(node);
+        engine.state = EngineState::Running;
+
+        engine.shutdown().await;
+
+        assert_eq!(engine.state(), EngineState::Stopped);
+        assert!(engine.kad.is_none(), "the Kad socket must be released");
+        assert!(engine.listener.is_none(), "TCP 4662 must be released");
+        assert!(engine.server.is_none(), "the server link must be dropped");
+
+        // What the session learned still reached disk.
+        let nd = read_nodes_dat(&std::fs::read(dir.join("nodes.dat")).unwrap()).unwrap();
+        assert!(
+            nd.contacts.iter().any(|c| c.id == learned.id),
+            "a stop must still persist the session's Kad contacts"
+        );
+
+        // The user is told, in a line the UI can show verbatim.
+        let evs = drain(&mut rx).await;
+        assert!(
+            evs.iter()
+                .any(|e| matches!(e, EngineEvent::Status(s) if s == "Stopped")),
+            "stop must announce itself; got {evs:?}"
+        );
+
+        // ...and it is restartable in-place, so a deliberate stop does not brick
+        // the app until it is relaunched.
+        engine.start().await;
+        assert_eq!(engine.state(), EngineState::Running);
+        engine.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The REAL `pause()` path must persist what the live Kad node learned.
+    ///
+    /// The first version of this fix added the union inside `checkpoint_contacts`
+    /// and was proven only by calling that helper directly - which MISSED that
+    /// `pause()` sets `self.kad = None` BEFORE it calls `checkpoint()`, so on the
+    /// one path that matters most on iPadOS the helper was handed `None` and the
+    /// stale snapshot was written anyway. This test drives `pause()` itself and
+    /// reads the nodes.dat that lands on disk, so it cannot be fooled the same way.
+    #[tokio::test]
+    async fn pause_persists_what_the_live_kad_node_learned() {
+        use crate::kad_live::KadNode;
+        use mule_files::read_nodes_dat;
+
+        let dir = tmp("pause-kad-persist");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+        engine.set_offline(true);
+
+        // A live node holding a contact the persisted table has never seen, with
+        // the verify key a real session would have captured from its response.
+        let learned = KadContact {
+            id: Kad128::from_hash(&[0xC3; 16]),
+            ip: 0x0B0B_0B0B,
+            udp_port: 4672,
+            tcp_port: 4662,
+            version: 8,
+            udp_key: 0x1234_5678,
+            udp_key_ip: 0x0202_0202,
+            verified: true,
+        };
+        let mut node = KadNode::bind("127.0.0.1:0".parse().unwrap(), 4662)
+            .await
+            .unwrap();
+        node.routing_mut()
+            .load_nodes(std::slice::from_ref(&learned));
+        engine.kad = Some(node);
+        engine.state = EngineState::Running;
+
+        engine.pause().await;
+
+        let bytes = std::fs::read(dir.join("nodes.dat")).expect("pause must write nodes.dat");
+        let nd = read_nodes_dat(&bytes).expect("valid nodes.dat");
+        let got = nd
+            .contacts
+            .iter()
+            .find(|c| c.id == learned.id)
+            .unwrap_or_else(|| {
+                panic!(
+                    "the contact learned this session is missing from nodes.dat: {:?}",
+                    nd.contacts
+                )
+            });
+        assert_eq!(got.udp_key, 0x1234_5678, "its verify key must persist too");
+        assert!(got.verified, "its verified bit must persist too");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A local mock eD2k server that answers a login with a HighID IDCHANGE
