@@ -66,6 +66,14 @@ pub struct PartStore {
     pub priority: u8,
 }
 
+/// The previous generation of a `.part.met`, kept so a lost or unreadable live
+/// met never strands a download (eMule `PARTMET_BAK_EXT`).
+fn met_bak_path(met_path: &Path) -> PathBuf {
+    let mut p = met_path.as_os_str().to_owned();
+    p.push(".bak");
+    PathBuf::from(p)
+}
+
 /// Free space we refuse to consume when preallocating, so a download can never
 /// fill the device to zero - iPadOS degrades badly there (and the user still has
 /// to be able to save the finished file out of Documents).
@@ -149,8 +157,18 @@ impl PartStore {
     /// Resume `NNN.part` from its `.part.met`.
     pub fn open(dir: &Path, index: u32) -> io::Result<Self> {
         let (part_path, met_path) = paths(dir, index);
-        let met = read_part_met(&fs::read(&met_path)?)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e:?}")))?;
+        // Prefer the live met; fall back to the previous generation if it is
+        // missing or unreadable, so one bad save (or a suspension kill mid-write
+        // on a filesystem that reorders) never strands a download. eMule does the
+        // same (DownloadQueue.cpp:103 loads PARTMET_BAK_EXT on failure).
+        let met = match fs::read(&met_path)
+            .ok()
+            .and_then(|b| read_part_met(&b).ok())
+        {
+            Some(m) => m,
+            None => read_part_met(&fs::read(met_bak_path(&met_path))?)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e:?}")))?,
+        };
 
         let size = met
             .tags
@@ -329,8 +347,17 @@ impl PartStore {
             tags,
         };
 
+        // Write new content aside, promote the PREVIOUS met to .bak, then
+        // atomically install - aMule's own save order (PartFile.cpp:855-865):
+        // one content write plus two metadata renames, and the live .part.met is
+        // never absent or partial at any observable moment. The .bak is not
+        // decorative: `open` recovers from it, exactly as eMule does when the
+        // live met fails to load (DownloadQueue.cpp:103).
         let tmp = self.met_path.with_extension("met.tmp");
         fs::write(&tmp, write_part_met(&met))?;
+        // Best-effort: a first save has nothing to promote, and a failure here
+        // must not cost us the new content.
+        let _ = fs::rename(&self.met_path, met_bak_path(&self.met_path));
         fs::rename(&tmp, &self.met_path)?;
         Ok(())
     }
@@ -420,6 +447,52 @@ fn parse_corrupted(s: &[u8]) -> Vec<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn saving_promotes_the_previous_met_to_a_bak_and_open_recovers_from_it() {
+        // Upstream keeps a previous generation of the part.met and RECOVERS from
+        // it: eMule 0.50a loads `<name>.part.met.bak` when the live file fails
+        // (DownloadQueue.cpp:103), and aMule installs it by renaming the old met
+        // aside before the atomic install (PartFile.cpp:855-865). padMule's
+        // tmp+rename already made a TORN write impossible, but a lost or
+        // unreadable met still stranded a download - which matters more here
+        // than on desktop, since iPadOS kills the app on suspension as routine.
+        use super::*;
+        let dir = std::env::temp_dir().join(format!("padmule-bak-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // create() writes the first met itself, so there is nothing to promote
+        // until a SUBSEQUENT save.
+        let mut st = PartStore::create(&dir, 1, [0x5A; 16], 40_000, b"first.bin").unwrap();
+        let bak = dir.join("001.part.met.bak");
+        assert!(!bak.exists(), "nothing to back up until a second save");
+
+        // The next save promotes the PREVIOUS content to .bak - so the backup
+        // must hold the OLD name, not the new one.
+        st.name = b"second.bin".to_vec();
+        st.save_met().unwrap();
+        assert!(bak.exists(), "the previous met must be kept as .bak");
+        let old = read_part_met(&std::fs::read(&bak).unwrap()).unwrap();
+        let old_name = old.tags.iter().find_map(|t| match (&t.name, &t.value) {
+            (mule_proto::TagName::Id(FT_FILENAME), TagValue::Str(v)) => Some(v.clone()),
+            _ => None,
+        });
+        assert_eq!(old_name.as_deref(), Some(&b"first.bin"[..]));
+
+        // The recovery path: a destroyed live met must not strand the download.
+        drop(st);
+        std::fs::write(dir.join("001.part.met"), b"garbage not a met").unwrap();
+        let recovered = PartStore::open(&dir, 1).expect("open must fall back to the .bak");
+        assert_eq!(recovered.name, b"first.bin".to_vec());
+        // A missing (not merely corrupt) met recovers too.
+        drop(recovered);
+        std::fs::remove_file(dir.join("001.part.met")).unwrap();
+        let recovered = PartStore::open(&dir, 1).expect("a MISSING met must also fall back");
+        assert_eq!(recovered.name, b"first.bin".to_vec());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn the_space_guard_refuses_only_what_would_exhaust_the_volume() {
         // Pure predicate, so the policy is testable without a full disk.
