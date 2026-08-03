@@ -106,6 +106,34 @@ itself is, row 1c). [RESOLVED 2026-07-19: AICH byte-validation landed vs REAL
 amuled - the master root matches known2_64.met bit-for-bit (build-progress 8u);
 a cross-check vs a live Windows eMule remains optional, not open.]
 
+## LANDMINE: aMule master reuses a tag number eMule already owns (2026-08-02)
+
+Post-3.0.1 aMule master defines, in `src/include/tags/FileTags.h:72-73`:
+
+    FT_LASTUPLOADED  0x55   // aMule master (issue #466)
+    FT_SHAREDSINCE   0x56   // aMule master (issue #466)
+
+But eMule 0.50a already owns 0x55 for something else, `opcodes.h:391`:
+
+    FT_MAXSOURCES    0x55   // <uint32>
+
+and eMule already HAS the "shared since" semantic at a different number,
+`opcodes.h:381`: `FT_LASTSHARED 0x34`.
+
+RULE (the authority split, CLAUDE.md): eMule 0.50a decides FILE FORMAT, so
+**0x55 is FT_MAXSOURCES**. padMule must NOT define 0x55/0x56 as aMule master
+does; if padMule ever needs "shared since", use eMule's `FT_LASTSHARED 0x34`.
+
+Blast radius is limited but the number is still wrong: these are written only
+in the known.met record path (`KnownFile.cpp:942,947`), NOT in
+`CreateOfferedFilePacket`, so this is a file-format divergence, not a wire one.
+padMule is unharmed either way because `mule-files::known_met` is tag-generic
+and round-trips every tag verbatim - an aMule-master-written known.met is
+preserved bit-for-bit and vice versa.
+
+Recorded so a future "let us import aMule's newer constants" pass does not
+helpfully overwrite eMule's meaning.
+
 ## Related
 
 - [[arch-upstream-amule]]
