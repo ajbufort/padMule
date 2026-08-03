@@ -8,7 +8,28 @@
 // ... and docs/wiki/lifecycle-and-reactivation.md for why pause/resume is honest.
 
 import Foundation
+import OSLog
 import SwiftUI
+
+/// The engine's on-device log. Until this existed, `idevicesyslog -p padMule`
+/// carried ZERO app-authored lines - a 1293-line capture across a full launch,
+/// search and download was entirely system frameworks - because nothing in the
+/// Swift shell or the Rust engine ever called os_log, and a GUI app's stdout
+/// (where Rust `println!` goes) is not captured. The UI rows were the only
+/// window into the engine on a device with no debugger.
+///
+/// Read it from a paired machine with:
+///   idevicesyslog -p padMule
+/// or filter to just these lines with:
+///   idevicesyslog -p padMule -m padMule.engine
+///
+/// PRIVACY: os_log redacts interpolated strings unless marked `.public`, and
+/// these are marked public DELIBERATELY - a redacted diagnostic is worthless.
+/// What flows through here is safe to show: the engine never emits our own
+/// public IP or client ID (`server_state_label` and `ServerInfo` exist precisely
+/// to keep those out of user-visible text), server addresses are public
+/// infrastructure, and the only local addresses that appear are RFC1918.
+let engineLog = Logger(subsystem: "us.ajbconsulting.padMule", category: "padMule.engine")
 
 // File-scope, NOT static members: a stored-property initializer cannot reference
 // `Self.` (covariant Self), so the recents key/cap live here where the
@@ -145,11 +166,13 @@ final class EngineModel: ObservableObject {
 
         let path = dir.path
         let docsPath = docs.path
+        engineLog.notice("boot: config=\(path, privacy: .public)")
         work.async { [weak self] in
             do {
                 let e = try MuleEngine(configDir: path, downloadsDir: docsPath)
                 let ident = e.identity()
                 e.start()
+                engineLog.notice("boot OK; engine started")
                 DispatchQueue.main.async {
                     guard let self else { return }
                     self.booting = false
@@ -159,6 +182,9 @@ final class EngineModel: ObservableObject {
                     self.refresh()
                 }
             } catch {
+                // A cold-boot failure is otherwise visible only as a message on
+                // screen, which is no help once the screen has moved on.
+                engineLog.error("boot FAILED: \(String(describing: error), privacy: .public)")
                 DispatchQueue.main.async {
                     self?.booting = false
                     self?.bootError = "\(error)"
@@ -474,13 +500,19 @@ final class EngineModel: ObservableObject {
 
     /// App backgrounded: checkpoint + release sockets. iPadOS would reclaim them
     /// anyway - doing it explicitly is what makes resume honest.
-    func pause() { run { $0.pause() } }
+    func pause() {
+        engineLog.notice("lifecycle: pause (backgrounded)")
+        run { $0.pause() }
+    }
 
     /// App foregrounded: rebuild + reconnect.
     /// (shutdown() is NOT called from the lifecycle hooks: iOS gives no reliable
     /// termination hook, and pause() already checkpoints on .background. It is
     /// reachable only from the explicit Stop control - see `stop()`.)
-    func resume() { run { $0.resume() } }
+    func resume() {
+        engineLog.notice("lifecycle: resume (foregrounded)")
+        run { $0.resume() }
+    }
 
     /// The user asked to stop: disconnect, release the sockets, flush, and give
     /// the forwarded port back to the router. iOS has no app-quit an app may
@@ -493,9 +525,11 @@ final class EngineModel: ObservableObject {
     /// across an app switch until the user starts it again.
     func stop() {
         guard let e = engine else { return }
+        engineLog.notice("lifecycle: STOP requested by the user")
         stopping = true
         work.async { [weak self] in
             e.shutdown()
+            engineLog.notice("lifecycle: stopped (sockets released, port handed back)")
             DispatchQueue.main.async {
                 self?.stopping = false
                 self?.refresh()
@@ -506,9 +540,11 @@ final class EngineModel: ObservableObject {
     /// Start again after an explicit stop, without relaunching the app.
     func startEngine() {
         guard let e = engine else { return }
+        engineLog.notice("lifecycle: START requested by the user")
         stopping = true
         work.async { [weak self] in
             e.start()
+            engineLog.notice("lifecycle: started")
             DispatchQueue.main.async {
                 self?.stopping = false
                 self?.refresh()
@@ -605,12 +641,17 @@ final class EngineModel: ObservableObject {
     private func apply(_ event: EngineEventFfi) {
         switch event {
         case .state(let s):
+            engineLog.notice("state -> \(String(describing: s), privacy: .public)")
             state = s
         case .status(let text):
+            engineLog.notice("status: \(text, privacy: .public)")
             status = text
             // The reconnect banner is a HARD lifecycle requirement.
             reconnecting = (text == "Reconnecting...")
         case .server(let text):
+            // Logged before the UPnP/notice split below, so the log carries BOTH
+            // kinds - the port-mapping results and the server news - in order.
+            engineLog.notice("server: \(text, privacy: .public)")
             // Port-mapping results go to a DURABLE field so the connection line
             // can't overwrite them (that "an event is not state" bug again).
             if text.hasPrefix("UPnP:") {
@@ -627,10 +668,16 @@ final class EngineModel: ObservableObject {
         case .serverDropped(let addr):
             // The server kicked/dropped us: raise a prominent dialog and refresh
             // the server list (the connected row is no longer connected).
+            engineLog.error("server DROPPED us: \(addr, privacy: .public)")
             serverKick = addr
             server = nil
             loadServers()
         case .kad(let contacts):
+            // Only on CHANGE: this one can arrive on every poll, and a log that
+            // repeats itself once a second is a log nobody reads.
+            if contacts != kadContacts {
+                engineLog.info("kad contacts: \(contacts, privacy: .public)")
+            }
             kadContacts = contacts
         case .progress:
             break // downloads() already carries the numbers

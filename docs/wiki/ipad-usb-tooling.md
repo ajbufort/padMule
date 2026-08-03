@@ -16,16 +16,32 @@ WORKING NOW, all without root:
   so the sudo tunnel this entry originally predicted is NOT needed. I can see
   the iPad's screen.
 - **Live syslog** - `idevicesyslog -p padMule` streams the app's log stream to
-  this box. **CORRECTED 2026-08-02:** this is NOT "padMule's own engine logging".
-  A 1293-line capture across a full launch + search + download-add contained
-  **ZERO app-authored lines** - every line came from a system framework
-  (UIKitCore, CoreHaptics, XCTAutomationSupport, ...), because neither the Swift
-  shell nor the Rust engine ever calls os_log/NSLog, and a GUI app's stdout
-  (where Rust `println!` goes) is not captured. Useful for lifecycle/UIKit
-  forensics and for proving a tap registered (haptics fire); useless for engine
-  state. The UI rows ARE the engine's only window today, exactly as
-  `engine.rs:1535-1540` argues for the UPnP line. FIX WORTH MAKING: route
-  EngineEvent through os_log so this command means what this entry used to claim.
+  this box, and since 2026-08-02 that INCLUDES padMule's own engine logging:
+
+  ```bash
+  idevicesyslog -p padMule                      # everything the app emits
+  idevicesyslog -p padMule -m padMule.engine    # just the engine lines
+  ```
+
+  Every `EngineEvent` (state, status, server/UPnP text, a server drop, Kad
+  contact changes) plus boot, boot FAILURES and every lifecycle transition
+  (pause / resume / stop / start) now goes to `os_log` under subsystem
+  `us.ajbconsulting.padMule`, category **`padMule.engine`**. Messages are marked
+  `.public` deliberately - os_log redacts interpolated strings otherwise, and a
+  redacted diagnostic is worthless; nothing sensitive flows through it, since the
+  engine never emits our own public IP or client id and the only local addresses
+  that appear are RFC1918.
+
+  [HISTORY, kept because it is why the work happened: before that change this
+  bullet had to be CORRECTED to say the opposite. A 1293-line capture across a
+  full launch + search + download-add contained **ZERO app-authored lines** -
+  every line came from a system framework - because nothing in the Swift shell or
+  the Rust engine ever called os_log, and a GUI app's stdout (where Rust
+  `println!` goes) is not captured. The UI rows were the engine's only window.]
+
+  STILL TRUE: this carries what the engine EMITS AS EVENTS. Internals that never
+  become an event (a peer refusing a block, a swallowed error) remain invisible;
+  routing those through a `Log` event is the next step if it is ever needed.
 - **App install** - `pymobiledevice3 apps install x.ipa` works. (NB
   `ideviceinstaller -i` timed out; prefer pymobiledevice3.)
 - **Reading the installed bundle** - `pymobiledevice3 developer dvt ls <path>`

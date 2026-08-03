@@ -51,10 +51,12 @@ Then verify on device (touch control makes this ~5 minutes, [[ipad-usb-tooling]]
 
 ## Open tasks
 
-1. **os_log the engine** - `idevicesyslog -p padMule` carries ZERO app-authored
-   lines; neither the Swift shell nor the Rust engine ever calls os_log, so the
-   UI rows are the only window into the engine on-device. This is the highest-
-   leverage remaining tooling item now that the agent can drive the device.
+1. [DONE 2026-08-02] ~~os_log the engine~~ - landed: every EngineEvent plus boot,
+   boot failures and each lifecycle transition now reach `os_log` under category
+   `padMule.engine`, so `idevicesyslog -p padMule -m padMule.engine` is a real
+   window into the engine. What remains OPEN is the narrower half: engine
+   INTERNALS that never become an event (a peer refusing a block, a swallowed
+   error) are still invisible; a `Log` event variant would carry them.
 2. **AICH block recovery** - the last scorecard PARTIAL, wave 11. Do NOT port the
    vendored 3.0.1 oracle's racy `known2_64.met` orphan-prune; route
    `localize_corruption`'s blamed parts into block-level recovery; ship the AICH
