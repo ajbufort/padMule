@@ -158,6 +158,12 @@ fn gate_loaded_nodes(contacts: &[KadContact], filter: Option<&IpFilter>) -> Vec<
 
 /// How long to wait for a server's search answer / source list. Servers reply in
 /// well under this or not at all.
+/// How often a RUNNING engine re-checkpoints (see `Engine::maintain_checkpoint`).
+/// Five minutes bounds what a suspend-kill can cost without writing often enough
+/// to matter: the Kad table and credit ledger both move slowly, and the write is
+/// a few small files.
+const CHECKPOINT_EVERY: Duration = Duration::from_secs(300);
+
 const SEARCH_WAIT: Duration = Duration::from_secs(20);
 const SOURCES_WAIT: Duration = Duration::from_secs(10);
 
@@ -1003,6 +1009,8 @@ pub struct Engine {
     identity: NodeIdentity,
     config_dir: PathBuf,
     state: EngineState,
+    /// When the last periodic checkpoint ran (see `maintain_checkpoint`).
+    last_checkpoint: Instant,
     events: mpsc::UnboundedSender<EngineEvent>,
     /// Persisted Kad contacts (loaded from / saved to `nodes.dat`).
     routing: RoutingTable,
@@ -1089,6 +1097,7 @@ impl Engine {
             downloads_dir: config_dir.join("downloads"),
             config_dir,
             state: EngineState::Stopped,
+            last_checkpoint: Instant::now(),
             events: tx,
             routing,
             downloads: Arc::new(Mutex::new(Vec::new())),
@@ -2930,6 +2939,32 @@ impl Engine {
         }
     }
 
+    /// Re-checkpoint periodically while RUNNING, so a kill that never reaches
+    /// `pause()` does not cost the whole session.
+    ///
+    /// A DELIBERATE DEVIATION from both authorities, flagged as such: eMule and
+    /// aMule each write `nodes.dat` only from `CRoutingZone`'s DESTRUCTOR
+    /// (RoutingZone.cpp:137-142 and :118-123 respectively) - i.e. on a clean
+    /// exit, never on a timer. That is sound for a desktop app that gets to run
+    /// its destructors. iPadOS does not offer that: the app is killed at
+    /// suspension as ROUTINE behavior, and `pause()` only runs if `.background`
+    /// is actually delivered first. So the platform, not the protocol, is the
+    /// reason - and nothing here touches the wire or the file FORMAT.
+    ///
+    /// Driven by the same 1s `downloads()` heartbeat as the other background
+    /// duties, and gated on elapsed time so all but one call in 300 is a clock
+    /// comparison.
+    pub async fn maintain_checkpoint(&mut self) {
+        if self.state != EngineState::Running || self.last_checkpoint.elapsed() < CHECKPOINT_EVERY {
+            return;
+        }
+        // Progress first: a half-finished download is the costliest thing to lose
+        // and the hot receive path only updates the IN-MEMORY gap list.
+        self.persist_downloads().await;
+        self.checkpoint();
+        self.last_checkpoint = Instant::now();
+    }
+
     /// Install or clear the live Kad node, absorbing whatever the OUTGOING node
     /// learned first.
     ///
@@ -3153,6 +3188,45 @@ mod tests {
         engine.start().await;
         assert_eq!(engine.state(), EngineState::Running);
         engine.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The periodic checkpoint must fire when it is DUE and stay quiet when it is
+    /// not - an unconditional write on the 1s heartbeat would hammer the disk.
+    #[tokio::test]
+    async fn the_periodic_checkpoint_fires_only_when_due() {
+        let dir = tmp("periodic-ckpt");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+        engine.set_offline(true);
+        engine.state = EngineState::Running;
+
+        let nodes = dir.join("nodes.dat");
+        let _ = std::fs::remove_file(&nodes);
+
+        // Just started: not due, so nothing is written.
+        engine.maintain_checkpoint().await;
+        assert!(
+            !nodes.exists(),
+            "a fresh engine must not checkpoint on every heartbeat"
+        );
+
+        // Due: it writes.
+        engine.last_checkpoint = Instant::now() - CHECKPOINT_EVERY - Duration::from_secs(1);
+        engine.maintain_checkpoint().await;
+        assert!(nodes.exists(), "an overdue checkpoint must write");
+
+        // ...and the timer resets, so the next heartbeat is quiet again.
+        std::fs::remove_file(&nodes).unwrap();
+        engine.maintain_checkpoint().await;
+        assert!(!nodes.exists(), "the timer must reset after a checkpoint");
+
+        // It is also inert unless RUNNING - pause/shutdown own those boundaries.
+        engine.state = EngineState::Paused;
+        engine.last_checkpoint = Instant::now() - CHECKPOINT_EVERY - Duration::from_secs(1);
+        engine.maintain_checkpoint().await;
+        assert!(!nodes.exists(), "a paused engine must not checkpoint again");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
