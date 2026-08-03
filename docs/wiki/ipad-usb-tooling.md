@@ -294,8 +294,19 @@ Windows Apple Mobile Device Service did not re-enumerate it without a physical
 replug.
 
 So the working division of labour today is: **CI builds, this box signs,
-Sideloadly (or a replug + retry) installs.** Copy the signed .ipa to
+Sideloadly (or a replug + retry) installs.** Copy the .ipa to
 `/mnt/c/Users/ajbuf/Downloads/` and install it from Windows.
+
+**...but hand Sideloadly the UNSIGNED artifact.** Learned the expensive way
+2026-08-02: a build already signed here with `-b us.ajbconsulting.padMule.
+Q444CHAF2Z` came back out of Sideloadly as
+`us.ajbconsulting.padMule.Q444CHAF2Z.Q444CHAF2Z` - it appends the team suffix
+AGAIN. That is a NEW bundle id, so it installs as a SEPARATE app with an empty
+container (fresh userhash and Kad ID, visible on the Status screen) instead of
+upgrading in place, and the previous app's downloads and identity are left
+behind. `-b` is correct ONLY for a direct `pymobiledevice3 apps install` from
+here; Sideloadly does its own signing and suffixing, so give it the raw CI
+artifact.
 
 ## Signing padMule locally (a genuine win, independent of WDA)
 
