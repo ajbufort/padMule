@@ -611,6 +611,11 @@ impl MuleEngine {
             // Detect a server drop/kick within ~1s and emit ServerDropped (the UI
             // shows a dialog). Cancel-safe peek, so this never disturbs framing.
             g.poll_server_drop().await;
+            // Re-checkpoint every few minutes so a suspend-kill that never
+            // delivers .background (and so never reaches pause()) cannot cost the
+            // whole session's download progress, Kad table and credits. Gated on
+            // elapsed time, so almost every call here is just a clock comparison.
+            g.maintain_checkpoint().await;
             out
         })
     }
