@@ -11,10 +11,11 @@ rows 8av-8ba + the [[log]] entries for 2026-08-03 + [[feature-server-hunter]].
 ## State of the tree
 
 - All work committed AND pushed; tree clean; branch even with origin/main at
-  **6d99fd4**. Session commits: 37eeac4 (doc-drift round), 4949f25
+  **c79caf6**. Session commits: 37eeac4 (doc-drift round), 4949f25
   (OP_GETSERVERLIST), fff31dc (magnet + Kad-gate fixes), c0de43a (device pass),
-  6d99fd4 (the RECURSIVE UDP CRAWL).
-- **Gate**: 548 tests, clippy WARNING-FREE, fmt clean, ASCII clean.
+  6d99fd4 (the RECURSIVE UDP CRAWL), c79caf6 (server NAMES for discovered
+  servers).
+- **Gate**: 552 tests, clippy WARNING-FREE, fmt clean, ASCII clean.
 - CI: all three workflows GREEN through fff31dc. The runs for c0de43a and
   6d99fd4 were in flight at handoff time - CONFIRM green before installing,
   since 6d99fd4 is the first build carrying the crawl's Swift + FFI changes
@@ -47,6 +48,14 @@ CRAWL, which asks servers we are NOT connected to and then asks the ones that
 answer. LIVE: 10 seeds -> asked 33 -> 28 answered -> 25 new servers (10 -> 35),
 and a 3-round run converged on the same 25, so it terminates rather than running
 away. Whole-net scanning stays deliberately out of scope.
+
+Anthony then caught that discovered servers showed only IPs - discovery yields
+ip:port and carries no name. Fixed the same session with PARITY (c79caf6):
+`OP_SERVER_DESC_REQ` (0xA2), which both authorities already send after a status
+answer, now rides along with the Servers-screen probe; both answer forms are
+handled and the learned name is persisted into server.met. LIVE: 33 of 35
+servers named after a crawl, the only two unnamed being the two that answered
+nothing at all.
 
 METHOD NOTE that should outlive this session: the wire question was settled by
 PROBING BEFORE CODING. Both authorities' opcode tables define
@@ -112,11 +121,12 @@ channel.
 
 ## Open tasks (ranked)
 
-1. **DEVICE-VERIFY THE CRAWL** - the only thing the new discovery engine still
-   lacks. Install a build with 6d99fd4 and tap "Discover more servers" on the
-   Servers screen: expect a "Crawl asked N server(s), M answered - K new"
-   notice and the table to grow. It blocks ~10s (2 rounds), so it also
-   exercises the known serial-queue freeze (task 2).
+1. **DEVICE-VERIFY THE CRAWL + NAMES** - all the new discovery work is
+   CI-green and live-proven from the dev box but NOT yet on glass. Install a
+   build with c79caf6 and tap "Discover more servers" on the Servers screen:
+   expect a "Crawl asked N server(s), M answered - K new" notice, the table to
+   grow, and the new rows to show NAMES rather than bare IPs. It blocks ~10s
+   (2 rounds), so it also exercises the known serial-queue freeze (task 2).
 2. **Portability Tier 2** ([[portability-audit]]) plus the reanalysis findings
    that belong with it: "Reconnecting..." can never render (events drain behind
    the blocking call on one serial queue; a second drain queue fixes it) AND
