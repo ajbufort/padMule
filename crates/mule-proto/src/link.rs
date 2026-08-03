@@ -93,7 +93,12 @@ fn parse_magnet(query: &str) -> Option<Ed2kLink> {
     let mut link = FileLink::default();
     let mut have_hash = false;
     for pair in query.split('&') {
-        let (key, val) = pair.split_once('=')?;
+        // A parameter without '=' (a flag like `x.pad`, or the empty segment
+        // from a trailing '&') is skipped, not fatal - mirrors the ed2k-path
+        // tolerance for unknown trailing segments above.
+        let Some((key, val)) = pair.split_once('=') else {
+            continue;
+        };
         // `xt` may repeat (ed2k + aich); strip a `.N` suffix eMule sometimes adds.
         let key = key.split('.').next().unwrap_or(key);
         let val = url_decode(val);
@@ -299,5 +304,16 @@ mod tests {
         assert!(parse_link("http://example.org").is_none());
         assert!(parse_link("ed2k://|file|x|10|tooshort|/").is_none());
         assert!(parse_link("magnet:?dn=noHash").is_none());
+    }
+
+    #[test]
+    fn magnet_ignores_flag_style_and_empty_parameters() {
+        let s = format!("magnet:?xt=urn:ed2k:{HASH_HEX}&xl=1024&dn=file.iso&x.pad&");
+        let Ed2kLink::File(f) = parse_link(&s).unwrap() else {
+            panic!()
+        };
+        assert_eq!(f.hash, HASH);
+        assert_eq!(f.size, 1024);
+        assert_eq!(f.name, "file.iso");
     }
 }

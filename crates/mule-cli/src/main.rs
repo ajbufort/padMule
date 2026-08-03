@@ -1177,6 +1177,9 @@ async fn cmd_peer_download(
 /// Wave-6 live gate: load a nodes.dat, then send obfuscated BOOTSTRAP_REQs to
 /// its contacts until one answers - proving the Kad UDP framing, obfuscation,
 /// and message codecs against a real node. On success, follow with a HELLO.
+/// Deliberately unfiltered beyond the version check below (no ipfilter, no
+/// private/loopback/DNS-port exclusion): this is a developer diagnostic against
+/// a file you hand it, not the engine's bootstrap path.
 async fn cmd_kad_bootstrap(nodes_path: &str, bind_ip: Option<&str>) {
     let bytes = match std::fs::read(nodes_path) {
         Ok(b) => b,
