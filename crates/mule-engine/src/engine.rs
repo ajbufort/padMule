@@ -1637,9 +1637,20 @@ impl Engine {
             )));
             Self::offer_shared_to(&self.shared, &mut link).await;
             self.server = Some(link);
+            // The DURABLE status line too, not only the notice above. The app
+            // feeds its status row from `Status` events ALONE and routes `Server`
+            // text to a transient banner, so without this the row keeps whatever
+            // start() last said - it read "Not connected - pick a server" on a
+            // screen that was simultaneously showing the server and "HighID"
+            // (found on-device 2026-08-02). Emitted after `self.server` is set,
+            // because `online_status` asks `is_online`.
+            self.emit(EngineEvent::Status(self.online_status()));
             true
         } else {
             self.emit(EngineEvent::Server(format!("could not connect to {addr}")));
+            // A failed dial also DROPPED any previous link above, so the row must
+            // stop claiming the connection we no longer have.
+            self.emit(EngineEvent::Status(self.online_status()));
             false
         }
     }
@@ -1653,6 +1664,7 @@ impl Engine {
         self.connection = None;
         self.search_session = None;
         self.emit(EngineEvent::Server("Disconnected from the server".into()));
+        self.emit(EngineEvent::Status(self.online_status()));
     }
 
     /// The Servers screen: read `server.met` and probe each server's UDP status
@@ -2852,6 +2864,70 @@ mod tests {
             out.push(e);
         }
         out
+    }
+
+    /// A local mock eD2k server that answers a login with a HighID IDCHANGE
+    /// (same shape as the one in link.rs, kept local to this test module).
+    async fn spawn_mock_login_server() -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut sfs = crate::framed::FramedStream::new(sock);
+                    if sfs.read_packet().await.is_err() {
+                        return;
+                    }
+                    let _ = sfs
+                        .write_packet(&mule_proto::Packet::new(
+                            mule_proto::PROT_EDONKEY,
+                            crate::server_messages::OP_IDCHANGE,
+                            0x0A00_0001u32.to_le_bytes().to_vec(),
+                        ))
+                        .await;
+                    let _ = sfs.read_packet().await;
+                });
+            }
+        });
+        addr
+    }
+
+    /// Connecting to a server must refresh the STATUS line, not only raise a
+    /// transient notice. Found on-device 2026-08-02: the Status screen kept
+    /// reading "Not connected - pick a server" while the very same screen showed
+    /// the server address and "HighID", because `connect_to_server` emitted only
+    /// `Server(..)` (which the app routes to its transient notice banner) and the
+    /// durable `status` field is fed ONLY by `Status(..)` events.
+    #[tokio::test]
+    async fn connecting_to_a_server_refreshes_the_status_line() {
+        let dir = tmp("status-on-connect");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut engine, mut rx) = Engine::new(&dir).unwrap();
+
+        let addr = spawn_mock_login_server().await;
+        assert!(
+            engine.connect_to_server(addr).await,
+            "mock login should win"
+        );
+
+        let evs = drain(&mut rx).await;
+        assert!(
+            evs.iter()
+                .any(|e| matches!(e, EngineEvent::Status(s) if s.contains("Connected to"))),
+            "connect must emit a Status line; got {evs:?}"
+        );
+
+        // ... and disconnecting must take it back to the honest resting text.
+        engine.disconnect_server().await;
+        let evs = drain(&mut rx).await;
+        assert!(
+            evs.iter().any(
+                |e| matches!(e, EngineEvent::Status(s) if s == "Not connected - pick a server")
+            ),
+            "disconnect must emit a Status line; got {evs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
