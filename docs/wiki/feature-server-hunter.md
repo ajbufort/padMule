@@ -39,9 +39,14 @@ lists + the part-3 gossip crawl QUEUED (next after the Settings slice).
   is bounded (2000) against a flood; runs on the engine task, so no server.met
   write races update_server_list. STILL FOLLOW-UP work, honestly scoped: (a) we
   ACCEPT what a server offers but do not yet SEND OP_GETSERVERLIST to ask (eMule
-  gates that on an "update list when connecting" pref); (b) the RECURSIVE UDP
-  crawl (harvest from servers we are NOT connected to, verify, recurse) is the
-  fuller "crawl" and remains unbuilt. Whole-net scanning stays out of scope
+  gates that on an "update list when connecting" pref). **DEVICE PASS 2026-08-03
+  PROVED THIS IS REQUIRED, not optional:** connected HighID to a real Lugdunum
+  server (ed2k-rust) and NO OP_SERVERLIST arrived (no "servers known" notice, no
+  merge) - modern servers do NOT volunteer the list on connect, you must ask.
+  So the harvest-on-connect cut is correct but INERT against real servers until
+  the OP_GETSERVERLIST send lands; that is now the immediate next step, not a
+  nicety. (b) the RECURSIVE UDP crawl (harvest from servers we are NOT connected
+  to, verify, recurse) is the fuller "crawl" and remains unbuilt. Whole-net scanning stays out of scope
   (below).
 
 Anthony wants a "Server Hunter" feature (2026-07-13): a tool that discovers and
