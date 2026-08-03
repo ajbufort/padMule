@@ -104,7 +104,9 @@ strongest (verified in the iPadOS research, docs/raw/ipados-constraints-*):
    file."** A user-initiated, bounded job with a mandatory system progress UI
    that can run a transfer past the ~30s window. Not indefinite seeding, but the
    clean supported way to let an in-progress download finish while away. (Its
-   availability on the A12Z under iPadOS 26 is an open question to measure.)
+   availability on the target device under iPadOS 26 is an open question to
+   measure. [Target changed 2026-08-02 to an M4 iPad Pro, iPad16,3 - measure
+   there, not on the A12Z these notes assumed.])
 4. **`BGProcessingTask` - opportunistic progress while charging.** Maintenance
    grade (OS discretion, may not fire): hash-check parts, prune sources, brief
    resume attempts while on power. Complements, never the primary runtime.
@@ -123,7 +125,9 @@ finish an active download; BGProcessingTask for charging-time upkeep). Crucially
 **clean pause/resume remains REQUIRED regardless** - every one of these
 mechanisms can be revoked or jetsam-killed by the OS, so the app must always
 degrade gracefully back to pause-and-resume. On-device measurement needed:
-keepalive longevity on the A12Z/iPadOS 26, and whether BGContinuedProcessingTask
+keepalive longevity on the target device/iPadOS 26 (now an M4 iPad Pro,
+iPad16,3, since 2026-08-02 - not the A12Z assumed here), and whether
+BGContinuedProcessingTask
 is eligible there (open questions in the iPadOS research).
 
 ## Where it landed (both DONE)

@@ -1,11 +1,26 @@
 # iPadOS Platform Constraints (padMule)
 
-Updated: 2026-07-18
+Updated: 2026-08-02 (TARGET DEVICE CHANGED - see the banner below)
 
 Distilled from adversarially-verified 2026 research. Full reference:
-`docs/raw/ipados-constraints-research-2026-07-12.md`. Target: iPad Pro 4th gen
-(A12Z, 6GB RAM, Wi-Fi only), free Apple ID sideload, no Mac. Confidence high
-except Rust-on-iOS (medium).
+`docs/raw/ipados-constraints-research-2026-07-12.md`. Free Apple ID sideload, no
+Mac. Confidence high except Rust-on-iOS (medium).
+
+> **TARGET DEVICE CHANGED (2026-08-02, confirmed by Anthony).** The target is now
+> an **iPad Pro 11-inch, M4 generation**: `iPad16,3`, board `J717AP`, arm64e,
+> iPadOS 26.5.2, 512GB with ~476GB free - read directly off the device over USB
+> ([[ipad-usb-tooling]]), not assumed. It REPLACES the original target, an iPad
+> Pro 4th gen (2020, A12Z, 6GB RAM).
+>
+> Everything below that is a PLATFORM rule (sandbox, background suspension,
+> storage locations, sideload limits, no multicast) is unaffected - those are
+> iPadOS behaviours, not hardware ones, and iPadOS 26 is what was already
+> assumed. What IS affected is anything derived from A12Z SILICON: the "~3GB RAM"
+> budget below was calibrated to a 6GB A12Z, and an M4 iPad Pro has substantially
+> more (8GB or 16GB depending on storage tier - NOT yet read off the device, so
+> not asserted here). Re-derive rather than scale the old number, and do not let
+> the extra headroom weaken the stream-to-disk design: a P2P client should not
+> hold a multi-GB file in RAM on any machine.
 
 ## The load-bearing verdicts
 
@@ -58,8 +73,12 @@ except Rust-on-iOS (medium).
   writable while locked, in-foreground). NEVER `Caches/`/`tmp/` (purged) or
   `NSFileProtectionComplete` (unreadable when locked). Finished files -> atomic
   move to `Documents/`, exposed via `UIFileSharingEnabled` +
-  `LSSupportsOpeningDocumentsInPlace`. Budget ~3GB RAM on A12Z (not 6); stream
-  to disk; guard free space before preallocating part-files.
+  `LSSupportsOpeningDocumentsInPlace`. [SUPERSEDED 2026-08-02: the "~3GB RAM on
+  A12Z (not 6)" budget was calibrated to the OLD target device; the M4 iPad Pro
+  has more, and the figure needs re-deriving - see the banner at the top.] Stream
+  to disk regardless; guard free space before preallocating part-files [DONE
+  2026-08-02, build-progress 8ap: PartStore::create refuses up front and keeps a
+  256MB margin].
 
 ## Consequences for the design
 

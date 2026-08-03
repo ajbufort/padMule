@@ -2,7 +2,7 @@
 
 Updated: 2026-07-18
 
-How to build + sign padMule's iOS app for Anthony's **iPad Pro 4th gen running
+How to build + sign padMule's iOS app for Anthony's **iPad Pro (M4, iPad16,3) running
 iPadOS 26.5.2**, given the available Mac is a **2011 Mac mini (Macmini5,x, 32GB,
 non-Metal)**. RESOLVED: Path C (CI macOS runner -> unsigned .ipa -> Sideloadly)
 is the active, proven route - the app ships on-device with no Mac at all

@@ -1,7 +1,6 @@
 # padMule - Operating Manual (CLAUDE.md)
 
-padMule brings **aMule 3.0.1** (eD2k/Kad P2P) to the **iPad Pro 4th gen**
-(iPadOS). DECIDED (2026-07-12) and SHIPPED: the engine is a from-scratch **Rust
+padMule brings **aMule 3.0.1** (eD2k/Kad P2P) to an **iPad Pro** (iPadOS). DECIDED (2026-07-12) and SHIPPED: the engine is a from-scratch **Rust
 rewrite** (`crates/`), the UI is **SwiftUI** (`ios/`) over a **UniFFI** seam
 (`crates/mule-ffi`). The upstream C++ tree (`amule-3.0.1/`) is a vendored,
 read-only REFERENCE ORACLE for differential testing - never linked or shipped.
@@ -60,7 +59,11 @@ Details: `docs/wiki/decisions-and-lessons.md`, `docs/wiki/ref-source-trees.md`,
 
 ## Platform facts (still in force)
 
-- Target device: iPad Pro 4th gen (2020, A12Z, arm64), iPadOS 26.x.
+- Target device: iPad Pro 11-inch, M4 generation - `iPad16,3` / board `J717AP`,
+  arm64e, iPadOS 26.5.2 (verified over USB 2026-08-02; 512GB, ~476GB free).
+  SUPERSEDES the original target (iPad Pro 4th gen, 2020, A12Z) - constraints
+  derived from A12Z (notably the ~3GB RAM budget) are calibrated to the wrong
+  machine and are being re-derived; see `docs/wiki/ipados-constraints.md`.
 - Sideload-only distribution (App Store is out for a P2P client). CI builds an
   UNSIGNED `.ipa`; **Sideloadly** on the Windows host installs it with a free
   Apple ID (7-day re-sign). AltStore/AltServer failed here (-22411); do not
