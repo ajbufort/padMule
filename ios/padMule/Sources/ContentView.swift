@@ -121,6 +121,13 @@ struct ContentView: View {
                 if let err = model.bootError {
                     banner("Engine failed: \(err)", systemImage: "exclamationmark.triangle", tint: .red)
                 }
+                // Boot takes 12-30s and EVERY control silently no-ops until it
+                // finishes. Saying so is the difference between "starting" and
+                // "broken" - previously the app looked live and did nothing.
+                if !model.ready && model.bootError == nil {
+                    banner("Starting padMule... searching and downloading will work in a moment.",
+                           systemImage: "hourglass", tint: .orange)
+                }
                 if let notice = model.notice {
                     banner(notice, systemImage: "info.circle", tint: .blue)
                 }
@@ -407,7 +414,13 @@ struct ContentView: View {
                 }
                 if model.searched, !model.searching {
                     if model.results.isEmpty {
-                        Text("No results.")
+                        // "No results" is only true if we actually ASKED someone.
+                        // With no server and no Kad contacts the honest answer is
+                        // about the connection - and this is the screen a new user
+                        // lands on, so it is where they will meet the problem.
+                        Text(model.canDiscover
+                             ? "No results."
+                             : "Not connected yet, so there was nobody to ask. Pick a server on the Servers tab, or give Kad a moment to find contacts.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     } else if model.presentedResults.isEmpty {
@@ -631,18 +644,28 @@ struct ContentView: View {
                             .font(.caption).monospacedDigit()
                             .frame(width: 84, alignment: .trailing)
                     } else {
-                        Text("offline")
+                        // "no reply" not "offline": the probe is a UDP status ping,
+                        // and plenty of networks block outbound UDP while passing
+                        // the TCP the actual login uses. Saying "offline" asserted
+                        // more than we know.
+                        Text("no reply")
                             .font(.caption).foregroundStyle(.secondary)
                             .frame(width: 154, alignment: .trailing)
                     }
-                    if srv.connected {
+                    if model.connectingTo == srv.addr {
+                        ProgressView()
+                    } else if srv.connected {
                         Image(systemName: "checkmark.circle.fill")
                             .foregroundStyle(.green)
                     }
                 }
             }
             .buttonStyle(.borderless)
-            .disabled(!srv.alive || srv.connected)
+            // A server that did not answer the UDP probe stays SELECTABLE. It used
+            // to be disabled, which made padMule unusable on any network that
+            // blocks outbound UDP - every row greyed out, no manual-address field,
+            // nothing to tap - even though the TCP login would likely have worked.
+            .disabled(srv.connected || model.connectingTo != nil)
             .foregroundStyle(.primary)
         }
     }

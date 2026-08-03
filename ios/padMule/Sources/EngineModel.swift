@@ -40,6 +40,12 @@ private let recentsCap = 12
 @MainActor
 final class EngineModel: ObservableObject {
     @Published private(set) var state: EngineStateFfi = .stopped
+    /// The engine object exists and start() has returned. Until this is true every
+    /// action would silently no-op (`guard let e = engine else { return }`), so the
+    /// UI must show that it is still starting rather than looking live and inert.
+    /// Boot is 12-30s: two HTTP fetches, the always-failing multicast SSDP probe,
+    /// then unicast + SOAP, then Kad.
+    @Published private(set) var ready: Bool = false
     /// A stop (or a start after one) is in flight. Both talk to the router, so
     /// they take seconds; the Status screen shows progress instead of freezing.
     @Published private(set) var stopping: Bool = false
@@ -63,6 +69,9 @@ final class EngineModel: ObservableObject {
     // auto-connect; the user picks a live server here.
     @Published private(set) var servers: [ServerEntryFfi] = []
     @Published private(set) var loadingServers = false
+    /// The address currently being dialled. connect_to_server blocks up to 12s, so
+    /// without this the first real action a new user takes appears to do nothing.
+    @Published private(set) var connectingTo: String?
     @Published var serverKick: String?
 
     @Published private(set) var results: [SearchHit] = []
@@ -102,6 +111,11 @@ final class EngineModel: ObservableObject {
     @Published var typeFilter: String?
     @Published var trustedOnly: Bool = false
     @Published var hideHave: Bool = false
+
+    /// Whether padMule has any way to find files right now - a connected server
+    /// or a populated Kad table. Mirrors the engine's own `can_discover`, and is
+    /// what lets the UI say "nobody to ask" instead of "no results".
+    var canDiscover: Bool { server != nil || kadContacts > 0 }
 
     /// The results after the current sort + filter. Recomputed on demand (cheap:
     /// a few hundred rows) so any input change reorders instantly.
@@ -181,6 +195,7 @@ final class EngineModel: ObservableObject {
                     guard let self else { return }
                     self.booting = false
                     self.engine = e
+                    self.ready = true
                     self.identity = ident
                     self.startPolling()
                     self.refresh()
@@ -399,10 +414,13 @@ final class EngineModel: ObservableObject {
                 case .alreadyAdded:
                     self.notice = "\"\(hit.name)\" is already downloading."
                 case .noSources:
-                    // Not an error: nobody who is online right now has it.
+                    // Not an error: nobody who is online right now has it. Only
+                    // reachable when we HAD a way to ask - the engine returns
+                    // .notConnected otherwise, so this no longer blames the file
+                    // for the user's connection.
                     self.notice = "No one online has \"\(hit.name)\" right now."
-                case .noServer:
-                    self.notice = "Not connected to a server."
+                case .notConnected:
+                    self.notice = "Not connected yet - pick a server on the Servers tab, or wait for Kad to find contacts. padMule cannot look for this file until then."
                 case .rejected(let reason):
                     self.notice = "Cannot download: \(reason)"
                 }
@@ -709,11 +727,22 @@ final class EngineModel: ObservableObject {
     /// Connect to a chosen (live) server, then refresh the list + status.
     func connectServer(_ addr: String) {
         guard let e = engine else { return }
+        engineLog.notice("connecting to \(addr, privacy: .public)")
+        connectingTo = addr
         work.async { [weak self] in
-            _ = e.connectToServer(addr: addr)
+            // The boolean was previously DISCARDED, so a failed dial produced only
+            // a lowercase blue "could not connect to ..." notice that reads like
+            // information. Report it as the failure it is.
+            let ok = e.connectToServer(addr: addr)
+            engineLog.notice("connect to \(addr, privacy: .public): \(ok ? "OK" : "FAILED", privacy: .public)")
             DispatchQueue.main.async {
-                self?.refresh()
-                self?.loadServers()
+                guard let self else { return }
+                self.connectingTo = nil
+                if !ok {
+                    self.notice = "Could not connect to \(addr). It may be down, or your network may be blocking it - try another server."
+                }
+                self.refresh()
+                self.loadServers()
             }
         }
     }

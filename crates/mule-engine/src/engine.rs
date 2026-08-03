@@ -763,10 +763,17 @@ pub enum AddResult {
     Started,
     /// This hash is already downloading.
     AlreadyAdded,
-    /// Nobody the server knows has this file.
+    /// Nobody we could ASK has this file. Only returned when we actually had a
+    /// way to ask - see `NotConnected` for the other case.
     NoSources,
-    /// No server is currently connected.
-    NoServer,
+    /// We have no way to find sources at all: no server connected AND no Kad
+    /// contacts. Distinct from `NoSources` on purpose. Reporting "nobody has this
+    /// file" to a user who is simply not connected is a claim about the NETWORK
+    /// when the truth is about them, and it sends them hunting for a different
+    /// file instead of connecting. (Was `NoServer`, which was unreachable in the
+    /// shipped app - it fired only under `offline`, which the FFI never exports,
+    /// so this branch never once reached a user.)
+    NotConnected,
     /// The request itself made no sense.
     BadRequest(&'static str),
     /// Could not create the part file.
@@ -1165,6 +1172,17 @@ impl Engine {
             // login" would be a lie - we simply have not been told to connect yet.
             "Not connected - pick a server".to_string()
         }
+    }
+
+    /// Have we any way to FIND sources right now - a connected server, or a Kad
+    /// table with contacts in it?
+    ///
+    /// The two channels are genuinely independent: a serverless client downloads
+    /// from HighID Kad sources, and a client with a server works with an empty Kad
+    /// table. Only when BOTH are absent is a "nobody has this file" answer a guess
+    /// about the network rather than a fact about us.
+    pub fn can_discover(&self) -> bool {
+        self.server.is_some() || self.kad_contacts() > 0
     }
 
     /// Do we currently hold a router port mapping?
@@ -2384,8 +2402,12 @@ impl Engine {
                 return AddResult::AlreadyAdded;
             }
         }
-        if self.offline {
-            return AddResult::NoServer;
+        if self.offline || !self.can_discover() {
+            // Bail BEFORE the source lookup: with no channel there is nobody to
+            // ask, so spending the 10s budget would only delay an answer we
+            // already know - and the honest answer is about our connection, not
+            // about the file.
+            return AddResult::NotConnected;
         }
         // No server gate: find_sources queries the connected server AND Kad, so a
         // SERVERLESS client still downloads from HighID Kad sources (a LowID Kad
@@ -3203,6 +3225,48 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A user with no server and no Kad must be told THEY are not connected, not
+    /// that the file is unavailable. The old code could only ever say the latter:
+    /// `NoServer` fired solely under `offline`, which the FFI never exports, so
+    /// every disconnected user was told "No one online has X right now" and sent
+    /// hunting for a different file.
+    #[tokio::test]
+    async fn a_disconnected_client_is_told_it_is_disconnected_not_that_the_file_is_gone() {
+        let dir = tmp("not-connected");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+
+        // No server, no Kad contacts - and NOT the offline test flag, because that
+        // is the path the shipped app can never take.
+        assert!(!engine.can_discover());
+        assert!(
+            matches!(
+                engine.add_download([0x11; 16], 1024, "whatever.bin").await,
+                AddResult::NotConnected
+            ),
+            "with no discovery channel the answer must be about US, not the file"
+        );
+
+        // With a channel, the same call is free to report a genuine NoSources -
+        // asserted here only as far as it does NOT claim we are disconnected.
+        engine.routing.load_nodes(&[KadContact {
+            id: Kad128::from_hash(&[0x77; 16]),
+            ip: 0x0808_0808,
+            udp_port: 4672,
+            tcp_port: 4662,
+            version: 8,
+            udp_key: 0,
+            udp_key_ip: 0,
+            verified: true,
+        }]);
+        assert!(
+            engine.can_discover(),
+            "a Kad contact IS a discovery channel"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The UI asks this before telling the user their port was handed back, so it
     /// must be false for everyone who never had a mapping - cellular, CGNAT, or a
     /// router without UPnP. Claiming otherwise would be the UI lying about work
@@ -3857,7 +3921,7 @@ mod tests {
         // No server -> say so; do not silently create a download nothing feeds.
         assert_eq!(
             engine.add_download([1; 16], 1000, "x.pdf").await,
-            AddResult::NoServer
+            AddResult::NotConnected
         );
         assert!(
             engine.downloads().await.is_empty(),
@@ -3867,20 +3931,46 @@ mod tests {
     }
 
     /// With NO server (but not `offline`), a download must fall through to Kad
-    /// source-finding, not be refused outright. Here neither a server nor a Kad
-    /// node exists, so find_sources touches no network and reports NoSources - the
-    /// old code returned NoServer before ever trying Kad, so a Kad-only client
-    /// (all servers down, Kad up) could search but never download. Caught by the
-    /// hands-on FFI simulation.
+    /// source-finding rather than being refused outright: the old code returned
+    /// NoServer before ever trying Kad, so a Kad-only client (all servers down,
+    /// Kad up) could search but never download. Caught by the hands-on FFI
+    /// simulation, row 8w.
+    ///
+    /// The 2026-08-03 honesty change added a bail for having NO channel at all,
+    /// which could reintroduce exactly that bug if it were keyed on the server
+    /// alone - so this test now pins BOTH halves: bail when there is nothing to
+    /// ask, and DO NOT bail when Kad alone could answer.
     #[tokio::test]
     async fn add_download_without_a_server_still_tries_kad() {
         let dir = tmp("kadonly");
         let _ = std::fs::remove_dir_all(&dir);
         let (mut engine, _rx) = Engine::new(&dir).unwrap();
-        // Deliberately NOT set_offline: server is None, kad is None.
+
+        // Neither channel: refusing is right, and the reason is about US.
         assert_eq!(
             engine.add_download([2; 16], 1000, "x.bin").await,
-            AddResult::NoSources
+            AddResult::NotConnected
+        );
+        assert!(engine.downloads().await.is_empty());
+
+        // THE 8w REGRESSION GUARD: a populated Kad table alone is a channel, so
+        // the same call must get PAST the bail and actually look. It reports
+        // NoSources here only because no live Kad node is attached, which is what
+        // keeps this test offline.
+        engine.routing.load_nodes(&[KadContact {
+            id: Kad128::from_hash(&[0x5A; 16]),
+            ip: 0x0808_0808,
+            udp_port: 4672,
+            tcp_port: 4662,
+            version: 8,
+            udp_key: 0,
+            udp_key_ip: 0,
+            verified: true,
+        }]);
+        assert_eq!(
+            engine.add_download([2; 16], 1000, "x.bin").await,
+            AddResult::NoSources,
+            "a Kad-only client must still TRY - never refused for lacking a server"
         );
         assert!(engine.downloads().await.is_empty());
         let _ = std::fs::remove_dir_all(&dir);

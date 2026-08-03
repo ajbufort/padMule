@@ -289,7 +289,7 @@ pub enum AddOutcome {
     Started,
     AlreadyAdded,
     NoSources,
-    NoServer,
+    NotConnected,
     Rejected { reason: String },
 }
 
@@ -299,7 +299,7 @@ impl From<AddResult> for AddOutcome {
             AddResult::Started => AddOutcome::Started,
             AddResult::AlreadyAdded => AddOutcome::AlreadyAdded,
             AddResult::NoSources => AddOutcome::NoSources,
-            AddResult::NoServer => AddOutcome::NoServer,
+            AddResult::NotConnected => AddOutcome::NotConnected,
             AddResult::BadRequest(r) => AddOutcome::Rejected {
                 reason: r.to_string(),
             },
