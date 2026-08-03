@@ -160,10 +160,12 @@ recover the case its own code comment names.** The chain:
 So a permanent lease (padMule asks for `lease_secs = 0`) plus any address change
 = **permanent LowID that padMule cannot fix by itself**.
 
+**RESOLVED THE SAME SESSION by option 1 below - see the confirmation at the end
+of this section.**
+
 CLEARING IT IS HARDER THAN EXPECTED: the BE9700's UPnP page (Advanced -> NAT
 Forwarding -> **UPnP**; NOT Port Forwarding, which lists only STATIC rules and is
-empty) is **display-only - it has no delete control**. Confirmed 2026-08-02, entry
-still present at end of session. The ways out, best first:
+empty) is **display-only - it has no delete control**. The ways out, best first:
 
 1. **DHCP-reserve the iPad at its OLD address (.182) and reconnect.** Then
    padMule OWNS the mapping again, and its existing delete-then-add self-heals on
@@ -173,6 +175,26 @@ still present at end of session. The ways out, best first:
 2. **Toggle UPnP off -> Save -> on -> Save**, which flushes the mapping table on
    most TP-Link firmware. Brief interruption for other UPnP clients.
 3. Reboot the router (blunt; disrupts everything).
+
+### CONFIRMED FIXED (2026-08-02, same session)
+
+Anthony added the DHCP reservation (option 1) and the iPad moved **.89 -> .182**.
+That alone resolved it, because the stale mapping now names the iPad's CURRENT
+address, so padMule owns it again. Proven at the network layer, no UI needed:
+
+- `192.168.0.182` answers ping; `.89` no longer does.
+- `mule-cli upnp-query 4662` -> `:4662 -> 192.168.0.182` (now the live iPad).
+- A direct LAN connect to `192.168.0.182:4662` SUCCEEDS - padMule is listening.
+- **NAT hairpin from the dev box to `<public-ip>:4662` SUCCEEDS** - an
+  external-facing connection reaches padMule on the iPad, which is the port
+  forward working end to end. (The BE9700 supports NAT loopback, so this is a
+  valid cheap proof; a hairpin FAILURE would have been inconclusive.)
+
+Still to confirm in the APP itself (blocked at session end by an unrelated
+pymobiledevice3 regression, [[ipad-usb-tooling]] gotcha 7): relaunch padMule and
+read the Status row for "UPnP: mapped port 4662" plus a HighID. padMule only
+attempts the mapping at start/resume, so the row still showed the old
+ConflictInMappingEntry error from its LAST launch.
 
 FIXES WORTH MAKING (none shipped yet, queued as tasks):
 - **Finite lease + renew** instead of `lease_secs = 0`, so a stale mapping

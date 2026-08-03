@@ -151,6 +151,21 @@ proceeds. No `sudo`, no `tunneld`. Verified on iPadOS 26.5.2.
 6. Beware `pkill -f <pattern>` here: the agent's own shell command line contains
    the pattern, so it kills its own session. Kill by PID (`ss -lptn`, `ps -eo
    pid,args`) instead.
+7. **pymobiledevice3 can go blind while libimobiledevice still works** (hit
+   2026-08-02, UNRESOLVED). After the iPad re-enumerated and **usbmuxd restarted**
+   (new PID), `idevice_id -l` / `ideviceinfo` / `idevicepair validate` all kept
+   working over USB, but every pmd3 command died with "Device is not connected"
+   and `pymobiledevice3 usbmux list` returned `[]` - including a direct
+   `await usbmux.list_devices()` against the same default socket. Ruled out:
+   pairing (valid, record world-readable), socket permissions (connects fine),
+   the Windows-usbmuxd-on-27015 theory (nothing listens there), an explicit
+   `--udid`. NB pmd3's FIRST listing of the session reported
+   `ConnectionType: Network`, so it may have been using a network path all along
+   and lost it when the iPad's address changed. Suspected fix, needs a REAL
+   terminal because sudo cannot prompt through the agent's shell (gotcha 4):
+   `sudo systemctl restart usbmuxd`, then detach/re-attach. Touch control is
+   down until pmd3 can enumerate again; libimobiledevice-based tools
+   (idevicesyslog, ideviceinstaller) are unaffected.
 
 ## WebDriverAgent (touch control): WORKING (2026-08-02)
 
