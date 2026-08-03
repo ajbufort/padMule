@@ -579,8 +579,11 @@ final class EngineModel: ObservableObject {
                 upnpStatus = text
             } else {
                 // News ("Saved 'x'", a server MOTD), NOT the connection status.
-                // Writing these to `status` would clobber the polled
-                // "Connected to <server> (HighID|LowID)" line.
+                // Writing these to `status` would clobber the
+                // "Connected to <server> (HighID|LowID)" line, which arrives as
+                // its own `.status` event. NB that line is EVENT-fed, not polled:
+                // the engine must emit `Status` on every connect/disconnect or
+                // this row goes stale (it did - see engine.rs connect_to_server).
                 notice = text
             }
         case .serverDropped(let addr):
