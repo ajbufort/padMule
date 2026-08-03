@@ -20,6 +20,7 @@ the Ingest / Query / Lint workflows.
 - [[nat-traversal-design]] - design for connecting two firewalled (LowID) padMule peers (hole punching + QUIC over Kad/buddy rendezvous); confirmed no stock hole punching; reusable Kad primitives; phased plan. Not built.
 
 ## Platform
+- [[portability-audit]] - usability for people NOT on the dev's network: the Tier-1/2/3 findings from the 2026-08-03 audit (UDP-blocked networks grey out every server, the splash clears before the engine is ready, a disconnected user is told the FILE is missing, no cellular/metered awareness). Open work.
 - [[ipados-constraints]] - iPadOS/Rust-on-iOS constraints; foreground-only engine, sockets OK, free-team sideload limits, storage plan (verified 2026).
 - [[lifecycle-and-reactivation]] - HARD requirement: honest status notice + clean pause/resume across focus loss; shapes the engine state model from Wave 3c.
 - [[mac-toolchain-setup]] - getting padMule onto the iPad (iPadOS 26.5.2). VERIFIED blocker: iPadOS 26 needs Xcode 26 needs macOS Tahoe 26.2, and OCLP has no Tahoe support -> the 2011 mini cannot run it. Escape hatch: padMule is sideload-only (the Xcode-26 mandate is App-Store-only), so CI builds with an older Xcode and Sideloadly installs it (AltStore died on -22411). Path C is the active, proven route.
