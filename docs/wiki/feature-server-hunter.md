@@ -132,6 +132,19 @@ scanning remains deliberately out of scope (below).
   Gaal and the rest - the only two unnamed being the two that answered nothing
   at all. `mule-cli server-crawl` now probes after crawling, mirroring the app's
   crawl -> reload sequence, and prints the named table.
+- **DEVICE-VERIFIED 2026-08-03 (c79caf6 install, agent-driven).** The whole
+  discovery engine confirmed on glass, not merely from the dev box: the
+  "Discover more servers" button exists on the Servers screen; tapping it
+  produced **"Crawl asked 33 server(s), 30 answered - 25 new"** and the table
+  grew **Servers (10) -> Servers (35)**; scrolling the full list showed
+  **32 of 34 distinct rows carrying a NAME** - Drunken Donkey, Astra-3/4/5,
+  Akteon Server / No3 / No8, Holy Donkey 1/2/3, Pentium Pilat 2022/2023, Gaal,
+  Don Pedro, eDonkey Server 1/2/3, eMule Angel/Cosmic/Security, aMule Server,
+  MO-Server and three "MO-ad-free" - with only the two servers that answered
+  nothing left unnamed. So the crawl, the merge, the description-request name
+  learning and its persistence all work on the device. NB a server name can
+  carry non-ASCII (a lightning glyph appears in three) - that is untrusted
+  server DATA rendering correctly, not a repo-content ASCII violation.
 
 Anthony wants a "Server Hunter" feature (2026-07-13): a tool that discovers and
 verifies active eD2k servers to build a safe, working, live server list - by

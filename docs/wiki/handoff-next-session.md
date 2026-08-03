@@ -110,6 +110,16 @@ field - open task below). NB the Servers list does NOT auto-refresh after a
 harvest - the count updates on the next "Refresh server list" probe; whether
 it SHOULD auto-refresh is a small UX question for the next slice.
 
+## DEVICE-VERIFIED (2026-08-03, c79caf6 install, agent-driven)
+
+The whole discovery engine, on glass: "Discover more servers" produced
+**"Crawl asked 33 server(s), 30 answered - 25 new"**, the table grew
+**Servers (10) -> Servers (35)**, and scrolling the full list showed **32 of 34
+rows NAMED** (only the two servers that answered nothing are unnamed). So the
+crawl, the merge, the description-request name learning and its persistence all
+work on the device. NB the iOS accessibility tree exposes only VISIBLE cells, so
+a full-list assertion needs scrolling + dedup.
+
 ## Still NOT device-verified
 
 The metered-sharing pause (needs a cellular/hotspot link; rests on its unit
@@ -121,14 +131,9 @@ channel.
 
 ## Open tasks (ranked)
 
-1. **DEVICE-VERIFY THE CRAWL + NAMES** - all the new discovery work is
-   CI-green and live-proven from the dev box but NOT yet on glass. Install a
-   build with c79caf6 and tap "Discover more servers" on the Servers screen:
-   expect a "Crawl asked N server(s), M answered - K new" notice, the table to
-   grow, and the new rows to show NAMES rather than bare IPs. It blocks ~10s
-   (2 rounds), so it also exercises the known serial-queue freeze (task 2).
-2. **Portability Tier 2** ([[portability-audit]]) plus the reanalysis findings
-   that belong with it: "Reconnecting..." can never render (events drain behind
+1. **Portability Tier 2 + the reanalysis siblings** (was task 2; the crawl is
+   now DEVICE-VERIFIED, see below).
+   ([[portability-audit]]) plus the reanalysis findings that belong with it: "Reconnecting..." can never render (events drain behind
    the blocking call on one serial queue; a second drain queue fixes it) AND
    its dangerous sibling - **pause() can be LOST on backgrounding** behind a
    long call on that same queue (no beginBackgroundTask anywhere; the 300s
