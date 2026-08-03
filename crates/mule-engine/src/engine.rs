@@ -41,8 +41,9 @@ use crate::search::{
 use crate::secure_ident::SecureIdentSession;
 use crate::server_crawl::ServerCrawl;
 use crate::server_messages::{
-    parse_serv_stat_res, parse_server_list, LoginRequest, OfferedFile, DEFAULT_SERVER_FLAGS,
-    FILE_COMPLETE_ID, FILE_COMPLETE_PORT, OP_GLOBSERVSTATREQ, OP_GLOBSERVSTATRES,
+    desc_req_challenge, parse_serv_stat_res, parse_server_desc_res, parse_server_list,
+    LoginRequest, OfferedFile, DEFAULT_SERVER_FLAGS, FILE_COMPLETE_ID, FILE_COMPLETE_PORT,
+    OP_GLOBSERVSTATREQ, OP_GLOBSERVSTATRES, OP_SERVER_DESC_REQ, OP_SERVER_DESC_RES,
     OP_SERVER_LIST_REQ2, OP_SERVER_LIST_RES, SERV_STAT_CHALLENGE,
 };
 use crate::share::{
@@ -1875,14 +1876,27 @@ impl Engine {
         // challenge-less ping); the server echoes it as the response's first u32.
         let ch = SERV_STAT_CHALLENGE.to_le_bytes();
         let req = [PROT_EDONKEY, OP_GLOBSERVSTATREQ, ch[0], ch[1], ch[2], ch[3]];
+        // The description challenge varies per probe (its low half is fixed by
+        // the protocol); names learned this round are collected then persisted.
+        let desc_challenge = desc_req_challenge((std::process::id() as u16) ^ 0xA5C3);
+        let mut learned: Vec<(SocketAddr, String)> = Vec::new();
         for e in &servers {
             if let Some(udp) = e.addr.port().checked_add(4) {
-                let _ = sock.send_to(&req, SocketAddr::new(e.addr.ip(), udp)).await;
+                let target = SocketAddr::new(e.addr.ip(), udp);
+                let _ = sock.send_to(&req, target).await;
+                // Ask for the NAME too, exactly as both authorities do right
+                // after a status answer (eMule UDPSocket.cpp:435, aMule
+                // ServerUDPSocket.cpp:243). This is what gives a server found by
+                // the crawl or the gossip harvest a name instead of a bare IP -
+                // discovery yields only ip:port.
+                let ch = desc_challenge.to_le_bytes();
+                let dreq = [PROT_EDONKEY, OP_SERVER_DESC_REQ, ch[0], ch[1], ch[2], ch[3]];
+                let _ = sock.send_to(&dreq, target).await;
             }
         }
         // Collect answers within a short budget; match each back by (ip, port-4).
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-        let mut buf = [0u8; 512];
+        let mut buf = [0u8; 2048];
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
@@ -1906,11 +1920,67 @@ impl Engine {
                         }
                     }
                 }
+                Ok(Ok((n, src)))
+                    if n >= 2 && buf[0] == PROT_EDONKEY && buf[1] == OP_SERVER_DESC_RES =>
+                {
+                    if let Some(desc) = parse_server_desc_res(&buf[2..n], desc_challenge) {
+                        let name = desc.name.trim().to_string();
+                        if !name.is_empty() {
+                            if let Some(e) = servers.iter_mut().find(|e| {
+                                e.addr.ip() == src.ip()
+                                    && e.addr.port().checked_add(4) == Some(src.port())
+                            }) {
+                                // Only ADOPT a learned name; never overwrite one
+                                // the user's own server.met already carries.
+                                if e.name.is_empty() {
+                                    e.name = name;
+                                    learned.push((e.addr, e.name.clone()));
+                                }
+                            }
+                        }
+                    }
+                }
                 Ok(Ok(_)) => {}
                 _ => break,
             }
         }
+        // Persist the names we just learned, so a crawled/harvested server stops
+        // reading as a bare IP everywhere (the Servers table, and the connected
+        // status line, which reads its name from server.met tag 0x01).
+        if !learned.is_empty() {
+            self.persist_server_names(&learned);
+        }
         servers
+    }
+
+    /// Write newly learned server names into server.met as tag 0x01, leaving
+    /// every other tag and the file's header untouched. Best-effort: a failure
+    /// only means the name is relearned by the next probe.
+    fn persist_server_names(&self, learned: &[(SocketAddr, String)]) {
+        let path = self.config_dir.join("server.met");
+        let Ok(bytes) = std::fs::read(&path) else {
+            return;
+        };
+        let Ok(mut met) = read_server_met(&bytes) else {
+            return;
+        };
+        let mut touched = false;
+        for (addr, name) in learned {
+            let IpAddr::V4(v4) = addr.ip() else { continue };
+            let met_ip = u32::from_le_bytes(v4.octets());
+            for s in met.servers.iter_mut() {
+                if s.ip == met_ip && s.port == addr.port() && tag_str(&s.tags, 0x01).is_none() {
+                    s.tags.push(mule_proto::Tag::id(
+                        0x01,
+                        mule_proto::TagValue::Str(name.as_bytes().to_vec()),
+                    ));
+                    touched = true;
+                }
+            }
+        }
+        if touched {
+            let _ = write_bytes_atomic(&path, &write_server_met(&met));
+        }
     }
 
     /// Path to the pin side store (padMule-specific; kept out of server.met).
