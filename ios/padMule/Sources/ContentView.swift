@@ -595,6 +595,15 @@ struct ContentView: View {
                     Label("Prune dead servers", systemImage: "trash")
                 }
                 .disabled(model.loadingServers)
+
+                // Crawl: ask known servers for the servers THEY know. Most stay
+                // silent, so this is a slow trickle, not a guaranteed find.
+                Button {
+                    model.crawlServers()
+                } label: {
+                    Label("Discover more servers", systemImage: "antenna.radiowaves.left.and.right")
+                }
+                .disabled(model.loadingServers)
             }
 
             Section("Servers (\(model.servers.count))") {

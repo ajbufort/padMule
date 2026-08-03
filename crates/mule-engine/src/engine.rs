@@ -39,9 +39,11 @@ use crate::search::{
     SearchResultFile, SearchResultPage, OP_GLOBSEARCHRES,
 };
 use crate::secure_ident::SecureIdentSession;
+use crate::server_crawl::ServerCrawl;
 use crate::server_messages::{
-    parse_serv_stat_res, LoginRequest, OfferedFile, DEFAULT_SERVER_FLAGS, FILE_COMPLETE_ID,
-    FILE_COMPLETE_PORT, OP_GLOBSERVSTATREQ, OP_GLOBSERVSTATRES, SERV_STAT_CHALLENGE,
+    parse_serv_stat_res, parse_server_list, LoginRequest, OfferedFile, DEFAULT_SERVER_FLAGS,
+    FILE_COMPLETE_ID, FILE_COMPLETE_PORT, OP_GLOBSERVSTATREQ, OP_GLOBSERVSTATRES,
+    OP_SERVER_LIST_REQ2, OP_SERVER_LIST_RES, SERV_STAT_CHALLENGE,
 };
 use crate::share::{
     classify_inbound, head_hash, serve_shared, InboundKind, ServeSec, SharedFile, UploadGate,
@@ -155,6 +157,14 @@ fn gate_loaded_nodes(contacts: &[KadContact], filter: Option<&IpFilter>) -> Vec<
         .cloned()
         .collect()
 }
+
+/// Recursive-crawl bounds (see `Engine::crawl_servers`). Deliberately modest:
+/// this is the one path that contacts hosts the user never chose, so each hop
+/// is a paced trickle and the whole run is short enough to sit behind a button.
+const MAX_CRAWL_ROUNDS: u32 = 3;
+const CRAWL_ASKS_PER_ROUND: usize = 40;
+const CRAWL_SEND_PACE: Duration = Duration::from_millis(40);
+const CRAWL_ROUND_WAIT: Duration = Duration::from_secs(4);
 
 /// How often a RUNNING engine re-checkpoints (see `Engine::maintain_checkpoint`).
 /// Five minutes bounds what a suspend-kill can cost without writing often enough
@@ -1988,10 +1998,20 @@ impl Engine {
             }
             std::mem::take(&mut *h)
         };
-        // Keep only routable public ip:port, honoring the user ipfilter. A server
-        // advertising 127.0.0.1, a LAN address, or a blocked range is bogus or
-        // hostile, and adding it would later point the UDP status probe at our own
-        // network (the SSRF posture from build-progress 8z/B8 applies here too).
+        self.merge_discovered_servers(pending).await
+    }
+
+    /// Filter a set of learned `(ip, port)`s and merge the survivors into
+    /// server.met, returning how many were NEW. The ONE safety gate shared by
+    /// both discovery channels - the connect-time gossip harvest and the
+    /// recursive UDP crawl - so the rule cannot drift between them.
+    ///
+    /// Keeps only routable public ip:port, honoring the user ipfilter. A server
+    /// advertising 127.0.0.1, a LAN address, or a blocked range is bogus or
+    /// hostile, and adding it would later point the UDP status probe (and the
+    /// crawl itself) at our own network - the SSRF posture from build-progress
+    /// 8z/B8 applies to anything that becomes a datagram target.
+    async fn merge_discovered_servers(&mut self, pending: Vec<(u32, u16)>) -> u32 {
         let filter = self.ip_filter.clone();
         let fresh: Vec<Server> = pending
             .into_iter()
@@ -2035,6 +2055,110 @@ impl Engine {
         } else {
             0
         }
+    }
+
+    /// The RECURSIVE UDP server crawl: ask servers we are NOT connected to for
+    /// the servers THEY know, then ask the ones that come back, for `rounds`
+    /// hops. The full Server Hunter discovery engine
+    /// (docs/wiki/feature-server-hunter.md part 3), where the connect-time
+    /// harvest only learns from the single server we logged into.
+    ///
+    /// Wire + the deliberate deviation: see `OP_SERVER_LIST_REQ2`. SILENCE IS
+    /// THE COMMON ANSWER - most servers never implement it - so a non-answer is
+    /// neither an error nor a liveness verdict, and the crawl simply moves on.
+    ///
+    /// Bounded on every axis, because this is the one feature that talks to
+    /// hosts the user never chose: at most `MAX_CRAWL_ROUNDS` hops,
+    /// `CRAWL_ASKS_PER_ROUND` asks per hop, paced `CRAWL_SEND_PACE` apart, a
+    /// `CRAWL_ROUND_WAIT` collection budget, and `MAX_CRAWL_DISCOVERED` total.
+    /// The abuse profile is deliberately no worse than the Servers screen's
+    /// existing status probe, which already sends every known server a datagram.
+    /// Whole-net scanning stays out of scope.
+    ///
+    /// Returns how many NEW servers were merged into server.met.
+    pub async fn crawl_servers(&mut self, rounds: u32) -> u32 {
+        if self.offline {
+            return 0;
+        }
+        let Ok(bytes) = std::fs::read(self.config_dir.join("server.met")) else {
+            return 0;
+        };
+        let Ok(met) = read_server_met(&bytes) else {
+            return 0;
+        };
+        let mut crawl = ServerCrawl::new(met.servers.iter().map(|s| (s.ip, s.port)));
+        let Ok(sock) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0u16)).await else {
+            return 0;
+        };
+        let filter = self.ip_filter.clone();
+        let req = [PROT_EDONKEY, OP_SERVER_LIST_REQ2];
+        let mut answered = 0u32;
+
+        for _ in 0..rounds.clamp(1, MAX_CRAWL_ROUNDS) {
+            let asks = crawl.next_asks(CRAWL_ASKS_PER_ROUND);
+            if asks.is_empty() {
+                break;
+            }
+            // The ipfilter gates who we SEND to, not merely what we keep: a
+            // blocked address must receive nothing at all.
+            let targets: Vec<SocketAddr> = asks
+                .iter()
+                .filter(|(ip, _)| filter.as_deref().is_none_or(|f| !f.is_blocked_u32(*ip)))
+                .filter_map(|&(ip, port)| {
+                    port.checked_add(4)
+                        .map(|udp| SocketAddr::new(IpAddr::V4(ip_from_met_u32(ip)), udp))
+                })
+                .collect();
+            if targets.is_empty() {
+                continue;
+            }
+            // Paced, so a round is a trickle rather than a burst at the network.
+            for t in &targets {
+                let _ = sock.send_to(&req, t).await;
+                tokio::time::sleep(CRAWL_SEND_PACE).await;
+            }
+            // Collect, accepting an answer ONLY from an address we just asked
+            // (anti-spoof - the same rule the global UDP search applies).
+            let expected: std::collections::HashSet<SocketAddr> = targets.into_iter().collect();
+            let deadline = tokio::time::Instant::now() + CRAWL_ROUND_WAIT;
+            let mut buf = [0u8; 2048];
+            loop {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                match timeout(remaining, sock.recv_from(&mut buf)).await {
+                    Ok(Ok((n, src)))
+                        if n >= 3
+                            && buf[0] == PROT_EDONKEY
+                            && buf[1] == OP_SERVER_LIST_RES
+                            && expected.contains(&src) =>
+                    {
+                        if let Ok(list) = parse_server_list(&buf[2..n]) {
+                            answered += 1;
+                            crawl.on_answer(&list);
+                        }
+                    }
+                    Ok(Ok(_)) => continue, // a stray or spoofed datagram
+                    _ => break,
+                }
+            }
+        }
+
+        let found = crawl.discovered().to_vec();
+        let asked = crawl.asked_count();
+        if found.is_empty() {
+            // Say so honestly: asking is cheap and most servers do not answer.
+            self.emit(EngineEvent::Server(format!(
+                "Crawl asked {asked} server(s), {answered} answered - no new servers"
+            )));
+            return 0;
+        }
+        let added = self.merge_discovered_servers(found).await;
+        self.emit(EngineEvent::Server(format!(
+            "Crawl asked {asked} server(s), {answered} answered - {added} new"
+        )));
+        added
     }
 
     /// Probe the server list and drop every server that is DEAD and not pinned,
@@ -3506,6 +3630,86 @@ mod tests {
 
         // An empty queue is a cheap no-op.
         assert_eq!(engine.maintain_server_harvest().await, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The crawl is the one path that sends datagrams to hosts the user never
+    /// chose, so its SSRF posture is asserted on the production entry point, not
+    /// on the helper: a server.met full of LAN/loopback entries must produce
+    /// ZERO asks. (Testing `is_crawlable` alone would not prove `crawl_servers`
+    /// consults it - the 8ae/8au lesson.)
+    #[tokio::test]
+    async fn a_crawl_never_targets_lan_or_loopback_servers() {
+        let dir = tmp("crawl-ssrf");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let met_ip = |a: u8, b: u8, c: u8, d: u8| u32::from_le_bytes([a, b, c, d]);
+        let servers = vec![
+            Server {
+                ip: met_ip(127, 0, 0, 1),
+                port: 4661,
+                tags: Vec::new(),
+            },
+            Server {
+                ip: met_ip(192, 168, 0, 5),
+                port: 4661,
+                tags: Vec::new(),
+            },
+            Server {
+                ip: met_ip(10, 0, 0, 7),
+                port: 4661,
+                tags: Vec::new(),
+            },
+        ];
+        std::fs::write(
+            dir.join("server.met"),
+            write_server_met(&ServerMet {
+                header: mule_files::server_met::SERVER_MET_HEADER,
+                servers,
+            }),
+        )
+        .unwrap();
+
+        let (mut engine, mut rx) = Engine::new(&dir).unwrap();
+        let added = engine.crawl_servers(2).await;
+        assert_eq!(added, 0);
+
+        let evs = drain(&mut rx).await;
+        assert!(
+            evs.iter()
+                .any(|e| matches!(e, EngineEvent::Server(s) if s.contains("asked 0 server"))),
+            "a LAN/loopback-only list must yield ZERO asks; got {evs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Offline means offline: no socket, no datagrams, no crawl.
+    #[tokio::test]
+    async fn a_crawl_is_a_no_op_when_offline() {
+        let dir = tmp("crawl-offline");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("server.met"),
+            write_server_met(&ServerMet {
+                header: mule_files::server_met::SERVER_MET_HEADER,
+                servers: vec![Server {
+                    ip: u32::from_le_bytes([85, 17, 116, 222]),
+                    port: 4242,
+                    tags: Vec::new(),
+                }],
+            }),
+        )
+        .unwrap();
+        let (mut engine, mut rx) = Engine::new(&dir).unwrap();
+        engine.set_offline(true);
+        assert_eq!(engine.crawl_servers(2).await, 0);
+        let evs = drain(&mut rx).await;
+        assert!(
+            !evs.iter()
+                .any(|e| matches!(e, EngineEvent::Server(s) if s.contains("Crawl"))),
+            "an offline crawl must not even report; got {evs:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

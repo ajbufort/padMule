@@ -25,6 +25,7 @@ pub mod peer_conn;
 pub mod portmap;
 pub mod search;
 pub mod secure_ident;
+pub mod server_crawl;
 pub mod server_messages;
 pub mod share;
 pub mod sources;

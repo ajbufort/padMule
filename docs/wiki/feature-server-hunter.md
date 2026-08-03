@@ -1,10 +1,11 @@
 # Feature: Server Hunter (future work)
 
-Updated: 2026-08-03 (the OP_GETSERVERLIST ask SHIPPED and LIVE-PROVEN - the
-gossip harvest is no longer inert)
-Status: PARTS 1-2 SHIPPED; part 1 EXTENDED to multi-URL 2026-08-03; gzip-wrapped
-lists SHIPPED; part-3 gossip crawl LIVE (harvest-on-connect + the
-OP_GETSERVERLIST ask); the recursive UDP crawl is the remaining future work.
+Updated: 2026-08-03 (the RECURSIVE UDP CRAWL shipped and live-proven - the
+Server Hunter is now feature-complete as designed)
+Status: ALL FOUR PARTS SHIPPED. Part 1 multi-URL lists + gzip/zip unwrap; part 2
+the UDP health probe; part 3 the gossip crawl (harvest-on-connect + the
+OP_GETSERVERLIST ask); part 4 the RECURSIVE UDP crawl (2026-08-03). Whole-net
+scanning remains deliberately out of scope (below).
 
 ## Progress (2026-08-03)
 
@@ -71,6 +72,45 @@ OP_GETSERVERLIST ask); the recursive UDP crawl is the remaining future work.
   the iPad produced "Discovered 24 server(s) from the network" and the
   Servers table grew 10 -> 34 rows after a refresh - the whole gossip loop
   (ask -> answer -> filter -> merge -> UI) working on glass.
+- **Part 4: the RECURSIVE UDP CRAWL SHIPPED (2026-08-03) - the discovery engine
+  is complete.** Where the harvest learns only from the ONE server we logged
+  into, the crawl asks servers we are NOT connected to, over UDP, and then asks
+  the ones that answer - the "server-graph crawl" of item 3 below.
+  `Engine::crawl_servers(rounds)`, driven from a "Discover more servers" button
+  on the Servers screen and `mule-cli server-crawl <server.met> [rounds]`.
+  **WIRE, and the deviation:** the ask is `OP_SERVER_LIST_REQ2` (0xA4,
+  bodiless) to UDP TCP+4; the answer `OP_SERVER_LIST_RES` (0xA1) has a payload
+  byte-identical to TCP OP_SERVERLIST, so `parse_server_list` reads both and no
+  second parser exists. NO CLIENT AUTHORITY SENDS 0xA4 - eMule 0.50a
+  (opcodes.h:205) and aMule (UDP.h:46) DEFINE the pair but never send or parse
+  it, sending only 0x96/0xA2 on this socket. padMule sends it because many
+  SERVERS answer, which was MEASURED rather than assumed - and the obvious guess
+  was WRONG: the vendored **Lugdunum eserver 17.15 oracle does NOT answer 0xA4**
+  (nor does `ed2k-rust`, nor eMule Sunrise), yet a live crawl had 28 of 33 asked
+  servers answer. Every silent server answered 0x96 and 0xA2 in the same burst,
+  so the silence is a real negative, not a dead host. **SILENCE IS THEREFORE A
+  NORMAL ANSWER** and is never treated as an error or a liveness verdict.
+  **Safety** (this is the one path that contacts hosts the user never chose):
+  bounded to 3 rounds / 40 asks per round / a 40ms send pace / a 4s collection
+  budget / 1000 discovered total; the user ipfilter gates who is SENT to, not
+  just what is kept; only routable public addresses are ever asked or merged
+  (the B8 SSRF posture); answers are accepted ONLY from an address we just asked
+  (anti-spoof, as the global UDP search does); and the merge reuses the ONE
+  shared gate `merge_discovered_servers`, which the connect-time harvest also
+  uses, so the rule cannot drift between the two channels. The abuse profile is
+  deliberately no worse than the Servers screen's existing status probe, which
+  already sends every known server a datagram. **LIVE-PROVEN 2026-08-03:** from
+  the 10-server published list, a 2-round crawl asked 33, had 28 answer, and
+  added 25 new servers (10 -> 35); a 3-round run reached 35 asked / 29 answered
+  and converged on the same 25, i.e. the reachable graph from that seed is
+  small and the crawl terminates rather than running away. The merged result was
+  audited byte-by-byte: ZERO private, loopback, multicast, reserved or port-0
+  entries, and one discovered address matched an independent raw-Python probe of
+  the same server exactly. Structure follows `mule_kad::lookup`: a PURE
+  `server_crawl::ServerCrawl` state machine (frontier, dedup, ceiling, the
+  recursion) unit-tested offline and MUTATION-CHECKED, with a thin I/O driver;
+  the SSRF posture is additionally asserted on the production entry point, since
+  a test of the helper would not prove the caller consults it.
 
 Anthony wants a "Server Hunter" feature (2026-07-13): a tool that discovers and
 verifies active eD2k servers to build a safe, working, live server list - by

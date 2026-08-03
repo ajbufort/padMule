@@ -999,4 +999,26 @@ final class EngineModel: ObservableObject {
             }
         }
     }
+
+    /// Ask known servers for the OTHER servers they know (2 rounds - the engine
+    /// clamps at 3), merging the safe survivors into server.met, then re-probe.
+    /// Most servers stay silent to this request, so a 0 result is normal.
+    func crawlServers() {
+        guard let e = engine, !loadingServers else { return }
+        loadingServers = true
+        engineLog.notice("crawling for more servers")
+        work.async { [weak self] in
+            let added = e.crawlServers(rounds: 2)
+            engineLog.notice("crawl added \(added, privacy: .public) new server(s)")
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.loadingServers = false
+                self.notice =
+                    added == 0
+                    ? "No new servers found - most servers do not answer list requests."
+                    : "Discovered \(added) new server(s)."
+                self.loadServers()
+            }
+        }
+    }
 }
