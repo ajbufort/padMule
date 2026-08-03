@@ -11,7 +11,7 @@ the bulk source; curated findings go in the KB). Anthony supplied these on
 | aMule 3.0.1 (our port target) | `amule-3.0.1/` (repo root, committed) | Primary oracle; the version being ported. |
 | eMule 0.50a | `refs/emule-0.50a/eMule0.50a-Sources/srchybrid/` | Canonical mainline eMule = de-facto eD2k/Kad protocol authority. |
 | eMule 0.70b | `refs/emule-0.70b/eMule0.70b-Sources/srchybrid/` | Community-fixed/altered eMule; check for protocol fixes. |
-| aMule mainline (master, v3.0.1-dev) | `refs/amule-master/amule-master/src/` | Pristine aMule dev branch; diff to see what (if anything) our tree changed. |
+| aMule mainline (master) | `refs/amule-master/amule-master/src/` | Pristine aMule dev branch; diff to see what (if anything) our tree changed. **Snapshot refreshed 2026-08-02 to `3.0.1-405-g645c9244bc` (node-date 2026-08-03)**, from `3.0.1-172` which was 233 commits stale. Refresh it by re-downloading `codeload.github.com/amule-org/amule/tar.gz/refs/heads/master` - it is a study reference, NOT an oracle, so keep it pristine and never hand-edit it. |
 
 eMule source lives in `srchybrid/` (opcodes.h, Packet.cpp, SafeFile.cpp,
 kademlia/, EncryptedDatagramSocket.cpp, ClientCredits.cpp, ...). aMule master
