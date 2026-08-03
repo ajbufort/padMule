@@ -1,116 +1,142 @@
 # HANDOFF - start here next session
 
-Updated: 2026-08-02 (end of a very long session; everything below is verified,
+Updated: 2026-08-03 (end of a very long session; everything below is verified,
 not assumed, and what is NOT verified says so)
 
-Living doc: replace it wholesale next time rather than appending. Full narrative
-in [[build-progress]] rows 8as-8au and the [[log]] entries for 2026-08-02.
+Living doc: replace it wholesale next time. Full narrative in [[build-progress]]
+rows 8as-8au + [[portability-audit]] + the [[log]] entries for 2026-08-02/03.
 
 ## State of the tree
 
 - All work committed AND pushed; tree clean; branch even with origin/main at
-  **11eec87**. CI green on all three workflows for every push tonight.
-- **Gate**: 525 tests, clippy WARNING-FREE, fmt clean, ASCII clean.
+  **26cc9f8**. CI green on all three workflows for every push.
+- **Gate**: 532 tests, clippy WARNING-FREE, fmt clean, ASCII clean.
 - [[security-model]] scorecard unchanged: **23 OPERATIONAL / 1 PARTIAL / 2
-  documented opt-outs**. The PARTIAL is AICH block recovery (wave 11), an
-  optimization, not an integrity hole.
+  documented opt-outs**. The PARTIAL is AICH block recovery (wave 11).
 
-## THE FIRST THING TO DO
+## THE HARD DEADLINE
 
-**Install `C:\Users\ajbuf\Downloads\padMule-INSTALL-THIS-unsigned-11eec87.ipa`**
-via Sideloadly (Anthony was mid-reinstall when the session ended). It is the
-UNSIGNED CI artifact on purpose - see the Sideloadly trap below. The three older
-.ipas in that folder are superseded; `padMule-signed-0cf6791.ipa` in particular
-is the double-suffixed trap and must NOT be used.
+**The free signing cert + provisioning profiles EXPIRE 2026-08-10** (a week out).
+After that, no new build installs until renewed via Sideloadly (Apple ID auth,
+App ID + device registration, cert issuance), then re-pull the profile with
+`ideviceprovision copy`. Plan a build/install pass before then, or renew early.
 
-Then verify on device (touch control makes this ~5 minutes, [[ipad-usb-tooling]]):
-1. Status -> **Stop padMule**, then check from the dev box that the mapping is
-   really gone: `cargo run -p mule-cli -- upnp-query 4662` must report NOT mapped.
-   That is the one piece of tonight's work with no test coverage on the device.
-2. **Start padMule** from the same screen; confirm it re-maps and earns HighID
-   without relaunching the app.
-3. Leave it running >5 minutes and confirm the periodic checkpoint is invisible
-   (no stutter, no log noise) - it should simply be there if the app is killed.
+## FIRST TWO THINGS TO DO
 
-## What landed tonight (all pushed)
+1. **Install the latest build** so the device is current:
+   `C:\Users\ajbuf\Downloads\padMule-INSTALL-THIS-unsigned-26cc9f8.ipa` (UNSIGNED,
+   for Sideloadly - hand it the unsigned artifact, never a pre-signed one; the
+   double-suffix trap is in [[ipad-usb-tooling]]). The device currently runs
+   e7c38d0, which is MISSING the connected-line server-name change.
 
-- **Agent-driven device control** - WebDriverAgent via pymobiledevice3; taps,
-  typing, screenshots, the accessibility tree. go-ios was never needed.
-- **The UPnP stale-mapping root cause**: a mapping can only be deleted by the
-  address that OWNS it, so padMule's own permanent mapping outlived the iPad's
-  DHCP address and stranded the port. Fixed three ways: eMule's
-  verify-then-reopen refresh on resume and on a LowID answer, a conflict message
-  that NAMES the holder, and (below) releasing the port on stop.
-- **Status line** went stale after connect - device-verified fixed (8as).
-- **Kad checkpoint** - mid-session contacts and verify keys were discarded; now
-  enforced structurally by `set_kad` (8at/8au).
-- **Explicit Stop action** - the closest honest analogue of eMule's Exit;
-  releases the port, restartable in place.
-- **Periodic checkpoint** every 300s, a documented deviation (both authorities
-  save nodes.dat only from a destructor).
+2. **Build the gossip `OP_GETSERVERLIST` send** - the device pass PROVED it is
+   required, not optional: connecting HighID to a real Lugdunum server delivered
+   NO OP_SERVERLIST (modern servers do not volunteer their list; you must ASK).
+   The harvest-on-connect merge already works ([[feature-server-hunter]] part 3);
+   this is the small "ask" step that makes it actually populate the list. eMule
+   gates it on an "update list when connecting" pref (PPgServer). Verify live
+   against a real server + the isolated eserver oracle.
 
-## Open tasks
+## The device is now AGENT-DRIVABLE (major capability, this session)
 
-1. [DONE 2026-08-02] ~~os_log the engine~~ - landed: every EngineEvent plus boot,
-   boot failures and each lifecycle transition now reach `os_log` under category
-   `padMule.engine`, so `idevicesyslog -p padMule -m padMule.engine` is a real
-   window into the engine. What remains OPEN is the narrower half: engine
-   INTERNALS that never become an event (a peer refusing a block, a swallowed
-   error) are still invisible; a `Log` event variant would carry them.
-2. **AICH block recovery** - the last scorecard PARTIAL, wave 11. Do NOT port the
-   vendored 3.0.1 oracle's racy `known2_64.met` orphan-prune; route
-   `localize_corruption`'s blamed parts into block-level recovery; ship the AICH
-   rate limit and an O(1) index in the SAME change.
-3. **Continuous block-request top-up** - padMule is stop-and-wait per 3-block
-   batch (`multi_source.rs`), shallower than BOTH authorities. eMule tops up as
-   each block completes (DownloadClient.cpp:870-919). No wire change, big win at
-   cellular RTT. Do NOT adopt aMule master's [3,24] clamp.
-4. **Smaller reanalysis findings**: `link.rs:96` aborts a whole magnet parse on a
-   flag-style parameter; the Kad bootstrap dial list bypasses the ipfilter and
-   routability gates that guard routing inserts; `ios/project.yml:56-61` names
-   NAT-PMP where the shipped path is unicast-SSDP UPnP; the related-search
-   fallback pollutes Recent Searches with a filename.
-5. **Research-pass backlog** - Download Inspector, known/cancelled marking in
-   search results, majority-filename rename, throughput-based slot recycling,
-   bulk select, persisted search results, ipfilter auto-update.
+Touch control works: WebDriverAgent via pymobiledevice3 - taps, typing,
+screenshots, the accessibility tree, and reading engine os_log. Full runbook +
+the traps in [[ipad-usb-tooling]]. The one that bites: **pymobiledevice3 defaults
+to the WINDOWS usbmuxd (127.0.0.1:27015)** under WSL mirrored networking; set
+`USBMUXD_SOCKET_ADDRESS=/var/run/usbmuxd` or it drives the wrong transport and
+goes blind when the iPad's address changes. Also: `strings` on the .ipa only
+finds Swift literals LONGER than 15 bytes (small-string optimization), so
+grepping the binary for a short new string gives a false negative.
 
-Also open, not yet tasks: serving PARTIAL files (complete files only today), and
-no oracle yet proves a real client CONSUMING our source-exchange answer.
+## What landed this session (all pushed, CI green)
 
-## Device + signing (see [[ipad-usb-tooling]] for the full runbook)
+- **Agent-driven device control** (WebDriverAgent) - see above.
+- **UPnP stale-mapping** root cause (only the owning address may delete a mapping)
+  + three fixes: verify-then-reopen refresh on resume and on a LowID answer, a
+  conflict message that NAMES the holder, and release-on-Stop. Device-verified:
+  Stop releases the port (confirmed at the router), Start re-claims it.
+- **Status line stale-after-connect** (8as) - device-verified fixed.
+- **Kad checkpoint gap** - mid-session contacts + verify keys were discarded;
+  fixed and made structural via `set_kad`; plus a **periodic checkpoint** (300s)
+  so a suspend-kill cannot cost the session (8at/8au).
+- **Explicit Stop action** - the honest analogue of eMule's Exit; device-verified.
+- **os_log** - the engine now logs to `idevicesyslog -p padMule -m
+  padMule.engine`; device-verified (21 app lines across a launch/suspend/stop).
+- **Portability audit** ([[portability-audit]]) - what breaks for users NOT on
+  the dev's fast/UPnP/unblocked network. Tiered.
+- **Tier 1 portability slice** - UDP-blocked networks no longer grey out every
+  server (rows stay selectable; probe is UDP, login is TCP); splash waits for
+  READINESS not a fixed 7s; a disconnected user is told THEY are not connected,
+  not that the file is gone.
+- **Settings screen (Tier 0)** - padMule's first. Persisted Leech Mode
+  (device-verified: survives relaunch - was a live bug), "pause sharing on
+  cellular/metered" (default ON - the one finding that can cost money),
+  multi-URL server lists (eMule addresses.dat model, merged), default priority,
+  remembered search filters, keep-screen-awake.
+- **gzip/zip-wrapped server lists** - transparently unwrapped in the fetch path,
+  bounded against a bomb.
+- **Gossip crawl first cut** (harvest-on-connect) - correct, but device-proven
+  INERT until the OP_GETSERVERLIST send lands (see FIRST THINGS TO DO #2).
+- **Connected line shows the server NAME** with the address in parens (26cc9f8).
 
-- **CI builds, this box SIGNS, Sideloadly INSTALLS.** Signing from here works
-  (zsign + the cached Sideloadly cert/key by PATH, never copied). Installing over
-  usbipd does NOT - a multi-megabyte transfer wedges the USB/IP link every time.
-- **THE SIDELOADLY TRAP**: hand Sideloadly the UNSIGNED artifact. A build already
-  signed here with `-b ...Q444CHAF2Z` came back as `...Q444CHAF2Z.Q444CHAF2Z`,
-  a NEW bundle id, so it installed as a SEPARATE app with an empty container
-  (fresh userhash + Kad ID) instead of upgrading in place.
-- **pymobiledevice3 defaults to the WINDOWS usbmuxd on 127.0.0.1:27015** (WSL
-  mirrored networking). Set `USBMUXD_SOCKET_ADDRESS=/var/run/usbmuxd` to pin it
-  to the real USB link, or it goes blind when the iPad's address changes.
-- **Certs + profiles EXPIRE 2026-08-10.** Renewal needs Sideloadly; re-pull the
-  profile with `ideviceprovision copy` afterwards.
+## NOT yet device-verified (CI-green only)
 
-## Discipline reminders that earned their keep TONIGHT
+The connected-line name change (26cc9f8), the metered-sharing pause (needs a
+cellular/hotspot link; this is Wi-Fi), keep-screen-awake, and the multi-URL merge
+RESULT. Confirm these on the 26cc9f8 install. The metered pause rests on its unit
+test (the truth table) since it cannot be produced on the dev Wi-Fi.
 
-- **"The authorities surely do X" is a hypothesis.** It was wrong twice in one
-  night: the planned UPnP finite-lease fix (nobody uses a finite lease) and the
-  periodic checkpoint (nobody saves nodes.dat on a timer). Checking cost one grep
-  each and produced smaller, better-grounded changes.
+## Open tasks (ranked)
+
+1. **Gossip `OP_GETSERVERLIST` send** - required, see above.
+2. **Recursive UDP server crawl** - the fuller "hidden servers" discovery
+   (harvest from servers we are NOT connected to, verify, recurse). Whole-net
+   scanning stays OUT of scope ([[feature-server-hunter]]).
+3. **Portability Tier 2** ([[portability-audit]]) - NAT-PMP is dead code in the
+   engine (routers that speak it get needless LowID); "Reconnecting..." can never
+   render (events drain behind the blocking call on one serial queue - up to ~20s
+   frozen UI per foreground return); the 4s `offer_files` timeout silently
+   disables uploads on a slow link; `RESUME_PER_DL`(4s) < `SOURCES_WAIT`(10s).
+4. **Settings Tier 1/2 engine work** - nickname (hardcoded "padMule"), obfuscation
+   policy tri-state (default to eMule's, cite both), ipfilter controls, UPnP
+   toggle, upload slots; then bandwidth caps (the big one - eMule's anti-leech
+   up/down coupling `Preferences.cpp:758-770` + the min-upload floor; `upload_queue.rs`
+   holds dead kbps logic to revive-or-delete), port override, See-My-Shared-Files.
+5. **AICH block recovery** (wave 11, the last scorecard PARTIAL). Do NOT port the
+   vendored 3.0.1 racy `known2_64.met` orphan-prune; route `localize_corruption`
+   into block recovery; ship the AICH rate limit + O(1) index together.
+6. **Continuous block-request top-up** - padMule is stop-and-wait per 3-block
+   batch, shallower than both authorities; no wire change, big win at cellular RTT.
+7. **Smaller reanalysis findings** - `link.rs:96` aborts a whole magnet parse on a
+   flag-style parameter; the Kad bootstrap dial list bypasses the ipfilter/
+   routability gate; `ios/project.yml:56-61` names NAT-PMP where the shipped path
+   is unicast-SSDP UPnP; the related-search fallback pollutes Recent Searches.
+
+## Discipline reminders that earned their keep THIS session
+
+- **A dev network that never fails is not a test environment for failure
+  handling.** The whole portability audit exists because every degraded path
+  (UDP-blocked, metered, no-UPnP, slow) is INVISIBLE from the dev box. Several
+  Tier-1 fixes cannot be fully device-verified here for the same reason - say so,
+  do not fudge it.
 - **A test that exercises a HELPER is not evidence about the CALLER.** The first
-  Kad checkpoint fix passed its test and did nothing on the pause path, because
-  pause drops the node before checkpointing. When a fix is about ORDERING, the
-  test must drive the ordering.
-- **Mutation-check a regression test**: break the fix, watch the test go red. Two
-  tests tonight only earned trust that way.
-- **Verify before reporting** - it turned an apparent decode bug into a filename
-  that is genuinely mojibake on the wire, and "the UPnP fix regressed" into a
-  port conflict that proved the fix works.
+  Kad checkpoint fix passed its test and did NOTHING on the pause path (the node
+  was dropped before the checkpoint). When a fix is about ORDERING, drive the
+  ordering. Mutation-check the regression test.
+- **"The authorities surely do X" is a hypothesis - check first.** Killed the
+  UPnP finite-lease plan (nobody uses one) and the periodic-nodes.dat-save
+  precedent (both authorities write only from a destructor) with one grep each.
+- **Only the device could prove the gossip harvest is inert** - the unit test
+  proved the merge, not that real servers stay silent. Verify features against
+  the real other side, not just a mock.
+- **Verify before reporting.** An on-screen mojibake filename was baked into the
+  wire name, not a decode bug. "The UPnP fix regressed" was a port conflict that
+  PROVED the fix works.
 
 ## Related
 
 - [[ipad-usb-tooling]] - device runbook, touch control, signing, the traps.
-- [[net-highid-and-port-forwarding]] - the stale-mapping dead end, start to end.
-- [[build-progress]] - wave-by-wave status.
-- [[security-model]] - the scorecard.
+- [[portability-audit]] - the Tier 1/2/3 findings; open work.
+- [[feature-server-hunter]] - the gossip crawl, its first cut, and the required
+  OP_GETSERVERLIST next step.
+- [[build-progress]] / [[security-model]].
