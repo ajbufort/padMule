@@ -135,6 +135,10 @@ final class EngineModel: ObservableObject {
     /// can't clobber it. This is our only window into why HighID did or didn't
     /// happen on a device with no debugger.
     @Published private(set) var upnpStatus: String?
+    /// Whether a router port mapping is actually held right now. Drives the Stop
+    /// wording: a user on cellular, behind CGNAT, or on a router without UPnP
+    /// never had one, and must not be told a port was handed back.
+    @Published private(set) var portMapped: Bool = false
     /// Whether padMule serves files to peers. Off is "Leech Mode". Polled as a
     /// SNAPSHOT, like the server login: the engine owns the truth, the UI mirrors
     /// it. Defaults to true so the switch reads correctly before the first poll.
@@ -584,6 +588,7 @@ final class EngineModel: ObservableObject {
             let srv = e.serverInfo()
             let shr = e.isSharing()
             let stats = e.transferStats()
+            let mapped = e.hasPortMapping()
             let evs = e.drainEvents()
             DispatchQueue.main.async {
                 guard let self else { return }
@@ -594,6 +599,7 @@ final class EngineModel: ObservableObject {
                 self.ipFilterRanges = ipf
                 self.server = srv
                 self.sharing = shr
+                self.portMapped = mapped
                 self.sampleStats(stats)
                 for ev in evs { self.apply(ev) }
             }

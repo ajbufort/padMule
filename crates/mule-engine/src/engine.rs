@@ -1167,6 +1167,18 @@ impl Engine {
         }
     }
 
+    /// Do we currently hold a router port mapping?
+    ///
+    /// The UI must not claim to "hand the port back" to a user who never had a
+    /// mapping - on cellular, behind CGNAT, or on any network whose router has no
+    /// UPnP, the map simply never succeeded. `public_ip` is exactly that fact: it
+    /// is set only on a successful map and cleared when the mapping is released.
+    /// Exposed as a BOOLEAN on purpose - the address itself is our public IP and
+    /// must never reach the screen.
+    pub fn has_port_mapping(&self) -> bool {
+        self.public_ip.is_some()
+    }
+
     /// The number of Kad contacts currently held.
     pub fn kad_contacts(&self) -> usize {
         self.routing.len()
@@ -3188,6 +3200,28 @@ mod tests {
         engine.start().await;
         assert_eq!(engine.state(), EngineState::Running);
         engine.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The UI asks this before telling the user their port was handed back, so it
+    /// must be false for everyone who never had a mapping - cellular, CGNAT, or a
+    /// router without UPnP. Claiming otherwise would be the UI lying about work
+    /// that never happened.
+    #[test]
+    fn has_port_mapping_reports_whether_one_is_actually_held() {
+        let dir = tmp("has-mapping");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+
+        assert!(
+            !engine.has_port_mapping(),
+            "a client that never mapped a port must not be told one was released"
+        );
+        engine.public_ip = Some(std::net::Ipv4Addr::new(203, 0, 113, 5));
+        assert!(engine.has_port_mapping());
+        engine.public_ip = None; // what release_port_mapping does on success
+        assert!(!engine.has_port_mapping());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
