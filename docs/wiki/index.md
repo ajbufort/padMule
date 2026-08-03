@@ -5,6 +5,9 @@ Updated: 2026-08-02
 AI-maintained knowledge base. Start here. See `/CLAUDE.md` for the schema and
 the Ingest / Query / Lint workflows.
 
+## START HERE
+- [[handoff-next-session]] - the living handoff: current state, open tasks, the top next action, and what was proven vs assumed. Replace wholesale each session.
+
 ## Architecture
 - [[arch-upstream-amule]] - upstream aMule 3.0.1 layout, build targets, dependencies, port seams.
 
