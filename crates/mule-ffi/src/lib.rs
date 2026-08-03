@@ -662,6 +662,16 @@ impl MuleEngine {
             .block_on(async { self.inner.lock().await.ip_filter_ranges() as u32 })
     }
 
+    /// Whether a router port mapping is currently held. The UI needs this to stay
+    /// HONEST about the Stop action: a user on cellular, behind CGNAT, or on a
+    /// router without UPnP never had a mapping, so telling them the port was
+    /// "handed back" would describe work that never happened. A boolean, never
+    /// the address - that is our public IP.
+    pub fn has_port_mapping(&self) -> bool {
+        self.rt
+            .block_on(async { self.inner.lock().await.has_port_mapping() })
+    }
+
     /// Snapshots of the shared library - the complete files we serve to peers.
     pub fn shared_files(&self) -> Vec<SharedFileInfo> {
         self.rt.block_on(async {

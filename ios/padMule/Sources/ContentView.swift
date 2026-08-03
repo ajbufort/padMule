@@ -774,17 +774,39 @@ struct ContentView: View {
                     }
                 }
             } footer: {
-                Text(model.state == .stopped
-                     ? "Stopped. Nothing is connected and the router port has been released - it is safe to close padMule from the app switcher."
-                     : "Disconnects, saves your progress and hands the forwarded port back to the router. Do this before closing padMule so it does not leave a port mapping behind.")
+                Text(stopFooter)
             }
         }
         .confirmationDialog("Stop padMule?", isPresented: $confirmStop, titleVisibility: .visible) {
             Button("Stop", role: .destructive) { model.stop() }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("Transfers stop and the router port is released. Your progress is saved and you can start again from this screen.")
+            Text(model.portMapped
+                 ? "Transfers stop and the router port is released. Your progress is saved and you can start again from this screen."
+                 : "Transfers stop. Your progress is saved and you can start again from this screen.")
         }
+    }
+
+    /// The Stop section's explanation, which must never describe work that did
+    /// not happen. Plenty of users have NO port mapping to hand back - on
+    /// cellular, behind CGNAT, or on a router without UPnP the mapping never
+    /// succeeded - so the router sentence appears only when one is actually held
+    /// (`model.portMapped`, read from the engine's own `has_port_mapping`, not
+    /// guessed from the status text).
+    private var stopFooter: String {
+        if model.state == .stopped {
+            // Deliberately silent about the port: a successful release sets
+            // portMapped back to false, so this state cannot distinguish "released
+            // one" from "never had one" - and it does not need to, because the
+            // "Port mapping" row directly above already reads "UPnP: released
+            // port 4662" when that happened. Say the one thing that row cannot.
+            return "Stopped. Nothing is connected - it is safe to close padMule from the app switcher."
+        }
+        // Running: this is a PROMISE about what Stop will do, so it is conditioned
+        // on whether a mapping is actually held right now.
+        return model.portMapped
+            ? "Disconnects, saves your progress and hands the forwarded port back to the router. Do this before closing padMule so it does not leave a port mapping behind."
+            : "Disconnects and saves your progress, so padMule stops cleanly. Do this before closing it from the app switcher."
     }
 
     // MARK: - Rows and helpers
