@@ -1,6 +1,6 @@
 # Lifecycle Status + Clean Reactivation (hard requirement)
 
-Updated: 2026-07-18
+Updated: 2026-08-02 (the M4 target-change annotations)
 
 padMule is foreground-only ([[ipados-constraints]]): iPadOS suspends the app
 ~30s after backgrounding and reclaims every TCP/UDP socket (EBADF). When focus

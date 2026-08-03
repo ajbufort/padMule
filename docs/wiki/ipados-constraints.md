@@ -57,7 +57,9 @@ Mac. Confidence high except Rust-on-iOS (medium).
   friction makes CI-macOS the sound choice.)
   - **Anthony's 2011 Mac mini does NOT change this (confirmed 2026-07-16):** it
     maxes at macOS 10.13 -> Xcode 10.1 -> iOS 12 SDK, but the iPad Pro 4th gen
-    is on **iPadOS 26.5.2** and can't downgrade, so the mini CANNOT build/sign
+    [the target since 2026-08-02 is the M4 iPad Pro (iPad16,3); the point
+    stands - it is on iPadOS 26.5.2 and can't downgrade] is on **iPadOS
+    26.5.2** and can't downgrade, so the mini CANNOT build/sign
     for the device (App-Store builds would need Xcode 26 / macOS Tahoe; even a
     sideload SDK floor is far past Xcode 10 - see [[mac-toolchain-setup]] for
     the verified chain). CI-macOS builds the `.ipa` (deployment target iOS 16

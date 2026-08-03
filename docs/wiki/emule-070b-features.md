@@ -1,7 +1,7 @@
 # eMule 0.70b Feature Backlog (mined for padMule)
 
 Updated: 2026-08-02 (reanalysis lint: DONE list completed - Tier 1 is ALL done,
-9 Tier-2 items landed incl. #11 CorruptionBlackBox as build-progress 8ai)
+10 Tier-2 items landed incl. #11 CorruptionBlackBox as build-progress 8ai)
 
 **DONE so far:** Tier 1 COMPLETE - #1 IP filter, #2 search history, #3 wire-side
 search filters, #4 verified badge (BOTH the encryption lock AND the identity

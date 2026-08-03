@@ -1,6 +1,7 @@
 # aMule Protocol + Format Reference (load-bearing constants)
 
-Updated: 2026-07-18
+Updated: 2026-08-02 (the FT_MAXSOURCES/FT_LASTUPLOADED tag-number LANDMINE
+section)
 
 Distilled from the full verified recon: `docs/raw/amule-upstream-reference-2026-07-12.md`
 (1746 lines, 5 subsystems, all high-confidence, adversarially checked against

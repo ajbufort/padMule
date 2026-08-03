@@ -1,6 +1,6 @@
 # eMule/aMule Ecosystem References
 
-Updated: 2026-07-12
+Updated: 2026-07-13 (the live-login validation note)
 
 References Anthony supplied on 2026-07-12, summarized after fetching.
 

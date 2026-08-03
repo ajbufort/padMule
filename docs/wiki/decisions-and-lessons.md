@@ -90,6 +90,8 @@ bullet each; Locked decisions newest first, Lessons in the order learned.
   Sideloadly from Windows with a free Apple ID (7-day re-sign, 3-app cap,
   AltServer auto-refresh on same Wi-Fi). A local/rented Mac can upgrade this
   later without changing the architecture.
+  [SUPERSEDED 2026-07-17: AltStore -22411 dead end; Sideloadly is the proven
+  installer, manual 7-day re-sign]
 - 2026-07-12 **Engine strategy: Rust rewrite.** Anthony chose a new Rust
   eD2k/Kad engine crate over porting the C++ amuled or a hybrid. Rationale:
   aarch64-apple-ios is a supported Rust target (engine develops/tests fully on

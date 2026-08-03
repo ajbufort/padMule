@@ -1,6 +1,7 @@
 # On-device test checklist
 
-Updated: 2026-07-19
+Updated: 2026-08-03 (Launch splash step corrected to readiness-gated; Lifecycle
+step corrected to drop the unrenderable Reconnecting-banner claim)
 
 What to tap through on the iPad after a fresh Sideloadly install, to verify the
 whole app in hand. The engine side of every item is also exercisable without a
@@ -13,7 +14,10 @@ DELETE the old app off the iPad first, then Sideloadly. See [[padmule-ios-app-pa
 
 ## Pass
 
-1. **Launch** - 3s splash (mascot), then the main screen. No crash.
+1. **Launch** - splash holds until the engine reports ready (minimum ~2.5s,
+   hard ceiling 20s, after which a "Starting padMule..." banner takes over),
+   then the main screen. No crash. [SUPERSEDED: previously read "3s splash
+   (mascot)" - it became 7s on 2026-07-18, then readiness-gated on 2026-08-03.]
 2. **Status** (gauge tab) - within ~15s: "Connected to <server> (HighID|LowID)"
    or an honest "Offline"; Kad contacts climb. HighID needs the BE9700 UPnP
    ([[padmule-dev-box-networking]]); LowID is fine.
@@ -37,8 +41,13 @@ DELETE the old app off the iPad first, then Sideloadly. See [[padmule-ios-app-pa
    ratio, updating each second while a transfer runs.
 10. **Priority** - long-press a transfer -> Priority -> High (row glyph updates).
 11. **Leech Mode** - toggle "Share uploads" off then on (Status/Sharing).
-12. **Lifecycle** - background the app, wait, foreground: a "Reconnecting..."
-    banner, then it resumes and reconnects. (Transfers honestly pause while away.)
+12. **Lifecycle** - background the app, wait, foreground: the Status row
+    returns to the connected line and transfers resume. (Transfers honestly
+    pause while away.) [SUPERSEDED: previously instructed checking for a
+    "Reconnecting..." banner on foreground - that banner provably CANNOT
+    render (portability-audit item 10: events drain behind the blocking resume
+    on one serial queue), so do not instruct a tester to look for it; it is a
+    known open Tier-2 defect - see [[portability-audit]].]
 13. **Cancel** - swipe a transfer to Remove; it disappears.
 14. **Finished file** - a completed download opens in Files (On My iPad >
     padMule), hash-verified.

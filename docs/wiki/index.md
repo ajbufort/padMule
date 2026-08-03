@@ -1,6 +1,6 @@
 # padMule Wiki - Index
 
-Updated: 2026-08-02
+Updated: 2026-08-03
 
 AI-maintained knowledge base. Start here. See `/CLAUDE.md` for the schema and
 the Ingest / Query / Lint workflows.
@@ -20,11 +20,11 @@ the Ingest / Query / Lint workflows.
 - [[nat-traversal-design]] - design for connecting two firewalled (LowID) padMule peers (hole punching + QUIC over Kad/buddy rendezvous); confirmed no stock hole punching; reusable Kad primitives; phased plan. Not built.
 
 ## Platform
-- [[portability-audit]] - usability for people NOT on the dev's network: the Tier-1/2/3 findings from the 2026-08-03 audit (UDP-blocked networks grey out every server, the splash clears before the engine is ready, a disconnected user is told the FILE is missing, no cellular/metered awareness). Open work.
+- [[portability-audit]] - usability for people NOT on the dev's network: the Tier-1/2/3 findings from the 2026-08-03 audit (UDP-blocked networks grey out every server, the splash clears before the engine is ready, a disconnected user is told the FILE is missing, no cellular/metered awareness). The Tier-1 slice (all four findings) LANDED and was annotated in place 2026-08-03; Tier 2/3 remain open.
 - [[ipados-constraints]] - iPadOS/Rust-on-iOS constraints; foreground-only engine, sockets OK, free-team sideload limits, storage plan (verified 2026).
 - [[lifecycle-and-reactivation]] - HARD requirement: honest status notice + clean pause/resume across focus loss; shapes the engine state model from Wave 3c.
 - [[mac-toolchain-setup]] - getting padMule onto the iPad (iPadOS 26.5.2). VERIFIED blocker: iPadOS 26 needs Xcode 26 needs macOS Tahoe 26.2, and OCLP has no Tahoe support -> the 2011 mini cannot run it. Escape hatch: padMule is sideload-only (the Xcode-26 mandate is App-Store-only), so CI builds with an older Xcode and Sideloadly installs it (AltStore died on -22411). Path C is the active, proven route.
-- [[ipad-usb-tooling]] - give this WSL2 box direct USB access to the iPad (usbipd-win + pymobiledevice3): screenshots, install, syslog, and TOUCH CONTROL via WebDriverAgent (2026-08-02: run end to end; the agent can now drive the app itself - go-ios proved unnecessary). NB the syslog carries NO app-authored lines - padMule never calls os_log.
+- [[ipad-usb-tooling]] - give this WSL2 box direct USB access to the iPad (usbipd-win + pymobiledevice3): screenshots, install, syslog, and TOUCH CONTROL via WebDriverAgent (2026-08-02: run end to end; the agent can now drive the app itself - go-ios proved unnecessary). The syslog claim below was corrected 2026-08-03: the engine now logs to os_log (subsystem us.ajbconsulting.padMule, category padMule.engine), device-verified via idevicesyslog capturing a readable boot/pause/resume/Stop narrative from app-authored lines.
 - [[on-device-test-checklist]] - the human on-glass pass after a Sideloadly install; the engine side of every item is coverable by the hands-on FFI simulation (scripts/simulate.sh).
 - [[net-highid-and-port-forwarding]] - HighID validated on the dev box (2026-07-14, 5-link manual chain) AND on the iPad via unicast-SSDP UPnP (2026-07-17); topology since 2026-07-17 is XB8-bridged -> TP-Link BE9700 (real UPnP IGD), which replaced the manual chain.
 
@@ -38,12 +38,14 @@ the Ingest / Query / Lint workflows.
 
 ## Process
 - [[decisions-and-lessons]] - locked decisions, rejected approaches, gotchas.
+- [[log]] - append-only, timestamped ledger of every ingest/work session; the
+  only complete record of the 2026-08-03 session narrative.
 - [[build-history]] - archive: the completed-milestone narratives (code-fix rounds, live milestones, differential-test history, wave notes) split verbatim out of [[build-progress]] on 2026-08-01.
-- [[build-progress]] - wave-by-wave build status. Engine complete through Kad + multi-source fetch; padMule RUNS on the iPad and does the full search->download->verify->save loop on-device; 0.70b Tier 1 COMPLETE + 9 Tier-2 items ([[emule-070b-features]]). Since 2026-07-20: the v1 readiness audit (8z), the reanalysis lint + Rust CI (8aa), the bulletproof security batch (8ab), the reverse peer oracle + multipacket serve (8ad/8ae), serve-side secure-ident + the full credit system (8af-8ah), the per-source corruption ban (8ai), and wave 10 Kad hard-verify (send-side keys + v8 handshake DONE and terminal-proven via [[kad-verify-oracle]]; Batch B enforcement pending), plus the 8aj/8ak reanalysis lint + fix round (doc drift, Kad key capture, nodes.dat v3, load gate, serve-path faithfulness, harness). Repo has LICENSE (GPL v2) + NOTICE + README.
+- [[build-progress]] - wave-by-wave build status. Engine complete through Kad + multi-source fetch; padMule RUNS on the iPad and does the full search->download->verify->save loop on-device; 0.70b Tier 1 COMPLETE + 10 Tier-2 items ([[emule-070b-features]]). Since 2026-07-20: the v1 readiness audit (8z), the reanalysis lint + Rust CI (8aa), the bulletproof security batch (8ab), the reverse peer oracle + multipacket serve (8ad/8ae), serve-side secure-ident + the full credit system (8af-8ah), the per-source corruption ban (8ai), and wave 10 Kad hard-verify (send-side keys + v8 handshake DONE and terminal-proven via [[kad-verify-oracle]]; Batch B enforcement DONE 2026-08-02, see 8al-8au below), plus the 8aj/8ak reanalysis lint + fix round (doc drift, Kad key capture, nodes.dat v3, load gate, serve-path faithfulness, harness), rows 8al-8au (outbound crypt-dial policy, source exchange wired, the function strip, wave-10 Batch B verified-bit enforcement, research-pass fixes incl. SO_REUSEADDR + free-space guard + serve request scoring, part.met .bak recovery, the aMule-master delta review + IGD:2 UPnP fix, the status-line fix, the Kad checkpoint/set_kad/periodic-checkpoint work, the explicit Stop action), and the 2026-08-03 session (portability audit + Tier-1 slice, Settings Tier 0, gzip/zip server lists, gossip crawl first cut, os_log, agent-drivable device control). Repo has LICENSE (GPL v2) + NOTICE + README.
 
 ## Backlog / feature ideas
-- [[feature-server-hunter]] - discover + verify live eD2k servers (auto-update, health-check, server-graph crawl); NOT literal whole-net scanning. Partially shipped (the auto-update/merge + prune landed as the 8y server manager; the status probe as the 8x Servers screen); the gossip crawl remains future work.
-- [[emule-070b-features]] - ranked backlog of eMule 0.70b features to adopt. From the 2026-07-18 dive; Tier 1 is COMPLETE (#1-10), and 9 Tier-2 items landed too (#11, 13, 14, 17-21, 30, 32-throttle); the rest of Tier 2+ is open backlog.
+- [[feature-server-hunter]] - discover + verify live eD2k servers (auto-update, health-check, server-graph crawl); NOT literal whole-net scanning. Partially shipped (the auto-update/merge + prune landed as the 8y server manager; the status probe as the 8x Servers screen). Part 1 (server-list URLs) extended to a full multi-URL list 2026-08-03 (Settings Tier 0), gzip/zip-wrapped list unwrap shipped the same day, and part 2's gossip harvest-on-connect landed as a FIRST CUT the same day too - but a 2026-08-03 device pass proved it INERT against real servers (modern Lugdunum servers do not volunteer OP_SERVERLIST on connect), so sending OP_GETSERVERLIST to ask is now the immediate next step.
+- [[emule-070b-features]] - ranked backlog of eMule 0.70b features to adopt. From the 2026-07-18 dive; Tier 1 is COMPLETE (#1-10), and 10 Tier-2 items landed too (#11, 13, 14, 17-21, 30, 32-throttle); the rest of Tier 2+ is open backlog.
 
 ## Strategy
 (All the big forks are LOCKED and executed - Rust engine rewrite, no-Mac

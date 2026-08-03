@@ -1,7 +1,8 @@
 # HighID and Port Forwarding (dev box + iPad)
 
-Updated: 2026-08-02 (the stale-mapping DEAD END found on-device; delete-then-add
-does NOT self-heal across a DHCP address change - see the section below)
+Updated: 2026-08-03 (the queued fixes below SHIPPED 2026-08-02 and are
+device-verified; the finite-lease idea was investigated and KILLED - see the
+annotations in place)
 
 How padMule earns a **HighID** on the eD2k network. Dev-box HighID via a manual
 forward chain **VALIDATED LIVE 2026-07-14**; iPad HighID via padMule's own
@@ -148,7 +149,9 @@ recover the case its own code comment names.** The chain:
    deleted that same mapping successfully (`mule-cli upnp-unmap 4663`, confirmed
    gone by a follow-up query). So a client CAN clean up after itself while its
    address is stable, and CANNOT once its address changes. That is exactly why
-   the **finite-lease fix is the load-bearing one**: it is the only remedy that
+   the **finite-lease fix is the load-bearing one** [KILLED 2026-08-02 - see the
+   FIXES WORTH MAKING section below; the idea was investigated and rejected, and
+   eMule's CheckAndRefresh port shipped instead]: it is the only remedy that
    survives an address change without a human.
 4. The add then fails **`ConflictInMappingEntry`** (error 718), and the delete's
    real reason never surfaces because the call site swallows it (`let _ =`).
@@ -195,15 +198,31 @@ pymobiledevice3 regression, [[ipad-usb-tooling]] gotcha 7): relaunch padMule and
 read the Status row for "UPnP: mapped port 4662" plus a HighID. padMule only
 attempts the mapping at start/resume, so the row still showed the old
 ConflictInMappingEntry error from its LAST launch.
+[SUPERSEDED 2026-08-02: confirmed the same day via the agent-driven device pass
+([[ipad-usb-tooling]]) - the gateway itself was queried before/after Stop/Start
+(Stop released 4662 at the gateway, Start re-claimed it), so this is no longer
+open.]
 
-FIXES WORTH MAKING (none shipped yet, queued as tasks):
+FIXES WORTH MAKING (none shipped yet, queued as tasks) [SUPERSEDED 2026-08-03:
+most of these SHIPPED 2026-08-02 (build-progress rows 8at/8au), device-verified -
+verify-then-reopen refresh on resume AND on a LowID server answer
+(upnp::refresh_mapping / refresh_and_remap), a conflict message that NAMES the
+current holder, and release-on-Stop (Engine::shutdown awaits unmap_port; Stop
+released 4662 at the gateway, Start re-claimed it). Per-item status below]:
 - **Finite lease + renew** instead of `lease_secs = 0`, so a stale mapping
   self-heals within one lease. Check what eMule 0.50a asks for before picking a
   number ([[emule-vs-amule-authority]] - this is wire-neutral policy, so aMule
   is also legitimate precedent).
+  [KILLED 2026-08-02: eMule 0.50a, eMule 0.70b, aMule 3.0.1, and aMule master
+  ALL request NewLeaseDuration=0 (nobody on the wire uses a finite lease), so
+  there was no precedent to follow either way. What shipped instead is eMule's
+  own CheckAndRefresh port: verify-then-reopen on resume and on a LowID server
+  answer (upnp::refresh_mapping / refresh_and_remap).]
 - **Surface the delete failure**: the `let _ =` hides the ONE fact that explains
   the conflict, on the one platform with no debugger. `engine.rs:1535-1540`
   already argues this exact point for the add.
+  [SHIPPED 2026-08-02: the conflict message now NAMES the current holder
+  (build-progress rows 8at/8au), device-verified.]
 - **Fall back to an alternate external port** on ConflictInMappingEntry (the
   UPnP-standard remedy) - but padMule advertises `TCP_PORT` to servers/peers, so
   it must then advertise the EXTERNAL port, which it cannot express today.

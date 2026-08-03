@@ -1,6 +1,9 @@
 # Mac Toolchain Setup (getting padMule onto the iPad)
 
-Updated: 2026-07-18
+Updated: 2026-08-03 (annotated the AltStore claims as SUPERSEDED - it died with
+-22411, Sideloadly is the proven installer; the body already carried
+2026-08-01 content - the rust.yml mention - so the old header date was stale
+regardless)
 
 How to build + sign padMule's iOS app for Anthony's **iPad Pro (M4, iPad16,3) running
 iPadOS 26.5.2**, given the available Mac is a **2011 Mac mini (Macmini5,x, 32GB,
@@ -43,6 +46,8 @@ All three end the same way: produce a signed `.ipa` and **install it with AltSto
 / Sideloadly**. AltServer runs on Anthony's **Windows host** (the same box as this
 WSL2 dev env). Free-Apple-ID signing expires every **7 days**; AltStore auto-resigns
 over Wi-Fi.
+[SUPERSEDED: AltStore died with -22411; Sideloadly is the proven installer - see
+[[ipad-usb-tooling]]]
 
 Path A costs you the Xcode debugger + Simulator and a slow IDE, but the CPU+32GB
 +SSD compile fine. Path B is the only one with real on-device debugging - worth it
@@ -55,6 +60,8 @@ Validate the **sideload leg** before investing days in OCLP: get a hello-world
 `.ipa` (from CI/path C, or any borrowed Mac), and confirm **AltStore installs and
 runs it on the iPadOS 26 iPad**. If that works, the whole approach is sound and you
 can then pick a build machine. If it does not, no build machine helps.
+[SUPERSEDED: AltStore died with -22411; Sideloadly is the proven installer - see
+[[ipad-usb-tooling]]]
 
 ## Phase A - the 2011 mini as a build box (path A)
 
@@ -92,6 +99,8 @@ can then pick a build machine. If it does not, no build machine helps.
 
 CI (path C) already emits an UNSIGNED `padMule.ipa` artifact - AltStore re-signs it
 with a free Apple ID at install, so no Xcode/Apple secrets are involved.
+[SUPERSEDED: AltStore died with -22411; Sideloadly is the proven installer - see
+[[ipad-usb-tooling]]]
 
 1. **Get it**: GitHub -> Actions -> latest green run -> Artifacts -> `padMule-ipa`
    (downloads as a **.zip**; unzip to get `padMule.ipa`).
@@ -137,6 +146,8 @@ with a free Apple ID at install, so no Xcode/Apple secrets are involved.
    step 5 first if you cannot find it.
 8. Put the `.ipa` where the iPad's **Files** app can see it (iCloud Drive), then
    AltStore -> **My Apps** -> **+** -> pick it.
+   [SUPERSEDED: AltStore died with -22411; Sideloadly is the proven installer -
+   see [[ipad-usb-tooling]]]
    **Sideloadly (sideloadly.io) is the RECOMMENDED route** after the -22411 wall:
    install it on Windows, plug the iPad in by USB, drag `padMule.ipa` onto it,
    enter the Apple ID, hit Start. No AltStore, no Files-app shuffle, no Wi-Fi
@@ -147,6 +158,9 @@ with a free Apple ID at install, so no Xcode/Apple secrets are involved.
    For proving the sideload leg works at all, that tradeoff is irrelevant.
 9. LIMITS of free-ID signing: apps expire every **7 days** (keep AltServer running
    on the same Wi-Fi and AltStore auto-refreshes) and **max 3 sideloaded apps**.
+   [SUPERSEDED: AltStore died with -22411, so this auto-refresh never applied in
+   practice; reality is a MANUAL re-sign every 7 days via Sideloadly - the
+   current cert expires 2026-08-10 - see [[ipad-usb-tooling]]]
 10. Debug by what the UI shows - there is no Xcode device support for iPadOS 26 on
     paths A/C, so the app's own status line IS the diagnostic. The Status screen
     shows State / Status / Server / ID (HighID|LowID) / Kad contacts.

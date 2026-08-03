@@ -1,6 +1,6 @@
 # Reference Source Trees (oracles)
 
-Updated: 2026-07-13
+Updated: 2026-08-03 (the refreshed aMule-master snapshot 3.0.1-405)
 
 Read-only reference source, extracted under `refs/` (gitignored - do NOT commit
 the bulk source; curated findings go in the KB). Anthony supplied these on

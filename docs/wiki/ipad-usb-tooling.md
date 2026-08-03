@@ -1,7 +1,8 @@
 # Driving the iPad from this box over USB (WSL2 + usbipd + pymobiledevice3)
 
-Updated: 2026-08-02 (TOUCH CONTROL NOW WORKS - go-ios was never needed; and the
-"live engine logs" claim below is CORRECTED - padMule emits nothing to os_log)
+Updated: 2026-08-03 (TOUCH CONTROL NOW WORKS - go-ios was never needed; and
+engine os_log logging LANDED - subsystem us.ajbconsulting.padMule, category
+padMule.engine - device-verified 2026-08-03 via idevicesyslog)
 
 How to give this WSL2 box direct access to the iPad over USB-C, so device logs,
 screenshots and app installs can happen from here instead of only through

@@ -156,14 +156,14 @@ fn gate_loaded_nodes(contacts: &[KadContact], filter: Option<&IpFilter>) -> Vec<
         .collect()
 }
 
-/// How long to wait for a server's search answer / source list. Servers reply in
-/// well under this or not at all.
 /// How often a RUNNING engine re-checkpoints (see `Engine::maintain_checkpoint`).
 /// Five minutes bounds what a suspend-kill can cost without writing often enough
 /// to matter: the Kad table and credit ledger both move slowly, and the write is
 /// a few small files.
 const CHECKPOINT_EVERY: Duration = Duration::from_secs(300);
 
+/// How long to wait for a server's search answer / source list. Servers reply in
+/// well under this or not at all.
 const SEARCH_WAIT: Duration = Duration::from_secs(20);
 const SOURCES_WAIT: Duration = Duration::from_secs(10);
 
@@ -201,8 +201,9 @@ pub enum ServerListUpdate {
     Updated { added: u32, total: u32 },
     /// The URL was not `http://` (v1 fetches plain http only).
     BadUrl,
-    /// Fetched, but the bytes were not a server.met (an HTML error page, or a
-    /// gzip/zip-wrapped list, which v1 does not unwrap).
+    /// Fetched, but the bytes were not a server.met (an HTML error page, or
+    /// malformed data; gzip/zip-wrapped lists ARE unwrapped in the fetch path
+    /// before this check, so this means genuinely-not-a-list).
     NotServerMet,
     /// The host could not be reached / the GET or the write failed.
     Unreachable,
@@ -1162,9 +1163,6 @@ impl Engine {
         }
     }
 
-    /// An honest one-line status for the UI - never claims a connection we do
-    /// not have. Carries the HighID/LowID answer, because a bare "Connected"
-    /// hides the one fact that decides whether peers can reach us.
     /// The display name of the server at `addr`, read from server.met (tag 0x01).
     /// None if the server is not in the list or has no name tag. Cheap and
     /// best-effort - called once per connect, not on the hot path.
@@ -1179,6 +1177,9 @@ impl Engine {
         })
     }
 
+    /// An honest one-line status for the UI - never claims a connection we do
+    /// not have. Names the connected server (address in parens); HighID/LowID
+    /// is NOT repeated here since the Status screen gives it its own row.
     fn online_status(&self) -> String {
         if self.is_online() {
             match &self.connection {

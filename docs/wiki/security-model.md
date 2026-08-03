@@ -32,7 +32,9 @@ secure-ident (build-progress 8af, commit 4d874e5) closed the last identification
 gap - both roles now verify, oracle-proven (-> 19/4/3); the credit store +
 reweight/accrual (8ag/8ah) took the credit row to OPERATIONAL (-> 20/4/2); the
 per-source corruption ban (8ai) closed the poisoning row (-> 21/3/2); the
-reanalysis fix round (8ak) closed the Kad send-side key-capture gap (-> 22/2/2).
+reanalysis fix round (8ak) closed the Kad send-side key-capture gap (-> 22/2/2);
+wave-10 Batch B (8ao, commit 5ef4c2e) ENFORCED the Kad verified bit in routing,
+closing the Kad node-ID/IP row (-> 23/1/2).
 Each change was eMule-0.50a-grounded, test-first, and adversarially re-reviewed -
 see [[build-progress]] rows 8ab / 8af-8ak.
 

@@ -1,6 +1,7 @@
 # Portability audit: usable for people who are NOT on the dev's network
 
-Updated: 2026-08-03 (first pass)
+Updated: 2026-08-03 (first pass; Tier-1 items 1-4 fixed same day and annotated
+below)
 
 Anthony asked: "have we handled all such cases - making the product usable for
 those who do not have my setup but meet minimum requirements?" The answer is NO,
@@ -15,29 +16,59 @@ which Anthony caught. That one bug was the visible tip.
 
 ## TIER 1 - the app is unusable or can cost the user money
 
-1. **A UDP-blocked network greys out EVERY server, with no escape hatch.**
-   `probe_server_list` marks a server `alive` only if it answers
-   `OP_GLOBSERVSTATREQ` on UDP port+4 (engine.rs:1767-1808); the UI then does
-   `.disabled(!srv.alive || srv.connected)` (ContentView.swift:645). CONNECTING
-   is TCP, so a hotel/corporate/school/carrier network that blocks outbound UDP
-   makes every row unselectable even though the TCP login would likely succeed.
-   There is NO manual server-address field anywhere - verified, the only
-   TextFields are Name / Search / Filter / Server-list-URL. The user sees "pick a
-   live server below" above a list with no live server.
-2. **The splash clears long before the engine is ready, and every control then
-   silently no-ops.** The splash is a fixed 7s (PadMuleApp.swift:26-30) while
-   `boot()` publishes `engine` only after `start()` returns - two HTTP fetches,
-   the always-failing multicast SSDP attempt, then unicast + SOAP, then Kad -
-   roughly 12-17s warm and 25s+ cold. In that window Search, Get, and even
-   "Start padMule" hit `guard let e = engine else { return }` and do NOTHING with
-   no feedback, and the Servers screen reads "No server list on disk", which is
-   false. There is no engine-ready flag on the model for any view to show.
-3. **A disconnected user is always told the FILE is unavailable.**
-   `AddResult::NoServer` is returned ONLY under `self.offline` (engine.rs:2387)
-   and `set_offline` is never exported over the FFI - so the Swift branch
-   "Not connected to a server." is DEAD, and the real path yields
-   "No one online has \"X\" right now." That sends a new user hunting for another
-   file when the fix is to connect. Verified by hand.
+1. [FIXED 2026-08-03] **~~A UDP-blocked network greys out EVERY server, with no
+   escape hatch~~.** The `.disabled` condition no longer includes `!srv.alive`:
+   it is now `srv.connected || model.connectingTo != nil`
+   (ContentView.swift:682), so every row stays SELECTABLE even when the UDP
+   status probe got no answer - the probe is UDP, the login is TCP, and plenty
+   of networks pass one and block the other. The dead-server label changed from
+   implying "offline" to the honest "no reply" (ContentView.swift:665), and
+   tapping a no-reply row dials it exactly like a live one, now with a spinner
+   and an honest failure report where the connect boolean used to be discarded.
+   There is still no manual server-address field - that part of the finding
+   remains open - but the escape hatch that shipped is "every server is
+   tappable," which is what actually made hotel/corporate/carrier networks
+   usable again. Device-verified 2026-08-03 (build 44ba972, [[log]]): the
+   connect path itself was seen live end to end, but the "no reply" state could
+   not be reproduced from the dev network (all ten configured servers answered
+   the UDP probe there), so that specific render rests on its unit test rather
+   than an on-glass repro.
+2. [FIXED 2026-08-03] **~~The splash clears long before the engine is ready,
+   and every control then silently no-ops~~.** The fixed 7s delay is gone.
+   PadMuleApp.swift:40-62 now polls a new `model.ready` flag every 150ms,
+   bounded on both sides: a 2.5s MINIMUM so the brand does not flash past on a
+   warm start, and a 20s CEILING so a hung or failed boot can never trap the
+   user behind the splash. Past either the ready flag or `bootError` becoming
+   non-nil (once the minimum has elapsed), the splash yields to the app, and a
+   new "Starting padMule... searching and downloading will work in a moment."
+   banner (ContentView.swift:128-129, gated on `!model.ready && model.bootError
+   == nil`) covers the remaining wait instead of a live-looking but inert UI.
+   Device-verified 2026-08-03 (build 44ba972, [[log]]): boot completed in ~1s
+   on the dev network, so the 2.5s splash minimum correctly covered the whole
+   boot and the "Starting padMule..." banner never had to render there - that
+   render, and the 20s-ceiling failure path, are proven by unit test rather
+   than on-glass, since this network cannot produce a slow or hung boot to
+   trigger them. The audit's own "12-17s warm / 25s+ cold" estimate was
+   corrected in the same pass: it was the sum of the timeouts, not a
+   measurement - warm boot with lists already on disk is closer to ~1s, though
+   the finding still holds for a cold, slow, or blocked network where those
+   timeouts actually elapse.
+3. [FIXED 2026-08-03] **~~A disconnected user is always told the FILE is
+   unavailable~~.** `AddResult::NoServer` is gone; it is now `NotConnected`
+   (engine.rs:761-777), and it is REACHABLE: `add_download` checks
+   `self.offline || !self.can_discover()` (engine.rs:2514, `can_discover` = a
+   server OR a populated Kad table) and returns `NotConnected` BEFORE spending
+   the 10s source-lookup budget, since with no channel there is nobody to ask -
+   the honest answer is about the connection, not the file. The regression
+   guard that the original bug's cause could have broken -
+   `add_download_without_a_server_still_tries_kad`, which pins Kad-only clients
+   never being refused for lacking a server - was updated to check BOTH halves:
+   bail when there is no channel at all, and do NOT bail when Kad alone could
+   still answer. Device-verified 2026-08-03 (build 44ba972, [[log]]): not
+   directly reproducible from the dev network, since it requires no server AND
+   zero Kad contacts, a state the app leaves within seconds there - it rests on
+   its unit test (`add_download_refuses_what_it_cannot_do_instead_of_
+   pretending`) instead.
 4. [FIXED 2026-08-03] **~~No cellular / metered awareness, sharing ON by
    default~~.** Landed in the Tier-0 Settings slice: a `NetworkWatcher`
    (`NWPathMonitor` -> `isExpensive || isConstrained`) drives a
