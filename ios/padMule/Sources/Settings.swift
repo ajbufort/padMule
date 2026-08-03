@@ -29,6 +29,12 @@ enum SettingsKey {
     /// "eMule-only" or "aMule-only" list to reconcile.
     static let serverListUrls = "padMule.serverListUrls"
     static let updateServerListAtLaunch = "padMule.updateServerListAtLaunch"
+    /// eMule's "update server list when connecting" (AddServersFromServer): every
+    /// fresh server login also ASKS that server for the servers it knows
+    /// (OP_GETSERVERLIST) and merges the answer. eMule defaults this OFF; padMule
+    /// defaults it ON - the merge is filtered and bounded, the ask is one empty
+    /// packet, and without it the discovered-servers feature is inert.
+    static let askServersForServers = "padMule.askServersForServers"
     static let defaultPriority = "padMule.defaultDownloadPriority"
     static let rememberSearchFilters = "padMule.rememberSearchFilters"
     // Persisted wire-filter values (only read back when the flag above is on).
@@ -55,6 +61,7 @@ enum SettingsDefaults {
             SettingsKey.keepAwakeWhileTransferring: true,
             SettingsKey.serverListUrls: [EngineModel.defaultServerListUrl],
             SettingsKey.updateServerListAtLaunch: false,
+            SettingsKey.askServersForServers: true,
             SettingsKey.defaultPriority: 1, // Normal
             SettingsKey.rememberSearchFilters: true,
         ])

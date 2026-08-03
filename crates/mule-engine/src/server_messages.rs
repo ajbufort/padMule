@@ -17,6 +17,16 @@ pub const OP_SERVERIDENT: u8 = 0x41;
 /// <tagset>)[count]`, opcodes.h:161) so it indexes them for keyword search and
 /// can hand us out as a source.
 pub const OP_OFFERFILES: u8 = 0x15;
+/// Ask the server for its known-servers list: a BODILESS client->server packet
+/// (eMule opcodes.h:160 "(null)"). Both authorities send it from
+/// ConnectionEstablished right after offering shares, gated on the "update
+/// server list when connecting" pref (eMule 0.50a sockets.cpp:253-260 +
+/// Preferences.cpp:2105; aMule 3.0.1 ServerConnect.cpp:289-296 +
+/// Preferences.cpp:1175). The answer arrives as unsolicited OP_SERVERLIST -
+/// and OP_SERVERIDENT comes ONLY to a client that asked (ServerSocket.cpp:431).
+/// Device-proven 2026-08-03: modern servers do NOT volunteer the list unasked,
+/// so this send is what makes the gossip harvest live.
+pub const OP_GETSERVERLIST: u8 = 0x14;
 
 /// Server TCP-capability bit (in the OP_IDCHANGE flags word) meaning the server
 /// answers "related files" searches - a keyword query whose string is
@@ -95,6 +105,11 @@ pub struct LoginRequest {
     pub nick: String,
     /// CT_SERVER_FLAGS capability bitmask (use DEFAULT_SERVER_FLAGS for v1).
     pub server_flags: u32,
+}
+
+/// Build the bodiless OP_GETSERVERLIST ask (see the opcode doc for citations).
+pub fn build_get_server_list() -> Packet {
+    Packet::new(PROT_EDONKEY, OP_GETSERVERLIST, Vec::new())
 }
 
 /// Build an OP_LOGINREQUEST packet. Tags are written in the verbose form aMule
@@ -298,6 +313,19 @@ pub fn parse_server_ident(payload: &[u8]) -> Result<ServerIdent, IoError> {
 mod tests {
     use super::*;
     use mule_proto::{read_packet, write_packet};
+
+    #[test]
+    fn get_server_list_is_the_bodiless_0x14() {
+        let pkt = build_get_server_list();
+        assert_eq!(pkt.protocol, PROT_EDONKEY);
+        assert_eq!(pkt.opcode, OP_GETSERVERLIST);
+        assert!(
+            pkt.payload.is_empty(),
+            "eMule sends Packet(OP_GETSERVERLIST,0)"
+        );
+        // Exact wire bytes: proto, u32 size (opcode only = 1), opcode.
+        assert_eq!(write_packet(&pkt), vec![0xE3, 0x01, 0x00, 0x00, 0x00, 0x14]);
+    }
 
     #[test]
     fn offer_files_round_trips_via_the_shared_result_record() {

@@ -883,7 +883,17 @@ final class EngineModel: ObservableObject {
         if UserDefaults.standard.bool(forKey: SettingsKey.updateServerListAtLaunch) {
             updateAllServerLists()
         }
+        applyAskServersForServers()
         applyKeepAwake()
+    }
+
+    /// Push the "ask a fresh login for its server list" pref into the engine.
+    /// The engine defaults it ON, so this only matters when the user turned it
+    /// off - but re-applying unconditionally keeps engine and pref in step.
+    func applyAskServersForServers() {
+        guard let e = engine else { return }
+        let on = UserDefaults.standard.bool(forKey: SettingsKey.askServersForServers)
+        work.async { e.setAddServersFromServer(on: on) }
     }
 
     /// Keep the screen from sleeping while a transfer is active, IF the user opted

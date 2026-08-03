@@ -79,6 +79,10 @@ fn spawn_event_printer(mut rx: mpsc::Receiver<ServerEvent>) -> tokio::task::Join
     })
 }
 
+/// login <host> <port>: connect + log in to one server, ask it for ITS server
+/// list (OP_GETSERVERLIST - the live check for the gossip harvest), then
+/// exercise the pause/resume lifecycle. Events (MOTD, status, the ServerList
+/// answer) print as they arrive.
 async fn cmd_login(addr: SocketAddr) {
     println!("connecting to {addr} ...");
     let (tx, rx) = mpsc::channel(64);
@@ -88,6 +92,14 @@ async fn cmd_login(addr: SocketAddr) {
     match timeout(Duration::from_secs(10), link.connect()).await {
         Ok(Ok(state)) => {
             println!("login result: {state:?}");
+            // Ask for the server's own server list and give the answer a moment
+            // to arrive; poll_incoming drains it (and any MOTD) to the printer.
+            println!("asking for the server's server list (OP_GETSERVERLIST) ...");
+            if let Err(e) = link.request_server_list().await {
+                println!("ask failed: {e}");
+            }
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            let _ = link.poll_incoming().await;
             // Demonstrate the lifecycle.
             println!("pausing (simulating background) ...");
             link.pause().await;
