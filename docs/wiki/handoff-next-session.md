@@ -30,15 +30,11 @@ early.
 
 ## FIRST THINGS TO DO
 
-1. **Install the LATEST build.** The device still runs e7c38d0, now FIVE
-   commits behind. Download the fff31dc `padMule-ipa` artifact once CI is
-   green, put the UNSIGNED .ipa in `C:\Users\ajbuf\Downloads\`, and hand it to
-   Sideloadly (never a pre-signed one - the double-suffix trap is in
-   [[ipad-usb-tooling]]).
-2. **Device-verify the batch** (see the list below). The headline check: on a
-   real-server connect the notice stream should now show "N servers known" /
-   "Discovered N server(s) from the network", and the Servers screen should
-   grow rows that came from no published list.
+[BOTH DONE same session: Anthony installed the fff31dc build via Sideloadly,
+and the agent-driven device pass verified the batch on glass - see the
+DEVICE-VERIFIED section below.] The next session starts at the ranked open
+tasks; the only install-related task left is the CERT RENEWAL before
+2026-08-10.
 
 ## THE HEADLINE: the gossip harvest is LIVE (OP_GETSERVERLIST shipped)
 
@@ -68,15 +64,29 @@ BEFORE its flood limiter, so a connect-burst answer cannot be dropped.
   (ipfilter/routability/port-53/Kad1) exactly like the table load - a poisoned
   nodes.dat can no longer aim the bootstrap sweep at loopback/LAN/DNS.
 
-## NOT yet device-verified (CI-green / live-CLI-proven only)
+## DEVICE-VERIFIED (2026-08-03, fff31dc install, agent-driven pass)
 
-Everything since e7c38d0, on the fff31dc install: the connected-line server
-NAME (26cc9f8), the gossip ask + harvest merge ON DEVICE (the ask itself is
-live-proven from the dev box), the new Settings toggle, the metered-sharing
-pause (needs a cellular/hotspot link; rests on its unit truth-table),
-keep-screen-awake, and the multi-URL merge RESULT. NB the name shows in the
-STATUS row only: `ServerInfoFfi` has no `name` field yet, so the Servers-screen
-header and the Status "Server" row still show the bare IP (open task below).
+Anthony installed the fff31dc build via Sideloadly the same session, and the
+WebDriverAgent pass verified on glass: the new Settings toggle "Ask connected
+servers for more servers" renders and defaults ON; tapping the live ed2k-rust
+server produced **"Discovered 24 server(s) from the network"** and "Refresh
+server list" grew the table from **"Servers (10)" to "Servers (34)"** - the
+gossip harvest working end to end ON THE DEVICE; the Status row reads
+**"Connected to ed2k-rust (85.17.116.222:6082)"** (the 26cc9f8 name change,
+verified); ID row HighID; "UPnP: mapped port 4662". As predicted, the
+Servers-screen header still shows the bare IP (`ServerInfoFfi` has no `name`
+field - open task below). NB the Servers list does NOT auto-refresh after a
+harvest - the count updates on the next "Refresh server list" probe; whether
+it SHOULD auto-refresh is a small UX question for the next slice.
+
+## Still NOT device-verified
+
+The metered-sharing pause (needs a cellular/hotspot link; rests on its unit
+truth-table), keep-screen-awake, and the multi-URL merge RESULT. Also: the
+`idevicesyslog -p padMule -m padMule.engine` capture came up EMPTY during this
+pass (only its connect marker) while the same command worked 2026-08-02/03 -
+unresolved harness quirk, retry before trusting it as the only evidence
+channel.
 
 ## Open tasks (ranked)
 

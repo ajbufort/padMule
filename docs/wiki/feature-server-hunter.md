@@ -66,7 +66,11 @@ OP_GETSERVERLIST ask); the recursive UDP crawl is the remaining future work.
   cleanly through a full pause/resume lifecycle (it advertises nothing - it
   knows no other servers), and a REAL public server answered with
   `[serverlist] 33 servers` on a HighID login - the exact list that stayed
-  silent without the ask on the device pass. 537 tests.
+  silent without the ask on the device pass. 537 tests. **DEVICE-VERIFIED
+  same day (fff31dc install, agent-driven):** connecting to that server on
+  the iPad produced "Discovered 24 server(s) from the network" and the
+  Servers table grew 10 -> 34 rows after a refresh - the whole gossip loop
+  (ask -> answer -> filter -> merge -> UI) working on glass.
 
 Anthony wants a "Server Hunter" feature (2026-07-13): a tool that discovers and
 verifies active eD2k servers to build a safe, working, live server list - by
