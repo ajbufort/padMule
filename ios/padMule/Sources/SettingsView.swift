@@ -18,6 +18,7 @@ struct SettingsView: View {
     @AppStorage(SettingsKey.pauseSharingOnCellular) private var pauseOnCellular = true
     @AppStorage(SettingsKey.keepAwakeWhileTransferring) private var keepAwake = true
     @AppStorage(SettingsKey.updateServerListAtLaunch) private var updateAtLaunch = false
+    @AppStorage(SettingsKey.askServersForServers) private var askServers = true
     @AppStorage(SettingsKey.defaultPriority) private var defaultPriority = 1
     @AppStorage(SettingsKey.rememberSearchFilters) private var rememberFilters = true
 
@@ -91,6 +92,10 @@ struct SettingsView: View {
                 .disabled(newUrl.isEmpty)
             }
             Toggle("Update all lists at launch", isOn: $updateAtLaunch)
+            Toggle("Ask connected servers for more servers", isOn: Binding(
+                get: { askServers },
+                set: { askServers = $0; model.applyAskServersForServers() }
+            ))
             Button {
                 model.updateAllServerLists()
             } label: {
@@ -104,7 +109,7 @@ struct SettingsView: View {
         } header: {
             Text("Server lists")
         } footer: {
-            Text("padMule merges every list, so adding more sources builds one comprehensive server list rather than replacing it. server.met is a single shared format - lists published for eMule and for aMule are the same files and both work.")
+            Text("padMule merges every list, so adding more sources builds one comprehensive server list rather than replacing it. server.met is a single shared format - lists published for eMule and for aMule are the same files and both work. With \"Ask connected servers\" on, every server you connect to is also asked for the servers it knows - discovering servers no published list carries.")
         }
     }
 

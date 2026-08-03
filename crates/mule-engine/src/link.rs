@@ -276,6 +276,19 @@ impl ServerLink {
         fs.write_packet(&build_callback_request(client_id)).await
     }
 
+    /// Ask the server for its known-servers list (OP_GETSERVERLIST, bodiless).
+    /// Fire-and-forget, like both authorities: the answer arrives as an
+    /// unsolicited OP_SERVERLIST (plus an OP_SERVERIDENT, which a server sends
+    /// ONLY to a client that asked - eMule ServerSocket.cpp:431), forwarded by
+    /// the event path into the engine's gossip harvest.
+    pub async fn request_server_list(&mut self) -> Result<(), FrameError> {
+        let Some(fs) = self.conn.as_mut() else {
+            return Err(not_connected());
+        };
+        fs.write_packet(&crate::server_messages::build_get_server_list())
+            .await
+    }
+
     /// Announce our shared files to the server (OP_OFFERFILES) so it indexes them
     /// for keyword search and can hand us out as a source. Fire-and-forget (no
     /// reply). padMule always passes the FILE_COMPLETE_ID/PORT markers for

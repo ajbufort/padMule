@@ -1047,6 +1047,16 @@ pub struct Engine {
     /// concurrent server.met write. A std mutex, held only briefly, never across
     /// an await. This is the Server Hunter gossip crawl's first step.
     harvested_servers: Arc<std::sync::Mutex<Vec<(u32, u16)>>>,
+    /// Ask a fresh login for the server's own server list (OP_GETSERVERLIST) -
+    /// eMule's "update server list when connecting" pref (AddServersFromServer).
+    /// BOTH authorities default it OFF (eMule 0.50a Preferences.cpp:2105, aMule
+    /// 3.0.1 Preferences.cpp:1175); padMule defaults it ON as a DELIBERATE,
+    /// documented policy deviation: the wire bytes and timing are identical,
+    /// the harvest merge is already filtered + bounded, one bodiless packet per
+    /// connect is negligible, and a default-off pref would leave the Server
+    /// Hunter harvest inert on every fresh install - the exact inertness the
+    /// 2026-08-03 device pass proved (docs/wiki/feature-server-hunter.md).
+    add_servers_from_server: bool,
     /// The upload switch. `false` is "Leech Mode": we still download, but serve
     /// nothing. An atomic so the listener task reads it without taking a lock.
     sharing: Arc<AtomicBool>,
@@ -1121,6 +1131,7 @@ impl Engine {
             shared: Arc::new(Mutex::new(Vec::new())),
             shared_dirty: Arc::new(AtomicBool::new(false)),
             harvested_servers: Arc::new(std::sync::Mutex::new(Vec::new())),
+            add_servers_from_server: true,
             sharing: Arc::new(AtomicBool::new(true)),
             upload_gate: Arc::new(UploadGate::new(MAX_UPLOAD_SLOTS, UPLOAD_QUEUE_CAP)),
             known_met_lock: Arc::new(Mutex::new(())),
@@ -1294,6 +1305,13 @@ impl Engine {
     /// listener consults this per connection, so it takes effect immediately.
     pub fn set_sharing(&self, on: bool) {
         self.sharing.store(on, Ordering::Relaxed);
+    }
+
+    /// The "update server list when connecting" pref (eMule AddServersFromServer;
+    /// see the field doc for the citations and padMule's default-ON deviation).
+    /// Takes effect on the NEXT connect/resume, like upstream's.
+    pub fn set_add_servers_from_server(&mut self, on: bool) {
+        self.add_servers_from_server = on;
     }
 
     pub fn state(&self) -> EngineState {
@@ -1681,6 +1699,22 @@ impl Engine {
             let mut win_start = tokio::time::Instant::now();
             let mut count = 0u32;
             while let Some(e) = rx.recv().await {
+                // Gossip crawl step 1: stash the servers this server advertised,
+                // for the heartbeat to filter + merge into server.met. Bounded, so
+                // a hostile server cannot grow it without limit; the public-IP
+                // filter and dedup happen at merge time, on the engine task.
+                // Stashed BEFORE the flood limiter below: the limiter protects
+                // the unbounded UI channel, but the OP_SERVERLIST answer to our
+                // own OP_GETSERVERLIST ask arrives inside the busy connect burst
+                // - exactly when the window is most likely spent - and this
+                // queue has its own bound, so the limiter must not eat it.
+                if let ServerEvent::ServerList(list) = &e {
+                    if let Ok(mut pend) = harvest.lock() {
+                        const MAX_HARVEST_PENDING: usize = 2000;
+                        let room = MAX_HARVEST_PENDING.saturating_sub(pend.len());
+                        pend.extend(list.iter().copied().take(room));
+                    }
+                }
                 if !matches!(e, ServerEvent::State(_)) {
                     let now = tokio::time::Instant::now();
                     if now.duration_since(win_start) >= WINDOW {
@@ -1689,18 +1723,7 @@ impl Engine {
                     }
                     count += 1;
                     if count > PER_WINDOW {
-                        continue; // drop the flood
-                    }
-                }
-                // Gossip crawl step 1: stash the servers this server advertised,
-                // for the heartbeat to filter + merge into server.met. Bounded, so
-                // a hostile server cannot grow it without limit; the public-IP
-                // filter and dedup happen at merge time, on the engine task.
-                if let ServerEvent::ServerList(list) = &e {
-                    if let Ok(mut pend) = harvest.lock() {
-                        const MAX_HARVEST_PENDING: usize = 2000;
-                        let room = MAX_HARVEST_PENDING.saturating_sub(pend.len());
-                        pend.extend(list.iter().copied().take(room));
+                        continue; // drop the flood (the harvest is already in)
                     }
                 }
                 let _ = out.send(map_server_event(e));
@@ -1763,6 +1786,14 @@ impl Engine {
                 self.refresh_port_mapping();
             }
             Self::offer_shared_to(&self.shared, &mut link).await;
+            // Ask for the server's own server list exactly where both
+            // authorities do - right after the shares offer - and fire-and-
+            // forget like theirs (eMule sockets.cpp:253-260, aMule
+            // ServerConnect.cpp:289-296). The OP_SERVERLIST answer rides the
+            // normal event path into the gossip harvest.
+            if self.add_servers_from_server {
+                let _ = link.request_server_list().await;
+            }
             self.server = Some(link);
             // The DURABLE status line too, not only the notice above. The app
             // feeds its status row from `Status` events ALONE and routes `Server`
@@ -2941,6 +2972,12 @@ impl Engine {
                             c.low_id = low_id;
                             c.related_search = related_search;
                         }
+                        // A resume is a FRESH login, and the ask lives in the
+                        // authorities' ConnectionEstablished - which runs on
+                        // every reconnect. Re-ask here too.
+                        if self.add_servers_from_server {
+                            let _ = s.request_server_list().await;
+                        }
                         true
                     }
                     _ => false,
@@ -3420,6 +3457,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The forwarder's flood limiter protects the unbounded UI channel; it must
+    /// NOT discard the gossip payload. Once padMule ASKS for the list
+    /// (OP_GETSERVERLIST), the OP_SERVERLIST answer arrives inside the busy
+    /// connect burst - exactly when the window is most likely to be spent - and
+    /// dropping it there silently re-inerts the whole harvest.
+    #[tokio::test]
+    async fn a_flooded_event_window_does_not_drop_the_harvest() {
+        let dir = tmp("harvest-flood");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+
+        let tx = engine.server_sender();
+        // Spend the whole 30-events/10s window on message spam...
+        for i in 0..40u32 {
+            tx.send(ServerEvent::Message(format!("spam {i}")))
+                .await
+                .unwrap();
+        }
+        // ...then deliver the gossip. The UI event may be dropped; the stash
+        // must not be.
+        tx.send(ServerEvent::ServerList(vec![(
+            u32::from_le_bytes([85, 17, 116, 222]),
+            4242,
+        )]))
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert!(
+            !engine.harvested_servers.lock().unwrap().is_empty(),
+            "the ServerList payload must be stashed even while the UI flood \
+             limiter is dropping events"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A user with no server and no Kad must be told THEY are not connected, not
     /// that the file is unavailable. The old code could only ever say the latter:
     /// `NoServer` fired solely under `offline`, which the FFI never exports, so
@@ -3654,6 +3728,126 @@ mod tests {
             }
         });
         addr
+    }
+
+    /// Like `spawn_mock_login_server`, but RECORDS the opcode of every packet
+    /// the client sends after its login, so a test can assert what the connect
+    /// burst contains (the shares offer, the OP_GETSERVERLIST ask, ...).
+    async fn spawn_recording_login_server() -> (SocketAddr, Arc<std::sync::Mutex<Vec<u8>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen: Arc<std::sync::Mutex<Vec<u8>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                let record = record.clone();
+                tokio::spawn(async move {
+                    let mut sfs = crate::framed::FramedStream::new(sock);
+                    if sfs.read_packet().await.is_err() {
+                        return; // the login request
+                    }
+                    let _ = sfs
+                        .write_packet(&mule_proto::Packet::new(
+                            mule_proto::PROT_EDONKEY,
+                            crate::server_messages::OP_IDCHANGE,
+                            0x0A00_0001u32.to_le_bytes().to_vec(),
+                        ))
+                        .await;
+                    while let Ok(p) = sfs.read_packet().await {
+                        record.lock().unwrap().push(p.opcode);
+                    }
+                });
+            }
+        });
+        (addr, seen)
+    }
+
+    /// Both authorities ask a fresh login for the server's own list - a bodiless
+    /// OP_GETSERVERLIST right after the shares offer (eMule 0.50a
+    /// sockets.cpp:253-260, aMule ServerConnect.cpp:289-296) - and the
+    /// 2026-08-03 device pass proved modern servers do NOT volunteer
+    /// OP_SERVERLIST unasked, so this send is what makes the gossip harvest
+    /// live. padMule defaults the pref ON (a documented deviation - field doc).
+    #[tokio::test]
+    async fn connecting_asks_the_server_for_its_server_list() {
+        let dir = tmp("ask-serverlist");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+
+        let (addr, seen) = spawn_recording_login_server().await;
+        assert!(
+            engine.connect_to_server(addr).await,
+            "mock login should win"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let ops = seen.lock().unwrap().clone();
+        assert!(
+            ops.contains(&crate::server_messages::OP_GETSERVERLIST),
+            "the connect burst must include the OP_GETSERVERLIST ask; got {ops:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The ask honors the pref, exactly as both authorities gate theirs on
+    /// AddServersFromServer.
+    #[tokio::test]
+    async fn the_server_list_ask_honors_the_pref() {
+        let dir = tmp("ask-serverlist-off");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+        engine.set_add_servers_from_server(false);
+
+        let (addr, seen) = spawn_recording_login_server().await;
+        assert!(
+            engine.connect_to_server(addr).await,
+            "mock login should win"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let ops = seen.lock().unwrap().clone();
+        assert!(
+            !ops.contains(&crate::server_messages::OP_GETSERVERLIST),
+            "with the pref off, no ask may be sent; got {ops:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// resume() is a FRESH login (the old socket died with the suspension), and
+    /// eMule's ConnectionEstablished - where the ask lives - runs on every
+    /// reconnect. So a resumed session re-asks too.
+    #[tokio::test]
+    async fn resuming_re_asks_for_the_server_list() {
+        let dir = tmp("ask-serverlist-resume");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+
+        let (addr, seen) = spawn_recording_login_server().await;
+        assert!(
+            engine.connect_to_server(addr).await,
+            "mock login should win"
+        );
+
+        // pause() requires Running; connect alone does not set it.
+        engine.state = EngineState::Running;
+        engine.pause().await;
+        engine.resume().await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let asks = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|o| **o == crate::server_messages::OP_GETSERVERLIST)
+            .count();
+        assert!(
+            asks >= 2,
+            "the fresh post-resume login must re-ask (want >= 2 asks, got {asks})"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Connecting to a server must refresh the STATUS line, not only raise a

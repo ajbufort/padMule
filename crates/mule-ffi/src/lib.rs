@@ -574,6 +574,15 @@ impl MuleEngine {
             .block_on(async { self.inner.lock().await.set_sharing(on) });
     }
 
+    /// The "update server list when connecting" pref (eMule AddServersFromServer):
+    /// a fresh login asks the server for its own server list (OP_GETSERVERLIST),
+    /// feeding the gossip harvest. Defaults ON in the engine; takes effect on the
+    /// next connect/resume.
+    pub fn set_add_servers_from_server(&self, on: bool) {
+        self.rt
+            .block_on(async { self.inner.lock().await.set_add_servers_from_server(on) });
+    }
+
     /// Snapshots of every in-progress download. This is ALSO the engine's
     /// heartbeat: each call drains pending share re-announces, finalizes
     /// downloads that completed outside a fetch task, detects a server
