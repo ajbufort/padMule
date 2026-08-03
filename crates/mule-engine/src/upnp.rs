@@ -41,11 +41,32 @@ const SEARCH_TARGETS: &[&str] = &[
     "urn:schemas-upnp-org:device:InternetGatewayDevice:1",
 ];
 
-/// The two WAN connection service types that expose AddPortMapping.
-const WAN_SERVICES: &[&str] = &[
-    "urn:schemas-upnp-org:service:WANIPConnection:1",
-    "urn:schemas-upnp-org:service:WANPPPConnection:1",
+/// The two WAN connection service types that expose AddPortMapping, WITHOUT a
+/// version suffix - a gateway may advertise `:1`, `:2` (every IGD:2 router does)
+/// or later, and all of them speak AddPortMapping. Matching the version exactly
+/// made an IGD:2 gateway invisible, which meant no port mapping and a stuck
+/// LowID; aMule hit the same wall and fixed it the same way
+/// (`TypeMatchesIgnoringVersion`, UPnPBase.cpp).
+///
+/// NOTE this deliberately does NOT apply to [`SEARCH_TARGETS`]: an M-SEARCH ST
+/// must carry a version, and UPnP's backward-compatibility rule already makes a
+/// v2 device answer a v1 search. Only the post-description CLASSIFICATION needs
+/// to be version-tolerant.
+const WAN_SERVICE_PREFIXES: &[&str] = &[
+    "urn:schemas-upnp-org:service:WANIPConnection:",
+    "urn:schemas-upnp-org:service:WANPPPConnection:",
 ];
+
+/// Is `advertised` one of our WAN connection services, in any version? The
+/// version is the trailing token after the final `:`; it must be present and
+/// numeric so `...:WANIPConnectionFoo` can never match.
+fn is_wan_service(advertised: &str) -> bool {
+    WAN_SERVICE_PREFIXES.iter().any(|p| {
+        advertised
+            .strip_prefix(p)
+            .is_some_and(|ver| !ver.is_empty() && ver.bytes().all(|b| b.is_ascii_digit()))
+    })
+}
 
 #[derive(Debug)]
 pub enum UpnpError {
@@ -172,9 +193,10 @@ pub fn resolve_url(base_url: &str, control_url: &str) -> String {
 /// From an IGD device-description XML + the URL it was fetched from, find the
 /// first WANIP/PPP connection service and its absolute control URL.
 pub fn parse_wan_service(desc_xml: &str, desc_url: &str) -> Option<WanService> {
-    for svc_type in WAN_SERVICES {
-        // Find a <service> block whose <serviceType> is this type, then its
-        // <controlURL>. Services are small blocks; scan block by block.
+    {
+        // Find a <service> block whose <serviceType> is a WAN connection service
+        // (any version), then its <controlURL>. Services are small blocks; scan
+        // block by block.
         let mut search_from = 0;
         while let Some(rel) = desc_xml[search_from..].find("<service") {
             let blk_start = search_from + rel;
@@ -184,11 +206,15 @@ pub fn parse_wan_service(desc_xml: &str, desc_url: &str) -> Option<WanService> {
                 .unwrap_or(desc_xml.len());
             let block = &desc_xml[blk_start..blk_end];
             if let Some(t) = xml_tag(block, "serviceType") {
-                if t.trim() == *svc_type {
+                let advertised = t.trim();
+                if is_wan_service(advertised) {
                     if let Some(ctrl) = xml_tag(block, "controlURL") {
                         return Some(WanService {
                             control_url: resolve_url(desc_url, ctrl.trim()),
-                            service_type: svc_type.to_string(),
+                            // Carry back the type the gateway ACTUALLY advertised:
+                            // it becomes the SOAP `xmlns:u`, so answering a v2
+                            // service in the v1 namespace would just be a new bug.
+                            service_type: advertised.to_string(),
                         });
                     }
                 }
@@ -793,6 +819,42 @@ mod tests {
             svc.service_type,
             "urn:schemas-upnp-org:service:WANIPConnection:1"
         );
+    }
+
+    #[test]
+    fn an_igd2_gateway_is_matched_and_answered_in_its_own_version() {
+        // An IGD:2 router advertises WANIPConnection:2. Matching the service
+        // type with an EXACT string compare against ":1" missed it entirely, so
+        // parse_wan_service returned None -> no port mapping -> stuck on LowID.
+        // aMule hit exactly this and fixed it by comparing the URN up to its
+        // version (TypeMatchesIgnoringVersion, UPnPBase.cpp). padMule's whole
+        // HighID story runs through this function.
+        let desc = "<root><device><serviceList>\
+<service><serviceType>urn:schemas-upnp-org:service:Layer3Forwarding:1</serviceType>\
+<controlURL>/ignore</controlURL></service>\
+<service><serviceType>urn:schemas-upnp-org:service:WANIPConnection:2</serviceType>\
+<controlURL>/ctl/IPConn2</controlURL></service>\
+</serviceList></device></root>";
+        let svc = parse_wan_service(desc, "http://192.168.0.1:5000/rootDesc.xml").unwrap();
+        assert_eq!(svc.control_url, "http://192.168.0.1:5000/ctl/IPConn2");
+        // The ACTUAL advertised type must come back, because it becomes the SOAP
+        // `xmlns:u` - answering a v2 service in the v1 namespace is a new bug.
+        assert_eq!(
+            svc.service_type,
+            "urn:schemas-upnp-org:service:WANIPConnection:2"
+        );
+        // A future version works for the same reason.
+        let v3 = desc.replace("WANIPConnection:2", "WANIPConnection:3");
+        assert_eq!(
+            parse_wan_service(&v3, "http://192.168.0.1:5000/rootDesc.xml")
+                .unwrap()
+                .service_type,
+            "urn:schemas-upnp-org:service:WANIPConnection:3"
+        );
+        // Version tolerance must NOT loosen which SERVICE we accept: a
+        // WLANConfiguration of any version is still not a WAN connection.
+        let wrong = desc.replace("WANIPConnection:2", "WLANConfiguration:2");
+        assert!(parse_wan_service(&wrong, "http://192.168.0.1/d").is_none());
     }
 
     #[test]
