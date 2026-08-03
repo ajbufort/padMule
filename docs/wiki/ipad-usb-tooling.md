@@ -247,6 +247,56 @@ pymobiledevice3's own `developer dvt xcuitest` launches the runner directly, so
 go-ios is not part of the path at all. The three go-ios recovery ideas queued
 here are retained only as history.]
 
+## SIGNING WORKS FROM HERE; INSTALLING OVER USB/IP DOES NOT (2026-08-02)
+
+Anthony authorized the agent to use his signing key, and the signing half of the
+loop now works end to end from this box:
+
+```bash
+# 1. the artifact CI just built (run inside the repo, gh needs the git remote)
+gh run download <run-id> -D ./ipa
+
+# 2. VERIFY it is the build you think it is, before signing anything
+strings Payload/padMule.app/padMule | grep "<a string only the new code has>"
+
+# 3. build zsign (no sudo needed - libssl-dev is already present here)
+git clone --depth 1 https://github.com/zhlynn/zsign.git && cd zsign/build/linux && make
+#    NB the Makefile lives in build/linux, NOT at the repo root.
+
+# 4. pull the profile off the device, then sign
+ideviceprovision copy ./profiles        # the dir must EXIST first
+zsign -k "$SL/key.pem" -c "$SL/cert-*.pem" -m ./profiles/<padmule-uuid>.mobileprovision \
+      -b us.ajbconsulting.padMule.Q444CHAF2Z -o padMule-signed.ipa -z 9 padMule.ipa
+```
+
+`SL` = `/mnt/c/Users/ajbuf/AppData/Roaming/Sideloadly`. The key is referenced BY
+PATH and never copied, read out or moved.
+
+**`-b` IS MANDATORY and the reason is easy to miss.** The .ipa CI builds carries
+`us.ajbconsulting.padMule`, but free provisioning issues the App ID
+`Q444CHAF2Z.us.ajbconsulting.padMule.Q444CHAF2Z` (read it out of the profile with
+`openssl smime -inform der -verify -noverify -in <profile>`). Signing without
+`-b` produces a bundle id the profile does not cover, and the install dies with
+`0xe8008016 (invalid entitlements)` - the same trap the WDA section hit. Using
+the team-suffixed id also means the install UPGRADES the existing app in place,
+so downloads and config survive.
+
+**THE INSTALL IS THE PART THAT DOES NOT WORK OVER USB/IP.** Repeated attempts:
+`pymobiledevice3 apps install` runs for 10+ minutes with ZERO output and never
+completes, and afterwards the link is wedged - lockdownd answers `Mux error
+(-8)`, pmd3 hangs on every device call, and only a usbipd detach/re-attach
+clears it. Small operations (screenshots, syslog, xcuitest, the accessibility
+tree) are all reliable; it is specifically the multi-megabyte transfer that
+destabilizes the USB/IP link. Contention makes it worse - kill the WDA runner and
+any `usbmux forward` FIRST, since a live XCUITest session holds its own tunnel.
+Handing the device back to Windows (`usbipd detach`) did not help either: the
+Windows Apple Mobile Device Service did not re-enumerate it without a physical
+replug.
+
+So the working division of labour today is: **CI builds, this box signs,
+Sideloadly (or a replug + retry) installs.** Copy the signed .ipa to
+`/mnt/c/Users/ajbuf/Downloads/` and install it from Windows.
+
 ## Signing padMule locally (a genuine win, independent of WDA)
 
 zsign + the cached Sideloadly cert/key + a device-pulled profile means padMule
