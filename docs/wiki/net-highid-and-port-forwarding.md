@@ -1,6 +1,7 @@
 # HighID and Port Forwarding (dev box + iPad)
 
-Updated: 2026-07-18
+Updated: 2026-08-02 (the stale-mapping DEAD END found on-device; delete-then-add
+does NOT self-heal across a DHCP address change - see the section below)
 
 How padMule earns a **HighID** on the eD2k network. Dev-box HighID via a manual
 forward chain **VALIDATED LIVE 2026-07-14**; iPad HighID via padMule's own
@@ -120,6 +121,53 @@ shows `padMule 192.168.0.182`. Root cause of the earlier on-device LowID was a
 leftover permanent 4662->dev-box mapping from a validation run plus a lenient
 query that read any fault as "free" - both fixed (honest 714-vs-fault query;
 delete-then-add). See [[build-progress]] row 8c.
+
+## THE STALE-MAPPING DEAD END (found on-device 2026-08-02) - supersedes the
+## "delete-then-add, so a stale mapping self-heals" claim above
+
+Driving the iPad over USB ([[ipad-usb-tooling]]) put the Status screen on screen
+for the first time since 2026-07-17, and it read:
+
+```
+UPnP: could not map port 4662 (gateway refused: ConflictInMappingEntry)
+```
+
+Traced to the end, and the conclusion is that **padMule's delete-then-add cannot
+recover the case its own code comment names.** The chain:
+
+1. The iPad's DHCP address moved **192.168.0.182 -> 192.168.0.89** (the
+   reservation this entry recommended in 2026-07-17 was never actually made).
+2. The BE9700 still held padMule's own PERMANENT mapping `4662 -> .182`
+   (`mule-cli upnp-query 4662` confirms; .182 no longer answers ARP or ping).
+3. `upnp.rs` map_port/map_port_unicast do `soap_delete_mapping` then
+   `soap_add_mapping`. The DELETE is refused: **`Action not authorized`**
+   (UPnP error 606) - reproduced from the dev box (.32), also a non-owner, via
+   `mule-cli upnp-unmap 4662`. This gateway only lets the OWNING internal host
+   delete a mapping.
+4. The add then fails **`ConflictInMappingEntry`** (error 718), and the delete's
+   real reason never surfaces because the call site swallows it (`let _ =`).
+5. LowID follows, and then a second-order failure: **eMule Sunrise KICKS LowID
+   clients** ("WARNING : You have a lowid ..." then closes the socket -
+   reproduced from the dev box), so the Servers screen honestly showed
+   "Not connected" even though the MOTD had arrived.
+
+So a permanent lease (padMule asks for `lease_secs = 0`) plus any address change
+= **permanent LowID that padMule cannot fix by itself**; it needs a human in the
+router UI (TP-Link: Advanced -> NAT Forwarding -> **UPnP**, not Port Forwarding,
+which lists only STATIC rules and was empty). Cleared manually 2026-08-02.
+
+FIXES WORTH MAKING (none shipped yet, queued as tasks):
+- **Finite lease + renew** instead of `lease_secs = 0`, so a stale mapping
+  self-heals within one lease. Check what eMule 0.50a asks for before picking a
+  number ([[emule-vs-amule-authority]] - this is wire-neutral policy, so aMule
+  is also legitimate precedent).
+- **Surface the delete failure**: the `let _ =` hides the ONE fact that explains
+  the conflict, on the one platform with no debugger. `engine.rs:1535-1540`
+  already argues this exact point for the add.
+- **Fall back to an alternate external port** on ConflictInMappingEntry (the
+  UPnP-standard remedy) - but padMule advertises `TCP_PORT` to servers/peers, so
+  it must then advertise the EXTERNAL port, which it cannot express today.
+- The cheap operational fix regardless: **DHCP-reserve the iPad** on the BE9700.
 
 Still true on foreign networks: UPnP-less routers, cellular, and CGNAT force
 **LowID** regardless ([[ipados-constraints]]). LowID is survivable (the live

@@ -49,10 +49,15 @@ this is the faithful other-side the send-side claim needed.
   Kad code - HELLO_REQ (no 0x04), HELLO_RES consumed, HELLO_RES_ACK echoing
   the peer's sender key -> bValidReceiverKey true -> VerifyContact. This is
   the wave-10 send-side terminal proof ([[build-progress]] wave 10).
-- Does NOT prove: verified-bit ENFORCEMENT in padMule's own routing (Batch B,
-  offline-provable, still pending), or key-echo coverage on the search paths
-  (search_source / search_keyword_node currently discard the peer's sender
-  key - 2026-08-02 reanalysis finding).
+- Does NOT prove: verified-bit ENFORCEMENT in padMule's own routing - that is
+  offline-provable and is covered by its own tests.
+  [BOTH gaps this bullet used to list are now CLOSED (2026-08-02), and the
+  bullet is corrected rather than deleted so the sequence stays legible:
+  Batch B enforcement LANDED (commit 5ef4c2e, [[build-progress]] 8ao - closest_to
+  hands out only IP-verified contacts), and the search-path key-echo gap
+  (search_source / search_keyword_node discarding the peer's sender key) was
+  closed by 8ak's single `note_responder` path (commit 2ab7800). Re-verified
+  against the code in the 2026-08-02 reanalysis.]
 - Related discovery: BOTH eD2k terminal claims need NO patch - stock aMule
   already logs the multipacket answer receipt (ClientTCPSocket.cpp:1147) and
   secure-ident success (BaseClient.cpp:2207); the reverse peer oracle asserts

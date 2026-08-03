@@ -1,6 +1,7 @@
 # Driving the iPad from this box over USB (WSL2 + usbipd + pymobiledevice3)
 
-Updated: 2026-08-02 (RUN END TO END - results below replace the predictions)
+Updated: 2026-08-02 (TOUCH CONTROL NOW WORKS - go-ios was never needed; and the
+"live engine logs" claim below is CORRECTED - padMule emits nothing to os_log)
 
 How to give this WSL2 box direct access to the iPad over USB-C, so device logs,
 screenshots and app installs can happen from here instead of only through
@@ -14,8 +15,17 @@ WORKING NOW, all without root:
   2420x1668 PNG. It auto-falls back to a "no-root userspace tunnel" on iOS 17+,
   so the sudo tunnel this entry originally predicted is NOT needed. I can see
   the iPad's screen.
-- **Live syslog** - `idevicesyslog -p padMule` streams padMule's own engine
-  logging to this box.
+- **Live syslog** - `idevicesyslog -p padMule` streams the app's log stream to
+  this box. **CORRECTED 2026-08-02:** this is NOT "padMule's own engine logging".
+  A 1293-line capture across a full launch + search + download-add contained
+  **ZERO app-authored lines** - every line came from a system framework
+  (UIKitCore, CoreHaptics, XCTAutomationSupport, ...), because neither the Swift
+  shell nor the Rust engine ever calls os_log/NSLog, and a GUI app's stdout
+  (where Rust `println!` goes) is not captured. Useful for lifecycle/UIKit
+  forensics and for proving a tap registered (haptics fire); useless for engine
+  state. The UI rows ARE the engine's only window today, exactly as
+  `engine.rs:1535-1540` argues for the UPnP line. FIX WORTH MAKING: route
+  EngineEvent through os_log so this command means what this entry used to claim.
 - **App install** - `pymobiledevice3 apps install x.ipa` works. (NB
   `ideviceinstaller -i` timed out; prefer pymobiledevice3.)
 - **Reading the installed bundle** - `pymobiledevice3 developer dvt ls <path>`
@@ -24,10 +34,13 @@ WORKING NOW, all without root:
   fine on iPadOS 26.5.2** (`pymobiledevice3 mounter auto-mount`) - both gates
   this entry flagged as risky turned out to be non-events.
 
+- **TOUCH CONTROL (2026-08-02)** - taps, typing, element queries and the whole
+  accessibility tree, via WebDriverAgent driven by **pymobiledevice3**. See the
+  runbook section below; go-ios turned out to be unnecessary.
+
 STILL NOT POSSIBLE:
 - Live screen MIRRORING. QuickTime/macOS only; repeated screenshots is the
   ceiling.
-- Touch input, so far - see the WebDriverAgent section.
 
 ## Prerequisites (the usual reasons this fails)
 
@@ -139,12 +152,59 @@ proceeds. No `sudo`, no `tunneld`. Verified on iPadOS 26.5.2.
    the pattern, so it kills its own session. Kill by PID (`ss -lptn`, `ps -eo
    pid,args`) instead.
 
-## WebDriverAgent (touch control): signed + installed, launch still blocked
+## WebDriverAgent (touch control): WORKING (2026-08-02)
 
-GOAL: taps/swipes via `pymobiledevice3 developer wda` (it has tap / swipe / type
-/ press / list-items / screenshot - but it is a CLIENT and needs WDA running).
+**go-ios was never needed.** The previous session was blocked on `ios tunnel
+start --userspace` never registering a tunnel. pymobiledevice3 has its OWN
+XCUITest launcher which opens the same no-root userspace tunnel that already
+made screenshots work, so the whole go-ios detour is skippable.
 
-DONE:
+THE WORKING SEQUENCE (four steps, all from this box):
+
+```bash
+# 0. If lockdownd says "Mux error (-8)", the attach is stale: detach + re-attach
+#    on the Windows side ("/mnt/c/Program Files/usbipd-win/usbipd.exe"), then:
+ideviceinfo -k ProductVersion            # must answer before going further
+
+# 1. start the runner (leave it running; it holds the XCUITest session)
+PYTHONUNBUFFERED=1 pymobiledevice3 developer dvt xcuitest \
+  com.facebook.WebDriverAgentRunner.xctrunner.Q444CHAF2Z
+
+# 2. expose WDA's HTTP API locally (leave it running)
+pymobiledevice3 usbmux forward 8100 8100
+
+# 3. drive it over plain HTTP
+curl -s localhost:8100/status                       # "ready to accept commands"
+curl -s -X POST localhost:8100/session -H 'Content-Type: application/json' \
+  -d '{"capabilities":{"alwaysMatch":{"bundleId":"us.ajbconsulting.padMule.Q444CHAF2Z"}}}'
+```
+
+Endpoints that matter: `GET /screenshot` (base64 PNG), `GET /source?format=json`
+(the ACCESSIBILITY TREE - labels + exact point rects, the best way to assert UI
+state in text), `POST /session/{id}/actions` (W3C tap), `POST
+/session/{id}/elements` then `.../element/{eid}/click` and `.../value`,
+`POST /session/{id}/alert/accept`.
+
+GOTCHAS (each cost real time):
+- **`/wda/tap/0` and `/wda/keys` do NOT exist** in WDA 16.1.1 - they answer
+  "Unhandled endpoint" / drop the connection. Use W3C `actions` and
+  element `/value` instead.
+- **Do not pipe the runner through `head`** - it buffers, and a working launch
+  looks like a full minute of silence. `PYTHONUNBUFFERED=1`, no pipe.
+- **Tap by ELEMENT, not by coordinate, whenever possible.** Dismissing the
+  keyboard reflowed the result list by 32 points between two reads, so a
+  coordinate tap captured moments earlier landed in the gap between rows and
+  silently did nothing.
+- iOS paints a **rotated "Automation Running" banner** over the screen for the
+  whole session. It is system chrome, not padMule; it does not take touches, and
+  holding both volume buttons kills the automation session (the user's escape
+  hatch). It disappears when the session ends.
+- padMule's **Local Network permission prompt** appears on a fresh install and
+  BLOCKS the UPnP/HighID path until answered; `alert/accept` clears it.
+
+The signing work below is what made this possible and still stands.
+
+DONE (the signing saga that unblocked it):
 - Prebuilt runner from `appium/WebDriverAgent` release v16.1.1 asset
   `WebDriverAgentRunner-Runner.zip`, repackaged as an `.ipa` (Payload/ + zip),
   with `PlugIns/WebDriverAgentRunner.xctest/Frameworks/WebDriverAgentLib.framework`
@@ -165,22 +225,12 @@ DONE:
   `0xe8008016 (invalid entitlements)`.
 - Install with `pymobiledevice3 apps install wda-signed2.ipa`.
 
-BLOCKED ON: starting the runner. `go-ios runwda` DID reach `testmanagerd` and
-complete a full XCUITest capability handshake earlier in the session (so the
-path is sound), but after several USB detach/attach cycles its tunnel stopped
-establishing - `ios tunnel start --userspace` logs "start tunnel" yet
-`ios tunnel ls` returns `[]`. Gotcha 5 above was one cause and was cleared;
-it still did not come up before the session ended.
-
-NEXT THINGS TO TRY (in order):
-1. Fresh state: attach the device, start NO pmd3 commands, then
-   `ios tunnel start --userspace`, confirm `ios tunnel ls` is non-empty, and
-   only then `runwda`.
-2. Give go-ios a kernel tunnel instead of userspace: `sudo ios tunnel start`, or
-   `sudo setcap cap_net_admin+eip ./goios/ios-amd64`.
-3. Or start pymobiledevice3's own tunnel (`sudo pymobiledevice3 remote tunneld`)
-   and pass its address/RSD port to go-ios via `--address` / `--rsd-port` /
-   `--userspace-port`.
+[RESOLVED 2026-08-02 - see the working runbook at the top of this section. The
+old blocker was go-ios's tunnel (`ios tunnel start --userspace` logged "start
+tunnel" but `ios tunnel ls` stayed `[]`). It was never worth solving:
+pymobiledevice3's own `developer dvt xcuitest` launches the runner directly, so
+go-ios is not part of the path at all. The three go-ios recovery ideas queued
+here are retained only as history.]
 
 ## Signing padMule locally (a genuine win, independent of WDA)
 
@@ -196,10 +246,20 @@ SECURITY NOTE: the signing key is Anthony's; the agent's tool call touching it
 was correctly blocked by a safety classifier, so ANTHONY runs the zsign command
 himself. Keep it that way.
 
-Until then the on-glass pass in [[on-device-test-checklist]] plus the FFI
-simulation (`scripts/simulate.sh`) remain the way padMule is verified on the
-device, and a Sideloadly install remains the way it gets there
+With touch control working, the [[on-device-test-checklist]] pass is now
+AGENT-DRIVABLE end to end (launch, tap, type, read the accessibility tree,
+screenshot) rather than a human-only on-glass exercise; the FFI simulation
+(`scripts/simulate.sh`) remains the offline equivalent, and a Sideloadly install
+remains how a fresh build gets there when the cert is renewed
 ([[mac-toolchain-setup]]).
+
+WHAT IT FOUND ON ITS FIRST RUN (2026-08-02), which is the argument for it: the
+function strip verified visually; Kad healthy at 172 contacts with the wave-10
+verified-bit gate ON (a live keyword search returned real results with no server
+connected); and the UPnP stale-mapping dead end that had left the iPad on LowID
+since its DHCP address changed - a failure invisible to CI, to the unit gate and
+to all three oracles, sitting in the one row only the device can show
+([[net-highid-and-port-forwarding]]).
 
 ## Related
 
