@@ -46,8 +46,17 @@ current build state is `docs/wiki/build-progress.md`.
 | `refs/` | Gitignored source oracles: eMule 0.50a (the WIRE authority), eMule 0.70b (community fork), aMule master. |
 
 Authority rule: for WIRE + FILE FORMATS, eMule 0.50a is the source of truth;
-aMule for wire-neutral policy. Details: `docs/wiki/decisions-and-lessons.md`,
-`docs/wiki/ref-source-trees.md`.
+aMule for wire-neutral policy. **Where they CONFLICT, follow eMule** - and say so
+in the commit + wiki with citations on BOTH sides. This needs active guarding,
+because aMule is the one that builds and runs and is vendored in-tree, so there
+is constant pull toward treating whatever it does as correct. Two live examples:
+aMule master defines `FT_LASTUPLOADED 0x55`, a number eMule already owns as
+`FT_MAXSOURCES`; and it clamps in-flight block requests to [3,24] citing "eMule's
+own pending range" for a depth eMule never requests. Also remember the vendored
+`amule-3.0.1/` oracle can itself hold a bug upstream later fixed (the racy
+`known2_64.met` orphan-prune) - check `refs/amule-master/` before transcribing.
+Details: `docs/wiki/decisions-and-lessons.md`, `docs/wiki/ref-source-trees.md`,
+`docs/wiki/protocol-reference.md` (LANDMINE section).
 
 ## Platform facts (still in force)
 

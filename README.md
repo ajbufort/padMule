@@ -9,21 +9,54 @@ speaks the real eD2k and Kad protocols and its on-disk formats are byte-compatib
 with the desktop clients, so an aMule (or eMule) download and a padMule download
 can pick up where the other left off.
 
-It draws on the whole lineage of the network's software, and adds its own:
+wxWidgets (aMule's GUI toolkit) has no usable iOS port, so padMule reimplements
+the engine below the UI rather than porting the desktop app.
 
-- **aMule 3.0.1** - vendored in-repo as the reference oracle for wire-neutral
-  behavior, and the client padMule differential-tests its transfers against.
-- **eMule 0.50a** - the authority for the wire protocol and on-disk formats;
-  padMule matches its bytes.
+## Where padMule stands relative to eMule and aMule
+
+padMule is a new implementation of an old, well-established protocol. Getting
+that right means being deliberate about *which* existing client answers *which*
+question - because on the details they do not always agree.
+
+**eMule 0.50a is the authority for anything that leaves the machine**: packet
+layouts, opcodes, tag numbers, on-disk formats, hashing. Most of the live
+network runs eMule or a client derived from it, so when padMule and eMule
+disagree about a byte, padMule is wrong by definition. Every wire decision in
+this repo is traceable to a line of eMule source.
+
+**aMule is the reference padMule can actually run.** It is the client the
+differential tests transfer against in both directions - padMule downloading
+from a real aMule byte-for-byte, and a real aMule downloading from padMule - and
+it is the authority for behaviour that never reaches the wire: queue policy,
+retry pacing, how many peers to dial at once. A vendored, unmodified copy of
+aMule 3.0.1 lives in `amule-3.0.1/` for exactly this.
+
+**Where they conflict, padMule follows eMule.** This is not hypothetical.
+Current aMule development defines a known.met tag at `0x55`, a number eMule
+already uses for something else, so padMule keeps eMule's meaning. Current aMule
+also raises the in-flight block-request ceiling well past what eMule requests,
+citing eMule as precedent for a number eMule does not actually use - so padMule
+adopts the part that is genuinely eMule's and treats the rest as aMule's own
+choice. Divergences like these are recorded in `docs/wiki/` with citations on
+both sides rather than settled from memory.
+
+The point is not that one project is better. They answer different questions,
+and a client that copies whichever source it read most recently ends up
+compatible with neither.
+
+padMule also draws on the wider ecosystem, and adds its own:
+
 - **eMule 0.70b** - a community fork mined for features: IP filter, search
   history, wire-side search filters, download categories, file ratings and
   comments, a per-source detail view, and more.
-- **padMule's own** - features that only make sense on an iPad: a Leech-Mode
-  upload toggle, client-side categories, HighID over unicast UPnP (iOS blocks the
-  multicast kind), and a padMule-to-padMule enhancement channel.
-
-wxWidgets (aMule's GUI toolkit) has no usable iOS port, so padMule reimplements
-the engine below the UI rather than porting the desktop app.
+- **eMuleAI** - a modern, actively maintained fork surveyed for ideas; GPL
+  compatible, so what is worth borrowing can be.
+- **padMule's own** - a Leech-Mode switch that turns uploading off outright,
+  client-side download categories, and a padMule-to-padMule enhancement channel.
+  A few additions are forced by the platform rather than chosen: HighID over
+  *unicast* UPnP, because iOS gives a sideloaded app no multicast, and an honest
+  foreground-only transfer model, because iPadOS suspends a backgrounded app and
+  reclaims its sockets.
 
 ## Status
 
@@ -68,7 +101,7 @@ UniFFI-generated binding.
 | `crates/mule-ffi`   | UniFFI seam: wraps `Engine` in a synchronous, FFI-friendly facade and generates the Swift bindings. |
 | `crates/mule-cli`   | A command-line harness used to exercise the engine against the real network. |
 | `ios/`              | The SwiftUI app and its XcodeGen project spec. |
-| `amule-3.0.1/`      | Upstream aMule, vendored unchanged as the reference oracle for protocol and format decisions. |
+| `amule-3.0.1/`      | Upstream aMule, vendored unchanged: the runnable oracle the differential tests transfer against, and the reference for wire-neutral behaviour. Never linked or shipped. |
 
 ## Building and testing the engine
 
