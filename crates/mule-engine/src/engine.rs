@@ -988,6 +988,9 @@ pub struct ServerEntry {
 pub struct ServerInfo {
     /// The server we are logged into ("ip:port").
     pub addr: String,
+    /// The server's display name (server.met tag 0x01), if known. Servers are
+    /// public infrastructure, so this is safe to show - unlike our own client id.
+    pub name: Option<String>,
     /// True when the server handed us a LowID (no reachable inbound port).
     pub low_id: bool,
     /// True when this server answers related-files searches (advertised
@@ -1162,14 +1165,31 @@ impl Engine {
     /// An honest one-line status for the UI - never claims a connection we do
     /// not have. Carries the HighID/LowID answer, because a bare "Connected"
     /// hides the one fact that decides whether peers can reach us.
+    /// The display name of the server at `addr`, read from server.met (tag 0x01).
+    /// None if the server is not in the list or has no name tag. Cheap and
+    /// best-effort - called once per connect, not on the hot path.
+    fn server_name_for(&self, addr: &SocketAddr) -> Option<String> {
+        let bytes = std::fs::read(self.config_dir.join("server.met")).ok()?;
+        let met = read_server_met(&bytes).ok()?;
+        met.servers.iter().find_map(|s| {
+            let saddr = SocketAddr::new(IpAddr::V4(ip_from_met_u32(s.ip)), s.port);
+            (saddr == *addr)
+                .then(|| tag_str(&s.tags, 0x01).filter(|n| !n.is_empty()))
+                .flatten()
+        })
+    }
+
     fn online_status(&self) -> String {
         if self.is_online() {
             match &self.connection {
-                Some(c) => format!(
-                    "Connected to {} ({})",
-                    c.addr,
-                    if c.low_id { "LowID" } else { "HighID" }
-                ),
+                // Lead with the server's NAME, the address in parens after it -
+                // a name is what the user recognises; the bare IP is not. HighID/
+                // LowID is not repeated here: it has its own row on the Status
+                // screen. Falls back to the address when no name is known.
+                Some(c) => match &c.name {
+                    Some(n) => format!("Connected to {n} ({})", c.addr),
+                    None => format!("Connected to {}", c.addr),
+                },
                 None => "Connected".to_string(),
             }
         } else if self.offline {
@@ -1720,13 +1740,17 @@ impl Engine {
         {
             // The client id is deliberately NOT recorded here: a HighID id encodes
             // our public IP and this text reaches the screen.
+            let addr_str = addr.to_string();
+            let name = self.server_name_for(&addr);
             self.connection = Some(ServerInfo {
-                addr: addr.to_string(),
+                addr: addr_str.clone(),
+                name: name.clone(),
                 low_id,
                 related_search,
             });
+            let shown = name.as_deref().unwrap_or(&addr_str);
             self.emit(EngineEvent::Server(format!(
-                "Connected to {addr} ({})",
+                "Connected to {shown} ({})",
                 if low_id { "LowID" } else { "HighID" }
             )));
             // A LowID answer is the server telling us its connect-back failed, so
@@ -3310,6 +3334,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The connected-line resolves the server's NAME from server.met and shows
+    /// it with the address in parens - the user asked for the name, not a bare IP.
+    #[tokio::test]
+    async fn the_connected_line_shows_the_server_name() {
+        use mule_files::{write_server_met, Server, ServerMet};
+        use mule_proto::{Tag, TagName, TagValue};
+
+        let dir = tmp("server-name");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (engine, _rx) = Engine::new(&dir).unwrap();
+
+        // A server.met with one named server at 85.17.116.222:6082 (met u32 is
+        // little-endian: low byte first).
+        let ip = u32::from_le_bytes([85, 17, 116, 222]);
+        let met = write_server_met(&ServerMet {
+            header: 0xE0,
+            servers: vec![Server {
+                ip,
+                port: 6082,
+                tags: vec![Tag {
+                    name: TagName::Id(0x01),
+                    value: TagValue::Str(b"ed2k-rust".to_vec()),
+                }],
+            }],
+        });
+        std::fs::write(dir.join("server.met"), met).unwrap();
+
+        let addr: SocketAddr = "85.17.116.222:6082".parse().unwrap();
+        assert_eq!(
+            engine.server_name_for(&addr).as_deref(),
+            Some("ed2k-rust"),
+            "the name must resolve from server.met"
+        );
+        // A server not in the list has no name (the line falls back to the addr).
+        let other: SocketAddr = "1.2.3.4:4242".parse().unwrap();
+        assert_eq!(engine.server_name_for(&other), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The gossip crawl merges advertised servers into server.met, and filters
     /// out the bogus/hostile ones a server must never be able to inject.
     #[tokio::test]
@@ -4220,6 +4284,7 @@ mod tests {
         // Stand in for a real login (no server needed to pin the reporting).
         engine.connection = Some(ServerInfo {
             addr: "192.0.2.1:4242".to_string(),
+            name: None,
             low_id: true,
             related_search: false,
         });
