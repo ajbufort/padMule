@@ -47,6 +47,90 @@ pub const OP_SERVER_LIST_REQ2: u8 = 0xA4;
 /// [`OP_SERVERLIST`] (eMule opcodes.h:202).
 pub const OP_SERVER_LIST_RES: u8 = 0xA1;
 
+/// Ask a server over UDP for its NAME and description (`<challenge u32>`).
+/// UNLIKE the crawl's 0xA4, this one IS what both authorities send - eMule
+/// `UDPSocket.cpp:435` and aMule `ServerUDPSocket.cpp:243` fire it right after
+/// a status answer - so learning a server's name this way is plain parity.
+///
+/// This is how a server discovered by the crawl or the gossip harvest gets a
+/// NAME: discovery yields only ip:port, and until the name is learned the UI
+/// can only show an address.
+pub const OP_SERVER_DESC_REQ: u8 = 0xA2;
+/// The answer to [`OP_SERVER_DESC_REQ`], in one of TWO forms - see
+/// [`parse_server_desc_res`].
+pub const OP_SERVER_DESC_RES: u8 = 0xA3;
+
+/// An INVALID string length, used as the low 16 bits of the description
+/// challenge so the new (tagged) answer can be told apart from the old one:
+/// the first two wire bytes of a new-form answer echo it, where an old-form
+/// answer would carry a real `name_len` there (eMule opcodes.h INV_SERV_DESC_LEN
+/// and the comment at `UDPSocket.cpp:431-437`).
+pub const INV_SERV_DESC_LEN: u16 = 0xF0FF;
+
+// Server description tag ids (eMule opcodes.h:299,300; aMule ServerTags.h:31,33).
+const ST_SERVERNAME: u8 = 0x01;
+const ST_DESCRIPTION: u8 = 0x0B;
+
+/// Build the 4-byte challenge for [`OP_SERVER_DESC_REQ`]. `seed` varies the
+/// high half; the low half MUST be [`INV_SERV_DESC_LEN`], which is what makes
+/// the two answer forms distinguishable (eMule `UDPSocket.cpp:436`).
+pub fn desc_req_challenge(seed: u16) -> u32 {
+    ((seed as u32) << 16) | INV_SERV_DESC_LEN as u32
+}
+
+/// What a server says about itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ServerDesc {
+    pub name: String,
+    pub description: String,
+}
+
+/// Parse an OP_SERVER_DESC_RES payload. TWO forms share this opcode and the
+/// first two bytes are what tell them apart (eMule `UDPSocket.cpp:452-470`):
+///
+/// - NEW (eserver 16.45+, only when we sent a challenge): `<challenge u32>
+///   <tagcount u32><tags>`, where ST_SERVERNAME/ST_DESCRIPTION carry the text.
+///   Recognised by the first u16 being [`INV_SERV_DESC_LEN`] AND the full u32
+///   matching the challenge we sent - so a stale or spoofed answer is refused.
+/// - OLD: `<name_len u16><name><desc_len u16><desc>`.
+pub fn parse_server_desc_res(payload: &[u8], expected_challenge: u32) -> Option<ServerDesc> {
+    let mut r = Reader::new(payload);
+    if payload.len() >= 8
+        && u16::from_le_bytes([payload[0], payload[1]]) == INV_SERV_DESC_LEN
+        && u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]])
+            == expected_challenge
+    {
+        let _challenge = r.read_u32().ok()?;
+        let count = r.read_u32().ok()?;
+        let mut desc = ServerDesc::default();
+        // Untrusted count: read until it runs out rather than pre-allocating.
+        for _ in 0..count {
+            let Ok(tag) = read_tag(&mut r) else { break };
+            let id = match tag.name {
+                mule_proto::TagName::Id(id) => id,
+                mule_proto::TagName::Str(_) => continue,
+            };
+            if let TagValue::Str(bytes) = &tag.value {
+                let text = String::from_utf8_lossy(bytes).into_owned();
+                match id {
+                    ST_SERVERNAME => desc.name = text,
+                    ST_DESCRIPTION => desc.description = text,
+                    _ => {}
+                }
+            }
+        }
+        return Some(desc);
+    }
+    // Old form. A truncated description is tolerated: the NAME is the payload
+    // we actually want, and some servers send only that.
+    let name = r.read_string_u16().ok()?;
+    let description = r.read_string_u16().unwrap_or_default();
+    Some(ServerDesc {
+        name: String::from_utf8_lossy(&name).into_owned(),
+        description: String::from_utf8_lossy(&description).into_owned(),
+    })
+}
+
 /// Server TCP-capability bit (in the OP_IDCHANGE flags word) meaning the server
 /// answers "related files" searches - a keyword query whose string is
 /// `related::<HEXHASH>`. eMule `server.h:39` SRV_TCPFLG_RELATEDSEARCH; gates
@@ -362,6 +446,63 @@ mod tests {
                 (u32::from_le_bytes([77, 42, 68, 79]), 4232),
             ]
         );
+    }
+
+    /// The OLD description answer: `<name_len u16><name><desc_len u16><desc>`.
+    /// This is what a server that ignores our challenge sends.
+    #[test]
+    fn the_old_description_answer_yields_the_name() {
+        let mut p = Vec::new();
+        p.extend_from_slice(&9u16.to_le_bytes());
+        p.extend_from_slice(b"Astra-3\0\0"[..9].as_ref());
+        p.extend_from_slice(&4u16.to_le_bytes());
+        p.extend_from_slice(b"desc");
+        let got = parse_server_desc_res(&p, desc_req_challenge(0x1234)).unwrap();
+        assert_eq!(got.name.trim_end_matches('\0'), "Astra-3");
+        assert_eq!(got.description, "desc");
+    }
+
+    /// The NEW (eserver 16.45+) answer: `<challenge u32><tagcount u32><tags>`,
+    /// told apart from the old form by the first u16 being INV_SERV_DESC_LEN.
+    #[test]
+    fn the_new_tagged_description_answer_yields_the_name() {
+        let challenge = desc_req_challenge(0xBEEF);
+        let mut w = Writer::new();
+        w.write_u32(challenge);
+        w.write_u32(2);
+        write_tag(
+            &mut w,
+            &Tag::id(0x01, TagValue::Str(b"Drunken Donkey".to_vec())),
+        );
+        write_tag(&mut w, &Tag::id(0x0B, TagValue::Str(b"a server".to_vec())));
+        let got = parse_server_desc_res(&w.into_inner(), challenge).unwrap();
+        assert_eq!(got.name, "Drunken Donkey");
+        assert_eq!(got.description, "a server");
+    }
+
+    /// A tagged answer whose challenge does NOT match ours must not be read as
+    /// the new form (it would misparse); the challenge is the anti-stale/spoof
+    /// check eMule applies before trusting the tags.
+    #[test]
+    fn a_tagged_answer_with_the_wrong_challenge_is_not_trusted() {
+        let mut w = Writer::new();
+        w.write_u32(desc_req_challenge(0x0001));
+        w.write_u32(1);
+        write_tag(&mut w, &Tag::id(0x01, TagValue::Str(b"spoofed".to_vec())));
+        let got = parse_server_desc_res(&w.into_inner(), desc_req_challenge(0xBEEF));
+        // Falls through to the OLD reading, which cannot yield our tag name.
+        assert!(got.is_none_or(|d| d.name != "spoofed"));
+    }
+
+    #[test]
+    fn the_description_challenge_keeps_its_protocol_low_half() {
+        // eMule UDPSocket.cpp:436 - the low 16 bits MUST be the invalid length,
+        // because that is what distinguishes the two answer forms.
+        assert_eq!(
+            desc_req_challenge(0xBEEF) & 0xFFFF,
+            INV_SERV_DESC_LEN as u32
+        );
+        assert_eq!(desc_req_challenge(0xBEEF) >> 16, 0xBEEF);
     }
 
     #[test]

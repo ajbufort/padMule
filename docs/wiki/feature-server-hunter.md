@@ -111,6 +111,27 @@ scanning remains deliberately out of scope (below).
   recursion) unit-tested offline and MUTATION-CHECKED, with a thin I/O driver;
   the SSRF posture is additionally asserted on the production entry point, since
   a test of the helper would not prove the caller consults it.
+- **Discovered servers now learn their NAME (2026-08-03).** Anthony caught the
+  gap immediately: discovery yields only `ip:port`, so every harvested or
+  crawled server rendered as a bare address while the published-list entries
+  had names. Fixed with plain parity rather than an invention - BOTH authorities
+  fire `OP_SERVER_DESC_REQ` (0xA2) right after a status answer (eMule
+  `UDPSocket.cpp:435`, aMule `ServerUDPSocket.cpp:243`), so `probe_server_list`
+  now sends it alongside the existing status ping and adopts the returned name.
+  The answer has TWO forms sharing one opcode, both handled: the OLD
+  `<name_len u16><name><desc_len u16><desc>`, and the eserver-16.45+ tagged
+  `<challenge u32><tagcount u32><tags>` (ST_SERVERNAME 0x01 / ST_DESCRIPTION
+  0x0B) - told apart by the first u16 being the deliberately INVALID length
+  `INV_SERV_DESC_LEN` 0xF0FF, which is exactly why eMule builds its challenge as
+  `(random << 16) | 0xF0FF`. A tagged answer whose challenge does not match ours
+  is refused (anti-stale/spoof). A learned name is PERSISTED into server.met as
+  tag 0x01 and never overwrites a name the user's own list already carries, so
+  it also fixes the connected status line for a discovered server. LIVE: after
+  a crawl, **33 of 35 servers have names** - Drunken Donkey, Astra-3/4/5, Akteon
+  Server No3/No8, Holy Donkey 1/2/3, Pentium Pilat 2022/2023, eMule Security,
+  Gaal and the rest - the only two unnamed being the two that answered nothing
+  at all. `mule-cli server-crawl` now probes after crawling, mirroring the app's
+  crawl -> reload sequence, and prints the named table.
 
 Anthony wants a "Server Hunter" feature (2026-07-13): a tool that discovers and
 verifies active eD2k servers to build a safe, working, live server list - by

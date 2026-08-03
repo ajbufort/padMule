@@ -1,22 +1,24 @@
 # HANDOFF - start here next session
 
 Updated: 2026-08-03 (second session that day: full reanalysis -> doc-drift fix
-round -> OP_GETSERVERLIST shipped + live-proven -> two-bug fix round. Everything
-below is verified, not assumed, and what is NOT verified says so.)
+round -> OP_GETSERVERLIST shipped + live-proven -> two-bug fix round -> device
+pass -> the RECURSIVE UDP CRAWL. Everything below is verified, not assumed, and
+what is NOT verified says so.)
 
 Living doc: replace it wholesale next time. Full narrative in [[build-progress]]
-rows 8av-8az + the [[log]] entries for 2026-08-03 + [[feature-server-hunter]].
+rows 8av-8ba + the [[log]] entries for 2026-08-03 + [[feature-server-hunter]].
 
 ## State of the tree
 
 - All work committed AND pushed; tree clean; branch even with origin/main at
-  **fff31dc**. Session commits: 37eeac4 (doc-drift round), 4949f25
-  (OP_GETSERVERLIST), fff31dc (magnet + Kad-gate fixes).
-- **Gate**: 539 tests, clippy WARNING-FREE, fmt clean, ASCII clean.
-- CI: Rust gate + iOS build GREEN on 4949f25 (the .ipa with the new Settings
-  toggle built, so the Swift + regenerated FFI binding compile); the iOS
-  simulator tests were still in flight at handoff time, as are all three runs
-  for fff31dc - CONFIRM green before installing.
+  **6d99fd4**. Session commits: 37eeac4 (doc-drift round), 4949f25
+  (OP_GETSERVERLIST), fff31dc (magnet + Kad-gate fixes), c0de43a (device pass),
+  6d99fd4 (the RECURSIVE UDP CRAWL).
+- **Gate**: 548 tests, clippy WARNING-FREE, fmt clean, ASCII clean.
+- CI: all three workflows GREEN through fff31dc. The runs for c0de43a and
+  6d99fd4 were in flight at handoff time - CONFIRM green before installing,
+  since 6d99fd4 is the first build carrying the crawl's Swift + FFI changes
+  (Swift is only type-checked in CI on this box).
 - [[security-model]] scorecard unchanged: **23 OPERATIONAL / 1 PARTIAL / 2
   documented opt-outs**. The PARTIAL is AICH block recovery (wave 11).
 
@@ -36,7 +38,27 @@ DEVICE-VERIFIED section below.] The next session starts at the ranked open
 tasks; the only install-related task left is the CERT RENEWAL before
 2026-08-10.
 
-## THE HEADLINE: the gossip harvest is LIVE (OP_GETSERVERLIST shipped)
+## THE HEADLINE: server discovery is COMPLETE (crawl + ask both shipped)
+
+The Server Hunter is now feature-complete as designed ([[feature-server-hunter]]):
+multi-URL lists + gzip/zip unwrap, the UDP health probe, the connect-time gossip
+harvest WITH its OP_GETSERVERLIST ask, and - new in 6d99fd4 - the RECURSIVE UDP
+CRAWL, which asks servers we are NOT connected to and then asks the ones that
+answer. LIVE: 10 seeds -> asked 33 -> 28 answered -> 25 new servers (10 -> 35),
+and a 3-round run converged on the same 25, so it terminates rather than running
+away. Whole-net scanning stays deliberately out of scope.
+
+METHOD NOTE that should outlive this session: the wire question was settled by
+PROBING BEFORE CODING. Both authorities' opcode tables define
+OP_SERVER_LIST_REQ2 (0xA4) / OP_SERVER_LIST_RES (0xA1) but NEITHER EVER SENDS OR
+PARSES THEM, so padMule sending it is a documented deviation - justified by
+measurement, with a 0xA2 DESC control to tell silence from a dead host. The
+obvious guess was then killed too: the vendored Lugdunum eserver 17.15 oracle
+does NOT answer 0xA4 either, so support is implementation-specific and SILENCE
+IS A NORMAL ANSWER (28 of 33 live servers did answer). The crawl is bounded on
+every axis and its merge shares ONE safety gate with the harvest.
+
+## The gossip harvest is LIVE (OP_GETSERVERLIST shipped)
 
 The 8ay device pass proved modern servers do NOT volunteer OP_SERVERLIST; the
 ask now ships (row 8az): a fresh login sends the bodiless 0x14 right after the
@@ -90,10 +112,11 @@ channel.
 
 ## Open tasks (ranked)
 
-1. **Recursive UDP server crawl** - the fuller "hidden servers" discovery
-   (harvest from servers we are NOT connected to via UDP OP_GLOBSERVSTATREQ /
-   server-list req, verify, recurse). Whole-net scanning stays OUT of scope
-   ([[feature-server-hunter]]).
+1. **DEVICE-VERIFY THE CRAWL** - the only thing the new discovery engine still
+   lacks. Install a build with 6d99fd4 and tap "Discover more servers" on the
+   Servers screen: expect a "Crawl asked N server(s), M answered - K new"
+   notice and the table to grow. It blocks ~10s (2 rounds), so it also
+   exercises the known serial-queue freeze (task 2).
 2. **Portability Tier 2** ([[portability-audit]]) plus the reanalysis findings
    that belong with it: "Reconnecting..." can never render (events drain behind
    the blocking call on one serial queue; a second drain queue fixes it) AND

@@ -1965,6 +1965,26 @@ async fn cmd_server_crawl(met_path: &str, rounds: u32) {
         .map(|m| m.servers.len())
         .unwrap_or(before);
     println!("added {added} new server(s): {before} -> {after}");
+    // Then probe, exactly as the app does after a crawl: the status ping also
+    // carries the description request, so servers discovered as bare ip:port
+    // learn their NAME here (and it is persisted into server.met).
+    println!("probing for status + names ...");
+    let probed = engine.probe_server_list().await;
+    let named = probed.iter().filter(|e| !e.name.is_empty()).count();
+    println!("{named}/{} server(s) now have a name:", probed.len());
+    for e in probed.iter().take(40) {
+        let name = if e.name.is_empty() {
+            "(no name)".to_string()
+        } else {
+            e.name.clone()
+        };
+        let stat = match (e.alive, e.users) {
+            (true, Some(u)) => format!("alive, {u} users"),
+            (true, None) => "alive".to_string(),
+            _ => "no reply".to_string(),
+        };
+        println!("   {:<38} {name}  [{stat}]", e.addr.to_string());
+    }
     println!("result: {}", dir.join("server.met").display());
     drop(engine);
     let _ = tokio::time::timeout(Duration::from_millis(200), printer).await;
