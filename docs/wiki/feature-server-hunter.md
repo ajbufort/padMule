@@ -23,9 +23,26 @@ lists + the part-3 gossip crawl QUEUED (next after the Settings slice).
   a decompression bomb from a user-entered URL; anything unrecognised or malformed
   falls through to the raw bytes, which the validator then rejects cleanly. So a
   gzipped list is no longer silently excluded from "comprehensive".
-- **QUEUED - part 3 gossip crawl** (below): the real answer to Anthony's
-  "war dialer for hidden servers" question (2026-08-03). Reuses `OP_SERVERLIST`,
-  which padMule already parses. Follow-up after the Settings slice lands.
+- **Part 3 gossip crawl - FIRST CUT SHIPPED (2026-08-03), harvest-on-connect.**
+  The gap was precise: a connected server VOLUNTEERS its known servers via
+  OP_SERVERLIST during the connect burst, padMule already parsed it into
+  `ServerEvent::ServerList`, and the engine then DROPPED it with a cosmetic
+  "N servers known" notice (engine.rs:925). Now the forwarder stashes those
+  advertised (ip,port)s and the 1s heartbeat merges them into server.met via the
+  existing `merge_server_met` (`Engine::maintain_server_harvest`). So simply
+  CONNECTING to a server teaches padMule about servers in no published list -
+  the responsible answer to the "hidden servers" question, since the servers
+  volunteer the data. No scanning, no new sockets, no recursion. Safety: the
+  merge filters to routable public ip:port and honors the user ipfilter (a server
+  advertising 127.0.0.1 / a LAN / a blocked address is dropped, else the UDP probe
+  would later point at our own network - the B8 SSRF posture); the pending queue
+  is bounded (2000) against a flood; runs on the engine task, so no server.met
+  write races update_server_list. STILL FOLLOW-UP work, honestly scoped: (a) we
+  ACCEPT what a server offers but do not yet SEND OP_GETSERVERLIST to ask (eMule
+  gates that on an "update list when connecting" pref); (b) the RECURSIVE UDP
+  crawl (harvest from servers we are NOT connected to, verify, recurse) is the
+  fuller "crawl" and remains unbuilt. Whole-net scanning stays out of scope
+  (below).
 
 Anthony wants a "Server Hunter" feature (2026-07-13): a tool that discovers and
 verifies active eD2k servers to build a safe, working, live server list - by

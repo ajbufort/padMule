@@ -616,6 +616,10 @@ impl MuleEngine {
             // whole session's download progress, Kad table and credits. Gated on
             // elapsed time, so almost every call here is just a clock comparison.
             g.maintain_checkpoint().await;
+            // Merge any servers a connected server advertised (OP_SERVERLIST) into
+            // server.met - the gossip crawl's first step. A no-op (one lock check)
+            // unless a server actually gossiped since the last poll.
+            g.maintain_server_harvest().await;
             out
         })
     }

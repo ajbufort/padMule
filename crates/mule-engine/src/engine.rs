@@ -49,7 +49,7 @@ use crate::share::{
 use crate::transfer::build_file_req_ans_no_fil;
 use mule_files::{
     merge_server_met, read_nodes_dat, read_pins, read_server_met, write_nodes_dat, write_pins,
-    write_server_met, IpFilter, KadContact, NodesDat, ServerMet, DEFAULT_IPFILTER_LEVEL,
+    write_server_met, IpFilter, KadContact, NodesDat, Server, ServerMet, DEFAULT_IPFILTER_LEVEL,
 };
 use mule_kad::RoutingTable;
 use mule_proto::{Kad128, Packet, Tag, TagName, TagValue, PROT_EDONKEY};
@@ -1037,6 +1037,12 @@ pub struct Engine {
     /// the next downloads() poll re-announces it to the server (OP_OFFERFILES).
     /// Cloned into each download's completion task, which has no path to `server`.
     shared_dirty: Arc<AtomicBool>,
+    /// Servers a connected server advertised via OP_SERVERLIST, awaiting merge
+    /// into server.met on the 1s heartbeat. The heartbeat is the race-free spot:
+    /// it runs on the same task as update_server_list, so there is never a
+    /// concurrent server.met write. A std mutex, held only briefly, never across
+    /// an await. This is the Server Hunter gossip crawl's first step.
+    harvested_servers: Arc<std::sync::Mutex<Vec<(u32, u16)>>>,
     /// The upload switch. `false` is "Leech Mode": we still download, but serve
     /// nothing. An atomic so the listener task reads it without taking a lock.
     sharing: Arc<AtomicBool>,
@@ -1110,6 +1116,7 @@ impl Engine {
             downloads: Arc::new(Mutex::new(Vec::new())),
             shared: Arc::new(Mutex::new(Vec::new())),
             shared_dirty: Arc::new(AtomicBool::new(false)),
+            harvested_servers: Arc::new(std::sync::Mutex::new(Vec::new())),
             sharing: Arc::new(AtomicBool::new(true)),
             upload_gate: Arc::new(UploadGate::new(MAX_UPLOAD_SLOTS, UPLOAD_QUEUE_CAP)),
             known_met_lock: Arc::new(Mutex::new(())),
@@ -1639,6 +1646,7 @@ impl Engine {
         }
         let (tx, mut rx) = mpsc::channel(64);
         let out = self.events.clone();
+        let harvest = self.harvested_servers.clone();
         tokio::spawn(async move {
             // Rate-limit SERVER-DRIVEN events (Message/Status/ServerList): a hostile
             // server could otherwise flood them (e.g. OP_SERVERMESSAGE) into the
@@ -1661,6 +1669,17 @@ impl Engine {
                     count += 1;
                     if count > PER_WINDOW {
                         continue; // drop the flood
+                    }
+                }
+                // Gossip crawl step 1: stash the servers this server advertised,
+                // for the heartbeat to filter + merge into server.met. Bounded, so
+                // a hostile server cannot grow it without limit; the public-IP
+                // filter and dedup happen at merge time, on the engine task.
+                if let ServerEvent::ServerList(list) = &e {
+                    if let Ok(mut pend) = harvest.lock() {
+                        const MAX_HARVEST_PENDING: usize = 2000;
+                        let room = MAX_HARVEST_PENDING.saturating_sub(pend.len());
+                        pend.extend(list.iter().copied().take(room));
                     }
                 }
                 let _ = out.send(map_server_event(e));
@@ -1893,6 +1912,72 @@ impl Engine {
         ServerListUpdate::Updated {
             added: total - before,
             total,
+        }
+    }
+
+    /// Merge servers a connected server advertised (OP_SERVERLIST) into
+    /// server.met. The first, non-abusive step of the Server Hunter gossip crawl
+    /// (docs/wiki/feature-server-hunter.md part 3): eD2k servers VOLUNTEER their
+    /// peer servers, so simply connecting teaches padMule about servers that are
+    /// in no published list - no scanning, no extra sockets. Runs on the 1s
+    /// heartbeat, the same task as update_server_list, so there is never a
+    /// concurrent server.met write. Returns how many NEW servers were added.
+    pub async fn maintain_server_harvest(&mut self) -> u32 {
+        let pending: Vec<(u32, u16)> = {
+            let Ok(mut h) = self.harvested_servers.lock() else {
+                return 0;
+            };
+            if h.is_empty() {
+                return 0;
+            }
+            std::mem::take(&mut *h)
+        };
+        // Keep only routable public ip:port, honoring the user ipfilter. A server
+        // advertising 127.0.0.1, a LAN address, or a blocked range is bogus or
+        // hostile, and adding it would later point the UDP status probe at our own
+        // network (the SSRF posture from build-progress 8z/B8 applies here too).
+        let filter = self.ip_filter.clone();
+        let fresh: Vec<Server> = pending
+            .into_iter()
+            .filter(|&(ip, port)| {
+                port != 0
+                    && crate::fetch::is_routable_public_v4(ip_from_met_u32(ip))
+                    && filter.as_deref().is_none_or(|f| !f.is_blocked_u32(ip))
+            })
+            .map(|(ip, port)| Server {
+                ip,
+                port,
+                tags: Vec::new(),
+            })
+            .collect();
+        if fresh.is_empty() {
+            return 0;
+        }
+
+        let path = self.config_dir.join("server.met");
+        let base = std::fs::read(&path)
+            .ok()
+            .and_then(|b| read_server_met(&b).ok())
+            .unwrap_or_else(|| ServerMet {
+                header: mule_files::server_met::SERVER_MET_HEADER,
+                servers: Vec::new(),
+            });
+        let before = base.servers.len();
+        let merged = merge_server_met(
+            &base,
+            &ServerMet {
+                header: base.header,
+                servers: fresh,
+            },
+        );
+        let added = (merged.servers.len() - before) as u32;
+        if added > 0 && write_bytes_atomic(&path, &write_server_met(&merged)).is_ok() {
+            self.emit(EngineEvent::Server(format!(
+                "Discovered {added} server(s) from the network"
+            )));
+            added
+        } else {
+            0
         }
     }
 
@@ -3222,6 +3307,51 @@ mod tests {
         engine.start().await;
         assert_eq!(engine.state(), EngineState::Running);
         engine.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The gossip crawl merges advertised servers into server.met, and filters
+    /// out the bogus/hostile ones a server must never be able to inject.
+    #[tokio::test]
+    async fn harvested_servers_are_filtered_and_merged() {
+        let dir = tmp("harvest");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+
+        // ip_from_met_u32 reads the u32 little-endian (low byte = first octet), so
+        // build the met-u32 for each address that way.
+        let met_ip = |a: u8, b: u8, c: u8, d: u8| u32::from_le_bytes([a, b, c, d]);
+        // NB use genuinely routable public IPs, not the 203.0.113/198.51.100
+        // TEST-NET documentation ranges - is_routable_public_v4 rejects those.
+        {
+            let mut h = engine.harvested_servers.lock().unwrap();
+            h.push((met_ip(85, 17, 116, 222), 4242)); // public - kept
+            h.push((met_ip(77, 42, 68, 79), 5000)); // public - kept
+            h.push((met_ip(192, 168, 0, 5), 4242)); // LAN - dropped
+            h.push((met_ip(127, 0, 0, 1), 4242)); // loopback - dropped
+            h.push((met_ip(8, 8, 8, 8), 0)); // port 0 - dropped
+        }
+
+        let added = engine.maintain_server_harvest().await;
+        assert_eq!(added, 2, "only the two routable public servers are added");
+
+        // Persisted, and re-harvesting the SAME set adds nothing (dedup).
+        let bytes = std::fs::read(dir.join("server.met")).unwrap();
+        let met = read_server_met(&bytes).unwrap();
+        assert_eq!(met.servers.len(), 2);
+        {
+            let mut h = engine.harvested_servers.lock().unwrap();
+            h.push((met_ip(85, 17, 116, 222), 4242)); // already present
+        }
+        assert_eq!(
+            engine.maintain_server_harvest().await,
+            0,
+            "dedup on re-harvest"
+        );
+
+        // An empty queue is a cheap no-op.
+        assert_eq!(engine.maintain_server_harvest().await, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
