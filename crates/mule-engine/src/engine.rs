@@ -102,6 +102,42 @@ fn routing_to_nodes(rt: &RoutingTable) -> Vec<KadContact> {
         .collect()
 }
 
+/// The contacts a checkpoint should persist: the table we loaded at start PLUS
+/// everything the LIVE Kad node has learned since.
+///
+/// `start_kad` folds the node's table into `self.routing` exactly ONCE, at the
+/// end of bootstrap. After that the two diverge: every lookup answer adds
+/// contacts to the LIVE table, and - the load-bearing part - `note_responder`
+/// records each responder's UDP verify key there. Without this merge, `pause()`
+/// dropped the node and `checkpoint()` wrote the stale bootstrap-time snapshot,
+/// so every contact AND every verify key learned during the session was thrown
+/// away. That defeats the point of persisting keys at all (see
+/// `routing_to_nodes`: "so we can echo it after a restart"), and on iPadOS
+/// pause/checkpoint is the ROUTINE path, not a rare one.
+///
+/// The live entry wins a collision: it is the fresher observation of the same
+/// node, and it is the one carrying any key captured this session.
+fn checkpoint_contacts(persisted: &RoutingTable, live: Option<&RoutingTable>) -> Vec<KadContact> {
+    let mut by_id: std::collections::HashMap<[u8; 16], KadContact> =
+        std::collections::HashMap::new();
+    let mut order: Vec<[u8; 16]> = Vec::new();
+    let mut fold = |c: KadContact| {
+        let key = c.id.to_wire();
+        if by_id.insert(key, c).is_none() {
+            order.push(key);
+        }
+    };
+    for c in routing_to_nodes(persisted) {
+        fold(c);
+    }
+    if let Some(live) = live {
+        for c in routing_to_nodes(live) {
+            fold(c);
+        }
+    }
+    order.into_iter().filter_map(|k| by_id.remove(&k)).collect()
+}
+
 /// Gate nodes.dat contacts at LOAD the way aMule does (RoutingZone.cpp:195-199):
 /// Kad2-only (contactVersion > 1), routable public ip:port, the user's ipfilter,
 /// and no legacy DNS-port contact. The file may have just been DOWNLOADED
@@ -1539,7 +1575,7 @@ impl Engine {
     /// port did or did not open. Messages are prefixed "UPnP:" so the UI can pin
     /// them to a durable row instead of the transient notice.
     async fn map_port(&mut self) {
-        match crate::upnp::map_port(TCP_PORT, "padMule", 0).await {
+        match crate::upnp::map_port(TCP_PORT, "padMule", crate::upnp::PERMANENT_LEASE).await {
             Ok(ip) => {
                 // The external IP the gateway reports is deliberately NOT emitted:
                 // this reaches the UI, and that is our public IP verbatim. It IS
@@ -1635,6 +1671,14 @@ impl Engine {
                 "Connected to {addr} ({})",
                 if low_id { "LowID" } else { "HighID" }
             )));
+            // A LowID answer is the server telling us its connect-back failed, so
+            // re-verify the port mapping - eMule does exactly this
+            // (ServerSocket.cpp:334, "refresh the UPnP mappings once"). It is the
+            // trigger that targets the real failure: a mapping that silently went
+            // stale is INVISIBLE until a server refuses to reach us.
+            if low_id {
+                self.refresh_port_mapping();
+            }
             Self::offer_shared_to(&self.shared, &mut link).await;
             self.server = Some(link);
             // The DURABLE status line too, not only the notice above. The app
@@ -2766,9 +2810,44 @@ impl Engine {
             if resumed {
                 self.shared_dirty.store(true, Ordering::Relaxed);
             }
+            self.refresh_port_mapping();
         }
 
         self.emit(EngineEvent::Status(self.online_status()));
+    }
+
+    /// Re-verify the UPnP port mapping after a foreground return, eMule's
+    /// `CheckAndRefresh` (see `upnp::refresh_mapping` for the citations - eMule
+    /// runs it on resume from system suspend, among other triggers).
+    ///
+    /// padMule mapped the port ONCE per launch and never looked again, so a
+    /// mapping lost while suspended - router reboot, lease change, or our own DHCP
+    /// address moving - left it silently LowID for the whole session with the
+    /// Status row still reading "mapped".
+    ///
+    /// SPAWNED, not awaited: discovery plus SOAP costs seconds, and resume() is on
+    /// the path the user waits behind every time they switch back to the app. The
+    /// result reaches the UI as the same durable "UPnP:" row that start() writes,
+    /// so a change still surfaces - just a moment later.
+    fn refresh_port_mapping(&self) {
+        // Nothing to refresh if we never had a mapping (no gateway, or the user is
+        // on a network where it failed) - start()'s attempt already said so.
+        if self.public_ip.is_none() || self.offline {
+            return;
+        }
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            let msg = match crate::upnp::refresh_and_remap(TCP_PORT, "padMule").await {
+                // Silent on the common case: saying "still mapped" every time the
+                // user switches apps is noise, and the row already says it.
+                Ok(crate::upnp::RefreshOutcome::Intact) => return,
+                Ok(crate::upnp::RefreshOutcome::Remapped) => {
+                    format!("UPnP: re-mapped port {TCP_PORT} after resume")
+                }
+                Err(e) => format!("UPnP: could not refresh port {TCP_PORT} ({e})"),
+            };
+            let _ = events.send(EngineEvent::Server(msg));
+        });
     }
 
     /// Final checkpoint and stop. Safe from any state.
@@ -2798,7 +2877,11 @@ impl Engine {
     /// the in-memory gaps, so this is NOT already durable per-block).
     fn checkpoint(&self) {
         let _ = self.identity.save(&self.config_dir);
-        let contacts = routing_to_nodes(&self.routing);
+        // Include what the LIVE node learned this session, not just the snapshot
+        // taken at the end of bootstrap - see `checkpoint_contacts`. This covers
+        // shutdown() as well as pause(), which is why it lives here rather than
+        // at the `self.kad = None` drop site.
+        let contacts = checkpoint_contacts(&self.routing, self.kad.as_ref().map(|k| k.routing()));
         let nd = NodesDat {
             version: 2,
             contacts,
@@ -2864,6 +2947,62 @@ mod tests {
             out.push(e);
         }
         out
+    }
+
+    /// A checkpoint must persist what the LIVE Kad node learned this session, not
+    /// only the snapshot `start_kad` took at the end of bootstrap. Reported by the
+    /// 2026-08-02 reanalysis: `pause()` drops the node and then checkpoints, so
+    /// every contact and - worse - every per-peer UDP verify key captured by
+    /// `note_responder` was silently discarded, defeating the wave-10 goal of
+    /// echoing a peer's key after a restart.
+    #[test]
+    fn a_checkpoint_keeps_contacts_and_verify_keys_learned_this_session() {
+        let me = Kad128::from_hash(&[0x11; 16]);
+        let seen_at_boot = KadContact {
+            id: Kad128::from_hash(&[0xAA; 16]),
+            ip: 0x0808_0808,
+            udp_port: 4672,
+            tcp_port: 4662,
+            version: 8,
+            udp_key: 0,
+            udp_key_ip: 0,
+            verified: false,
+        };
+        // The SAME node, re-observed live: it answered us, so we now hold its
+        // verify key and it is IP-verified.
+        let with_key = KadContact {
+            udp_key: 0xDEAD_BEEF,
+            udp_key_ip: 0x0101_0101,
+            verified: true,
+            ..seen_at_boot
+        };
+        // ...plus a node discovered by a lookup AFTER bootstrap.
+        let found_later = KadContact {
+            id: Kad128::from_hash(&[0xBB; 16]),
+            ip: 0x0909_0909,
+            ..with_key
+        };
+
+        let mut persisted = RoutingTable::new(me);
+        persisted.load_nodes(&[seen_at_boot]);
+        let mut live = RoutingTable::new(me);
+        live.load_nodes(&[with_key.clone(), found_later.clone()]);
+
+        let out = checkpoint_contacts(&persisted, Some(&live));
+        assert_eq!(out.len(), 2, "the union, not a replacement: {out:?}");
+
+        let a = out.iter().find(|c| c.id == with_key.id).expect("boot node");
+        assert_eq!(a.udp_key, 0xDEAD_BEEF, "the key learned live must survive");
+        assert!(a.verified, "the verified bit learned live must survive");
+        assert!(
+            out.iter().any(|c| c.id == found_later.id),
+            "a contact discovered after bootstrap must be persisted"
+        );
+
+        // With no live node (never started, or already dropped) it is a pass-through.
+        let only = checkpoint_contacts(&persisted, None);
+        assert_eq!(only.len(), 1);
+        assert_eq!(only[0].udp_key, 0, "no live node, no invented state");
     }
 
     /// A local mock eD2k server that answers a login with a HighID IDCHANGE

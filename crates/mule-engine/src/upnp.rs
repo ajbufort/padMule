@@ -489,22 +489,51 @@ pub async fn map_port(
         }
     };
     let client = local_ip_toward(gateway).await?;
-    // Claim the port even if a stale mapping still holds it - our OWN previous
-    // DHCP IP after a lease change, or a leftover permanent mapping. Strict IGDs
-    // (TP-Link) return ConflictInMappingEntry instead of overwriting, so clear it
-    // first. Delete is idempotent: a free port just returns "no such entry".
-    let _ = soap_delete_mapping(&svc, port, Proto::Tcp).await;
-    soap_add_mapping(
-        &svc,
-        port,
-        Proto::Tcp,
-        port,
-        client,
-        description,
-        lease_secs,
-    )
-    .await?;
-    external_ip(&svc).await
+    claim_mapping(&svc, port, client, description, lease_secs).await
+}
+
+/// Delete-then-add `port` for `client`, then report the external IP.
+///
+/// Shared by both discovery routes so the conflict diagnosis below exists once.
+///
+/// The delete clears a stale mapping so we can re-claim the port. It works only
+/// when WE own the entry: this gateway class (TP-Link) answers a non-owner's
+/// DeletePortMapping with `Action not authorized`, so an entry left by our own
+/// PREVIOUS DHCP address cannot be removed - the case the comment here used to
+/// claim it handled. That is why callers should pass a FINITE lease: expiry is
+/// the only recovery that does not need a human. Verified against the real
+/// gateway 2026-08-02 (docs/wiki/net-highid-and-port-forwarding.md).
+async fn claim_mapping(
+    svc: &WanService,
+    port: u16,
+    client: Ipv4Addr,
+    description: &str,
+    lease_secs: u32,
+) -> Result<Ipv4Addr, UpnpError> {
+    // Idempotent: a free port just returns "no such entry". A delete we are not
+    // authorized to make is NORMAL when someone else holds the entry, so the
+    // result is inspected only through the conflict path below.
+    let _ = soap_delete_mapping(svc, port, Proto::Tcp).await;
+    if let Err(e) =
+        soap_add_mapping(svc, port, Proto::Tcp, port, client, description, lease_secs).await
+    {
+        // A bare "ConflictInMappingEntry" is the least useful thing we can show a
+        // user on a device with no debugger: it never says WHO holds the port,
+        // which is the one fact that decides what they must do about it. Ask the
+        // gateway and say so. Best-effort: if the query fails, report the raw
+        // error rather than inventing a cause.
+        if format!("{e}").contains("Conflict") {
+            if let Ok(Some(holder)) = query_specific_mapping(svc, port, Proto::Tcp).await {
+                return Err(UpnpError::Gateway(format!(
+                    "port {port} is already mapped to {holder} - another device, or a stale \
+                     entry for this one at an older address, holds it; clear it on the router \
+                     or reserve this device's address"
+                )));
+            }
+        }
+        return Err(e);
+    }
+    external_ip(svc).await
 }
 
 /// Map `port` using ONLY the unicast path (skip multicast entirely). Same result
@@ -534,6 +563,77 @@ pub async fn map_port_unicast(
     )
     .await?;
     external_ip(&svc).await
+}
+
+/// The lease padMule requests, in seconds. 0 = PERMANENT, which is what eMule
+/// 0.50a, eMule 0.70b, aMule 3.0.1 and aMule master all request (citations on
+/// [`refresh_and_remap`]). A finite lease was considered as a self-healing fix
+/// for a stale mapping stranded by a DHCP address change and REJECTED as an
+/// unnecessary deviation: the ecosystem's answer to that is re-verification
+/// ([`refresh_mapping`]) plus deleting on exit, not expiry.
+pub const PERMANENT_LEASE: u32 = 0;
+
+/// What a refresh found, so the caller can word an honest status line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshOutcome {
+    /// The gateway still maps the port to US. Nothing was sent to change it.
+    Intact,
+    /// The mapping was gone (or pointed elsewhere) and has been re-claimed.
+    Remapped,
+}
+
+/// eMule's `CheckAndRefresh`, ported: ask whether OUR mapping still exists and
+/// re-add it ONLY if it does not.
+///
+/// Grounded in eMule 0.50a `UPnPImplMiniLib.cpp:190-210` + `:343-359`, whose own
+/// comment is the specification - "we also don't delete old ports ... but only
+/// check that our current mappings still exist and refresh them if not". eMule
+/// drives it roughly hourly from Kad (`Kademlia.cpp:211-215`), on a LowID answer
+/// from a server (`ServerSocket.cpp:334`), and on resume from system suspend
+/// (`emuleDlg.cpp:3692`). padMule mapped the port exactly once per launch and
+/// never re-checked, so a mapping lost to a router reboot, a lease change or our
+/// own DHCP move left it silently LowID for the rest of the session.
+///
+/// Takes an already-discovered service: eMule deliberately skips re-discovery
+/// here ("we expect to find the same router like the first time"), and it keeps
+/// this testable against a mock IGD.
+pub async fn refresh_mapping(
+    svc: &WanService,
+    port: u16,
+    client: Ipv4Addr,
+    description: &str,
+    lease_secs: u32,
+) -> Result<RefreshOutcome, UpnpError> {
+    // A mapping that already names US needs nothing - and must NOT be deleted and
+    // re-added, which is what makes this cheap enough to run on every resume.
+    if let Ok(Some(holder)) = query_specific_mapping(svc, port, Proto::Tcp).await {
+        if holder == client.to_string() {
+            return Ok(RefreshOutcome::Intact);
+        }
+    }
+    claim_mapping(svc, port, client, description, lease_secs).await?;
+    Ok(RefreshOutcome::Remapped)
+}
+
+/// Discover the gateway, then run [`refresh_mapping`] against it.
+///
+/// The lease stays PERMANENT (0), matching every authority: eMule 0.50a's
+/// bundled miniupnpc hardcodes `NewLeaseDuration=0`
+/// (`miniupnpc/upnpcommands.c:339-340`), its Windows-COM path passes the same
+/// (`UPnPImplWinServ.cpp:866-867`), and aMule 3.0.1 and master both set
+/// `"NewLeaseDuration" = "0"` (`UPnPBase.cpp:1109-1110`). Not one of them
+/// requests a finite lease, so not one of them needs a renewal timer - they keep
+/// the mapping honest by RE-VERIFYING it, which is what this function is for.
+pub async fn refresh_and_remap(port: u16, description: &str) -> Result<RefreshOutcome, UpnpError> {
+    let (svc, gateway) = match discover(Duration::from_secs(3)).await {
+        Ok(v) => v,
+        Err(_) => {
+            let candidates = unicast_candidates().await;
+            discover_unicast(&candidates, Duration::from_secs(2)).await?
+        }
+    };
+    let client = local_ip_toward(gateway).await?;
+    refresh_mapping(&svc, port, client, description, PERMANENT_LEASE).await
 }
 
 /// Discover the IGD by unicast and report which internal client holds `port`
@@ -1021,6 +1121,103 @@ ST: urn:schemas-upnp-org:service:WANIPConnection:1\r\n\r\n"
             "urn:schemas-upnp-org:service:WANIPConnection:1"
         );
         assert_eq!(svc.control_url, format!("http://{http_addr}/ctl"));
+    }
+
+    /// eMule's CheckAndRefresh contract: a mapping that still names US is left
+    /// completely alone (no delete, no re-add), and one that names somebody else
+    /// is re-claimed. The "left alone" half is what makes it cheap enough to run
+    /// on every resume, so it is asserted by counting what the gateway RECEIVED.
+    #[tokio::test]
+    async fn refresh_reopens_only_a_mapping_that_is_not_ours() {
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // `holder` is what the mock says currently owns the port; `seen` records
+        // every SOAP action it was asked to perform.
+        async fn mock_igd(holder: &'static str, seen: Arc<Mutex<Vec<String>>>) -> WanService {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let svc = WanService {
+                service_type: "urn:schemas-upnp-org:service:WANIPConnection:1".to_string(),
+                control_url: format!("http://{addr}/ctl"),
+            };
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut s, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let seen = seen.clone();
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 8192];
+                        let Ok(n) = s.read(&mut buf).await else {
+                            return;
+                        };
+                        let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                        let action = [
+                            "GetSpecificPortMappingEntry",
+                            "AddPortMapping",
+                            "DeletePortMapping",
+                            "GetExternalIPAddress",
+                        ]
+                        .iter()
+                        .find(|a| req.contains(*a))
+                        .map(|a| a.to_string())
+                        .unwrap_or_else(|| "?".into());
+                        seen.lock().unwrap().push(action.clone());
+                        let body = match action.as_str() {
+                            "GetSpecificPortMappingEntry" => format!(
+                                "<s:Envelope><s:Body><u:GetSpecificPortMappingEntryResponse>\
+<NewInternalClient>{holder}</NewInternalClient>\
+</u:GetSpecificPortMappingEntryResponse></s:Body></s:Envelope>"
+                            ),
+                            "GetExternalIPAddress" => "<s:Envelope><s:Body>\
+<u:GetExternalIPAddressResponse><NewExternalIPAddress>203.0.113.5\
+</NewExternalIPAddress></u:GetExternalIPAddressResponse></s:Body></s:Envelope>"
+                                .to_string(),
+                            _ => "<s:Envelope><s:Body><u:Ok></u:Ok></s:Body></s:Envelope>"
+                                .to_string(),
+                        };
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = s.write_all(resp.as_bytes()).await;
+                        let _ = s.shutdown().await;
+                    });
+                }
+            });
+            svc
+        }
+
+        let us = Ipv4Addr::new(192, 168, 0, 182);
+
+        // (1) The gateway still maps the port to US -> untouched.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let svc = mock_igd("192.168.0.182", seen.clone()).await;
+        let out = refresh_mapping(&svc, 4662, us, "padMule", 0).await.unwrap();
+        assert_eq!(out, RefreshOutcome::Intact);
+        let acts = seen.lock().unwrap().clone();
+        assert_eq!(
+            acts,
+            vec!["GetSpecificPortMappingEntry"],
+            "an intact mapping must be verified and then LEFT ALONE, got {acts:?}"
+        );
+
+        // (2) It maps the port to somebody else (our own older DHCP address is the
+        // real-world case) -> re-claimed.
+        let seen2 = Arc::new(Mutex::new(Vec::new()));
+        let svc2 = mock_igd("192.168.0.89", seen2.clone()).await;
+        let out2 = refresh_mapping(&svc2, 4662, us, "padMule", 0)
+            .await
+            .unwrap();
+        assert_eq!(out2, RefreshOutcome::Remapped);
+        let acts2 = seen2.lock().unwrap().clone();
+        assert!(
+            acts2.contains(&"AddPortMapping".to_string()),
+            "a foreign mapping must be re-claimed, got {acts2:?}"
+        );
     }
 
     // Integration test of the real HTTP+SOAP network path (everything except SSDP
