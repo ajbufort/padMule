@@ -105,6 +105,7 @@ struct ContentView: View {
     /// Guards the explicit Stop: it drops connections and releases the router
     /// port, so it asks first.
     @State private var confirmStop = false
+    @State private var showSettings = false
 
     var body: some View {
         NavigationStack {
@@ -141,6 +142,19 @@ struct ContentView: View {
                 case .stats: StatsView().environmentObject(model)
                 case .status: statusScreen
                 }
+            }
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button {
+                        showSettings = true
+                    } label: {
+                        Image(systemName: "gearshape")
+                    }
+                    .accessibilityLabel("Settings")
+                }
+            }
+            .sheet(isPresented: $showSettings) {
+                SettingsView().environmentObject(model)
             }
             .navigationTitle("padMule")
             .navigationBarTitleDisplayMode(.inline)

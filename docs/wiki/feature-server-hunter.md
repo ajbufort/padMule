@@ -1,7 +1,30 @@
 # Feature: Server Hunter (future work)
 
-Updated: 2026-07-13
-Status: BACKLOG (post-core; parts are near-term, one part needs care)
+Updated: 2026-08-03
+Status: PARTS 1-2 SHIPPED; part 1 EXTENDED to multi-URL 2026-08-03; gzip-wrapped
+lists + the part-3 gossip crawl QUEUED (next after the Settings slice).
+
+## Progress (2026-08-03)
+
+- **Part 1 (auto-update from a trusted URL) SHIPPED and now EXTENDED to eMule's
+  full `addresses.dat` model**: the Settings screen holds a LIST of server.met
+  URLs, and `updateAllServerLists` fetches + merges each. The engine's
+  `merge_server_met` keeps existing entries and appends only new (ip,port)s, so
+  several lists accumulate into one comprehensive set. NB `server.met` is a single
+  shared format - eMule and aMule both read/write it and the published lists are
+  the same files, so there is no eMule-vs-aMule list to reconcile (Anthony asked;
+  verified in `mule-files/src/server_met.rs`, which accepts headers 0xE0 AND the
+  legacy 0x0E).
+- **Part 2 (verify/health-check) SHIPPED** as the 8x Servers screen UDP probe.
+- **QUEUED NEXT - gzip/zip-wrapped lists**: several popular lists are served
+  gzipped, and `server_met.rs`'s doc explicitly defers archive unwrapping to "a
+  higher layer" that does not exist yet, so those lists are currently REJECTED as
+  not-a-server.met. A small decompress step in the fetch path
+  (`bootstrap::http_get_bytes` / `update_server_list`) closes it. Without it
+  "comprehensive" silently excludes some of the best sources.
+- **QUEUED - part 3 gossip crawl** (below): the real answer to Anthony's
+  "war dialer for hidden servers" question (2026-08-03). Reuses `OP_SERVERLIST`,
+  which padMule already parses. Follow-up after the Settings slice lands.
 
 Anthony wants a "Server Hunter" feature (2026-07-13): a tool that discovers and
 verifies active eD2k servers to build a safe, working, live server list - by

@@ -38,10 +38,15 @@ which Anthony caught. That one bug was the visible tip.
    "Not connected to a server." is DEAD, and the real path yields
    "No one online has \"X\" right now." That sends a new user hunting for another
    file when the fix is to connect. Verified by hand.
-4. **No cellular / metered awareness at all, and sharing is ON by default.** No
-   `NWPathMonitor`, no Wi-Fi-only option, no warning anywhere; Leech Mode is
-   opt-in to turn uploading OFF. Many iPads are cellular. This is the only
-   finding that can cost real money.
+4. [FIXED 2026-08-03] **~~No cellular / metered awareness, sharing ON by
+   default~~.** Landed in the Tier-0 Settings slice: a `NetworkWatcher`
+   (`NWPathMonitor` -> `isExpensive || isConstrained`) drives a
+   "Pause sharing on cellular / metered networks" setting that DEFAULTS ON, so a
+   fresh install protects a data plan without being configured. It pauses
+   SHARING only (uploads); pausing downloads on a metered link is Tier 2, since
+   there is no per-transfer pause yet, only cancel. Also fixed here: Leech Mode
+   was initialised ON in the engine and NEVER PERSISTED, so turning it off
+   silently turned itself back on every launch - now stored and re-applied.
 
 ## TIER 2 - silently degrades, no diagnostic
 

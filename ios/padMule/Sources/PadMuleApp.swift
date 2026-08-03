@@ -10,8 +10,16 @@ import SwiftUI
 @main
 struct PadMuleApp: App {
     @StateObject private var model = EngineModel()
+    @StateObject private var network = NetworkWatcher()
     @Environment(\.scenePhase) private var scenePhase
     @State private var showSplash = true
+
+    init() {
+        // Register setting DEFAULTS before any view reads them, so a first launch
+        // behaves as intended (sharing on, metered-pause on) rather than as the
+        // false/zero UserDefaults returns for absent keys.
+        SettingsDefaults.register()
+    }
 
     var body: some Scene {
         WindowGroup {
@@ -19,6 +27,12 @@ struct PadMuleApp: App {
                 ContentView()
                     .environmentObject(model)
                     .onAppear { model.boot() }
+                    // Feed the metered verdict in, so sharing can pause on a
+                    // cellular/hotspot/Low-Data link. onChange also fires for the
+                    // first value the monitor delivers.
+                    .onChange(of: network.isMetered) { metered in
+                        model.setMetered(metered)
+                    }
                 if showSplash {
                     SplashView().transition(.opacity)
                 }

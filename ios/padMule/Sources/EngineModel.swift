@@ -10,6 +10,7 @@
 import Foundation
 import OSLog
 import SwiftUI
+import UIKit  // UIApplication.isIdleTimerDisabled (keep-screen-awake setting)
 
 /// The engine's on-device log. Until this existed, `idevicesyslog -p padMule`
 /// carried ZERO app-authored lines - a 1293-line capture across a full launch,
@@ -153,6 +154,8 @@ final class EngineModel: ObservableObject {
     /// wording: a user on cellular, behind CGNAT, or on a router without UPnP
     /// never had one, and must not be told a port was handed back.
     @Published private(set) var portMapped: Bool = false
+    /// Whether the current network is metered (cellular / hotspot / Low Data).
+    @Published private(set) var meteredNow: Bool = false
     /// Whether padMule serves files to peers. Off is "Leech Mode". Polled as a
     /// SNAPSHOT, like the server login: the engine owns the truth, the UI mirrors
     /// it. Defaults to true so the switch reads correctly before the first poll.
@@ -197,6 +200,11 @@ final class EngineModel: ObservableObject {
                     self.engine = e
                     self.ready = true
                     self.identity = ident
+                    // Re-apply persisted settings the moment the engine exists.
+                    // Without this the engine keeps its own defaults and the
+                    // user's choices look like they were ignored.
+                    self.applyEffectiveSharing()
+                    self.applyLaunchSettings()
                     self.startPolling()
                     self.refresh()
                 }
@@ -218,6 +226,7 @@ final class EngineModel: ObservableObject {
         let q = keyword.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let e = engine, !q.isEmpty, !searching else { return }
         recordRecent(q)
+        saveSearchFilters()
         searching = true
         notice = nil
         let mb: UInt64 = 1_048_576
@@ -392,10 +401,53 @@ final class EngineModel: ObservableObject {
     /// Toggle uploading. Off is "Leech Mode": padMule keeps downloading but stops
     /// serving files to peers. Optimistic - the 1s poll timer's refresh()
     /// reconciles from the engine.
+    ///
+    /// This records the user's PREFERENCE and then applies the effective value,
+    /// which may differ while a metered-network pause is in force.
     func setSharing(_ on: Bool) {
+        UserDefaults.standard.set(on, forKey: SettingsKey.shareUploads)
+        applyEffectiveSharing()
+    }
+
+    /// Push the sharing decision into the engine.
+    ///
+    /// effective = the user wants to share AND we are not pausing for a metered
+    /// link. Kept in ONE place because the inputs arrive from three directions -
+    /// the Shared-screen toggle, Settings, and the network path changing under us
+    /// - and a rule spread across three call sites is a rule that will disagree
+    /// with itself.
+    ///
+    /// Also the fix for a live bug: sharing was initialised true in the engine and
+    /// never persisted, so turning it OFF silently turned itself back ON at the
+    /// next launch.
+    func applyEffectiveSharing() {
         guard let e = engine else { return }
-        sharing = on
-        work.async { e.setSharing(on: on) }
+        let wanted = UserDefaults.standard.bool(forKey: SettingsKey.shareUploads)
+        let pauseOnMetered = UserDefaults.standard.bool(forKey: SettingsKey.pauseSharingOnCellular)
+        let effective = wanted && !(pauseOnMetered && meteredNow)
+        if effective != sharing {
+            let detail = "user wants \(wanted ? "on" : "off"), metered \(meteredNow ? "yes" : "no")"
+            engineLog.notice(
+                "sharing -> \(effective ? "on" : "off", privacy: .public) (\(detail, privacy: .public))"
+            )
+        }
+        sharing = effective
+        work.async { e.setSharing(on: effective) }
+    }
+
+    /// True when sharing is off ONLY because of the metered-network rule, so the
+    /// UI can explain itself rather than look broken.
+    var sharingPausedForMeteredLink: Bool {
+        meteredNow
+            && UserDefaults.standard.bool(forKey: SettingsKey.pauseSharingOnCellular)
+            && UserDefaults.standard.bool(forKey: SettingsKey.shareUploads)
+    }
+
+    /// Latest metered verdict from the NetworkWatcher; the app feeds this in.
+    func setMetered(_ metered: Bool) {
+        guard meteredNow != metered else { return }
+        meteredNow = metered
+        applyEffectiveSharing()
     }
 
     /// Start downloading a hit. Blocks briefly (asking the server for sources),
@@ -410,6 +462,11 @@ final class EngineModel: ObservableObject {
                 self.adding.remove(hit.hash)
                 switch outcome {
                 case .started:
+                    // Apply the user's default priority. add_download registers at
+                    // Normal; set it right after, so a non-Normal default is
+                    // honored without a new engine argument.
+                    let pri = UserDefaults.standard.integer(forKey: SettingsKey.defaultPriority)
+                    if pri != 1 { self.setPriority(hit.hash, priority: UInt8(pri)) }
                     self.notice = "Downloading \"\(hit.name)\"."
                 case .alreadyAdded:
                     self.notice = "\"\(hit.name)\" is already downloading."
@@ -620,6 +677,9 @@ final class EngineModel: ObservableObject {
                 self.portMapped = mapped
                 self.sampleStats(stats)
                 for ev in evs { self.apply(ev) }
+                // Transfers start and finish between polls, and keep-awake is
+                // gated on there being active ones, so re-evaluate it each poll.
+                self.applyKeepAwake()
             }
         }
     }
@@ -722,6 +782,119 @@ final class EngineModel: ObservableObject {
                 self?.loadingServers = false
             }
         }
+    }
+
+    // MARK: - Server list URLs (multi-source, eMule addresses.dat model)
+
+    /// The user's configured list of server.met URLs. Always non-empty (the
+    /// default is registered), and de-duplicated on write.
+    var serverListUrls: [String] {
+        UserDefaults.standard.stringArray(forKey: SettingsKey.serverListUrls)
+            ?? [EngineModel.defaultServerListUrl]
+    }
+
+    func addServerListUrl(_ raw: String) {
+        let url = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard url.hasPrefix("http://") || url.hasPrefix("https://") else {
+            notice = "A server-list URL must start with http:// or https://"
+            return
+        }
+        var urls = serverListUrls
+        guard !urls.contains(url) else { return }
+        urls.append(url)
+        UserDefaults.standard.set(urls, forKey: SettingsKey.serverListUrls)
+        objectWillChange.send()
+    }
+
+    func removeServerListUrl(_ url: String) {
+        var urls = serverListUrls.filter { $0 != url }
+        // Never leave it empty - fall back to the trusted default rather than a
+        // list that can never find a server.
+        if urls.isEmpty { urls = [EngineModel.defaultServerListUrl] }
+        UserDefaults.standard.set(urls, forKey: SettingsKey.serverListUrls)
+        objectWillChange.send()
+    }
+
+    /// Fetch and MERGE every configured list, one after another, then report the
+    /// combined result. The engine merges into the on-disk server.met on each
+    /// call, so this accumulates into one comprehensive set. Serial rather than
+    /// concurrent: the engine holds a single lock, so parallel calls would just
+    /// queue anyway, and serial keeps the running total honest.
+    func updateAllServerLists() {
+        guard let e = engine, !loadingServers else { return }
+        let urls = serverListUrls
+        loadingServers = true
+        engineLog.notice("updating \(urls.count, privacy: .public) server list(s)")
+        work.async { [weak self] in
+            var added = 0
+            var total = 0
+            var failures: [String] = []
+            for url in urls {
+                switch e.updateServerList(url: url) {
+                case let .updated(a, t):
+                    added += Int(a)
+                    total = Int(t)
+                case .badUrl: failures.append("bad URL")
+                case .notServerMet: failures.append("not a server.met")
+                case .unreachable: failures.append("unreachable")
+                }
+            }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.loadingServers = false
+                if failures.count == urls.count {
+                    self.notice = "Could not update the server list (\(failures.first ?? "failed"))."
+                } else if failures.isEmpty {
+                    self.notice = "Server lists updated: +\(added) new (\(total) total)."
+                } else {
+                    self.notice = "Server lists updated: +\(added) new (\(total) total); \(failures.count) source(s) failed."
+                }
+                self.loadServers()
+            }
+        }
+    }
+
+    /// Persist the wire search filters, if the user asked us to remember them.
+    /// iPadOS suspends and relaunches padMule constantly, so a filter set the user
+    /// dialed in is otherwise lost many times a day.
+    func saveSearchFilters() {
+        guard UserDefaults.standard.bool(forKey: SettingsKey.rememberSearchFilters) else { return }
+        let d = UserDefaults.standard
+        d.set(wireCompleteOnly, forKey: SettingsKey.wireCompleteOnly)
+        d.set(wireGlobal, forKey: SettingsKey.wireGlobal)
+        d.set(Int(wireMinSizeMb), forKey: SettingsKey.wireMinSizeMb)
+        d.set(Int(wireMaxSizeMb), forKey: SettingsKey.wireMaxSizeMb)
+    }
+
+    /// Restore the persisted wire filters at launch (guarded by the same flag).
+    func restoreSearchFilters() {
+        guard UserDefaults.standard.bool(forKey: SettingsKey.rememberSearchFilters) else { return }
+        let d = UserDefaults.standard
+        wireCompleteOnly = d.bool(forKey: SettingsKey.wireCompleteOnly)
+        wireGlobal = d.bool(forKey: SettingsKey.wireGlobal)
+        wireMinSizeMb = UInt64(max(0, d.integer(forKey: SettingsKey.wireMinSizeMb)))
+        wireMaxSizeMb = UInt64(max(0, d.integer(forKey: SettingsKey.wireMaxSizeMb)))
+    }
+
+    /// Apply settings that only take effect at launch: refresh the server lists if
+    /// the user asked for it, and honor the keep-awake preference.
+    func applyLaunchSettings() {
+        restoreSearchFilters()
+        if UserDefaults.standard.bool(forKey: SettingsKey.updateServerListAtLaunch) {
+            updateAllServerLists()
+        }
+        applyKeepAwake()
+    }
+
+    /// Keep the screen from sleeping while a transfer is active, IF the user opted
+    /// in. This is the honest iPadOS translation of eMule's "Prevent Standby":
+    /// padMule is foreground-only, so a screen that sleeps mid-transfer suspends
+    /// the app and pauses everything. Gated on there being active transfers so it
+    /// does not hold the screen awake on an idle Search screen.
+    func applyKeepAwake() {
+        let want = UserDefaults.standard.bool(forKey: SettingsKey.keepAwakeWhileTransferring)
+        let active = downloads.contains { !$0.complete }
+        UIApplication.shared.isIdleTimerDisabled = want && active
     }
 
     /// Connect to a chosen (live) server, then refresh the list + status.
