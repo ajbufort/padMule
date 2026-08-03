@@ -6,8 +6,9 @@
 //! MET-format tags. The IP is stored verbatim (eMule byte-order convention);
 //! this codec keeps it opaque. Records preserve exactly what was read so a
 //! read-then-write round-trips bit-for-bit (the header byte is preserved rather
-//! than forced to 0xE0). Archive-wrapped server.met (gzip/zip from a URL) is a
-//! separate higher-layer concern, not handled here.
+//! than forced to 0xE0). Archive-wrapped server.met (gzip/zip from a URL) is
+//! unwrapped one layer up, in `mule_engine::bootstrap::maybe_decompress`, before
+//! the bytes reach this parser.
 
 use mule_proto::{read_tag, write_tag, IoError, Reader, Tag, Writer};
 

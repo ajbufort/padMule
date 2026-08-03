@@ -112,7 +112,92 @@ pub async fn http_get_bytes(url: &str) -> Result<Vec<u8>, BootstrapError> {
     if body.is_empty() {
         return Err(BootstrapError::Empty);
     }
-    Ok(body)
+    // Transparently unwrap an archive-wrapped list before returning. Every caller
+    // wants list DATA (a server.met / nodes.dat to parse or write), never the raw
+    // archive, so this is the right single place.
+    Ok(maybe_decompress(body))
+}
+
+/// gzip magic (`\x1f\x8b`).
+const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
+/// ZIP local-file-header signature (`PK\x03\x04`).
+const ZIP_MAGIC: [u8; 4] = [0x50, 0x4b, 0x03, 0x04];
+/// Cap on decompressed output. A server.met with tens of thousands of servers is
+/// far under this; the bound stops a hostile or MITM'd URL (update_server_list
+/// takes a user-entered URL) turning a tiny archive into an OOM - the wire-level
+/// 16 MiB body cap does not help once a gzip bomb is inside.
+const MAX_DECOMPRESSED: usize = 32 * 1024 * 1024;
+
+/// Transparently unwrap an archive-wrapped list.
+///
+/// Many published `server.met` lists are served gzipped (`server.met.gz`) or,
+/// less often, zipped; without this they arrive as opaque bytes and are rejected
+/// as "not a server.met", silently excluding some of the best sources. Anything
+/// that is not a recognised archive - INCLUDING a plain, already-decompressed
+/// `.met`/`.dat` - is returned unchanged, so this is safe on every fetched body.
+/// A malformed or over-cap archive also falls through to the raw bytes, which the
+/// caller's validator then rejects cleanly rather than trusting garbage.
+pub fn maybe_decompress(body: Vec<u8>) -> Vec<u8> {
+    if body.starts_with(&GZIP_MAGIC) {
+        if let Some(out) = gunzip(&body) {
+            return out;
+        }
+    } else if body.starts_with(&ZIP_MAGIC) {
+        if let Some(out) = unzip_first(&body) {
+            return out;
+        }
+    }
+    body
+}
+
+fn gunzip(body: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut out = Vec::new();
+    // Read one past the cap so an over-limit stream is detectable, not silently
+    // truncated into plausible-looking garbage.
+    let mut dec = flate2::read::GzDecoder::new(body).take(MAX_DECOMPRESSED as u64 + 1);
+    dec.read_to_end(&mut out).ok()?;
+    (out.len() <= MAX_DECOMPRESSED && !out.is_empty()).then_some(out)
+}
+
+/// Extract the FIRST entry of a ZIP (a list archive holds exactly one file).
+/// Handles the common stored (0) and deflate (8) methods; anything else - an
+/// unknown method, or a streaming entry whose size lives in a trailing data
+/// descriptor (general-purpose bit 3) that needs the central directory to locate
+/// - returns None, and the raw bytes are kept.
+fn unzip_first(body: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Read;
+    if body.len() < 30 {
+        return None;
+    }
+    let le16 = |i: usize| u16::from_le_bytes([body[i], body[i + 1]]);
+    let le32 = |i: usize| u32::from_le_bytes([body[i], body[i + 1], body[i + 2], body[i + 3]]);
+
+    let flags = le16(6);
+    if flags & 0x0008 != 0 {
+        return None; // size deferred to a data descriptor - not resolvable here
+    }
+    let method = le16(8);
+    let comp_size = le32(18) as usize;
+    let name_len = le16(26) as usize;
+    let extra_len = le16(28) as usize;
+    let data_start = 30usize.checked_add(name_len)?.checked_add(extra_len)?;
+    let data_end = data_start.checked_add(comp_size)?;
+    if data_end > body.len() {
+        return None;
+    }
+    let data = &body[data_start..data_end];
+    let out = match method {
+        0 => data.to_vec(),
+        8 => {
+            let mut o = Vec::new();
+            let mut dec = flate2::read::DeflateDecoder::new(data).take(MAX_DECOMPRESSED as u64 + 1);
+            dec.read_to_end(&mut o).ok()?;
+            o
+        }
+        _ => return None,
+    };
+    (out.len() <= MAX_DECOMPRESSED && !out.is_empty()).then_some(out)
 }
 
 /// What `ensure` did, so the engine can report it honestly to the UI.
@@ -216,6 +301,78 @@ mod tests {
         assert!(!looks_like_server_met(b"<html>404</html>"));
         assert!(!looks_like_nodes_dat(b"<html>404</html>"));
         assert!(!looks_like_server_met(&[]));
+    }
+
+    /// A minimal but REAL server.met (one server), so decompression is validated
+    /// against the actual parser, not a stand-in blob.
+    fn sample_server_met() -> Vec<u8> {
+        use mule_files::{write_server_met, Server, ServerMet};
+        write_server_met(&ServerMet {
+            header: 0xE0,
+            servers: vec![Server {
+                ip: 0x0102_0304,
+                port: 4242,
+                tags: vec![],
+            }],
+        })
+    }
+
+    #[test]
+    fn gunzips_a_wrapped_server_met() {
+        use flate2::{write::GzEncoder, Compression};
+        use std::io::Write;
+        let raw = sample_server_met();
+        assert!(looks_like_server_met(&raw));
+
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(&raw).unwrap();
+        let gz = enc.finish().unwrap();
+        assert_ne!(gz, raw, "the gzip must actually differ from the payload");
+
+        let out = maybe_decompress(gz);
+        assert_eq!(out, raw, "gunzip must recover the exact bytes");
+        assert!(
+            looks_like_server_met(&out),
+            "a gzipped list must parse after unwrapping"
+        );
+    }
+
+    #[test]
+    fn unwraps_a_stored_zip_entry() {
+        let raw = sample_server_met();
+        // Hand-build a ZIP local file header with a single STORED entry named "x".
+        let name = b"x";
+        let mut zip = Vec::new();
+        zip.extend_from_slice(&ZIP_MAGIC); // signature
+        zip.extend_from_slice(&[20, 0]); // version needed
+        zip.extend_from_slice(&[0, 0]); // flags (no data descriptor)
+        zip.extend_from_slice(&[0, 0]); // method 0 = stored
+        zip.extend_from_slice(&[0, 0, 0, 0]); // mod time/date
+        zip.extend_from_slice(&[0, 0, 0, 0]); // crc (unchecked here)
+        zip.extend_from_slice(&(raw.len() as u32).to_le_bytes()); // compressed size
+        zip.extend_from_slice(&(raw.len() as u32).to_le_bytes()); // uncompressed size
+        zip.extend_from_slice(&(name.len() as u16).to_le_bytes()); // name len
+        zip.extend_from_slice(&[0, 0]); // extra len
+        zip.extend_from_slice(name); // name
+        zip.extend_from_slice(&raw); // stored data
+
+        let out = maybe_decompress(zip);
+        assert_eq!(out, raw, "a stored zip entry must extract verbatim");
+        assert!(looks_like_server_met(&out));
+    }
+
+    #[test]
+    fn plain_and_malformed_bytes_pass_through_unchanged() {
+        // A plain (already-decompressed) server.met is returned as-is.
+        let raw = sample_server_met();
+        assert_eq!(maybe_decompress(raw.clone()), raw);
+        // Gzip magic but truncated garbage: fall through to the raw bytes so the
+        // validator rejects it, never a panic and never invented content.
+        let fake_gz = vec![0x1f, 0x8b, 0x08, 0x00, 0xAA, 0xBB];
+        assert_eq!(maybe_decompress(fake_gz.clone()), fake_gz);
+        // ZIP magic but too short to hold a header.
+        let fake_zip = vec![0x50, 0x4b, 0x03, 0x04, 0x00];
+        assert_eq!(maybe_decompress(fake_zip.clone()), fake_zip);
     }
 
     #[tokio::test]
