@@ -46,13 +46,13 @@ the Ingest / Query / Lint workflows.
 CI+Sideloadly deploy path, foreground-only v1 - see [[decisions-and-lessons]];
 the app is shipped and on-device, and 0.70b Tier-1 parity is done
 ([[emule-070b-features]]). Current direction: the BULLETPROOF security release
-gate - close the [[security-model]] scorecard (22 operational / 2 partial / 2
-documented opt-outs as of 2026-08-02). Serve-side secure-ident, the full credit
+gate - the [[security-model]] scorecard now reads 23 operational / 1 partial / 2
+documented opt-outs (2026-08-02), and there is NO protocol work left in it. Serve-side secure-ident, the full credit
 system (store + reweight + accrual), and per-source corruption attribution + ban
 all landed 2026-08-02 ([[build-progress]] 8af-8ai); server-obf is a documented v1
 opt-out ([[obfuscation-posture]]). The Kad hard-verify send-side is DONE,
 terminal-proven (a log-patched real amuled verifies padMule via the v8
-HELLO_RES_ACK handshake, [[kad-verify-oracle]]) and now key-capture-complete
-(8ak). The ONLY protocol item left for the gate is wave-10 Batch B: verified-bit
-ENFORCEMENT in routing, flag-gated and offline-provable. Wave 9 seedbox mode is
-the open v1.1 item.)
+HELLO_RES_ACK handshake, [[kad-verify-oracle]]), key-capture-complete (8ak), and
+wave-10 Batch B LANDED (8ao) - the Kad verified bit is now ENFORCED in routing.
+The single remaining PARTIAL is AICH block recovery, an OPTIMIZATION rather than
+an integrity gap, queued as wave 11. Wave 9 seedbox mode is the open v1.1 item.)
