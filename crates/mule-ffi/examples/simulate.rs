@@ -330,7 +330,9 @@ fn main() {
             AddOutcome::Started => println!("add_download: Started"),
             AddOutcome::AlreadyAdded => println!("add_download: AlreadyAdded"),
             AddOutcome::NoSources => println!("add_download: NoSources"),
-            AddOutcome::NoServer => println!("add_download: NoServer"),
+            AddOutcome::NotConnected => {
+                println!("add_download: NotConnected (no server AND no Kad - nobody to ask)")
+            }
             AddOutcome::Rejected { reason } => println!("add_download: Rejected ({reason})"),
         }
         // Preview ON from the start -> sequential block bias -> a contiguous head

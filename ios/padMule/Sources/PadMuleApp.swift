@@ -24,8 +24,26 @@ struct PadMuleApp: App {
                 }
             }
             .task {
-                // The engine boots underneath, so these 7 seconds are not dead time.
-                try? await Task.sleep(nanoseconds: 7_000_000_000)
+                // Hold the splash until the engine is actually READY, not for a
+                // fixed 7s. The original intent was to cover the boot; the bug was
+                // that boot takes 12-30s (two HTTP fetches, the always-failing
+                // multicast SSDP probe, unicast + SOAP, then Kad), so a fixed
+                // delay reliably cleared EARLY and left a live-looking, inert UI.
+                //
+                // Bounded on both sides: a MINIMUM so the brand does not flash past
+                // on a warm start, and a CEILING so a hung boot or a boot FAILURE
+                // can never trap the user behind the splash - past it the
+                // "Starting padMule..." banner takes over the explaining.
+                let start = Date()
+                let minimum: TimeInterval = 2.5
+                let ceiling: TimeInterval = 20
+                while Date().timeIntervalSince(start) < ceiling {
+                    if model.ready || model.bootError != nil,
+                       Date().timeIntervalSince(start) >= minimum {
+                        break
+                    }
+                    try? await Task.sleep(nanoseconds: 150_000_000)
+                }
                 withAnimation(.easeOut(duration: 0.35)) { showSplash = false }
             }
         }
