@@ -2116,7 +2116,7 @@ impl Engine {
         if !bootstrapped {
             self.emit(EngineEvent::Server("Kad bootstrap incomplete".into()));
         }
-        self.kad = Some(node);
+        self.set_kad(Some(node));
     }
 
     /// Search BOTH the connected server AND the Kad network, deduped + ranked by
@@ -2737,14 +2737,12 @@ impl Engine {
         if let Some(s) = &mut self.server {
             s.pause().await;
         }
-        // Fold what the live node learned into the persisted table BEFORE
-        // dropping it. `checkpoint()` below reads `self.kad` to build the union,
-        // and by then it would be None - so without this the checkpoint writes
-        // the stale bootstrap-time snapshot and every contact and verify key
-        // learned this session is lost, which is the whole bug this is meant to
-        // fix. Ordering is preserved deliberately: sockets still go first.
-        self.absorb_kad_routing();
-        self.kad = None; // dropping the KadNode closes its UDP socket
+        // `set_kad` folds the live table into the persisted one before dropping
+        // the node - load-bearing, because `checkpoint()` below runs AFTER this
+        // and would otherwise write the stale bootstrap-time snapshot, losing
+        // every contact and verify key the session learned. Socket release still
+        // happens first, as the comment above intends.
+        self.set_kad(None);
         if let Some(h) = self.listener.take() {
             h.abort(); // release TCP 4662; resume() rebinds it
         }
@@ -2876,8 +2874,7 @@ impl Engine {
         self.search_session = None;
         // Same ordering rule as pause(): fold the live table in BEFORE the node
         // is dropped, or the checkpoint below writes a stale snapshot.
-        self.absorb_kad_routing();
-        self.kad = None;
+        self.set_kad(None);
         if let Some(h) = self.listener.take() {
             h.abort();
         }
@@ -2933,6 +2930,20 @@ impl Engine {
         }
     }
 
+    /// Install or clear the live Kad node, absorbing whatever the OUTGOING node
+    /// learned first.
+    ///
+    /// EVERY assignment to `self.kad` goes through here on purpose. The rule
+    /// "fold the live table in before you drop the node" was previously a thing
+    /// each call site had to remember, and `pause()` did not - it dropped the
+    /// node and then checkpointed, silently discarding every contact and verify
+    /// key of the session. A rule that cannot be forgotten is worth more than a
+    /// comment asking callers to remember it.
+    fn set_kad(&mut self, node: Option<KadNode>) {
+        self.absorb_kad_routing();
+        self.kad = node;
+    }
+
     /// Copy the LIVE Kad node's table into the persisted one.
     ///
     /// Must run before any path that drops the node and then checkpoints -
@@ -2954,9 +2965,10 @@ impl Engine {
     fn checkpoint(&self) {
         let _ = self.identity.save(&self.config_dir);
         // Include what the LIVE node learned this session, not just the snapshot
-        // taken at the end of bootstrap - see `checkpoint_contacts`. This covers
-        // shutdown() as well as pause(), which is why it lives here rather than
-        // at the `self.kad = None` drop site.
+        // taken at the end of bootstrap - see `checkpoint_contacts`. This catches
+        // any caller that checkpoints while the node is still alive; the callers
+        // that DROP it first are covered by `set_kad`, which absorbs the table on
+        // the way out. Both are needed: this one alone silently missed pause().
         let contacts = checkpoint_contacts(&self.routing, self.kad.as_ref().map(|k| k.routing()));
         let nd = NodesDat {
             version: 2,
@@ -3141,6 +3153,55 @@ mod tests {
         engine.start().await;
         assert_eq!(engine.state(), EngineState::Running);
         engine.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// REPLACING the live node must not throw away what the outgoing one learned.
+    ///
+    /// No caller does this today (both `start_kad` callers run with `self.kad`
+    /// already None), so this pins the INVARIANT rather than a live bug: the rule
+    /// is now enforced by `set_kad` instead of remembered at each call site,
+    /// because forgetting it at exactly one site is what silently lost a whole
+    /// session's contacts and verify keys.
+    #[tokio::test]
+    async fn replacing_the_kad_node_keeps_what_the_outgoing_one_learned() {
+        use crate::kad_live::KadNode;
+
+        let dir = tmp("kad-replace");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+        engine.set_offline(true);
+
+        let learned = KadContact {
+            id: Kad128::from_hash(&[0xE5; 16]),
+            ip: 0x0D0D_0D0D,
+            udp_port: 4672,
+            tcp_port: 4662,
+            version: 8,
+            udp_key: 0xABCD_1234,
+            udp_key_ip: 0x0404_0404,
+            verified: true,
+        };
+        let mut outgoing = KadNode::bind("127.0.0.1:0".parse().unwrap(), 4662)
+            .await
+            .unwrap();
+        outgoing
+            .routing_mut()
+            .load_nodes(std::slice::from_ref(&learned));
+        engine.set_kad(Some(outgoing));
+
+        // A fresh node replaces it, as a re-bootstrap would.
+        let replacement = KadNode::bind("127.0.0.1:0".parse().unwrap(), 4662)
+            .await
+            .unwrap();
+        engine.set_kad(Some(replacement));
+
+        let kept = routing_to_nodes(&engine.routing)
+            .into_iter()
+            .find(|c| c.id == learned.id)
+            .expect("the outgoing node's contact must have been absorbed");
+        assert_eq!(kept.udp_key, 0xABCD_1234, "and its verify key with it");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
