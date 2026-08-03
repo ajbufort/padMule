@@ -102,6 +102,9 @@ struct ContentView: View {
     @State private var newCategoryName = ""
     @State private var sourcesFor: DownloadInfo?
     @State private var ratingFor: SharedFileInfo?
+    /// Guards the explicit Stop: it drops connections and releases the router
+    /// port, so it asks first.
+    @State private var confirmStop = false
 
     var body: some View {
         NavigationStack {
@@ -745,6 +748,42 @@ struct ContentView: View {
                     row("Kad ID", String(id.kadId.prefix(16)) + "...")
                 }
             }
+
+            // The closest thing iOS allows to eMule's Exit. iOS has no app-quit an
+            // app may call, so this stops the ENGINE cleanly and tells the user
+            // they can now close the app; the alternative was leaving the port
+            // mapping and connections behind on every exit.
+            Section {
+                if model.stopping {
+                    HStack(spacing: 10) {
+                        ProgressView()
+                        Text(model.state == .stopped ? "Starting..." : "Stopping...")
+                            .foregroundStyle(.secondary)
+                    }
+                } else if model.state == .stopped {
+                    Button {
+                        model.startEngine()
+                    } label: {
+                        Label("Start padMule", systemImage: "play.circle")
+                    }
+                } else {
+                    Button(role: .destructive) {
+                        confirmStop = true
+                    } label: {
+                        Label("Stop padMule", systemImage: "stop.circle")
+                    }
+                }
+            } footer: {
+                Text(model.state == .stopped
+                     ? "Stopped. Nothing is connected and the router port has been released - it is safe to close padMule from the app switcher."
+                     : "Disconnects, saves your progress and hands the forwarded port back to the router. Do this before closing padMule so it does not leave a port mapping behind.")
+            }
+        }
+        .confirmationDialog("Stop padMule?", isPresented: $confirmStop, titleVisibility: .visible) {
+            Button("Stop", role: .destructive) { model.stop() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Transfers stop and the router port is released. Your progress is saved and you can start again from this screen.")
         }
     }
 

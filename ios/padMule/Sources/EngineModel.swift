@@ -19,6 +19,9 @@ private let recentsCap = 12
 @MainActor
 final class EngineModel: ObservableObject {
     @Published private(set) var state: EngineStateFfi = .stopped
+    /// A stop (or a start after one) is in flight. Both talk to the router, so
+    /// they take seconds; the Status screen shows progress instead of freezing.
+    @Published private(set) var stopping: Bool = false
     @Published private(set) var status: String = "Idle"
     @Published private(set) var reconnecting: Bool = false
     @Published private(set) var downloads: [DownloadInfo] = []
@@ -474,9 +477,44 @@ final class EngineModel: ObservableObject {
     func pause() { run { $0.pause() } }
 
     /// App foregrounded: rebuild + reconnect.
-    /// (There is deliberately no shutdown() here: iOS gives no reliable
-    /// termination hook, and pause() already checkpoints on .background.)
+    /// (shutdown() is NOT called from the lifecycle hooks: iOS gives no reliable
+    /// termination hook, and pause() already checkpoints on .background. It is
+    /// reachable only from the explicit Stop control - see `stop()`.)
     func resume() { run { $0.resume() } }
+
+    /// The user asked to stop: disconnect, release the sockets, flush, and give
+    /// the forwarded port back to the router. iOS has no app-quit an app may
+    /// call, so this is the closest honest equivalent of eMule's Exit - the user
+    /// still closes padMule from the app switcher, but nothing is left behind.
+    ///
+    /// Slower than the other actions (releasing the port means talking to the
+    /// gateway), hence `stopping` for the UI to show progress rather than appear
+    /// frozen. A resume() after this is a no-op while Stopped, so the stop sticks
+    /// across an app switch until the user starts it again.
+    func stop() {
+        guard let e = engine else { return }
+        stopping = true
+        work.async { [weak self] in
+            e.shutdown()
+            DispatchQueue.main.async {
+                self?.stopping = false
+                self?.refresh()
+            }
+        }
+    }
+
+    /// Start again after an explicit stop, without relaunching the app.
+    func startEngine() {
+        guard let e = engine else { return }
+        stopping = true
+        work.async { [weak self] in
+            e.start()
+            DispatchQueue.main.async {
+                self?.stopping = false
+                self?.refresh()
+            }
+        }
+    }
 
     private func run(_ body: @escaping (MuleEngine) -> Void) {
         guard let e = engine else { return }
