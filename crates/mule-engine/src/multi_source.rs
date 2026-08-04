@@ -178,6 +178,12 @@ pub struct SourceInfo {
     pub rating: u8,
     /// Its comment on this file (from OP_FILEDESC); empty if none.
     pub comment: String,
+    /// Wall-clock second this source was last CONNECTED or last gave us bytes.
+    /// The badge counts only recently-live sources: `note_source` upserts by
+    /// address and nothing ever removed a record, so the count was every source
+    /// EVER contacted for this download and only ever grew - which is why the
+    /// Transfers badge read 99 while the Search tab said 12 for the same file.
+    pub last_seen: u64,
     /// How we DISCOVERED this source - the eD2k server, Kad, or a source
     /// exchange with another peer. Already known at dial time
     /// (`fetch::PeerSource::origin`); it just was not carried this far, so the
@@ -391,6 +397,7 @@ impl Download {
             s.obfuscated = obfuscated;
             s.low_id = low_id;
             s.origin = origin;
+            s.last_seen = crate::credit_store::now_secs() as u64;
         } else {
             g.push(SourceInfo {
                 addr,
@@ -400,6 +407,7 @@ impl Download {
                 verified: false,
                 rating: 0,
                 comment: String::new(),
+                last_seen: crate::credit_store::now_secs() as u64,
                 origin,
             });
         }
@@ -409,10 +417,21 @@ impl Download {
     /// `(server, kad, source-exchange)`. Feeds the per-transfer origin badge:
     /// "which channel is actually feeding this download" is invisible otherwise,
     /// and it is the question a user asks when one file flies and another crawls.
+    /// How long a source stays counted in the badge after we last heard from it.
+    /// A peer that dropped ten minutes ago is not "a source you have" in any
+    /// sense a user means.
+    pub const SOURCE_FRESH_SECS: u64 = 180;
+
     pub async fn source_origins(&self) -> (u32, u32, u32) {
+        let now = crate::credit_store::now_secs() as u64;
         let g = self.sources.lock().await;
         let mut counts = (0u32, 0u32, 0u32);
         for s in g.iter() {
+            // Only sources still in play. Counting every address ever contacted
+            // made the badge grow without bound over a session.
+            if now.saturating_sub(s.last_seen) > Self::SOURCE_FRESH_SECS {
+                continue;
+            }
             match s.origin {
                 crate::fetch::SourceOrigin::Server => counts.0 += 1,
                 crate::fetch::SourceOrigin::Kad => counts.1 += 1,
@@ -651,10 +670,18 @@ impl Download {
         // Bytes really arrived. This is what the activity indicator reads - a
         // row can be registered, hold sources and still be moving nothing, and
         // until now the screen could not tell those apart.
-        self.last_byte_at.store(
-            u64::from(crate::credit_store::now_secs()),
-            Ordering::Relaxed,
-        );
+        let now = u64::from(crate::credit_store::now_secs());
+        self.last_byte_at.store(now, Ordering::Relaxed);
+        // Keep the DELIVERING source fresh, or a transfer running longer than
+        // SOURCE_FRESH_SECS from one peer would age out of the badge while that
+        // peer is visibly still sending. Cheap: the list is tens of entries and
+        // the critical section is a find-and-store.
+        if let Some(addr) = source {
+            let mut g = self.sources.lock().await;
+            if let Some(si) = g.iter_mut().find(|s| s.addr == addr) {
+                si.last_seen = now;
+            }
+        }
         // Remember which source fed each AICH block this write touches, so a
         // later failure can be attributed - per part without AICH
         // (localize_corruption), per BLOCK with it (apply_aich_recovery).
@@ -2647,6 +2674,54 @@ mod tests {
 
         drop(fs);
         let _ = server.await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn the_badge_counts_sources_in_play_not_every_one_ever_seen() {
+        // Anthony's cross-tab report: the Search tab said 12 sources and the
+        // Transfers badge said 99 for the SAME file. Cause: `note_source`
+        // upserts by address and nothing ever removed a record, so the badge was
+        // every address EVER contacted for that download and only grew. A peer
+        // that dropped ten minutes ago is not "a source you have".
+        let dir = tmpdir("fresh-sources");
+        let store = PartStore::create(&dir, 1, [0x44; 16], 400_000, b"f.bin").unwrap();
+        let dl = Download::new(store);
+        let a: SocketAddr = "1.1.1.1:4662".parse().unwrap();
+        let b: SocketAddr = "2.2.2.2:4662".parse().unwrap();
+        dl.note_source(
+            "a".into(),
+            a,
+            false,
+            false,
+            crate::fetch::SourceOrigin::Server,
+        )
+        .await;
+        dl.note_source("b".into(), b, false, false, crate::fetch::SourceOrigin::Kad)
+            .await;
+        assert_eq!(dl.source_origins().await, (1, 1, 0), "both fresh");
+
+        // Age BOTH well past the window, as a long session does.
+        {
+            let mut g = dl.sources.lock().await;
+            for s in g.iter_mut() {
+                s.last_seen = 0;
+            }
+        }
+        assert_eq!(
+            dl.source_origins().await,
+            (0, 0, 0),
+            "stale sources must not be counted - this is the 99-vs-12 bug"
+        );
+
+        // A source that is still DELIVERING stays counted: commit refreshes it,
+        // so a transfer longer than the window does not age out mid-flight.
+        dl.commit(0, &[7u8; 32], Some(a)).await.unwrap();
+        assert_eq!(
+            dl.source_origins().await,
+            (1, 0, 0),
+            "the delivering source is live again; the silent one is not"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
