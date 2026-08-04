@@ -84,6 +84,11 @@ which Anthony caught. That one bug was the visible tip.
 Anthony's first extended on-device session found what the audit's static reading
 had not. Closed here, each TDD + mutation-checked:
 
+- Item 17 below (the README never states minimum requirements) is still open,
+  but the related "no way to get at a finished file" gap is CLOSED: the
+  Downloaded tab lists finished files from disk, tapping one opens it in
+  QuickLook, and a ShareLink hands it to another app. NB iOS refuses a
+  `file://` URL to `UIApplication.open`, so those two are the ONLY routes.
 - Item 6 below (RESUME_PER_DL < SOURCES_WAIT) was WORSE than recorded: the two
   source arms are JOINED, so the call returns in max(), and the 4s outer timeout
   DISCARDED the server sources that had already arrived. Resume therefore worked
