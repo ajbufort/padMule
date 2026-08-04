@@ -107,6 +107,11 @@ pub struct IdentityInfo {
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct ServerInfoFfi {
     pub addr: String,
+    /// The server's display NAME from server.met, when known. The engine has
+    /// carried this since the connected-line change but only ever baked it into
+    /// the status STRING, so every other place that showed a server - the
+    /// Servers header, the Status screen's Server row - still printed a bare IP.
+    pub name: Option<String>,
     pub low_id: bool,
     /// True when this server answers related-files searches, so the UI can offer
     /// the true `related::` query instead of a filename-keyword search.
@@ -254,6 +259,10 @@ impl From<HitStatus> for HitStatusFfi {
 /// [`MuleEngine::add_download`].
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct SearchHit {
+    /// Where this hit came from: "server", "kad", or "server + kad" (a popular
+    /// file legitimately arrives from both, which is why the engine tracks it as
+    /// a bitset). Empty when unknown.
+    pub origin: String,
     pub hash: String,
     pub name: String,
     pub size: u64,
@@ -343,16 +352,32 @@ async fn search_outcome_to_ffi(g: &Engine, outcome: EngineSearchOutcome) -> Sear
 /// have/fetching/new status. Shared by `search` and `related_search`. `g` is
 /// borrowed immutably, so call it AFTER the `&mut self` search has returned its
 /// owned Vec - the borrows never overlap.
+/// Render the ORIGIN_* bitset as something a person can read. Both bits set is
+/// the common case for a popular file and is worth saying explicitly - it means
+/// two independent networks agree the file exists.
+fn origin_label(bits: u8) -> String {
+    let server = bits & (mule_engine::ORIGIN_SERVER | mule_engine::ORIGIN_GLOBAL) != 0;
+    let kad = bits & mule_engine::ORIGIN_KAD != 0;
+    match (server, kad) {
+        (true, true) => "server + kad".to_string(),
+        (true, false) => "server".to_string(),
+        (false, true) => "kad".to_string(),
+        (false, false) => String::new(),
+    }
+}
+
 async fn ranked_to_hits(g: &Engine, ranked: Vec<RankedFile>) -> Vec<SearchHit> {
     let mut out = Vec::with_capacity(ranked.len());
     for r in ranked {
         let status = g.hit_status(r.hash).await.into();
+        let origin = origin_label(r.origins);
         let trusted = r.is_trusted();
         let warning = match r.trust {
             Trust::Ok => String::new(),
             Trust::Suspect(why) => why.to_string(),
         };
         out.push(SearchHit {
+            origin,
             hash: hex::encode(r.hash),
             name: r.name,
             size: r.size,
@@ -464,6 +489,7 @@ impl MuleEngine {
                 .server_info()
                 .map(|s| ServerInfoFfi {
                     addr: s.addr,
+                    name: s.name,
                     low_id: s.low_id,
                     related_search: s.related_search,
                 })
@@ -636,6 +662,10 @@ impl MuleEngine {
             // whole session's download progress, Kad table and credits. Gated on
             // elapsed time, so almost every call here is just a clock comparison.
             g.maintain_checkpoint().await;
+            // Stop sharing anything the user deleted in the Files app.
+            g.maintain_share_verify().await;
+            // Re-drive a download that went idle (the missing retry).
+            g.maintain_resume_fetches().await;
             // Merge any servers a connected server advertised (OP_SERVERLIST) into
             // server.met - the gossip crawl's first step. A no-op (one lock check)
             // unless a server actually gossiped since the last poll.
@@ -903,6 +933,7 @@ mod tests {
     fn search_hit_has_the_rich_fields() {
         // Compile-level guarantee that the record carries the new shape.
         let h = SearchHit {
+            origin: "server + kad".to_string(),
             hash: "00".to_string(),
             name: "x".to_string(),
             size: 1,

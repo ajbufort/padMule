@@ -605,8 +605,19 @@ where
     } = session;
     // Unregisters this peer from the file's served list on EVERY exit path.
     let mut served: Option<ServedGuard> = None;
+    // A shared file counts as OURS only while its bytes are still on disk at the
+    // size we hashed. The downloads directory is the user-visible Files folder,
+    // so a finished file can be deleted (or replaced) under us at any moment,
+    // and the in-memory library is only rebuilt at start(). Without this check
+    // padMule answered "I have it, COMPLETE", took an upload slot, and then
+    // dropped the connection when the read failed - the worst possible shape,
+    // because the peer had every reason to trust us. Costs one stat per file
+    // REQUEST (not per block), and the miss path is the same FNF/silence the
+    // authorities send for a file they do not have.
     let lookup = |payload: &[u8]| {
-        head_hash(payload).and_then(|h| library.iter().find(|f| f.hash == h).cloned())
+        head_hash(payload)
+            .and_then(|h| library.iter().find(|f| f.hash == h).cloned())
+            .filter(|f| matches!(std::fs::metadata(&f.path), Ok(m) if m.len() == f.size))
     };
     // The file this peer is after, once it names one.
     let mut file: Option<SharedFile> = None;
@@ -902,6 +913,20 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A REAL file on disk for a `SharedFile` fixture. The serve path now
+    /// verifies a shared file still exists at the size we hashed before
+    /// claiming we have it, so a fixture path must be real - which also makes
+    /// these tests faithful to what a live serve actually sees.
+    fn fixture_file(tag: &str, size: usize) -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "padmule-serve-{tag}-{}-{:?}.bin",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&p, vec![0u8; size]).unwrap();
+        p
+    }
     use crate::multi_source::{download_from_peer, Download};
     use crate::part_store::PartStore;
     use crate::peer::HelloInfo;
@@ -1310,6 +1335,56 @@ mod tests {
         ));
     }
 
+    /// A file the user DELETED must never be claimed. Before this, `lookup`
+    /// matched purely on the in-memory library, so padMule answered
+    /// OP_SETREQFILEID with "COMPLETE" for a file whose bytes were gone, took an
+    /// upload slot, and then dropped the connection when the read failed. The
+    /// honest answer is the same OP_FILEREQANSNOFIL the authorities send for a
+    /// file they do not have.
+    #[tokio::test]
+    async fn we_never_claim_a_file_whose_bytes_are_gone() {
+        use crate::transfer::{OP_FILEREQANSNOFIL, OP_SETREQFILEID};
+        use mule_proto::{Packet, PROT_EDONKEY};
+
+        let hash = [0x5B; 16];
+        let path = fixture_file("deleted", 100);
+        let shared = vec![SharedFile {
+            hash,
+            size: 100,
+            name: b"deleted.bin".to_vec(),
+            part_hashes: vec![],
+            path: path.clone(),
+            rating: 0,
+            comment: String::new(),
+        }];
+        // The user deletes it in the Files app; the library still lists it.
+        std::fs::remove_file(&path).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let up = tokio::spawn(async move {
+            let me = HelloInfo::baseline([0xBB; 16], 0, 4662, 4672, "seed");
+            if let Ok((_p, mut fs)) = accept_peer(&listener, &me).await {
+                let _ = serve_shared(&mut fs, &shared, None, None, 0, Default::default()).await;
+            }
+        });
+
+        let me = HelloInfo::baseline([0xAA; 16], 0x0A00_0001, 4663, 4673, "dl");
+        let (_p, mut fs) = connect_peer(addr, &me).await.unwrap();
+        fs.write_packet(&Packet::new(PROT_EDONKEY, OP_SETREQFILEID, hash.to_vec()))
+            .await
+            .unwrap();
+
+        let ans = fs.read_packet().await.unwrap();
+        assert_eq!(
+            ans.opcode, OP_FILEREQANSNOFIL,
+            "a deleted file must draw file-not-found, never a COMPLETE claim"
+        );
+        assert_eq!(&ans.payload[..16], &hash);
+        drop(fs);
+        let _ = up.await;
+    }
+
     #[tokio::test]
     async fn serve_verifies_a_faithful_mock_leecher() {
         // The faithful other-side per [[interop-test-fidelity]]: a mock playing the
@@ -1325,7 +1400,7 @@ mod tests {
             size: 100,
             name: b"verify.bin".to_vec(),
             part_hashes: vec![],
-            path: PathBuf::from("/does/not/matter"),
+            path: fixture_file("shared", 100),
             rating: 0,
             comment: String::new(),
         }];
@@ -1467,7 +1542,7 @@ mod tests {
             size: 100,
             name: b"multi.bin".to_vec(),
             part_hashes: vec![],
-            path: PathBuf::from("/does/not/matter"),
+            path: fixture_file("shared", 100),
             rating: 0,
             comment: String::new(),
         }];
@@ -1561,7 +1636,7 @@ mod tests {
             size: 100,
             name: b"sx.bin".to_vec(),
             part_hashes: vec![],
-            path: PathBuf::from("/does/not/matter"),
+            path: fixture_file("shared", 100),
             rating: 0,
             comment: String::new(),
         }];
@@ -1649,7 +1724,7 @@ mod tests {
             size: 100,
             name: b"known.bin".to_vec(),
             part_hashes: vec![],
-            path: PathBuf::from("/does/not/matter"),
+            path: fixture_file("shared", 100),
             rating: 0,
             comment: String::new(),
         }];
@@ -1711,7 +1786,7 @@ mod tests {
             size: 100,
             name: b"rated.bin".to_vec(),
             part_hashes: vec![],
-            path: PathBuf::from("/does/not/matter"),
+            path: fixture_file("shared", 100),
             rating: 4,
             comment: "great little file".to_string(),
         }];
@@ -1754,7 +1829,7 @@ mod tests {
             size: 100,
             name: b"rated.bin".to_vec(),
             part_hashes: vec![],
-            path: PathBuf::from("/does/not/matter"),
+            path: fixture_file("shared", 100),
             rating: 4,
             comment: "hidden".to_string(),
         }];

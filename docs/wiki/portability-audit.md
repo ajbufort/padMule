@@ -79,6 +79,34 @@ which Anthony caught. That one bug was the visible tip.
    was initialised ON in the engine and NEVER PERSISTED, so turning it off
    silently turned itself back on every launch - now stored and re-applied.
 
+## FIXED 2026-08-03 by the usage-feedback round (build-progress 8bb)
+
+Anthony's first extended on-device session found what the audit's static reading
+had not. Closed here, each TDD + mutation-checked:
+
+- Item 6 below (RESUME_PER_DL < SOURCES_WAIT) was WORSE than recorded: the two
+  source arms are JOINED, so the call returns in max(), and the 4s outer timeout
+  DISCARDED the server sources that had already arrived. Resume therefore worked
+  only when Kad was BROKEN. The budget is now a parameter bounding each arm, so
+  partial results always survive; the whole-pass cap (2 downloads) is raised and
+  a periodic re-drive fixes the total absence of any retry.
+- Item 9's sibling: a finished file the user DELETED was still advertised and
+  still answered "COMPLETE" to peers. Verified at the serve path now, plus a 60s
+  prune of the library and known.met.
+- The server-DROP path never emitted Status, so the Status row kept claiming a
+  connection after a kick (the 8as bug's mirror).
+- Search rows never refreshed: a completed file never showed "Have", and a file
+  just tapped reverted to "Get" and could be started twice.
+- Every silent long operation now shows progress ("Discover more servers" had
+  none at all for ~12s), and the two FALSE UI claims (transfers "resume when you
+  come back", keep-awake "only while actually transferring") are now true
+  statements with the code changed to match.
+
+STILL OPEN from Tier 2 below: the serial-queue freeze itself (items 10 and the
+pause() starvation risk are mitigated, not eliminated - the real fix is getting
+blocking engine calls off the one queue), NAT-PMP dead code, the 4s offer_files
+timeout, and bandwidth limiting.
+
 ## TIER 2 - silently degrades, no diagnostic
 
 5. **Uploads are never announced on a slow link.** `maintain_shares` wraps

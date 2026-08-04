@@ -64,10 +64,20 @@ pub enum Trust {
     Suspect(&'static str),
 }
 
+/// Where a result came from. A file commonly arrives from BOTH channels (the
+/// popular case), so this is a BITSET rather than an enum - "Kad only" and
+/// "server and Kad" are different facts and the user asked to tell them apart.
+pub const ORIGIN_SERVER: u8 = 1;
+pub const ORIGIN_KAD: u8 = 2;
+/// A global (UDP) search answer - still a server, just not the connected one.
+pub const ORIGIN_GLOBAL: u8 = 4;
+
 /// One unique file in the catalog (deduped by hash).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RankedFile {
     pub hash: [u8; 16],
+    /// OR of the ORIGIN_* bits for every result that carried this hash.
+    pub origins: u8,
     /// The agreed file size (0 if none was advertised).
     pub size: u64,
     /// The most-seen filename.
@@ -96,6 +106,8 @@ pub struct RankedFile {
 
 #[derive(Default)]
 struct Group {
+    /// OR of the ORIGIN_* bits for every row folded into this hash.
+    origins: u8,
     sizes: BTreeMap<u64, u32>, // size -> times seen (nonzero only)
     names: BTreeMap<String, u32>,
     sources: u32,
@@ -146,9 +158,19 @@ fn normalize_type(tag: &str) -> String {
 /// Fold raw search results into a ranked, deduped catalog. Ranks Ok-trust files
 /// above suspect ones, then by availability (descending).
 pub fn catalog(files: &[SearchResultFile]) -> Vec<RankedFile> {
+    catalog_with_origins(files, &[])
+}
+
+/// Like [`catalog`], but each entry of `origins` gives the ORIGIN_* bits for the
+/// result at the same index (a missing or short slice means "unknown", 0). The
+/// bits are OR-accumulated per hash, which is the whole point: dedupe collapses
+/// the same file arriving from the server AND from Kad into one row, and that
+/// row should say BOTH rather than whichever won the merge order.
+pub fn catalog_with_origins(files: &[SearchResultFile], origins: &[u8]) -> Vec<RankedFile> {
     let mut groups: BTreeMap<[u8; 16], Group> = BTreeMap::new();
-    for f in files {
+    for (i, f) in files.iter().enumerate() {
         let g = groups.entry(f.hash).or_default();
+        g.origins |= origins.get(i).copied().unwrap_or(0);
         if let Some(sz) = tag_u64(&f.tags, FT_FILESIZE) {
             if sz > 0 {
                 *g.sizes.entry(sz).or_default() += 1;
@@ -241,6 +263,7 @@ pub fn catalog(files: &[SearchResultFile]) -> Vec<RankedFile> {
                 .unwrap_or_else(|| infer_type(&name).to_string());
             RankedFile {
                 hash,
+                origins: g.origins,
                 size,
                 name,
                 sources: g.sources,
@@ -296,6 +319,53 @@ impl RankedFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The whole point of tracking origin as a BITSET: dedupe collapses the same
+    /// file arriving from the server AND from Kad into one row, and that row must
+    /// say BOTH rather than whichever channel happened to be merged first.
+    #[test]
+    fn origins_or_together_across_the_dedupe() {
+        let mk = |hash: [u8; 16], name: &str| SearchResultFile {
+            hash,
+            id: 0,
+            port: 0,
+            tags: vec![
+                Tag::id(FT_FILENAME, TagValue::Str(name.as_bytes().to_vec())),
+                Tag::id(FT_FILESIZE, TagValue::U32(1000)),
+            ],
+        };
+        let h = [0xAB; 16];
+        let other = [0xCD; 16];
+        let files = vec![
+            mk(h, "both.bin"),
+            mk(h, "both.bin"),
+            mk(other, "kadonly.bin"),
+        ];
+        let origins = [ORIGIN_SERVER, ORIGIN_KAD, ORIGIN_KAD];
+
+        let out = catalog_with_origins(&files, &origins);
+        let both = out.iter().find(|r| r.hash == h).unwrap();
+        assert_eq!(
+            both.origins,
+            ORIGIN_SERVER | ORIGIN_KAD,
+            "one hash seen on both channels must report both"
+        );
+        let kad_only = out.iter().find(|r| r.hash == other).unwrap();
+        assert_eq!(kad_only.origins, ORIGIN_KAD);
+    }
+
+    /// A caller that knows nothing about origins (the plain `catalog`) must keep
+    /// working and simply report "unknown" rather than mislabelling everything.
+    #[test]
+    fn catalog_without_origins_reports_unknown() {
+        let f = SearchResultFile {
+            hash: [0x11; 16],
+            id: 0,
+            port: 0,
+            tags: vec![Tag::id(FT_FILENAME, TagValue::Str(b"x.bin".to_vec()))],
+        };
+        assert_eq!(catalog(&[f])[0].origins, 0);
+    }
     use mule_proto::Tag;
 
     #[test]
