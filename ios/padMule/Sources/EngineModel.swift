@@ -484,6 +484,7 @@ final class EngineModel: ObservableObject {
                     self.applyEffectiveSharing()
                     self.applyLaunchSettings()
                     self.startPolling()
+                    self.refreshFast()
                     self.refresh()
                 }
             } catch {
@@ -759,7 +760,7 @@ final class EngineModel: ObservableObject {
                 case .rejected(let reason):
                     self.notice = "Cannot download: \(reason)"
                 }
-                self.refresh()
+                self.refreshAll()
             }
         }
     }
@@ -770,7 +771,7 @@ final class EngineModel: ObservableObject {
         guard let e = engine else { return }
         work.async { [weak self] in
             _ = e.cancelDownload(hash: hash)
-            DispatchQueue.main.async { self?.refresh() }
+            DispatchQueue.main.async { self?.refreshAll() }
         }
     }
 
@@ -856,7 +857,7 @@ final class EngineModel: ObservableObject {
         guard let e = engine else { return }
         work.async { [weak self] in
             _ = e.unshareFile(hash: hash)
-            DispatchQueue.main.async { self?.refresh() }
+            DispatchQueue.main.async { self?.refreshAll() }
         }
     }
 
@@ -867,7 +868,7 @@ final class EngineModel: ObservableObject {
         guard let e = engine else { return }
         work.async { [weak self] in
             _ = e.setFileRating(hash: hash, rating: rating, comment: comment)
-            DispatchQueue.main.async { self?.refresh() }
+            DispatchQueue.main.async { self?.refreshAll() }
         }
     }
 
@@ -877,7 +878,7 @@ final class EngineModel: ObservableObject {
         guard let e = engine else { return }
         work.async { [weak self] in
             _ = e.setDownloadPriority(hash: hash, priority: priority)
-            DispatchQueue.main.async { self?.refresh() }
+            DispatchQueue.main.async { self?.refreshAll() }
         }
     }
 
@@ -939,7 +940,7 @@ final class EngineModel: ObservableObject {
             e.pause()
             DispatchQueue.main.async {
                 guard let self else { return }
-                self.refresh()
+                self.refreshAll()
                 self.endPauseBackgroundTask()
             }
         }
@@ -983,7 +984,7 @@ final class EngineModel: ObservableObject {
             engineLog.notice("lifecycle: stopped (sockets released, port handed back)")
             DispatchQueue.main.async {
                 self?.stopping = false
-                self?.refresh()
+                self?.refreshAll()
             }
         }
     }
@@ -998,7 +999,7 @@ final class EngineModel: ObservableObject {
             engineLog.notice("lifecycle: started")
             DispatchQueue.main.async {
                 self?.stopping = false
-                self?.refresh()
+                self?.refreshAll()
             }
         }
     }
@@ -1007,7 +1008,7 @@ final class EngineModel: ObservableObject {
         guard let e = engine else { return }
         work.async { [weak self] in
             body(e)
-            DispatchQueue.main.async { self?.refresh() }
+            DispatchQueue.main.async { self?.refreshAll() }
         }
     }
 
@@ -1016,6 +1017,7 @@ final class EngineModel: ObservableObject {
         let t = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 self?.pumpEvents()
+                self?.refreshFast()
                 self?.refresh()
             }
         }
@@ -1053,50 +1055,80 @@ final class EngineModel: ObservableObject {
     /// Pull a fresh snapshot off the main thread. Events are NOT drained here
     /// any more - `pumpEvents()` owns that, on its own queue, so a banner or a
     /// status change still arrives while a long engine call is holding `work`.
-    /// The downloads() call is ALSO the engine's heartbeat (share re-announce,
-    /// completion finalize, server-drop detection) - the 1s timer must keep
-    /// firing this even when no screen shows transfers.
+    /// This half takes the ENGINE LOCK, so it stalls behind a long search or
+    /// crawl - by design, and honestly: only the Status scalars lag. It also
+    /// drives `heartbeat()`, so the 1s timer must keep firing it even when no
+    /// screen shows transfers.
     ///
     /// Guarded by `refreshInFlight` so a slow call ahead of this one on the
     /// serial `work` queue (e.g. a 20s search) cannot let the 1s timer stack
     /// dozens of queued jobs in front of something urgent like pause(). The
     /// heartbeat still fires every ~1s once the in-flight one clears; this
     /// only caps concurrency at one.
-    private func refresh() {
-        guard let e = engine, !refreshInFlight else { return }
-        refreshInFlight = true
-        work.async { [weak self] in
-            let st = e.state()
+    /// The LOCK-FREE half: transfers, the shared library, the sharing switch,
+    /// byte totals and the port-mapping flag. None of these touches the engine
+    /// mutex in the Rust seam, so they keep answering while a ~20s search or
+    /// ~10s crawl holds it - which is exactly when the progress numbers used to
+    /// freeze. Runs on its own queue for the same reason the event pump does:
+    /// `work` is serial, so sharing it would reintroduce the very stall this
+    /// removes. No in-flight guard needed - these calls cannot block.
+    /// Both halves, for a caller that means "update the screen NOW" - a cancel, a
+    /// priority change, a finished action. `refresh()` alone no longer touches
+    /// the transfer list (that moved to `refreshFast`), so an action handler that
+    /// called only it would leave the row it just changed stale for up to a
+    /// second. The two dispatch to DIFFERENT queues, so this does not
+    /// reintroduce the coupling: the fast half still runs while the slow half
+    /// queues behind a long engine call.
+    private func refreshAll() {
+        refreshFast()
+        refresh()
+    }
+
+    private func refreshFast() {
+        guard let e = engine else { return }
+        eventQueue.async { [weak self] in
             let dls = e.downloads()
             let shf = e.sharedFiles()
-            let kad = e.kadContacts()
-            let ipf = e.ipFilterRanges()
-            let srv = e.serverInfo()
             let shr = e.isSharing()
-            let ipPause = e.sharingPausedForIpChange()
             let stats = e.transferStats()
             let mapped = e.hasPortMapping()
             DispatchQueue.main.async {
                 guard let self else { return }
-                self.refreshInFlight = false
-                self.state = st
                 self.downloads = dls
                 self.sharedFiles = shf
-                // A completed-but-still-listed download counts as HAVE (not
-                // downloading); anything shared counts as HAVE too.
                 self.downloadingHashes = Set(dls.filter { !$0.complete }.map { $0.hash })
                 self.haveHashes =
                     Set(dls.filter { $0.complete }.map { $0.hash }).union(shf.map { $0.hash })
+                self.sharing = shr
+                self.portMapped = mapped
+                self.sampleStats(stats)
+                self.applyKeepAwake()
+            }
+        }
+    }
+
+    private func refresh() {
+        guard let e = engine, !refreshInFlight else { return }
+        refreshInFlight = true
+        work.async { [weak self] in
+            // THE HEARTBEAT FIRST. It used to be a side effect of downloads();
+            // splitting the read out made it a caller obligation, and seven
+            // background duties fail SILENTLY if it stops - so it leads, before
+            // anything that could early-return.
+            e.heartbeat()
+            let st = e.state()
+            let kad = e.kadContacts()
+            let ipf = e.ipFilterRanges()
+            let srv = e.serverInfo()
+            let ipPause = e.sharingPausedForIpChange()
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.refreshInFlight = false
+                self.state = st
                 self.kadContacts = kad
                 self.ipFilterRanges = ipf
                 self.server = srv
-                self.sharing = shr
                 self.sharingPausedForIpChange = ipPause
-                self.portMapped = mapped
-                self.sampleStats(stats)
-                // Transfers start and finish between polls, and keep-awake is
-                // gated on there being active ones, so re-evaluate it each poll.
-                self.applyKeepAwake()
             }
         }
     }
@@ -1400,7 +1432,7 @@ final class EngineModel: ObservableObject {
                 if !ok {
                     self.notice = "Could not connect to \(addr). It may be down, or your network may be blocking it - try another server."
                 }
-                self.refresh()
+                self.refreshAll()
                 self.loadServers()
             }
         }
@@ -1412,7 +1444,7 @@ final class EngineModel: ObservableObject {
         work.async { [weak self] in
             e.disconnectServer()
             DispatchQueue.main.async {
-                self?.refresh()
+                self?.refreshAll()
                 self?.loadServers()
             }
         }
