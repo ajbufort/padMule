@@ -36,6 +36,9 @@ the Ingest / Query / Lint workflows.
 - [[ed2k-server-oracle]] - the SERVER oracle: real Lugdunum eserver 17.15 run LOCALLY + fully ISOLATED (unshare -rn, zero egress), driven by scripts/eserver-oracle.sh. padMule logs in against real eserver; enables #9 global-UDP-search testing. Untrusted binary, gitignored, sha256-verified; i686 build (x86_64 hits the vsyscall trap).
 - [[kad-verify-oracle]] - the REVERSE-Kad oracle: a log-patched real amuled 3.0.1 (logging-only patch on a build copy; pristine tree untouched) that proves a real node marks padMule IP-VERIFIED via the v8 HELLO_RES_ACK handshake. The wave-10 send-side terminal proof (2026-08-02). scripts/kad-verify-oracle.sh.
 
+## Tools
+- `crates/mule-ffi/examples/stress.rs` - the LIVE stress harness: N real downloads through the SAME FFI the app uses, reporting ever-received / receiving-now / search-vs-connected sources. Built 2026-08-04 and immediately earned its keep: it measured the retry starvation, proved the 30x retry-cost win, and REFUTED the queue-bail hypothesis. Reach for it before theorising about transfer behaviour. See [[build-progress]] rows 8br/8bs.
+
 ## Process
 - [[decisions-and-lessons]] - locked decisions, rejected approaches, gotchas.
 - [[log]] - append-only, timestamped ledger of every ingest/work session; the

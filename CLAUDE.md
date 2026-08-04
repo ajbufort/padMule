@@ -90,9 +90,15 @@ Details and what is portable from them: `docs/wiki/ref-ecosystem.md`.
 source "$HOME/.cargo/env"              # cargo is NOT on the default PATH
 
 cargo build --workspace
-cargo test --workspace                 # the unit gate (~608 tests, offline)
+cargo test --workspace                 # the unit gate (~610 tests, offline)
 cargo clippy --workspace --all-targets # must be warning-free
 cargo fmt --all -- --check
+
+# LIVE STRESS HARNESS (dozens of real downloads through the app's own FFI):
+#   cargo run --release -p mule-ffi --example stress -- /tmp/cfg /tmp/dl linux 25 480
+# Reports how many downloads EVER received a byte, how many are receiving now,
+# and search-vs-connected source counts. Reach for it BEFORE theorising about
+# transfer behaviour - it is what refuted the queue-bail hypothesis.
 
 # Differential oracle (real amuled 3.0.1):
 scripts/build-amuled-oracle.sh         # one-time build into build-oracle/
