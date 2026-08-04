@@ -34,6 +34,7 @@ struct SettingsView: View {
     @State private var listenText = ""
     @State private var advertisedText = ""
     @State private var kadText = ""
+    @State private var kadAdvertisedText = ""
     @FocusState private var focusedPort: PortField?
 
     var body: some View {
@@ -150,7 +151,7 @@ struct SettingsView: View {
     /// there is no `.onSubmit` to rely on - the commit happens when focus LEAVES
     /// a field (including via the keyboard's Done button) and when the screen
     /// goes away.
-    private enum PortField: Hashable { case listen, advertised, kad }
+    private enum PortField: Hashable { case listen, advertised, kad, kadAdvertised }
 
     private var networkSection: some View {
         Section {
@@ -164,11 +165,14 @@ struct SettingsView: View {
                     "Port peers are told (advertised)", text: $advertisedText,
                     field: .advertised, hint: "5999")
                 portRow("Kad port (UDP)", text: $kadText, field: .kad, hint: "5999")
+                portRow(
+                    "Kad port peers are told (advertised)", text: $kadAdvertisedText,
+                    field: .kadAdvertised, hint: "5999")
             }
         } header: {
             Text("Network / VPN")
         } footer: {
-            Text("Most people should leave these alone. Behind a VPN, the provider forwards a port into the tunnel: turn UPnP off above, and set all three ports to the one the provider assigned you (the advertised port can differ from the listening port only if the provider forwards to a different local port). Tap Done, or tap outside a field, to apply. Changes take effect the next time padMule starts.")
+            Text("Most people should leave these alone. Behind a VPN, the provider forwards a port into the tunnel: turn UPnP off above, and set all four ports to the one the provider assigned you. The two \"advertised\" fields only differ from their listening counterparts when the provider forwards its port to a DIFFERENT local port - then padMule must listen locally but tell peers the provider's number. Tap Done, or tap outside a field, to apply. Changes take effect the next time padMule starts.")
         }
     }
 
@@ -196,6 +200,7 @@ struct SettingsView: View {
         listenText = String(d.integer(forKey: SettingsKey.listenPort))
         advertisedText = String(d.integer(forKey: SettingsKey.advertisedPort))
         kadText = String(d.integer(forKey: SettingsKey.kadPort))
+        kadAdvertisedText = String(d.integer(forKey: SettingsKey.kadAdvertisedPort))
     }
 
     /// A port is 1-65535; anything else (including an empty field) falls back to
@@ -212,13 +217,16 @@ struct SettingsView: View {
         let l = sanitizedPort(listenText, fallback: 5999)
         let a = sanitizedPort(advertisedText, fallback: 5999)
         let k = sanitizedPort(kadText, fallback: 5999)
+        let ka = sanitizedPort(kadAdvertisedText, fallback: k)
         let d = UserDefaults.standard
         d.set(l, forKey: SettingsKey.listenPort)
         d.set(a, forKey: SettingsKey.advertisedPort)
         d.set(k, forKey: SettingsKey.kadPort)
+        d.set(ka, forKey: SettingsKey.kadAdvertisedPort)
         listenText = String(l)
         advertisedText = String(a)
         kadText = String(k)
+        kadAdvertisedText = String(ka)
         model.applyPortSettings()
     }
 

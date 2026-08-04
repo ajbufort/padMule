@@ -1231,6 +1231,10 @@ pub struct Engine {
     advertised_port: u16,
     /// The Kad UDP bind port.
     kad_port: u16,
+    /// The Kad UDP port to ADVERTISE, when a VPN forwards a remote port to a
+    /// DIFFERENT local one. `kad_port` is what we BIND (and must match what the
+    /// provider forwards TO); this is what peers are told to dial.
+    kad_advertised_port: u16,
     /// Whether to attempt UPnP at all. Pointless - and its failure line
     /// misleading - when a VPN tunnel is carrying the traffic, because the
     /// mapping would be made on the LAN router the tunnel bypasses.
@@ -1306,6 +1310,7 @@ impl Engine {
             listen_port: TCP_PORT,
             advertised_port: TCP_PORT,
             kad_port: KAD_UDP_PORT,
+            kad_advertised_port: KAD_UDP_PORT,
             upnp_enabled: true,
             public_ip: Arc::new(std::sync::Mutex::new(None)),
             listener: None,
@@ -1465,10 +1470,18 @@ impl Engine {
     /// N). They differ when an external forwarder maps one port to another -
     /// the VPN case - and getting this wrong is invisible locally but means
     /// every peer dials a port nothing is listening on.
-    pub fn set_ports(&mut self, listen: u16, advertised: u16, kad: u16) {
+    ///
+    /// `kad_advertised` is the same split for Kad's UDP port. It used to be one
+    /// value for both bind and advertise, which silently broke inbound Kad on a
+    /// provider that remaps remote->local (padMule would bind the local port
+    /// correctly and then tell every peer to dial it, while the forward only
+    /// exists on the remote one). Pass the same value as `kad` for the ordinary
+    /// same-port case.
+    pub fn set_ports(&mut self, listen: u16, advertised: u16, kad: u16, kad_advertised: u16) {
         self.listen_port = listen;
         self.advertised_port = advertised;
         self.kad_port = kad;
+        self.kad_advertised_port = kad_advertised;
     }
 
     /// Turn the UPnP attempt on or off. Takes effect on the next `start()` /
@@ -1694,7 +1707,7 @@ impl Engine {
             self.identity.userhash,
             0,
             self.advertised_port,
-            self.kad_port,
+            self.kad_advertised_port,
             "padMule",
         )
         .with_crypt_supported()
@@ -2768,6 +2781,14 @@ impl Engine {
             self.emit(EngineEvent::Server("Kad UDP port unavailable".into()));
             return;
         };
+        // Tell peers the port the PROVIDER forwards, which is only the bound one
+        // in the ordinary same-port case. Without this a remap means padMule
+        // binds correctly and then advertises a port nothing forwards, so no
+        // peer can ever reach it - inbound Kad silently dies while everything
+        // outbound keeps working, which is the hardest shape to notice.
+        node.set_advertised_udp_port(
+            (self.kad_advertised_port != self.kad_port).then_some(self.kad_advertised_port),
+        );
         // Thread the user blocklist into Kad so it gates routing inserts (eMule
         // filters every Kad contact, RoutingZone.cpp:477), matching the eD2k path.
         node.set_ip_filter(self.ip_filter.clone());
@@ -3238,7 +3259,7 @@ impl Engine {
             self.identity.userhash,
             0,
             self.advertised_port,
-            self.kad_port,
+            self.kad_advertised_port,
             "padMule",
         )
         .with_secident();
@@ -4555,7 +4576,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let (mut engine, _rx) = Engine::new(&dir).unwrap();
         // The VPN shape: bind locally on 4662, but the provider forwards 51234.
-        engine.set_ports(4662, 51234, 4672);
+        engine.set_ports(4662, 51234, 4672, 4672);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -4737,14 +4758,25 @@ mod tests {
         assert_eq!(engine.listen_port, 4662);
         assert_eq!(engine.advertised_port, 4662);
         assert_eq!(engine.kad_port, 4672);
+        assert_eq!(engine.kad_advertised_port, 4672, "same-port by default");
         assert!(engine.upnp_enabled, "UPnP is on by default (home router)");
 
         // The VPN shape: the provider forwards remote 51234 to our local 4662.
-        engine.set_ports(4662, 51234, 4672);
+        // Kad gets the SAME split - it used to be one value for both bind and
+        // advertise, so a remap left padMule binding the local port correctly
+        // and then telling every peer to dial it, while the forward only existed
+        // on the remote one. Inbound Kad died silently while everything outbound
+        // kept working, which is the hardest shape to notice.
+        engine.set_ports(4662, 51234, 4672, 51235);
         assert_eq!(engine.listen_port, 4662, "we still BIND the local port");
         assert_eq!(
             engine.advertised_port, 51234,
             "but peers must be told the port the PROVIDER forwards"
+        );
+        assert_eq!(engine.kad_port, 4672, "Kad BINDS the local UDP port");
+        assert_eq!(
+            engine.kad_advertised_port, 51235,
+            "and Kad peers must be told the forwarded UDP port, not the bound one"
         );
 
         // On a VPN the LAN router mapping accomplishes nothing, so it must be

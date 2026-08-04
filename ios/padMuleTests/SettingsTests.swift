@@ -58,6 +58,16 @@ final class SettingsTests: XCTestCase {
         XCTAssertEqual(d.integer(forKey: SettingsKey.listenPort), 5999)
         XCTAssertEqual(d.integer(forKey: SettingsKey.advertisedPort), 5999)
         XCTAssertEqual(d.integer(forKey: SettingsKey.kadPort), 5999)
+        // The FOURTH field. Kad used one value for both bind and advertise, so a
+        // provider that remaps remote->local left padMule binding correctly and
+        // then telling every peer to dial the local port - inbound Kad died
+        // silently while everything outbound kept working. It must default equal
+        // to kadPort, so the ordinary same-port case needs no thought.
+        XCTAssertEqual(d.integer(forKey: SettingsKey.kadAdvertisedPort), 5999)
+        XCTAssertEqual(
+            d.integer(forKey: SettingsKey.kadAdvertisedPort),
+            d.integer(forKey: SettingsKey.kadPort),
+            "advertised Kad port must default to the bound one")
     }
 
     func testServerListUrlValidationAndDedup() {
