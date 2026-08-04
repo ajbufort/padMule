@@ -71,7 +71,22 @@ padMule's four port fields all that number, UPnP OFF (now the default).
 
 ## Open work (ranked)
 
-0. **THE QUEUE-BAIL POLICY - the root cause of "downloads stall", found 2026-08-04
+0. **WHY DOWNLOADS STALL - still OPEN, and the obvious answer is REFUTED.**
+   The suspect was `bail_on_queue`: padMule bails the instant a peer queues it,
+   and eD2k rations upload slots, so never queueing looked like the cause.
+   **Measured A/B, queue policy the only variable: BAILING gave 5/20 downloads
+   receiving and 53.7MB in 243s; WAITING gave 1/21 and 0.0MB.** The manager runs
+   ~4 concurrent peers per download, so waiting parks them all in hopeless
+   queues instead of cycling to whoever has a FREE slot. Fast-bail is doing real
+   work. Reverted.
+   WHAT IS ACTUALLY KNOWN: retries are now cheap (~195ms) and fair, and 15 of 17
+   lookups find 2-7 usable sources - yet only ~5 of 20 downloads ever receive a
+   byte. Sources are found; data does not follow. The cause is NOT identified.
+   Untested candidate: bail while UNTRIED sources remain, wait only once every
+   known source has queued us. Reproduce with
+   `cargo run --release -p mule-ffi --example stress`.
+   [SUPERSEDED text follows, kept because the refutation is the useful part:]
+   **THE QUEUE-BAIL POLICY - the root cause of "downloads stall", found 2026-08-04
    and deliberately NOT fixed.** `OP_QUEUERANKING if bail_on_queue =>
    Err(TransferError::Queued)` makes padMule bail the INSTANT a peer queues it.
    That came from the three-file HUNT, where sitting in a queue is dead time.
