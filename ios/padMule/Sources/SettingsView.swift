@@ -25,6 +25,13 @@ struct SettingsView: View {
 
     @State private var newUrl = ""
 
+    // Port fields edit LOCAL buffers, seeded on appear and validated once at
+    // commit - never written through on each keystroke (see loadPortText).
+    @State private var listenText = ""
+    @State private var advertisedText = ""
+    @State private var kadText = ""
+    @FocusState private var focusedPort: PortField?
+
     var body: some View {
         NavigationStack {
             Form {
@@ -37,9 +44,18 @@ struct SettingsView: View {
             }
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
+            .onAppear { loadPortText() }
+            // Commit whenever focus LEAVES a port field, and once more on the
+            // way out: .numberPad has no Return key, so there is no onSubmit.
+            .onChange(of: focusedPort) { _ in commitPorts() }
+            .onDisappear { commitPorts() }
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") { dismiss() }
+                }
+                ToolbarItemGroup(placement: .keyboard) {
+                    Spacer()
+                    Button("Done") { focusedPort = nil }
                 }
             }
         }
@@ -126,6 +142,12 @@ struct SettingsView: View {
     // the local one. Kept behind a disclosure group so the default experience -
     // a normal home user who should never touch this - stays a single toggle.
 
+    /// Which port field the keyboard is in. `.numberPad` has no Return key, so
+    /// there is no `.onSubmit` to rely on - the commit happens when focus LEAVES
+    /// a field (including via the keyboard's Done button) and when the screen
+    /// goes away.
+    private enum PortField: Hashable { case listen, advertised, kad }
+
     private var networkSection: some View {
         Section {
             Toggle("Use UPnP port mapping", isOn: Binding(
@@ -133,60 +155,67 @@ struct SettingsView: View {
                 set: { upnpEnabled = $0; model.applyPortSettings() }
             ))
             DisclosureGroup("Advanced (behind a VPN)") {
-                HStack {
-                    Text("Listening port (TCP)")
-                    Spacer()
-                    TextField("4662", text: portBinding(SettingsKey.listenPort, defaultPort: 4662))
-                        .keyboardType(.numberPad)
-                        .multilineTextAlignment(.trailing)
-                        .frame(maxWidth: 100)
-                        .onSubmit { model.applyPortSettings() }
-                }
-                HStack {
-                    Text("Port peers are told (advertised)")
-                    Spacer()
-                    TextField(
-                        "4662", text: portBinding(SettingsKey.advertisedPort, defaultPort: 4662)
-                    )
-                    .keyboardType(.numberPad)
-                    .multilineTextAlignment(.trailing)
-                    .frame(maxWidth: 100)
-                    .onSubmit { model.applyPortSettings() }
-                }
-                HStack {
-                    Text("Kad port (UDP)")
-                    Spacer()
-                    TextField("4672", text: portBinding(SettingsKey.kadPort, defaultPort: 4672))
-                        .keyboardType(.numberPad)
-                        .multilineTextAlignment(.trailing)
-                        .frame(maxWidth: 100)
-                        .onSubmit { model.applyPortSettings() }
-                }
+                portRow("Listening port (TCP)", text: $listenText, field: .listen, hint: "4662")
+                portRow(
+                    "Port peers are told (advertised)", text: $advertisedText,
+                    field: .advertised, hint: "4662")
+                portRow("Kad port (UDP)", text: $kadText, field: .kad, hint: "4672")
             }
         } header: {
             Text("Network / VPN")
         } footer: {
-            Text("Most people should leave these alone. Behind a VPN, the provider forwards a port into the tunnel: turn UPnP off above, and set the advertised port to the one the provider assigned you (and the listening port to whatever local port it actually forwards to, if different from that). Changes take effect the next time padMule starts.")
+            Text("Most people should leave these alone. Behind a VPN, the provider forwards a port into the tunnel: turn UPnP off above, and set all three ports to the one the provider assigned you (the advertised port can differ from the listening port only if the provider forwards to a different local port). Tap Done, or tap outside a field, to apply. Changes take effect the next time padMule starts.")
         }
     }
 
-    /// A text-field binding for one port setting, reading/writing UserDefaults
-    /// directly (not through @AppStorage, so it can reject a bad keystroke
-    /// without losing the field's current valid value). Non-digit characters
-    /// are stripped; a value over 65535 is ignored outright; a blank or zero
-    /// entry restores `defaultPort`.
-    private func portBinding(_ key: String, defaultPort: Int) -> Binding<String> {
-        Binding<String>(
-            get: { String(UserDefaults.standard.integer(forKey: key)) },
-            set: { newValue in
-                let digits = newValue.filter { $0.isNumber }
-                guard let n = Int(digits), n <= 65535 else {
-                    if digits.isEmpty { UserDefaults.standard.set(defaultPort, forKey: key) }
-                    return
-                }
-                UserDefaults.standard.set(n == 0 ? defaultPort : n, forKey: key)
-            }
-        )
+    private func portRow(
+        _ label: String, text: Binding<String>, field: PortField, hint: String
+    ) -> some View {
+        HStack {
+            Text(label)
+            Spacer()
+            TextField(hint, text: text)
+                .keyboardType(.numberPad)
+                .multilineTextAlignment(.trailing)
+                .frame(maxWidth: 100)
+                .focused($focusedPort, equals: field)
+        }
+    }
+
+    /// Seed the editable buffers from what is stored. The fields edit LOCAL
+    /// state, not UserDefaults: the first version wrote on every keystroke and
+    /// re-read the stored value to redraw, so clearing a field instantly wrote
+    /// the default back and the old number kept reasserting itself while you
+    /// typed. Editing is now unconstrained; validation happens once, at commit.
+    private func loadPortText() {
+        let d = UserDefaults.standard
+        listenText = String(d.integer(forKey: SettingsKey.listenPort))
+        advertisedText = String(d.integer(forKey: SettingsKey.advertisedPort))
+        kadText = String(d.integer(forKey: SettingsKey.kadPort))
+    }
+
+    /// A port is 1-65535; anything else (including an empty field) falls back to
+    /// the eD2k default rather than being stored as junk or as port 0.
+    private func sanitizedPort(_ text: String, fallback: Int) -> Int {
+        let digits = text.filter { $0.isNumber }
+        guard let n = Int(digits), (1...65535).contains(n) else { return fallback }
+        return n
+    }
+
+    /// Store all three, then write back what was ACTUALLY stored so a rejected
+    /// entry visibly snaps to the value in force instead of lying about it.
+    private func commitPorts() {
+        let l = sanitizedPort(listenText, fallback: 4662)
+        let a = sanitizedPort(advertisedText, fallback: 4662)
+        let k = sanitizedPort(kadText, fallback: 4672)
+        let d = UserDefaults.standard
+        d.set(l, forKey: SettingsKey.listenPort)
+        d.set(a, forKey: SettingsKey.advertisedPort)
+        d.set(k, forKey: SettingsKey.kadPort)
+        listenText = String(l)
+        advertisedText = String(a)
+        kadText = String(k)
+        model.applyPortSettings()
     }
 
     // MARK: - Downloads
