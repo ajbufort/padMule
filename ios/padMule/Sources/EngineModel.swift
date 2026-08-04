@@ -55,6 +55,28 @@ enum TransferSortKey: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+/// How the Servers table is ordered - one case per column header, so tapping a
+/// header sorts by it. Live servers always float above dead ones regardless:
+/// a dead row cannot be connected to, so burying the usable ones under it would
+/// make the sort actively unhelpful.
+enum ServerSortKey: String, CaseIterable, Identifiable {
+    case name = "Server"
+    case users = "Users"
+    case files = "Files"
+    var id: String { rawValue }
+}
+
+/// How the Downloaded list is ordered. Name is the alphanumeric case: it uses
+/// `localizedStandardCompare`, the Finder/Files ordering, so "file 2" sorts
+/// before "file 10" instead of after it - which a plain string compare gets
+/// wrong and is exactly what people mean by alphanumeric.
+enum DownloadedSortKey: String, CaseIterable, Identifiable {
+    case name = "Name"
+    case size = "Size"
+    case date = "Date"
+    var id: String { rawValue }
+}
+
 /// One finished file as it actually sits in Documents (see boot()'s `docsPath`),
 /// read straight from the filesystem for the Downloaded screen - NOT derived
 /// from `sharedFiles`, which is the seeding library and goes silent on a file
@@ -251,6 +273,62 @@ final class EngineModel: ObservableObject {
     /// SNAPSHOT, like the server login: the engine owns the truth, the UI mirrors
     /// it. Defaults to true so the switch reads correctly before the first poll.
     @Published private(set) var sharing = true
+    @Published var serverSortKey: ServerSortKey = .users
+    @Published var serverSortAscending = false
+
+    /// `servers` in the user's chosen column order, live ones first.
+    var presentedServers: [ServerEntryFfi] {
+        var xs = servers
+        xs.sort { a, b in
+            // A dead server cannot be connected to; keeping them below means the
+            // sort orders what you can actually USE.
+            if a.alive != b.alive { return a.alive }
+            let cmp: ComparisonResult
+            switch serverSortKey {
+            // Alphanumeric, so "Server 10" follows "Server 2". Falls back to the
+            // address when a server has published no name at all.
+            case .name:
+                let an = a.name.isEmpty ? a.addr : a.name
+                let bn = b.name.isEmpty ? b.addr : b.name
+                cmp = an.localizedStandardCompare(bn)
+            case .users: cmp = a.users == b.users ? .orderedSame
+                : (a.users < b.users ? .orderedAscending : .orderedDescending)
+            case .files: cmp = a.files == b.files ? .orderedSame
+                : (a.files < b.files ? .orderedAscending : .orderedDescending)
+            }
+            if cmp == .orderedSame { return a.addr < b.addr }
+            return serverSortAscending
+                ? cmp == .orderedAscending
+                : cmp == .orderedDescending
+        }
+        return xs
+    }
+
+    @Published var downloadedSortKey: DownloadedSortKey = .date
+    @Published var downloadedSortAscending = false
+
+    /// `downloadedFiles` in the user's chosen order.
+    var presentedDownloadedFiles: [DownloadedFile] {
+        var xs = downloadedFiles
+        xs.sort { a, b in
+            let cmp: ComparisonResult
+            switch downloadedSortKey {
+            // localizedStandardCompare, NOT a plain <: it orders digit runs
+            // numerically, so "part 2" precedes "part 10".
+            case .name: cmp = a.name.localizedStandardCompare(b.name)
+            case .size: cmp = a.size == b.size ? .orderedSame
+                : (a.size < b.size ? .orderedAscending : .orderedDescending)
+            case .date: cmp = a.modified == b.modified ? .orderedSame
+                : (a.modified < b.modified ? .orderedAscending : .orderedDescending)
+            }
+            if cmp == .orderedSame { return a.name < b.name }
+            return downloadedSortAscending
+                ? cmp == .orderedAscending
+                : cmp == .orderedDescending
+        }
+        return xs
+    }
+
     /// Finished files as they sit in Documents right now (the Downloaded screen).
     /// Read straight off the filesystem by `loadDownloadedFiles()` - see that
     /// method's doc comment for why this is not derived from `sharedFiles`.
@@ -282,6 +360,72 @@ final class EngineModel: ObservableObject {
     private var docsURL: URL?
 
     private var booting = false
+
+    /// Open padMule's Documents folder in the Files app.
+    ///
+    /// Documents is where finished, hash-verified downloads land, and it is
+    /// already visible to Files because Info.plist sets `UIFileSharingEnabled`
+    /// and `LSSupportsOpeningDocumentsInPlace` - so this lands the user on
+    /// padMule's own folder under "On My iPad" rather than the Files root.
+    ///
+    /// `shareddocuments://` is the scheme Files answers on. It is not in the
+    /// public SDK, which would be a problem for an App Store app and is not one
+    /// here: padMule is sideload-only by necessity (a P2P client cannot ship on
+    /// the App Store), the same reason the project is free to consider other
+    /// review-blocked capabilities. It degrades honestly - if the open fails the
+    /// user is told, rather than the button silently doing nothing.
+    func openDownloadsInFiles() {
+        let dir = docsURL ?? FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        var comps = URLComponents(url: dir, resolvingAgainstBaseURL: false)
+        comps?.scheme = "shareddocuments"
+        guard let url = comps?.url else {
+            notice = "Could not locate padMule's Downloads folder."
+            return
+        }
+        UIApplication.shared.open(url, options: [:]) { [weak self] ok in
+            if !ok {
+                self?.notice = "Could not open the Files app."
+            }
+        }
+    }
+
+    /// Retains the in-flight Open-In controller: UIKit does not, and a
+    /// deallocated one dismisses its own menu instantly. Replaced per use, so at
+    /// most one is ever alive.
+    private var openInController: UIDocumentInteractionController?
+
+    /// Hand a finished file to ANOTHER app, full screen - as opposed to the row
+    /// tap, which previews it inside padMule via QuickLook.
+    ///
+    /// HONEST ABOUT WHAT iOS DOES: there is no "default app for this type" on
+    /// iOS the way there is on a desktop, and `UIApplication.open` refuses a
+    /// `file://` URL outright. The documented route is the Open In chooser,
+    /// which lists every installed app that declares support for the file's
+    /// type; the user picks, and that app takes over. So a video really does
+    /// leave padMule for a video app - which BACKGROUNDS padMule and therefore
+    /// pauses transfers, per the foreground-only rule.
+    ///
+    /// The popover needs a real anchor on iPad or UIKit has nowhere to put it.
+    func openInAnotherApp(_ file: DownloadedFile) {
+        guard
+            let scene = UIApplication.shared.connectedScenes
+                .compactMap({ $0 as? UIWindowScene })
+                .first(where: { $0.activationState == .foregroundActive }),
+            let root = scene.windows.first(where: { $0.isKeyWindow })?.rootViewController
+                ?? scene.windows.first?.rootViewController
+        else {
+            notice = "Could not open \"\(file.name)\"."
+            return
+        }
+        let controller = UIDocumentInteractionController(url: file.url)
+        openInController = controller
+        let view = root.view!
+        let anchor = CGRect(x: view.bounds.midX, y: view.bounds.midY, width: 1, height: 1)
+        if !controller.presentOpenInMenu(from: anchor, in: view, animated: true) {
+            openInController = nil
+            notice = "No app on this iPad can open \"\(file.name)\"."
+        }
+    }
 
     /// Create the engine and start it. Idempotent - safe to call from onAppear.
     ///

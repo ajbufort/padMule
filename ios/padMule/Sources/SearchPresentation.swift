@@ -44,7 +44,12 @@ func present(
         case .sources: cmp = threeWay(a.sources, b.sources)
         case .completeSources: cmp = threeWay(a.completeSources, b.completeSources)
         case .size: cmp = threeWay(a.size, b.size)
-        case .name: cmp = a.name.localizedCaseInsensitiveCompare(b.name)
+        // localizedStandardCompare, NOT localizedCaseInsensitiveCompare: it is
+        // the Finder/Files ordering, which reads runs of digits as NUMBERS. A
+        // plain string compare puts "part 10" before "part 2", which is the
+        // thing people mean when they ask for alphanumeric sorting. Also
+        // case-insensitive, so nothing is lost by the swap.
+        case .name: cmp = a.name.localizedStandardCompare(b.name)
         case .type: cmp = threeWay(a.fileType, b.fileType)
         case .length: cmp = threeWay(a.lengthSecs, b.lengthSecs)
         case .bitrate: cmp = threeWay(a.bitrate, b.bitrate)
