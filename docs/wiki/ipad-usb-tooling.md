@@ -9,6 +9,22 @@ screenshots and app installs can happen from here instead of only through
 Sideloadly on the Windows host. Written AND RUN end to end 2026-08-02; the
 "VERIFIED RESULTS" section below is fact, not prediction.
 
+## CORRECTION 2026-08-04: `usbipd bind` is NOT a prerequisite
+
+Anthony caught this. `pymobiledevice3` reaches the iPad WITHOUT binding or
+attaching the USB device to WSL at all - it talks to Windows' own Apple Mobile
+Device Service, so the host keeps the device (Sideloadly still sees it) while
+this box can screenshot, install, mount the DDI and drive WebDriverAgent.
+`usbipd list` showing the iPad as "Not shared" is NOT a blocker.
+
+What DOES fail in that state is the older libimobiledevice CLI set
+(`idevice_id -l`, `idevicesyslog`), which speaks to the local
+`/var/run/usbmuxd` socket - so prefer the `pymobiledevice3` equivalents.
+`bind` also requires an elevated PowerShell, which is worth not asking for
+when it buys nothing.
+
+Device is now on **iPadOS 26.6** (was 26.5.2 when this entry was written).
+
 ## VERIFIED RESULTS (2026-08-02, run end to end)
 
 WORKING NOW, all without root:
