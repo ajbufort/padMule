@@ -1,6 +1,6 @@
 # HighID and Port Forwarding (dev box + iPad)
 
-Updated: 2026-08-03 (VPN/port-forwarding section added; the queued fixes below SHIPPED 2026-08-02 and are
+Updated: 2026-08-04 (CORRECTED: the AirVPN "Local" field cannot be left blank - it refuses to save and keeps the old port, which is what held padMule at LowID; VPN/port-forwarding section added; the queued fixes below SHIPPED 2026-08-02 and are
 device-verified; the finite-lease idea was investigated and KILLED - see the
 annotations in place)
 
@@ -281,8 +281,20 @@ Verified against AirVPN's own FAQ and iOS guide, not from memory:
   nicety - without it padMule could not have used AirVPN at all.
 
   **The clean setup, given that:** reserve ONE available port X with BOTH TCP
-  and UDP enabled, leave the "Local" field EMPTY (same-port forwarding), and set
-  padMule's listen = advertised = kad = X. One number for TCP and UDP is fine -
+  and UDP enabled, set the "Local" field EXPLICITLY TO X, and set
+  padMule's listen = advertised = kad = X.
+
+  [CORRECTED 2026-08-04, device-verified. This used to say "leave the Local
+  field EMPTY (same-port forwarding)" and that is WRONG IN PRACTICE: the AirVPN
+  UI REFUSES TO SAVE a blank Local port, and silently keeps the previous value.
+  Anthony hit exactly this - the rule kept its old 4662 while the form appeared
+  blank, so AirVPN delivered remote 5999 to local 4662 while padMule listened on
+  5999. The tell was `Connection refused (111)` from the "Test open" checker
+  rather than a timeout: refused means the packet TRAVERSED the tunnel and
+  reached the iPad, which actively replied "nothing listening" - so the path was
+  never the problem, only the port. A timeout would have meant the opposite.
+  Type the port number into Local explicitly, and if an edit will not stick,
+  REMOVE the rule and re-add it.] One number for TCP and UDP is fine -
   they are separate namespaces, and nothing in the eD2k protocol requires a
   client's UDP port to differ from its TCP port; the 4662/4672 split is only
   convention. That covers peer connections AND Kad from a single reservation,
@@ -296,9 +308,12 @@ Verified against AirVPN's own FAQ and iOS guide, not from memory:
   noted in [[protocol-reference]].
 - **TCP and UDP both supported**, per-port ("TCP, UDP or both, according to
   your selection") - so Kad's UDP port can be forwarded too, as a second port.
-- **Remote-to-local mapping is supported**: leaving the "Local" field empty
-  forwards port n to local port n; filling it forwards remote n to a DIFFERENT
-  local port x. This is the case that forces the advertised-vs-listen split.
+- **Remote-to-local mapping is supported**: the "Local" field decides the local
+  port. Setting it to n forwards remote n -> local n; setting it to a different
+  x forwards remote n -> local x, which is the case that forces the
+  advertised-vs-listen split. It CANNOT be left blank - the form refuses to save
+  and keeps whatever was there before (device-verified 2026-08-04), so a rule
+  that looks blank may still be pointing at an old port.
 - **Forwarding is configured SERVER-SIDE** in Client Area -> Ports -> Manage,
   independent of the client app - which is what makes it usable on an iPad at
   all. A port can be bound to a specific device or to all devices.
