@@ -11,7 +11,7 @@ rows 8av-8bh + the [[log]] entries for 2026-08-03.
 ## State of the tree
 
 - All work committed AND pushed; tree clean; branch even with origin/main at
-  **89d8a2c**.
+  **d7d555a**.
 - **Gate**: 564 Rust tests, clippy WARNING-FREE, fmt clean, ASCII clean.
 - CI: all three workflows GREEN on the last code commit.
 - ALL FOUR ORACLES re-run and PASS after the serve-path change: amuled
@@ -21,7 +21,7 @@ rows 8av-8bh + the [[log]] entries for 2026-08-03.
 - [[security-model]] scorecard unchanged: **23 OPERATIONAL / 1 PARTIAL / 2
   documented opt-outs**. The PARTIAL is AICH block recovery (wave 11).
 - Latest build staged for install:
-  `C:\Users\ajbuf\Downloads\padMule-INSTALL-THIS-unsigned-89d8a2c.ipa`.
+  `C:\Users\ajbuf\Downloads\padMule-INSTALL-THIS-unsigned-d7d555a.ipa`.
 
 ## THE HARD DEADLINE
 
@@ -57,9 +57,10 @@ what turned the port override from a nicety into a prerequisite.
 
 ## Open tasks (ranked)
 
-1. **Prove the VPN path on device.** Reserve one port with BOTH TCP+UDP, leave
-   "Local" EMPTY (same-port), set padMule's listen = advertised = kad = that
-   port, UPnP off, RESTART padMule. Then AirVPN's Test open (only meaningful
+1. **Prove the VPN path on device.** The AirVPN side is DONE: port 5999
+   reserved, TCP+UDP, All devices, "Local" cleared for same-port forwarding,
+   and the app now DEFAULTS all three ports to 5999. Remaining: UPnP off,
+   RESTART padMule (ports bind when the listener starts). Then AirVPN's Test open (only meaningful
    with padMule running) and Status -> HighID. Expect the public-address guard
    to fire once as the tunnel comes up; that is correct.
    KNOWN LIMIT: the advertised/listen split covers the TCP port only - Kad's
