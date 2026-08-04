@@ -45,17 +45,24 @@ the original bug exactly (10.001s against a 600ms budget).
 ## State of the tree
 
 - All work committed AND pushed; tree clean; branch even with origin/main at
-  **c79caf6**. Session commits: 37eeac4 (doc-drift round), 4949f25
-  (OP_GETSERVERLIST), fff31dc (magnet + Kad-gate fixes), c0de43a (device pass),
-  6d99fd4 (the RECURSIVE UDP CRAWL), c79caf6 (server NAMES for discovered
-  servers).
-- **Gate**: 552 tests, clippy WARNING-FREE, fmt clean, ASCII clean.
-- CI: all three workflows GREEN through fff31dc. The runs for c0de43a and
-  6d99fd4 were in flight at handoff time - CONFIRM green before installing,
-  since 6d99fd4 is the first build carrying the crawl's Swift + FFI changes
-  (Swift is only type-checked in CI on this box).
+  **47974b9**. This session: 37eeac4 (doc-drift), 4949f25 (OP_GETSERVERLIST),
+  fff31dc (magnet + Kad gate), c0de43a + 58d31f8 (device passes), 6d99fd4 (the
+  RECURSIVE UDP CRAWL), c79caf6 (server names), ee780b6 (the SEVEN feedback
+  bugs), e744bbf (the UI half), 47974b9 (a CI-caught test fixture).
+- **Gate**: 559 Rust tests, clippy WARNING-FREE, fmt clean, ASCII clean.
+- CI: all three workflows GREEN on 47974b9.
+- ALL FOUR ORACLES re-run and PASS after the serve-path change: amuled
+  differential (byte-for-byte, 3 files), the REVERSE oracle (real amuled
+  downloads FROM padMule + serve-side secure-ident - the one that proves the
+  new "is this file still on disk" check does not refuse a legitimate upload),
+  the isolated eserver login, and the Kad verify oracle.
 - [[security-model]] scorecard unchanged: **23 OPERATIONAL / 1 PARTIAL / 2
   documented opt-outs**. The PARTIAL is AICH block recovery (wave 11).
+- A CI lesson worth keeping: the iOS app BUILT while the test bundle failed to
+  compile, because `SearchHit` gained a field after the test helpers were
+  written. Swift is type-checked ONLY in CI on this box, so grep-and-read
+  verifies symbols exist but cannot catch a changed initializer signature -
+  always wait for the iOS TEST workflow, not just the build.
 
 ## THE HARD DEADLINE
 
