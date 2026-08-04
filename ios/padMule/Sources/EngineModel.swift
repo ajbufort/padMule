@@ -278,6 +278,22 @@ final class EngineModel: ObservableObject {
             do {
                 let e = try MuleEngine(configDir: path, downloadsDir: docsPath)
                 let ident = e.identity()
+                // Ports and the UPnP toggle MUST be pushed before start(): they
+                // take effect when the listener binds, and every launch builds a
+                // fresh engine - so applying them afterwards (with the other
+                // settings, below) would leave them inert forever rather than
+                // merely one launch late. A stored 0 means "never set"; fall back
+                // to the eD2k defaults rather than binding port 0.
+                let d = UserDefaults.standard
+                let storedPort = { (key: String, fallback: UInt16) -> UInt16 in
+                    let v = UInt16(clamping: d.integer(forKey: key))
+                    return v == 0 ? fallback : v
+                }
+                e.setPorts(
+                    listen: storedPort(SettingsKey.listenPort, 4662),
+                    advertised: storedPort(SettingsKey.advertisedPort, 4662),
+                    kad: storedPort(SettingsKey.kadPort, 4672))
+                e.setUpnpEnabled(on: d.bool(forKey: SettingsKey.upnpEnabled))
                 e.start()
                 engineLog.notice("boot OK; engine started")
                 DispatchQueue.main.async {
