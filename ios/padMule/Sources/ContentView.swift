@@ -678,6 +678,15 @@ struct ContentView: View {
                     }
                     ForEach(shown, id: \.hash) { dl in
                         transferRow(dl)
+                            // ACTUALLY receiving bytes right now, as opposed to
+                            // registered-and-hopeful. A row can hold sources and
+                            // move nothing, and nothing on screen said so.
+                            // Amber rather than green: this is "working", not
+                            // "done", and Done is already green.
+                            .listRowBackground(
+                                dl.receiving
+                                    ? Color.yellow.opacity(0.16)
+                                    : Color.clear)
                             .swipeActions(edge: .trailing) {
                                 Button(role: .destructive) {
                                     model.cancel(dl.hash)

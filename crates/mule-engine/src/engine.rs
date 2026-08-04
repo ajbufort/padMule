@@ -3960,16 +3960,32 @@ impl Engine {
             return false;
         }
         // Nothing to do is the common case - check before paying for anything.
+        // FAIR ROTATION, and this is a bug fix rather than a refinement. The old
+        // selection sorted by priority and took `.first()`; Rust's sort is
+        // STABLE, so with every download at the same (Normal) priority it
+        // returned the SAME download on every sweep and every other one was
+        // never retried at all. With dozens queued that is not "slow", it is
+        // "never" - which is exactly the "downloads stop or crawl" report.
+        //
+        // Now: highest priority first, and WITHIN a priority tier the one
+        // retried longest ago. Priority still wins, but it can no longer starve
+        // its own tier.
+        let now = u64::from(now_secs());
         let candidate: Option<Arc<Download>> = {
             let guard = self.downloads.lock().await;
-            let mut idle: Vec<&Arc<Download>> = guard
+            guard
                 .iter()
                 .filter(|dl| !dl.is_cancelled() && !dl.is_fetching())
-                .collect();
-            idle.sort_by_key(|dl| std::cmp::Reverse(dl.priority()));
-            idle.first().map(|dl| Arc::clone(dl))
+                .min_by_key(|dl| (std::cmp::Reverse(dl.priority()), dl.last_retry_at()))
+                .map(Arc::clone)
         };
         self.last_resume_retry = Instant::now();
+        if let Some(dl) = candidate.as_ref() {
+            // Stamp on SELECTION, not on success: a download whose retry finds
+            // no sources must still yield its turn, or it becomes the new
+            // permanent winner and we are back to the same starvation.
+            dl.mark_retried(now);
+        }
         let Some(dl) = candidate else {
             return false;
         };
