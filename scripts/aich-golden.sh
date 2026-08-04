@@ -74,3 +74,21 @@ assert expect == len(data), f"unexpected layout: 1+20+4+{count}*20={expect} != {
 print(f"known2_64.met version={ver:#x}, blocks={count}, ok")
 print("AICH_GOLDEN_HEX=" + root.hex())
 PY
+
+# Wave 11 extensions, both against the SAME running amuled:
+MULE_CLI="$REPO/target/release/mule-cli"
+if [ -x "$MULE_CLI" ]; then
+  echo "== byte-comparing padMule's known2_64.met ENTRY against amuled's =="
+  "$MULE_CLI" aich-hash "$CFG/Incoming/aich-golden-10mb.bin" "$WORK/ours.entry" | tee "$WORK/aich-hash.out"
+  # amuled's store holds exactly one entry: everything after the version byte.
+  tail -c +2 "$CFG/known2_64.met" > "$WORK/theirs.entry"
+  cmp "$WORK/ours.entry" "$WORK/theirs.entry" \
+    && echo "ENTRY_BYTES=IDENTICAL (root + count + $( { stat -c%s "$WORK/ours.entry"; } ) bytes)" \
+    || { echo "ENTRY_BYTES=MISMATCH"; exit 1; }
+
+  echo "== live AICH probe: root (0x9E/0x9D) + part-0 recovery (0x9B/0x9C) from real amuled =="
+  ED2K=$(grep '^ed2k=' "$WORK/aich-hash.out" | cut -d= -f2)
+  "$MULE_CLI" aich-probe 127.0.0.1 "$PORT" "$ED2K" "$N" 0
+else
+  echo "NOTE: $MULE_CLI not built - skipped the entry byte-compare + live probe"
+fi
