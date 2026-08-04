@@ -113,6 +113,10 @@ struct ContentView: View {
     @State private var query = ""
     @State private var serverListUrl = EngineModel.defaultServerListUrl
     @State private var detail: SearchHit?
+    /// Whether the "Results (N)" header is on screen. Drives the floating Top
+    /// button: the old one lived IN that header, so it scrolled away exactly
+    /// when it became useful.
+    @State private var resultsHeaderVisible = true
     @State private var showAddCategory = false
     @State private var newCategoryName = ""
     @State private var sourcesFor: DownloadInfo?
@@ -531,23 +535,18 @@ struct ContentView: View {
                         // An honest count (client-side filters can hide rows,
                         // so show both numbers when they differ), plus a way
                         // back to the top once the list is long enough to need one.
-                        HStack {
-                            Text(model.presentedResults.count == model.results.count
-                                 ? "Results (\(model.results.count))"
-                                 : "Results (\(model.presentedResults.count) of \(model.results.count))")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                            Spacer()
-                            if model.presentedResults.count > 20 {
-                                Button {
-                                    withAnimation { proxy.scrollTo("results-top", anchor: .top) }
-                                } label: {
-                                    Label("Top", systemImage: "arrow.up.to.line")
-                                }
-                                .font(.caption)
-                                .buttonStyle(.borderless)
-                            }
-                        }
+                        Text(model.presentedResults.count == model.results.count
+                             ? "Results (\(model.results.count))"
+                             : "Results (\(model.presentedResults.count) of \(model.results.count))")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            // The trigger for the floating Top button below: once
+                            // this header scrolls off, there is something to go
+                            // back TO. Cheaper and steadier than reading scroll
+                            // offset, and it works on iOS 16 (onScrollGeometryChange
+                            // is 18+).
+                            .onAppear { resultsHeaderVisible = true }
+                            .onDisappear { resultsHeaderVisible = false }
                     }
                     ForEach(Array(model.presentedResults.enumerated()), id: \.element.hash) { idx, hit in
                         resultRow(hit, number: idx + 1)
@@ -609,6 +608,33 @@ struct ContentView: View {
                     }
                 }
             }
+            // A way back to the top that is THERE when you need it. Apple's own
+            // convention is the status-bar tap (verified working here), but it
+            // is invisible to anyone who does not already know it, so this is
+            // the familiar long-feed affordance on top of it - not instead of
+            // it. Deliberately ONE floating control rather than a button per
+            // row: a 351-result list would otherwise repeat the same chrome 351
+            // times, competing with Get on every single row.
+            .overlay(alignment: .bottomTrailing) {
+                if !resultsHeaderVisible, model.presentedResults.count > 20 {
+                    Button {
+                        withAnimation { proxy.scrollTo("results-top", anchor: .top) }
+                    } label: {
+                        Label("Top", systemImage: "arrow.up.to.line")
+                            .font(.caption.weight(.semibold))
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 10)
+                            .background(.regularMaterial, in: Capsule())
+                            .overlay(Capsule().stroke(.quaternary))
+                            .shadow(radius: 6, y: 2)
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.trailing, 20)
+                    .padding(.bottom, 24)
+                    .transition(.opacity.combined(with: .scale))
+                }
+            }
+            .animation(.easeInOut(duration: 0.18), value: resultsHeaderVisible)
         }
     }
 
