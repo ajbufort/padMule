@@ -16,7 +16,10 @@ import SwiftUI
 
 /// The top-toolbar destinations. Each is one eD2k function, one icon.
 enum Screen: String, CaseIterable, Identifiable {
-    case search, transfers, downloaded, servers, shared, stats, status
+    // Order is Anthony's: the strip reads left-to-right as the order you
+    // actually use them - pick a server, check you are on it, search, see what
+    // arrived, watch what is moving, then the two reference screens.
+    case servers, status, search, downloaded, transfers, shared, stats
     var id: String { rawValue }
 
     var title: String {
@@ -102,6 +105,8 @@ private struct FunctionButton: View {
 struct ContentView: View {
     @EnvironmentObject var model: EngineModel
     @State private var screen: Screen = .search
+    /// The finished file being previewed, if any (the Downloaded tab's Open).
+    @State private var quickLook: QuickLookItem?
     @State private var query = ""
     @State private var serverListUrl = EngineModel.defaultServerListUrl
     @State private var detail: SearchHit?
@@ -191,6 +196,9 @@ struct ContentView: View {
             }
             .sheet(item: $model.preview) { item in
                 PreviewPlayerView(item: item).environmentObject(model)
+            }
+            .sheet(item: $quickLook) { item in
+                QuickLookView(url: item.url).ignoresSafeArea()
             }
             .alert(
                 "Disconnected from server",
@@ -641,15 +649,32 @@ struct ContentView: View {
                 } else {
                     ForEach(model.downloadedFiles) { file in
                         HStack {
-                            Image(systemName: "doc")
-                                .foregroundStyle(.secondary)
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(file.name).lineLimit(1)
-                                Text("\(bytes(file.size)) - \(file.modified.formatted(date: .abbreviated, time: .shortened))")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
+                            // Tapping the row OPENS the file in the system
+                            // viewer (video, audio, PDF, images, documents).
+                            // iOS refuses to hand a file:// URL to another app
+                            // via UIApplication.open, so QuickLook is the real
+                            // "open" - and its own toolbar carries the share
+                            // button for handing off to a specific app.
+                            Button {
+                                quickLook = QuickLookItem(id: file.id, url: file.url)
+                            } label: {
+                                HStack {
+                                    Image(systemName: "doc")
+                                        .foregroundStyle(.secondary)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(file.name).lineLimit(1)
+                                            .foregroundStyle(.primary)
+                                        Text("\(bytes(file.size)) - \(file.modified.formatted(date: .abbreviated, time: .shortened))")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                }
                             }
-                            Spacer()
+                            .buttonStyle(.plain)
+                            .accessibilityLabel("Open \(file.name)")
+                            // Explicit share stays alongside: "open here" and
+                            // "send it to another app" are different intents.
                             ShareLink(item: file.url) {
                                 Image(systemName: "square.and.arrow.up")
                             }
