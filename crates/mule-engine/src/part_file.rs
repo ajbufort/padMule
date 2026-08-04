@@ -218,6 +218,19 @@ impl PartFile {
         }
     }
 
+    /// Re-open one byte range as missing (AICH block recovery: only the ~180KiB
+    /// blocks whose SHA-1 leaves failed stay open, the verified rest is filled
+    /// back). The range sibling of [`Self::mark_corrupt`]; does NOT touch the
+    /// per-part `corrupted` list - block recovery has already localized finer
+    /// than a part.
+    pub fn reopen_range(&mut self, start: u64, end: u64) {
+        if start >= end || end > self.size {
+            return;
+        }
+        self.gaps.push(Gap { start, end });
+        self.normalize();
+    }
+
     /// Verify a completed part's bytes against the hashset.
     ///
     /// The single-part case is where aMule has a real bug: it compares against

@@ -36,13 +36,15 @@ use crate::sources::{
     OP_ANSWERSOURCES2, SOURCE_EXCHANGE_VERSION,
 };
 use crate::transfer::{
-    build_hashset_request, build_request_filename_ext, build_request_parts, build_set_req_file_id,
-    build_start_upload_req, parse_file_desc, parse_file_status, parse_hashset_answer,
-    BlockReceiver, FileStatus, OP_ACCEPTUPLOADREQ, OP_FILEDESC, OP_FILEREQANSNOFIL, OP_FILESTATUS,
+    build_aich_file_hash_req, build_aich_request, build_hashset_request,
+    build_request_filename_ext, build_request_parts, build_set_req_file_id, build_start_upload_req,
+    parse_aich_answer, parse_aich_file_hash_ans, parse_file_desc, parse_file_status,
+    parse_hashset_answer, AichAnswer, BlockReceiver, FileStatus, EMBLOCKSIZE, OP_ACCEPTUPLOADREQ,
+    OP_AICHANSWER, OP_AICHFILEHASHANS, OP_FILEDESC, OP_FILEREQANSNOFIL, OP_FILESTATUS,
     OP_HASHSETANSWER, OP_QUEUERANKING, STANDARD_BLOCKS_REQUEST,
 };
 use crate::transfer_session::TransferError;
-use mule_proto::{Packet, PARTSIZE};
+use mule_proto::{AichTree, Packet, PARTSIZE};
 
 /// Inputs the download-side secure-ident exchange needs: our RSA identity, and
 /// whether the peer advertised secure-ident support in its HELLO (so we know to
@@ -64,6 +66,69 @@ pub struct PeerSession {
     /// it knows both the peer's advertised SX support and whether we already
     /// asked this IP ([`Download::mark_asked_sources`]).
     pub ask_sources: bool,
+    /// The peer's announced AICH version (hello MISCOPTIONS1 bits 29-31).
+    /// Gates the root ask and recovery requests on eMule's own
+    /// IsSupportingAICH bit-0 test.
+    pub peer_aich: u8,
+}
+
+/// The AICH trust states padMule holds in memory (eMule EAICHStatus,
+/// SHAHashSet.h:74-81, minus the set-level states).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AichStatus {
+    /// No root known yet.
+    Empty,
+    /// A root is known but has not met the vote threshold - recovery stays OFF.
+    Untrusted,
+    /// The root won the source vote (>= 10 distinct /20s and >= 92% agreement).
+    Trusted,
+    /// The root is part of the file's identity (ed2k link) - never displaced.
+    Verified,
+}
+
+/// Master-root trust + recovery bookkeeping for one download (the CPartFile
+/// half of eMule's CAICHRecoveryHashSet coupling).
+struct AichState {
+    status: AichStatus,
+    master: Option<[u8; 20]>,
+    /// Votes: candidate root -> the /20-masked IPs signing it. eMule
+    /// AddSigningIP masks the network-order dword with 0x00F0FFFF
+    /// (SHAHashSet.cpp:523-532) = keep octet1, octet2, and the top nibble of
+    /// octet3; one /20 signs at most ONE hash (:975-983).
+    votes: HashMap<[u8; 20], HashSet<u32>>,
+    /// Which root each source IP reported - a recovery ask goes only to a
+    /// source whose reported root IS the trusted one (eMule PartFile.cpp:6089).
+    reported: HashMap<IpAddr, [u8; 20]>,
+    /// Parts whose MD4 failed, awaiting block recovery: part -> the epoch secs
+    /// the current ask was issued (None = unclaimed). One in-flight ask per
+    /// part (eMule m_liRequestedData); a claim a dead connection abandoned is
+    /// re-askable after AICH_CLAIM_STALE_SECS - upstream has NO timeout at all
+    /// (cleanup only on disconnect), a wire-neutral padMule improvement.
+    pending: HashMap<u64, Option<u64>>,
+}
+
+/// eMule MINUNIQUEIPS_TOTRUST (SHAHashSet.cpp:42).
+const AICH_MIN_UNIQUE_IPS: usize = 10;
+/// eMule MINPERCENTAGE_TOTRUST (SHAHashSet.cpp:43 - the macro says 92; the
+/// nearby comment says 95 and is wrong).
+const AICH_MIN_PERCENT: usize = 92;
+/// A pending recovery ask older than this is considered abandoned.
+const AICH_CLAIM_STALE_SECS: u64 = 60;
+
+/// The /20 vote mask (see [`AichState::votes`]).
+fn aich_vote_key(ip: IpAddr) -> u32 {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            u32::from_be_bytes([o[0], o[1], o[2] & 0xF0, 0])
+        }
+        // eMule is v4-only here; a v6 source folds to one bucket per /48-ish
+        // prefix using the leading bytes (never reachable on today's wire).
+        IpAddr::V6(v6) => {
+            let o = v6.octets();
+            u32::from_be_bytes([o[0], o[1], o[2], o[3]])
+        }
+    }
 }
 
 /// What we learned about one source we connected to, for the per-source UI.
@@ -111,13 +176,18 @@ pub struct Download {
     /// of one that is still running (pause() does not abort the old task), which
     /// would multiply outbound peer connections every background/foreground cycle.
     fetching: AtomicBool,
-    /// Which source IP(s) contributed to each data part, recorded as blocks commit.
-    /// On a part-hash failure, the SOLE contributor of a bad part is the
-    /// unambiguous culprit (no false-positive). Keyed by IP, NOT SocketAddr: a
+    /// Which source IP(s) contributed to each AICH BLOCK (keyed by the block's
+    /// lattice start offset), recorded as data commits. On a part-hash failure
+    /// the union over the part's blocks gives the old per-part view; after
+    /// AICH recovery each BAD BLOCK's sole contributor is blamed individually -
+    /// which is what defeats the "share every poisoned part with a good
+    /// source" evasion 8ai documented. Values are IPs, NOT SocketAddrs: a
     /// LowID source reaches us on a fresh ephemeral port every callback, so a
-    /// port-inclusive key would never match. A separate std lock: a quick insert on
-    /// the hot commit path must never contend the async transfer lock.
-    part_sources: StdMutex<HashMap<u64, HashSet<IpAddr>>>,
+    /// port-inclusive key would never match. A separate std lock: a quick
+    /// insert on the hot commit path must never contend the async transfer lock.
+    block_sources: StdMutex<HashMap<u64, HashSet<IpAddr>>>,
+    /// AICH master-root trust + recovery bookkeeping (see [`AichState`]).
+    aich: StdMutex<AichState>,
     /// Source IPs banned for THIS download after being caught delivering a corrupt
     /// part (eMule's CorruptionBlackBox, per-file). BOTH the outbound fetch sweep
     /// AND the inbound called-back-source path skip them.
@@ -165,7 +235,14 @@ impl Download {
             preview: AtomicBool::new(false),
             finalizing: AtomicBool::new(false),
             fetching: AtomicBool::new(false),
-            part_sources: StdMutex::new(HashMap::new()),
+            block_sources: StdMutex::new(HashMap::new()),
+            aich: StdMutex::new(AichState {
+                status: AichStatus::Empty,
+                master: None,
+                votes: HashMap::new(),
+                reported: HashMap::new(),
+                pending: HashMap::new(),
+            }),
             banned: StdMutex::new(HashSet::new()),
             sx_sources: StdMutex::new(Vec::new()),
             asked_sources: StdMutex::new(HashSet::new()),
@@ -475,15 +552,19 @@ impl Download {
 
     /// Write received bytes through to disk and close their gap.
     async fn commit(&self, start: u64, data: &[u8], source: Option<SocketAddr>) -> io::Result<()> {
-        // Remember which source contributed each part this block touches, so a
-        // later part-hash failure can be attributed (localize_corruption).
+        // Remember which source fed each AICH block this write touches, so a
+        // later failure can be attributed - per part without AICH
+        // (localize_corruption), per BLOCK with it (apply_aich_recovery).
         if let Some(addr) = source {
             let end = start.saturating_add(data.len() as u64);
-            let first = start / PARTSIZE;
-            let last = end.saturating_sub(1) / PARTSIZE;
-            let mut ps = self.part_sources.lock().unwrap();
-            for p in first..=last {
-                ps.entry(p).or_default().insert(addr.ip());
+            let mut bs = self.block_sources.lock().unwrap();
+            let mut pos = start;
+            while pos < end {
+                let part_start = pos - pos % PARTSIZE;
+                let key = part_start + ((pos - part_start) / EMBLOCKSIZE) * EMBLOCKSIZE;
+                bs.entry(key).or_default().insert(addr.ip());
+                // next lattice boundary: the block's end, capped at the part's
+                pos = (key + EMBLOCKSIZE).min(part_start + PARTSIZE);
             }
         }
         let mut g = self.inner.lock().await;
@@ -578,20 +659,232 @@ impl Download {
         drop(g);
         // Attribute each bad part to its SOLE contributor and BAN it (eMule's
         // CorruptionBlackBox, per-file). Only a sole contributor is unambiguous -
-        // a part fed by several sources is NOT blamed (we cannot tell which block
-        // was bad without AICH block hashes), so a good source is never
-        // false-banned. Clear each bad part's contributor set: its bytes were just
-        // re-gapped, so a re-fetch re-attributes from scratch.
-        let mut ps = self.part_sources.lock().unwrap();
-        let mut banned = self.banned.lock().unwrap();
-        for p in &bad {
-            if let Some(sources) = ps.remove(p) {
-                if sources.len() == 1 {
-                    banned.extend(sources);
+        // a part fed by several sources is NOT blamed AT THIS GRANULARITY (AICH
+        // recovery below narrows the blame to individual blocks), so a good
+        // source is never false-banned. Clear each bad part's contributor
+        // entries: its bytes were just re-gapped, so a re-fetch re-attributes.
+        {
+            let mut bs = self.block_sources.lock().unwrap();
+            let mut banned = self.banned.lock().unwrap();
+            for p in &bad {
+                let (ps, pe) = (p * PARTSIZE, (p + 1) * PARTSIZE);
+                let keys: Vec<u64> = bs
+                    .keys()
+                    .filter(|k| (ps..pe).contains(k))
+                    .copied()
+                    .collect();
+                let union: HashSet<IpAddr> = keys
+                    .iter()
+                    .filter_map(|k| bs.get(k))
+                    .flatten()
+                    .copied()
+                    .collect();
+                if union.len() == 1 {
+                    // Sole contributor: blamed and handled - clear the part's
+                    // records so the re-fetch re-attributes from scratch.
+                    banned.extend(union);
+                    for k in keys {
+                        bs.remove(&k);
+                    }
                 }
+                // Ambiguous (several feeders): KEEP the per-block records -
+                // they are exactly what AICH recovery needs to pinpoint the
+                // bad block's sole contributor. Blocks re-fetched before the
+                // recovery answer only ADD contributors, which can suppress a
+                // ban but never mis-aim one.
+            }
+        }
+        // Queue the bad parts for AICH block recovery: once a trusted root
+        // exists, a capable source holding the SAME root is asked for the
+        // part's block hashes and only the truly-bad ~180KB blocks stay open
+        // (eMule fires RequestAICHRecovery at this same moment,
+        // PartFile.cpp:4851-4853). Harmless if no root ever becomes trusted.
+        {
+            let mut a = self.aich.lock().unwrap();
+            for p in &bad {
+                a.pending.entry(*p).or_insert(None);
             }
         }
         true
+    }
+
+    /// Set the AICH master root from the file's IDENTITY (an ed2k link that
+    /// carried an aich part) - VERIFIED, never displaced by votes (eMule
+    /// PartFile.cpp:197-201).
+    pub fn set_aich_master_verified(&self, root: [u8; 20]) {
+        let mut a = self.aich.lock().unwrap();
+        a.master = Some(root);
+        a.status = AichStatus::Verified;
+    }
+
+    /// The trusted/verified master root, if recovery is allowed to use one.
+    pub fn aich_trusted_root(&self) -> Option<[u8; 20]> {
+        let a = self.aich.lock().unwrap();
+        matches!(a.status, AichStatus::Trusted | AichStatus::Verified)
+            .then_some(a.master)
+            .flatten()
+    }
+
+    /// Whether to ask a capable source for its root: always, until VERIFIED -
+    /// every answer is a vote toward (or against) trusting a root.
+    pub fn aich_wants_root(&self) -> bool {
+        self.aich.lock().unwrap().status != AichStatus::Verified
+    }
+
+    /// A source reported its AICH root: record it against the source and vote
+    /// (eMule UntrustedHashReceived, SHAHashSet.cpp:955-1031): one /20 signs
+    /// one hash; at least MINUNIQUEIPS_TOTRUST distinct /20s AND at least
+    /// MINPERCENTAGE_TOTRUST agreement promote the winner to TRUSTED, else
+    /// it stays the UNTRUSTED front-runner. A VERIFIED root ignores votes.
+    pub fn note_aich_root(&self, ip: IpAddr, root: [u8; 20]) {
+        let mut a = self.aich.lock().unwrap();
+        a.reported.insert(ip, root);
+        if a.status == AichStatus::Verified {
+            return;
+        }
+        let key = aich_vote_key(ip);
+        // One /20 may sign only ONE hash: a different root from the same /20
+        // is ignored outright (:975-983).
+        if a.votes
+            .iter()
+            .any(|(r, ips)| *r != root && ips.contains(&key))
+        {
+            return;
+        }
+        a.votes.entry(root).or_default().insert(key);
+        let total: usize = a.votes.values().map(|s| s.len()).sum();
+        let (best, most) = a
+            .votes
+            .iter()
+            .max_by_key(|(_, s)| s.len())
+            .map(|(r, s)| (*r, s.len()))
+            .expect("just inserted");
+        if most >= AICH_MIN_UNIQUE_IPS && 100 * most / total >= AICH_MIN_PERCENT {
+            a.master = Some(best);
+            a.status = AichStatus::Trusted;
+        } else {
+            a.master = Some(best);
+            a.status = AichStatus::Untrusted;
+        }
+    }
+
+    /// Claim one pending recovery ask for a source at `ip` (eMule
+    /// RequestAICHRecovery's eligibility, PartFile.cpp:6064-6090): a
+    /// trusted/verified root, the source having REPORTED exactly that root,
+    /// the part bigger than one block, and no live ask for the part. Returns
+    /// the (part, root) to put on the wire; the claim self-expires if the
+    /// answer never comes.
+    pub fn claim_aich_recovery(&self, ip: IpAddr, size: u64) -> Option<(u64, [u8; 20])> {
+        let mut a = self.aich.lock().unwrap();
+        let root = matches!(a.status, AichStatus::Trusted | AichStatus::Verified)
+            .then_some(a.master)
+            .flatten()?;
+        if a.reported.get(&ip) != Some(&root) || size <= EMBLOCKSIZE {
+            return None;
+        }
+        let now = u64::from(now_secs());
+        let part = a
+            .pending
+            .iter()
+            .find(|(p, claim)| {
+                let part_len = crate::part_file::part_size(**p, size);
+                part_len > EMBLOCKSIZE
+                    && match claim {
+                        None => true,
+                        Some(t) => now.saturating_sub(*t) > AICH_CLAIM_STALE_SECS,
+                    }
+            })
+            .map(|(p, _)| *p)?;
+        a.pending.insert(part, Some(now));
+        Some((part, root))
+    }
+
+    /// A recovery ask failed (refusal, bad data, or a source that answered
+    /// wrongly): release the claim so ANOTHER source can be asked (eMule
+    /// ClientAICHRequestFailed retries elsewhere, SHAHashSet.cpp:1033-1043).
+    pub fn aich_recovery_failed(&self, part: u64) {
+        let mut a = self.aich.lock().unwrap();
+        if let Some(c) = a.pending.get_mut(&part) {
+            *c = None;
+        }
+    }
+
+    /// Apply VERIFIED recovery data for one part (eMule
+    /// AICHRecoveryDataAvailable, PartFile.cpp:6136-6247): hash the part's
+    /// bytes on disk per ~180KB block against the verified leaves, FILL back
+    /// the blocks that match (their bytes were fine all along), keep or
+    /// re-open the mismatching ones, and blame each bad block's SOLE
+    /// contributor - the per-BLOCK attribution that closes 8ai's honest
+    /// limitation. Returns (verified_blocks, bad_blocks).
+    pub async fn apply_aich_recovery(
+        &self,
+        part: u64,
+        verified: &[(u64, u64, [u8; 20])],
+    ) -> io::Result<(usize, usize)> {
+        let path = {
+            let g = self.inner.lock().await;
+            g.store.part_path().to_path_buf()
+        };
+        let spans: Vec<(u64, u64, [u8; 20])> = verified.to_vec();
+        let results = tokio::task::spawn_blocking(move || {
+            use sha1::{Digest, Sha1};
+            use std::io::{Read, Seek, SeekFrom};
+            let mut f = std::fs::File::open(&path)?;
+            let mut out: Vec<(u64, u64, bool)> = Vec::with_capacity(spans.len());
+            for (start, len, want) in spans {
+                let mut buf = vec![0u8; len as usize];
+                f.seek(SeekFrom::Start(start))?;
+                f.read_exact(&mut buf)?;
+                let got: [u8; 20] = {
+                    let mut h = Sha1::new();
+                    h.update(&buf);
+                    h.finalize().into()
+                };
+                out.push((start, len, got == want));
+            }
+            io::Result::Ok(out)
+        })
+        .await
+        .map_err(io::Error::other)??;
+
+        let mut good = 0usize;
+        let mut bad = 0usize;
+        {
+            let mut g = self.inner.lock().await;
+            for (start, len, ok) in &results {
+                if *ok {
+                    g.store.pf.fill_gap(*start, start + len);
+                    good += 1;
+                } else {
+                    // Still wrong (or refilled with wrong bytes since): keep
+                    // it open. Re-opening is safe - the hash it failed is
+                    // anchored to the TRUSTED root.
+                    g.store.pf.reopen_range(*start, start + len);
+                    bad += 1;
+                }
+            }
+            let _ = g.store.save_met();
+        }
+        // Per-BLOCK blame: a bad block fed by exactly one source is that
+        // source's doing, no ambiguity. Clear each bad block's entry so the
+        // re-fetch re-attributes.
+        {
+            let mut bs = self.block_sources.lock().unwrap();
+            let mut banned = self.banned.lock().unwrap();
+            for (start, _len, ok) in &results {
+                if !*ok {
+                    if let Some(srcs) = bs.remove(start) {
+                        if srcs.len() == 1 {
+                            banned.extend(srcs);
+                        }
+                    }
+                }
+            }
+        }
+        // The part's recovery is DONE (good blocks filled, bad ones open for a
+        // clean re-fetch); a future MD4 failure re-queues it.
+        self.aich.lock().unwrap().pending.remove(&part);
+        Ok((good, bad))
     }
 
     /// Recompute the whole-file ed2k hash from the bytes actually on disk and
@@ -793,6 +1086,7 @@ async fn handle_aux_packet<S>(
     fs: &mut FramedStream<S>,
     dl: &Download,
     peer: Option<SocketAddr>,
+    aich_asked: &mut Option<u64>,
 ) -> Result<(), TransferError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -827,7 +1121,77 @@ where
             }
         }
     }
+    // The source's AICH root answer: a VOTE toward trusting a master root
+    // (and the eligibility record a later recovery ask checks).
+    if pkt.opcode == OP_AICHFILEHASHANS {
+        if let Ok((h, root)) = parse_aich_file_hash_ans(&pkt.payload) {
+            if h == dl.hash().await {
+                if let Some(addr) = peer {
+                    dl.note_aich_root(addr.ip(), root);
+                }
+            }
+        }
+    }
+    // The recovery answer for the part WE asked this source about.
+    if pkt.opcode == OP_AICHANSWER {
+        handle_aich_answer(&pkt.payload, dl, aich_asked).await;
+    }
     Ok(())
+}
+
+/// Process an OP_AICHANSWER (eMule ProcessAICHAnswer,
+/// DownloadClient.cpp:2286-2325): the echoes must match what we asked on THIS
+/// connection (`aich_asked` - eMule matches the recorded request per client),
+/// the echoed root must be the trusted master, and the payload must verify
+/// against it. The refusal form and every failure release the claim so
+/// ANOTHER source can be asked; a good answer fills back the part's verified
+/// blocks and blames the bad ones.
+async fn handle_aich_answer(payload: &[u8], dl: &Download, aich_asked: &mut Option<u64>) {
+    let Ok(ans) = parse_aich_answer(payload) else {
+        return;
+    };
+    let our_hash = dl.hash().await;
+    match ans {
+        AichAnswer::Failure(h) => {
+            // A NORMAL outcome (the source cannot serve this part right now).
+            if h == our_hash {
+                if let Some(p) = aich_asked.take() {
+                    dl.aich_recovery_failed(p);
+                }
+            }
+        }
+        AichAnswer::Recovery {
+            hash,
+            part,
+            root,
+            recovery,
+        } => {
+            let Some(asked) = *aich_asked else {
+                return; // unsolicited; eMule treats this as a packet error
+            };
+            let part = u64::from(part);
+            if hash != our_hash || part != asked || dl.aich_trusted_root() != Some(root) {
+                *aich_asked = None;
+                dl.aich_recovery_failed(asked);
+                return;
+            }
+            let size = dl.size().await;
+            let verified = AichTree::with_master(size, root)
+                .filter(|_| part * PARTSIZE < size)
+                .and_then(|mut t| {
+                    t.read_recovery_data(part * PARTSIZE, &recovery)
+                        .then(|| t.part_block_hashes(part * PARTSIZE))
+                        .flatten()
+                });
+            *aich_asked = None;
+            match verified {
+                Some(blocks) => {
+                    let _ = dl.apply_aich_recovery(part, &blocks).await;
+                }
+                None => dl.aich_recovery_failed(part),
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -847,7 +1211,12 @@ where
         sec,
         credit,
         ask_sources,
+        peer_aich,
     } = session;
+    // The AICH part (if any) we asked THIS source recovery data for; the
+    // answer handler matches against it like eMule matches its recorded
+    // per-client request.
+    let mut aich_asked: Option<u64> = None;
 
     // Secure-ident, when enabled: build our session and - if the peer advertised
     // support - proactively ask it to prove it owns its userhash, exactly as a
@@ -878,6 +1247,12 @@ where
         fs.write_packet(&build_request_sources2(&hash, SOURCE_EXCHANGE_VERSION))
             .await?;
     }
+    // Ask an AICH-capable source for its master root (the standalone 0x9E,
+    // eMule's non-multipacket send site, DownloadClient.cpp:471-479). Every
+    // answer is a trust vote; fire-and-forget like the asks above.
+    if peer_aich & 1 != 0 && dl.aich_wants_root() {
+        fs.write_packet(&build_aich_file_hash_req(&hash)).await?;
+    }
     let status = loop {
         let pkt = fs.read_packet_unpacked().await?;
         match pkt.opcode {
@@ -885,7 +1260,7 @@ where
             OP_FILESTATUS => break parse_file_status(&pkt.payload)?,
             // A source's OP_FILEDESC (rating/comment) or a secure-ident packet
             // can arrive here; neither is what we are waiting for.
-            _ => handle_aux_packet(&pkt, &mut sec, fs, dl, peer).await?,
+            _ => handle_aux_packet(&pkt, &mut sec, fs, dl, peer, &mut aich_asked).await?,
         }
     };
     // Record what this peer holds so block selection knows which parts are rare.
@@ -901,7 +1276,7 @@ where
                 dl.set_hashset(hashes).await;
                 break;
             }
-            handle_aux_packet(&pkt, &mut sec, fs, dl, peer).await?;
+            handle_aux_packet(&pkt, &mut sec, fs, dl, peer, &mut aich_asked).await?;
         }
     }
 
@@ -916,7 +1291,7 @@ where
         match pkt.opcode {
             OP_ACCEPTUPLOADREQ => break,
             OP_QUEUERANKING if bail_on_queue => return Err(TransferError::Queued),
-            _ => handle_aux_packet(&pkt, &mut sec, fs, dl, peer).await?,
+            _ => handle_aux_packet(&pkt, &mut sec, fs, dl, peer, &mut aich_asked).await?,
         }
     }
 
@@ -924,6 +1299,19 @@ where
     let size = dl.size().await;
     let mut delivered = 0u64;
     loop {
+        // A corrupt part awaiting AICH recovery: ask THIS source for its block
+        // hashes if it is eligible (capable, reported the trusted root, no ask
+        // in flight here). The answer rides the aux channel; the transfer is
+        // never blocked on it.
+        if peer_aich & 1 != 0 && aich_asked.is_none() {
+            if let Some(ip) = peer.map(|a| a.ip()) {
+                if let Some((part, root)) = dl.claim_aich_recovery(ip, size) {
+                    fs.write_packet(&build_aich_request(&hash, part as u16, &root))
+                        .await?;
+                    aich_asked = Some(part);
+                }
+            }
+        }
         let blocks = dl.take_blocks(&status, STANDARD_BLOCKS_REQUEST).await;
         if blocks.is_empty() {
             return Ok(delivered);
@@ -938,14 +1326,19 @@ where
         let mut rx = BlockReceiver::new(hash, size, &blocks);
         while !rx.is_done() {
             let pkt = fs.read_packet_unpacked().await?;
-            // A secure-ident packet (or a late OP_FILEDESC) can interleave with
-            // block data on the same connection; handle it and keep waiting for
-            // the blocks we asked for.
+            // A secure-ident packet, a late OP_FILEDESC, or an AICH answer can
+            // interleave with block data on the same connection; handle it and
+            // keep waiting for the blocks we asked for.
             if matches!(
                 pkt.opcode,
-                OP_SECIDENTSTATE | OP_PUBLICKEY | OP_SIGNATURE | OP_FILEDESC
+                OP_SECIDENTSTATE
+                    | OP_PUBLICKEY
+                    | OP_SIGNATURE
+                    | OP_FILEDESC
+                    | OP_AICHFILEHASHANS
+                    | OP_AICHANSWER
             ) {
-                handle_aux_packet(&pkt, &mut sec, fs, dl, peer).await?;
+                handle_aux_packet(&pkt, &mut sec, fs, dl, peer, &mut aich_asked).await?;
                 continue;
             }
             for w in rx.accept(pkt.opcode, &pkt.payload)? {
@@ -1090,6 +1483,145 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn aich_root_vote_follows_emule_thresholds() {
+        let dir = tmpdir("aichvote");
+        let store = PartStore::create(&dir, 1, [0xAB; 16], 1_000_000, b"v.bin").unwrap();
+        let dl = Download::new(store);
+        let root_a = [0xAA; 20];
+        let root_b = [0xBB; 20];
+
+        // 9 distinct /20s: still UNTRUSTED (>= 10 required).
+        for i in 0..9u8 {
+            dl.note_aich_root(ip(&format!("10.{i}.0.1")), root_a);
+        }
+        assert_eq!(dl.aich_trusted_root(), None, "9 < MINUNIQUEIPS_TOTRUST");
+        // Two more voters from ONE /20 that already signed: no advance
+        // (one /20 signs once - the mask keeps the top nibble of octet 3).
+        dl.note_aich_root(ip("10.0.15.9"), root_a); // same /20 as 10.0.0.1
+        assert_eq!(dl.aich_trusted_root(), None, "a /20 cannot vote twice");
+        // The 10th distinct /20 promotes to TRUSTED (10/10 = 100% >= 92%).
+        dl.note_aich_root(ip("10.9.0.1"), root_a);
+        assert_eq!(dl.aich_trusted_root(), Some(root_a));
+        // One dissenting /20 drops agreement to 10/11 = 90% < 92%: demoted,
+        // exactly as eMule re-evaluates on every vote.
+        dl.note_aich_root(ip("172.16.0.1"), root_b);
+        assert_eq!(dl.aich_trusted_root(), None, "90% < MINPERCENTAGE_TOTRUST");
+        // A VERIFIED root (ed2k link identity) ignores votes entirely.
+        dl.set_aich_master_verified(root_b);
+        for i in 0..12u8 {
+            dl.note_aich_root(ip(&format!("192.{i}.0.1")), root_a);
+        }
+        assert_eq!(
+            dl.aich_trusted_root(),
+            Some(root_b),
+            "votes never displace VERIFIED"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn aich_recovery_claim_lifecycle() {
+        let dir = tmpdir("aichclaim");
+        let size = 2 * PARTSIZE;
+        let store = PartStore::create(&dir, 1, [0xAB; 16], size, b"c.bin").unwrap();
+        let dl = Download::new(store);
+        let root = [0x5A; 20];
+        dl.set_aich_master_verified(root);
+        // No pending parts yet: nothing to claim.
+        let src = ip("9.9.9.9");
+        dl.note_aich_root(src, root);
+        assert_eq!(dl.claim_aich_recovery(src, size), None);
+        // Queue part 1 (the private path localize_corruption uses).
+        dl.aich.lock().unwrap().pending.insert(1, None);
+        // A source that reported a DIFFERENT root is ineligible (eMule
+        // PartFile.cpp:6089 - the source must have reported the trusted root).
+        let liar = ip("8.8.8.8");
+        dl.note_aich_root(liar, [0xEE; 20]);
+        assert_eq!(dl.claim_aich_recovery(liar, size), None);
+        // The matching source claims it; a second concurrent claim is refused
+        // (one in-flight ask per part).
+        assert_eq!(dl.claim_aich_recovery(src, size), Some((1, root)));
+        assert_eq!(dl.claim_aich_recovery(src, size), None);
+        // Failure releases it for the NEXT source.
+        dl.aich_recovery_failed(1);
+        assert_eq!(dl.claim_aich_recovery(src, size), Some((1, root)));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn aich_recovery_fills_good_blocks_and_bans_the_block_poisoner() {
+        // THE 8ai closure: an attacker who always shares a poisoned part with a
+        // good source evaded the sole-contributor PART ban. With AICH the blame
+        // lands on the single bad BLOCK - whose sole contributor is unambiguous.
+        let dir = tmpdir("aichrepair");
+        let size = (PARTSIZE + 4 * EMBLOCKSIZE + 500) as usize;
+        let good: Vec<u8> = (0..size as u32)
+            .map(|i| (i.wrapping_mul(13)) as u8)
+            .collect();
+        let hash = ed2k_hash(&good);
+        let ph = vec![
+            md4(&good[..PARTSIZE as usize]),
+            md4(&good[PARTSIZE as usize..]),
+        ];
+        let store = PartStore::create(&dir, 1, hash, size as u64, b"r.bin").unwrap();
+        let dl = Download::new(store);
+        dl.set_hashset(ph).await;
+
+        let good_src: SocketAddr = "1.2.3.4:4662".parse().unwrap();
+        let bad_src: SocketAddr = "5.6.7.8:4662".parse().unwrap();
+        // Part 0 wholly from GOOD. Part 1: block 1 (a 180KB lattice block) from
+        // BAD - and CORRUPTED - the rest from GOOD.
+        dl.commit(0, &good[..PARTSIZE as usize], Some(good_src))
+            .await
+            .unwrap();
+        let p1 = PARTSIZE as usize;
+        let b1_start = p1 + EMBLOCKSIZE as usize;
+        let b1_end = p1 + 2 * EMBLOCKSIZE as usize;
+        dl.commit(PARTSIZE, &good[p1..b1_start], Some(good_src))
+            .await
+            .unwrap();
+        let mut poisoned = good[b1_start..b1_end].to_vec();
+        poisoned[7] ^= 0xFF;
+        dl.commit(b1_start as u64, &poisoned, Some(bad_src))
+            .await
+            .unwrap();
+        dl.commit(b1_end as u64, &good[b1_end..], Some(good_src))
+            .await
+            .unwrap();
+        assert!(dl.is_complete().await);
+
+        // MD4 localization: part 1 blamed + re-gapped, but fed by TWO sources,
+        // so the part-level ban must stay silent (no false positive)...
+        assert!(dl.localize_corruption().await);
+        assert!(!dl.is_banned(&bad_src), "part-level blame is ambiguous");
+        assert!(!dl.is_banned(&good_src));
+
+        // ...then AICH recovery pinpoints the block. Trusted root via the link
+        // path; the true tree plays the answering source's verified leaves.
+        let tree = mule_proto::AichTree::from_file_data(&good).unwrap();
+        dl.set_aich_master_verified(tree.master_hash().unwrap());
+        let blocks = tree.part_block_hashes(PARTSIZE).unwrap();
+        let (kept, reopened) = dl.apply_aich_recovery(1, &blocks).await.unwrap();
+        assert_eq!(reopened, 1, "exactly the poisoned block stays open");
+        assert_eq!(kept, blocks.len() - 1, "every good block filled back");
+        assert_eq!(
+            dl.missing().await,
+            EMBLOCKSIZE,
+            "only one 180KB block remains to re-fetch, not a 9.28MB part"
+        );
+        assert!(
+            dl.is_banned(&bad_src),
+            "the BLOCK's sole contributor is banned"
+        );
+        assert!(!dl.is_banned(&good_src), "the good source is untouched");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
