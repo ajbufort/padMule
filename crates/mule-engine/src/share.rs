@@ -1336,6 +1336,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn corrupt_block_is_repaired_over_the_wire_not_redownloaded() {
+        // THE WAVE-11 END-TO-END: a padMule downloader holding a part poisoned
+        // by one source repairs it against a padMule seeder over the REAL wire
+        // loop - root ask (0x9E/0x9D), recovery ask (0x9B/0x9C), verified
+        // block fill-back - re-fetching only what is actually bad, and banning
+        // the block's feeder. FIFTY 180KB blocks re-gapped, a handful re-sent.
+        use crate::multi_source::{download_from_peer_at, Download, PeerSession};
+        use crate::part_store::PartStore;
+        use crate::peer_conn::connect_peer;
+        use mule_proto::{md4, AichTree, PARTSIZE};
+
+        let dir = tmpdir("e2e-repair");
+        let size = (PARTSIZE + 20 * EMBLOCKSIZE + 500) as usize;
+        let good: Vec<u8> = (0..size as u32)
+            .map(|i| (i.wrapping_mul(29)) as u8)
+            .collect();
+        let hash = ed2k_hash(&good);
+        let part_hashes = vec![
+            md4(&good[..PARTSIZE as usize]),
+            md4(&good[PARTSIZE as usize..]),
+        ];
+
+        // The SEEDER: the whole good file + its AICH hashset.
+        let seed_path = dir.join("seed.bin");
+        std::fs::write(&seed_path, &good).unwrap();
+        let tree = AichTree::from_file_data(&good).unwrap();
+        let root = tree.master_hash().unwrap();
+        let store = Arc::new(crate::known2_store::Known2Store::load(&dir));
+        store.append(&root, &tree.leaves().unwrap()).unwrap();
+        let shared = vec![SharedFile {
+            hash,
+            size: size as u64,
+            name: b"seed.bin".to_vec(),
+            part_hashes: part_hashes.clone(),
+            path: seed_path,
+            rating: 0,
+            comment: String::new(),
+            aich_root: Some(root),
+        }];
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let up = tokio::spawn(async move {
+            let me = HelloInfo::baseline([0xBB; 16], 0, 4662, 4672, "seed");
+            if let Ok((_p, mut fs)) = accept_peer(&listener, &me).await {
+                let session = ServeSession {
+                    peer_aich: 1,
+                    aich: Some(store),
+                    ..Default::default()
+                };
+                let _ = serve_shared(&mut fs, &shared, None, None, 0, session).await;
+            }
+        });
+
+        // The DOWNLOADER: byte-complete but one block of part 1 poisoned by a
+        // "bad" source; MD4 localization re-gaps the whole part and queues it.
+        let dldir = dir.join("dl");
+        std::fs::create_dir_all(&dldir).unwrap();
+        let pstore = PartStore::create(&dldir, 1, hash, size as u64, b"seed.bin").unwrap();
+        let dl = Download::new(pstore);
+        dl.set_hashset(part_hashes).await;
+        let good_src: SocketAddr = "1.2.3.4:4662".parse().unwrap();
+        let bad_src: SocketAddr = "5.6.7.8:4662".parse().unwrap();
+        let p1 = PARTSIZE as usize;
+        let b_start = p1 + 3 * EMBLOCKSIZE as usize;
+        let b_end = p1 + 4 * EMBLOCKSIZE as usize;
+        dl.commit(0, &good[..p1], Some(good_src)).await.unwrap();
+        dl.commit(p1 as u64, &good[p1..b_start], Some(good_src))
+            .await
+            .unwrap();
+        let mut poison = good[b_start..b_end].to_vec();
+        poison[99] ^= 0xFF;
+        dl.commit(b_start as u64, &poison, Some(bad_src))
+            .await
+            .unwrap();
+        dl.commit(b_end as u64, &good[b_end..], Some(good_src))
+            .await
+            .unwrap();
+        assert!(dl.localize_corruption().await, "part 1 blamed + queued");
+        let regapped = dl.missing().await;
+        assert_eq!(
+            regapped,
+            crate::part_file::part_size(1, size as u64),
+            "the whole part is open before recovery"
+        );
+        // The root arrived via the file's ed2k link (VERIFIED).
+        dl.set_aich_master_verified(root);
+
+        // One real connection to the seeder does the whole repair.
+        let me = HelloInfo::baseline([0xAA; 16], 0x0A00_0001, 4663, 4673, "dl");
+        let (_p, mut fs) = connect_peer(addr, &me).await.unwrap();
+        let session = PeerSession {
+            peer_aich: 1,
+            ..Default::default()
+        };
+        let delivered = download_from_peer_at(&mut fs, &dl, true, Some(addr), session)
+            .await
+            .unwrap();
+
+        assert_eq!(dl.missing().await, 0, "complete again");
+        assert!(
+            dl.verify_whole_file(size as u64, hash).await,
+            "and the bytes are RIGHT"
+        );
+        assert!(
+            delivered < regapped / 2,
+            "recovery FILLED most of the part back; only a few blocks were \
+             re-sent ({delivered} bytes of a {regapped}-byte part)"
+        );
+        assert!(
+            dl.is_banned(&bad_src),
+            "the poisoned block's feeder is banned"
+        );
+        assert!(!dl.is_banned(&good_src));
+        drop(fs);
+        up.await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
     async fn a_peer_downloads_a_complete_file_we_share() {
         let dir = tmpdir("one");
         // ~400 KB: several blocks, still a single eD2k part (no hashset needed).

@@ -551,7 +551,13 @@ impl Download {
     }
 
     /// Write received bytes through to disk and close their gap.
-    async fn commit(&self, start: u64, data: &[u8], source: Option<SocketAddr>) -> io::Result<()> {
+    /// Crate-visible so the share-side end-to-end tests can stage a download.
+    pub(crate) async fn commit(
+        &self,
+        start: u64,
+        data: &[u8],
+        source: Option<SocketAddr>,
+    ) -> io::Result<()> {
         // Remember which source fed each AICH block this write touches, so a
         // later failure can be attributed - per part without AICH
         // (localize_corruption), per BLOCK with it (apply_aich_recovery).
@@ -723,12 +729,6 @@ impl Download {
         matches!(a.status, AichStatus::Trusted | AichStatus::Verified)
             .then_some(a.master)
             .flatten()
-    }
-
-    /// Whether to ask a capable source for its root: always, until VERIFIED -
-    /// every answer is a vote toward (or against) trusting a root.
-    pub fn aich_wants_root(&self) -> bool {
-        self.aich.lock().unwrap().status != AichStatus::Verified
     }
 
     /// A source reported its AICH root: record it against the source and vote
@@ -1248,9 +1248,13 @@ where
             .await?;
     }
     // Ask an AICH-capable source for its master root (the standalone 0x9E,
-    // eMule's non-multipacket send site, DownloadClient.cpp:471-479). Every
-    // answer is a trust vote; fire-and-forget like the asks above.
-    if peer_aich & 1 != 0 && dl.aich_wants_root() {
+    // eMule's non-multipacket send site, DownloadClient.cpp:471-479). ALWAYS
+    // asked, even with a VERIFIED root in hand: the answer is a trust vote
+    // AND the per-source eligibility record a recovery ask requires (the
+    // source must have REPORTED the trusted root, PartFile.cpp:6089) - eMule
+    // likewise gathers every source's claimed root, and treats one that
+    // differs from a verified hash as file-not-found. Fire-and-forget.
+    if peer_aich & 1 != 0 {
         fs.write_packet(&build_aich_file_hash_req(&hash)).await?;
     }
     let status = loop {
