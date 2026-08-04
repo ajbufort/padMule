@@ -231,7 +231,10 @@ struct ContentView: View {
                      ? "Transfers stop and the router port is released. Your progress is saved, and you can start again from the toolbar or the Status screen."
                      : "Transfers stop. Your progress is saved, and you can start again from the toolbar or the Status screen.")
             }
-            .navigationTitle("\\__ p a d M u l e __/")
+            // Text(verbatim:) NOT a string literal: .navigationTitle("...")
+            // takes a LocalizedStringKey, which performs escape processing and
+            // swallowed the leading backslash on device.
+            .navigationTitle(Text(verbatim: "\\__ p a d M u l e __/"))
             .navigationBarTitleDisplayMode(.inline)
             .sheet(item: $detail) { hit in
                 SearchDetailView(hit: hit).environmentObject(model)
@@ -1010,14 +1013,15 @@ struct ContentView: View {
                 // (HighID)" here AND "X" there). The Server row now carries
                 // the identity; this row only answers "are we connected".
                 row("Status", model.connectionSummary)
-                // The engine also pushes transient progress text through the
-                // same channel ("Fetching network lists...", "Opening
-                // port...") that the pure verdict above does not capture.
-                // Shown only when it says something new, so a settled
-                // connection does not show the same word twice.
-                if model.status != model.connectionSummary {
-                    row("Activity", model.status)
-                }
+                // NO "Activity" row. It was meant to preserve the engine's
+                // transient text ("Fetching network lists...", "Opening
+                // port..."), but its guard compared against the SUMMARY
+                // ("Connected") while the engine's string is the full sentence
+                // ("Connected to X (addr)") - so once connected it always
+                // differed, and rendered a verbatim duplicate of Server below.
+                // Nothing is lost: Paused/Stopped/Reconnecting are already the
+                // Status verdict, and the boot-time messages happen behind the
+                // splash and the "Starting padMule..." banner.
                 // The ID type decides whether peers can reach us at all, so it
                 // gets its own row instead of riding on the status line, where a
                 // later event would overwrite it.
