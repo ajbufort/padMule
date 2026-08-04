@@ -7,20 +7,30 @@ says so explicitly.
 Living doc - replace it wholesale next time. Full narrative:
 [[build-progress]] rows 8av-8bi and the [[log]] entries for 2026-08-03.
 
-## READ THIS FIRST: there is unmerged AICH work in a worktree
+## RESOLVED: the AICH worktree is FINISHED, rebased, and up for review
 
-`.claude/worktrees/wave11-aich` (branch `worktree-wave11-aich`, LOCKED) holds
-**6 unmerged commits implementing wave 11 - AICH block recovery**, the last
-PARTIAL on the security scorecard, plus 4 files with uncommitted changes. It
-is ~3,400 lines across `aich.rs`, a new `known2_met.rs` codec, the 0x9B-0x9E
-packet codecs, serve-side root/recovery answers, download-side recovery with
-per-BLOCK corruption attribution, and an end-to-end wire-loop repair proof.
+[SUPERSEDES the previous "unmerged work in a worktree" note, which was written
+while this build was mid-flight.] `.claude/worktrees/wave11-aich` (branch
+`worktree-wave11-aich`) now holds **wave 11 COMPLETE** - AICH block recovery,
+the last PARTIAL on the security scorecard - as [[build-progress]] row 8bj.
+Nothing is uncommitted, and the branch has been REBASED onto main (it was 12
+commits behind; main's 13 new commits are all `ios/` + `docs/`, so the rebase
+was clean and the gate was re-run green on top of it).
 
-It is **12 commits behind main** and mid-flight (uncommitted edits in
-`engine.rs`, `known2_store.rs`, `multi_source.rs`, `share.rs`). Do NOT delete
-the worktree and do not treat wave 11 as unstarted. Decide deliberately
-whether to rebase and finish it or park it; either way, the state above is
-what you inherit.
+What it contains: the materialized AICH tree, a `known2_met.rs` codec + a
+file-backed store with aMule master's root->offset index, the 0x9B/0x9C/0x9D/
+0x9E packet codecs, serve-side root + recovery answers, download-side recovery
+with per-BLOCK corruption attribution, and three terminal proofs - padMule's
+known2_64.met ENTRY bytes are byte-identical to real amuled's, `mule-cli
+aich-probe` verifies real amuled's recovery data live, and a padMule wire loop
+repairs a poisoned block re-sending only a fraction of the part. A 3-lens
+adversarial review confirmed 9 findings (incl. a FALSE BAN of the source
+repairing the file, and a poisoned root that could livelock a download); all
+are fixed and the two headline guards are mutation-checked.
+
+Its state: 601 tests, clippy warning-free, fmt/ASCII clean, all three peer
+oracles PASS. NOT device-verified - nothing about it is visible in the UI (the
+repair is engine-internal). Next step is review + merge of its PR.
 
 ## State of the tree (main)
 
@@ -31,8 +41,9 @@ what you inherit.
   amuled differential (byte-for-byte, 3 files), the REVERSE oracle (real
   amuled downloads FROM padMule + serve-side secure-ident), the isolated
   eserver login, and the Kad verify oracle.
-- [[security-model]]: **23 OPERATIONAL / 1 PARTIAL / 2 documented opt-outs**.
-  The PARTIAL is AICH block recovery - see the worktree note above.
+- [[security-model]]: **24 OPERATIONAL / 0 PARTIAL / 2 documented opt-outs**
+  once the AICH branch merges (the last PARTIAL closed 2026-08-03; see the
+  worktree note above). On main alone it still reads 23/1/2.
 - Build staged for install:
   `C:\Users\ajbuf\Downloads\padMule-INSTALL-THIS-unsigned-d7d555a.ipa`.
 
@@ -107,9 +118,9 @@ releasing the router port and Start reclaiming it.
    remote-to-local REMAP would break Kad's inbound reachability. Same-port
    forwarding sidesteps it; add a fourth field only if a remap is needed.
 2. **Device-verify the unproven list above**, starting with resume.
-3. **Decide the fate of the AICH worktree** (see the top). Rebase onto main
-   and finish, or park it explicitly - but do not let it rot silently 12
-   commits behind.
+3. **Review + merge the AICH branch** (see the top): it is finished, rebased
+   onto main and green, with a draft PR open. Merging it is what actually
+   moves the scorecard to 24/0/2.
 4. **Get blocking engine calls OFF the one serial queue** - the biggest
    remaining structural risk. "Reconnecting..." still cannot render;
    `pause()` starvation is MITIGATED (background-task assertion + refresh
