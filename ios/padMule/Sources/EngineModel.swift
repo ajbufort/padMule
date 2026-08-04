@@ -259,6 +259,21 @@ final class EngineModel: ObservableObject {
     private var engine: MuleEngine?
     private var timer: Timer?
     private let work = DispatchQueue(label: "us.ajbconsulting.padMule.engine")
+    /// A SECOND queue, for the one call that does not need the engine.
+    ///
+    /// `work` is SERIAL and every FFI call went through it, so a ~20s search or
+    /// a ~10s crawl blocked all 27 other call sites behind it - including the
+    /// event drain, which is why "Reconnecting..." could never render during
+    /// one. `drainEvents()` locks only the event channel in the Rust seam, never
+    /// the engine mutex, so it is safe to run CONCURRENTLY with a long
+    /// engine-holding call and returns in microseconds.
+    ///
+    /// This does not fix the deeper half - `downloads()` and friends still block
+    /// on the engine mutex while `Engine::search` holds `&mut self` across its
+    /// whole join - so the numbers still freeze during a search. But the app
+    /// keeps painting, banners and status text keep arriving, and it stays
+    /// interactive, which is the difference between "busy" and "hung".
+    private let eventQueue = DispatchQueue(label: "us.ajbconsulting.padMule.events")
     /// The background-task assertion held while pause() finishes; see pause().
     private var pauseBackgroundTask: UIBackgroundTaskIdentifier = .invalid
     /// The Documents directory `boot()` handed to the engine as `downloadsDir` -
@@ -855,10 +870,32 @@ final class EngineModel: ObservableObject {
     private func startPolling() {
         timer?.invalidate()
         let t = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.refresh() }
+            Task { @MainActor in
+                self?.pumpEvents()
+                self?.refresh()
+            }
         }
         RunLoop.main.add(t, forMode: .common)
         timer = t
+    }
+
+    /// Drain engine events on `eventQueue`, independent of the heavy poll.
+    ///
+    /// This is the ONLY caller of `drainEvents()`: the channel drains once, so
+    /// two callers would race for which one saw a given event and the loser
+    /// would silently drop it. It deliberately has no in-flight guard - the call
+    /// is a try_recv loop over a channel and cannot pile up the way refresh()
+    /// can.
+    private func pumpEvents() {
+        guard let e = engine else { return }
+        eventQueue.async { [weak self] in
+            let evs = e.drainEvents()
+            guard !evs.isEmpty else { return }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                for ev in evs { self.apply(ev) }
+            }
+        }
     }
 
     /// Hashes backing `liveStatus(for:)`, rebuilt once per refresh() poll - NOT
@@ -869,7 +906,9 @@ final class EngineModel: ObservableObject {
     /// True while a refresh() poll is in flight; see refresh()'s doc comment.
     private var refreshInFlight = false
 
-    /// Pull a fresh snapshot + drain queued events, all off the main thread.
+    /// Pull a fresh snapshot off the main thread. Events are NOT drained here
+    /// any more - `pumpEvents()` owns that, on its own queue, so a banner or a
+    /// status change still arrives while a long engine call is holding `work`.
     /// The downloads() call is ALSO the engine's heartbeat (share re-announce,
     /// completion finalize, server-drop detection) - the 1s timer must keep
     /// firing this even when no screen shows transfers.
@@ -893,7 +932,6 @@ final class EngineModel: ObservableObject {
             let ipPause = e.sharingPausedForIpChange()
             let stats = e.transferStats()
             let mapped = e.hasPortMapping()
-            let evs = e.drainEvents()
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.refreshInFlight = false
@@ -912,7 +950,6 @@ final class EngineModel: ObservableObject {
                 self.sharingPausedForIpChange = ipPause
                 self.portMapped = mapped
                 self.sampleStats(stats)
-                for ev in evs { self.apply(ev) }
                 // Transfers start and finish between polls, and keep-awake is
                 // gated on there being active ones, so re-evaluate it each poll.
                 self.applyKeepAwake()
