@@ -1145,6 +1145,68 @@ pub struct SearchFilters {
 
 /// The padMule engine. Create with [`Engine::new`], drive with the lifecycle
 /// methods, observe via the returned event receiver.
+/// The parts of the engine a READ-ONLY caller can reach WITHOUT the engine lock.
+///
+/// Every FFI poll used to go through `Mutex<Engine>`, so a ~20s search or ~10s
+/// crawl - which holds `&mut self` across its whole `tokio::join!` - blocked the
+/// 1s UI poll behind it and the transfer numbers froze. But five of those polls
+/// never needed engine STATE at all: the downloads list, the shared library, the
+/// sharing switch and the public IP are already `Arc`s, and the byte totals are
+/// process-global atomics. They took the lock purely because they were methods
+/// on `Engine`.
+///
+/// Handing out clones is not a new pattern here - the engine already clones
+/// these same `Arc`s into spawned tasks in seven places - and none of them is
+/// ever REASSIGNED, so a handle taken once at construction stays valid for the
+/// engine's life. That last property is what makes this safe; if any of these
+/// fields were ever replaced rather than mutated in place, a handle would
+/// silently go stale and the UI would read a dead copy forever.
+#[derive(Clone)]
+pub struct EngineHandles {
+    downloads: Arc<Mutex<Vec<Arc<Download>>>>,
+    shared: Arc<Mutex<Vec<SharedFile>>>,
+    sharing: Arc<AtomicBool>,
+    public_ip: Arc<std::sync::Mutex<Option<Ipv4Addr>>>,
+}
+
+impl EngineHandles {
+    /// The in-progress downloads. Clones `Arc`s, not files.
+    pub async fn downloads(&self) -> Vec<Arc<Download>> {
+        self.downloads.lock().await.clone()
+    }
+
+    /// The shared library, in the same shape `Engine::shared_files` returns.
+    pub async fn shared_files(&self) -> Vec<([u8; 16], String, u64, u8, String)> {
+        self.shared
+            .lock()
+            .await
+            .iter()
+            .map(|s| {
+                (
+                    s.hash,
+                    String::from_utf8_lossy(&s.name).into_owned(),
+                    s.size,
+                    s.rating,
+                    s.comment.clone(),
+                )
+            })
+            .collect()
+    }
+
+    pub fn is_sharing(&self) -> bool {
+        self.sharing.load(Ordering::Relaxed)
+    }
+
+    pub fn has_port_mapping(&self) -> bool {
+        self.public_ip.lock().map(|g| g.is_some()).unwrap_or(false)
+    }
+
+    /// Session byte totals - process-global atomics, never engine state.
+    pub fn transfer_totals(&self) -> (u64, u64) {
+        (crate::stats::downloaded(), crate::stats::uploaded())
+    }
+}
+
 /// What the last successful status probe of a server said, and how many probes
 /// have gone unanswered since. A server is only shown DEAD once it has missed
 /// `PROBE_MISSES_BEFORE_DEAD` in a row.
@@ -1448,6 +1510,17 @@ impl Engine {
     /// (see [`crate::stats`]). Process-global, so they survive a pause/resume.
     pub fn transfer_totals(&self) -> (u64, u64) {
         (crate::stats::downloaded(), crate::stats::uploaded())
+    }
+
+    /// Handles a reader can use WITHOUT holding the engine lock. Take this ONCE
+    /// at construction; the underlying `Arc`s are never reassigned.
+    pub fn handles(&self) -> EngineHandles {
+        EngineHandles {
+            downloads: Arc::clone(&self.downloads),
+            shared: Arc::clone(&self.shared),
+            sharing: Arc::clone(&self.sharing),
+            public_ip: Arc::clone(&self.public_ip),
+        }
     }
 
     /// The in-progress downloads. Cheap: clones `Arc`s, not files.
