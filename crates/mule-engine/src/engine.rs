@@ -57,6 +57,7 @@ use mule_files::{
 };
 use mule_kad::RoutingTable;
 use mule_proto::{Kad128, Packet, Tag, TagName, TagValue, PROT_EDONKEY};
+use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -1144,6 +1145,25 @@ pub struct SearchFilters {
 
 /// The padMule engine. Create with [`Engine::new`], drive with the lifecycle
 /// methods, observe via the returned event receiver.
+/// What the last successful status probe of a server said, and how many probes
+/// have gone unanswered since. A server is only shown DEAD once it has missed
+/// `PROBE_MISSES_BEFORE_DEAD` in a row.
+#[derive(Clone, Copy)]
+struct ProbeHealth {
+    users: u32,
+    files: u32,
+    misses: u8,
+}
+
+/// How many consecutive silent probes before a server is called dead. Three
+/// rounds of UDP loss in a row is a real signal; one is just UDP.
+const PROBE_MISSES_BEFORE_DEAD: u8 = 3;
+
+/// Collection budget for the whole status fan-out. Was 3s, which is tight once
+/// the path runs through a VPN (~200ms base RTT before the server even thinks)
+/// and the fan-out is dozens of servers.
+const PROBE_COLLECT_BUDGET: Duration = Duration::from_secs(6);
+
 pub struct Engine {
     identity: NodeIdentity,
     config_dir: PathBuf,
@@ -1258,6 +1278,15 @@ pub struct Engine {
     /// Servers the user pinned (canonical `"ip:port"` keys), so `prune_dead_servers`
     /// keeps them even when down. Persisted to `config_dir/pinned.txt`.
     pinned: std::collections::HashSet<String>,
+    /// Last GOOD probe answer per server, plus how many probes have missed since.
+    ///
+    /// A status probe is UDP, and UDP loses datagrams - more so through a VPN
+    /// tunnel at ~200ms RTT. Treating one silent round as DEATH is the "an event
+    /// is not state" bug again: it greyed out servers that were answering fine
+    /// moments earlier, and that padMule had been connecting to. Observed
+    /// directly - the same two servers read "no reply" and then 3,651 / 47,008
+    /// users minutes apart, which no dead server does.
+    server_health: Arc<std::sync::Mutex<HashMap<SocketAddr, ProbeHealth>>>,
     /// Suppress ALL network activity. Tests set this so the unit suite never
     /// touches the real network; the UI never does.
     offline: bool,
@@ -1318,6 +1347,7 @@ impl Engine {
             last_server_search: None,
             search_session: None,
             pinned: std::collections::HashSet::new(),
+            server_health: Arc::new(std::sync::Mutex::new(HashMap::new())),
             offline: false,
         };
         Ok((engine, rx))
@@ -2211,7 +2241,7 @@ impl Engine {
             }
         }
         // Collect answers within a short budget; match each back by (ip, port-4).
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let deadline = tokio::time::Instant::now() + PROBE_COLLECT_BUDGET;
         let mut buf = [0u8; 2048];
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -2257,8 +2287,47 @@ impl Engine {
                     }
                 }
                 Ok(Ok(_)) => {}
-                _ => break,
+                // The DEADLINE elapsing is the normal end. A transient socket
+                // error is not, and must not throw away every answer still in
+                // flight for the servers we have not heard from yet.
+                Err(_) => break,
+                Ok(Err(_)) => continue,
             }
+        }
+
+        // Fold in what we remember. A server that answered THIS round resets its
+        // miss counter; one that stayed silent keeps its last good answer until
+        // it has missed PROBE_MISSES_BEFORE_DEAD in a row. Without this a single
+        // dropped datagram - routine on UDP, more so through a tunnel - greys out
+        // a server that is answering perfectly well, which is what Anthony saw.
+        if let Ok(mut health) = self.server_health.lock() {
+            for e in servers.iter_mut() {
+                if e.alive {
+                    health.insert(
+                        e.addr,
+                        ProbeHealth {
+                            users: e.users.unwrap_or(0),
+                            files: e.files.unwrap_or(0),
+                            misses: 0,
+                        },
+                    );
+                    continue;
+                }
+                let Some(h) = health.get_mut(&e.addr) else {
+                    continue; // never answered us; nothing to vouch for it
+                };
+                h.misses = h.misses.saturating_add(1);
+                if h.misses < PROBE_MISSES_BEFORE_DEAD {
+                    // Still believed live, showing the counts it last reported.
+                    e.alive = true;
+                    e.users = Some(h.users);
+                    e.files = Some(h.files);
+                }
+            }
+            // Do not accumulate forever: forget servers no longer in the list.
+            let live: std::collections::HashSet<SocketAddr> =
+                servers.iter().map(|e| e.addr).collect();
+            health.retain(|addr, _| live.contains(addr));
         }
         // Persist the names we just learned, so a crawled/harvested server stops
         // reading as a bare IP everywhere (the Servers table, and the connected
@@ -6311,6 +6380,70 @@ mod tests {
             "still incomplete, still resumable"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_single_silent_probe_does_not_kill_a_server() {
+        // "an event is not state", third occurrence. A status probe is UDP and
+        // UDP loses datagrams - more so through a VPN at ~200ms RTT. One silent
+        // round greyed out servers that were answering moments earlier and that
+        // padMule had been connecting to. Observed live: the same two servers
+        // read "no reply", then 3,651 / 47,008 users minutes later.
+        //
+        // This drives the same fold the probe applies to its raw results.
+        fn fold(
+            health: &Arc<std::sync::Mutex<HashMap<SocketAddr, ProbeHealth>>>,
+            addr: SocketAddr,
+            answered: bool,
+            users: u32,
+        ) -> (bool, Option<u32>) {
+            let mut alive = answered;
+            let mut shown = answered.then_some(users);
+            let mut h = health.lock().unwrap();
+            if answered {
+                h.insert(
+                    addr,
+                    ProbeHealth {
+                        users,
+                        files: 9,
+                        misses: 0,
+                    },
+                );
+            } else if let Some(e) = h.get_mut(&addr) {
+                e.misses = e.misses.saturating_add(1);
+                if e.misses < PROBE_MISSES_BEFORE_DEAD {
+                    alive = true;
+                    shown = Some(e.users);
+                }
+            }
+            (alive, shown)
+        }
+
+        let health: Arc<std::sync::Mutex<HashMap<SocketAddr, ProbeHealth>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let addr: SocketAddr = "1.2.3.4:4661".parse().unwrap();
+
+        // It answers once, so we know it is real.
+        assert_eq!(fold(&health, addr, true, 5000), (true, Some(5000)));
+        // Two silent rounds: still shown live, with the counts it last gave.
+        assert_eq!(fold(&health, addr, false, 0), (true, Some(5000)), "1 miss");
+        assert_eq!(
+            fold(&health, addr, false, 0),
+            (true, Some(5000)),
+            "2 misses"
+        );
+        // Three in a row is a real signal, not just UDP being UDP.
+        assert_eq!(
+            fold(&health, addr, false, 0),
+            (false, None),
+            "3 misses -> dead"
+        );
+        // And one good answer rehabilitates it immediately.
+        assert_eq!(fold(&health, addr, true, 6000), (true, Some(6000)));
+
+        // A server that has NEVER answered is not vouched for by anything.
+        let unknown: SocketAddr = "9.9.9.9:4661".parse().unwrap();
+        assert_eq!(fold(&health, unknown, false, 0), (false, None));
     }
 
     #[tokio::test]
