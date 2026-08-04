@@ -1,11 +1,33 @@
 # HANDOFF - start here next session
 
-Updated: 2026-08-04 (written fresh at the close of a very long 2026-08-03
-session). Everything below is verified, not assumed; anything NOT verified
+Updated: 2026-08-04 (wave 11 finished, then INDEPENDENTLY SWEPT - see the
+next section). Everything below is verified, not assumed; anything NOT verified
 says so explicitly.
 
 Living doc - replace it wholesale next time. Full narrative:
-[[build-progress]] rows 8av-8bi and the [[log]] entries for 2026-08-03.
+[[build-progress]] rows 8av-8bk and the [[log]] entries for 2026-08-03/04.
+
+## THE SWEEP FOUND A HOLE THE BRANCH'S OWN GATE COULD NOT SEE (row 8bk)
+
+An independent reanalysis of the FINISHED wave-11 branch - read as an outsider,
+not as its author - found the serve-side AICH answer was **unreachable on the
+path real clients use**: `is_upload_request` omitted 0x9B/0x9E, so
+`classify_inbound` returned `Other` and the listener dropped exactly the
+connections eMule opens to ask (`SendAICHRequest` ->
+`SafeConnectAndSendPacket`, BaseClient.cpp:2402-2414; the source is picked at
+RANDOM from `srclist` with no connection filter, PartFile.cpp:6087-6106). It
+also found a SECOND corruption round blaming the FIRST round's source, breaking
+the sole-contributor no-false-positive rule. Both fixed, mutation-checked, and
+both oracles re-run green. **Take the lesson forward: the branch had 601 green
+tests, warning-free clippy and three passing oracles, and every AICH serve test
+called `serve_shared` directly - so not one of them could discover that the
+connection dies before reaching it. That is the 8ad/8ae shape for the third
+time.** Gate now 603 tests.
+
+NOTE FOR NEXT TIME: a PARALLEL session was finishing the same task in the same
+worktree while this sweep began. Two agents in one worktree is a data-loss
+shape - check `git worktree list` against the running session transcripts under
+`~/.claude/projects/` before writing.
 
 ## RESOLVED: the AICH worktree is FINISHED, rebased, and up for review
 
