@@ -118,6 +118,7 @@ struct ContentView: View {
     /// port, so it asks first.
     @State private var confirmStop = false
     @State private var showSettings = false
+    @State private var showHelp = false
 
     var body: some View {
         NavigationStack {
@@ -174,9 +175,61 @@ struct ContentView: View {
                     }
                     .accessibilityLabel("Settings")
                 }
+                // Stop/Start reachable from ANY screen, not only Status: it is
+                // the thing to do before closing padMule, and hunting for the
+                // right tab first is exactly when people skip it. Same icons and
+                // the same confirmation as the Status control, so the two read
+                // as one feature in two places.
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    if model.state == .stopped {
+                        Button {
+                            model.startEngine()
+                        } label: {
+                            Image(systemName: "play.circle")
+                                .foregroundStyle(.blue)
+                        }
+                        .disabled(model.stopping)
+                        .accessibilityLabel("Start padMule")
+                    } else {
+                        Button {
+                            confirmStop = true
+                        } label: {
+                            Image(systemName: "stop.circle")
+                                .foregroundStyle(.red)
+                        }
+                        .disabled(model.stopping)
+                        .accessibilityLabel("Stop padMule")
+                    }
+                }
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button {
+                        showHelp = true
+                    } label: {
+                        Image(systemName: "questionmark.circle")
+                    }
+                    .accessibilityLabel("How to use padMule")
+                }
             }
             .sheet(isPresented: $showSettings) {
                 SettingsView().environmentObject(model)
+            }
+            .sheet(isPresented: $showHelp) {
+                HelpView()
+            }
+            // At the ROOT, not on the Status screen: the toolbar Stop button is
+            // reachable from every tab, and a confirmationDialog only presents
+            // if its host view is on screen - attached to statusScreen it would
+            // silently do nothing from anywhere else. Wording says "from the
+            // toolbar or the Status screen" for the same reason.
+            .confirmationDialog(
+                "Stop padMule?", isPresented: $confirmStop, titleVisibility: .visible
+            ) {
+                Button("Stop", role: .destructive) { model.stop() }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text(model.portMapped
+                     ? "Transfers stop and the router port is released. Your progress is saved, and you can start again from the toolbar or the Status screen."
+                     : "Transfers stop. Your progress is saved, and you can start again from the toolbar or the Status screen.")
             }
             .navigationTitle("padMule")
             .navigationBarTitleDisplayMode(.inline)
@@ -1020,14 +1073,6 @@ struct ContentView: View {
             } footer: {
                 Text(stopFooter)
             }
-        }
-        .confirmationDialog("Stop padMule?", isPresented: $confirmStop, titleVisibility: .visible) {
-            Button("Stop", role: .destructive) { model.stop() }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text(model.portMapped
-                 ? "Transfers stop and the router port is released. Your progress is saved and you can start again from this screen."
-                 : "Transfers stop. Your progress is saved and you can start again from this screen.")
         }
     }
 
