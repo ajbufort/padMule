@@ -173,6 +173,12 @@ const CRAWL_ROUND_WAIT: Duration = Duration::from_secs(4);
 /// a few small files.
 const CHECKPOINT_EVERY: Duration = Duration::from_secs(300);
 
+/// How often a RUNNING engine re-checks that its shared files are still on disk
+/// (see `Engine::verify_shared_library`). The user can delete a finished file in
+/// the Files app at any moment; a minute of staleness is invisible to them and
+/// costs one stat per shared file.
+const SHARE_VERIFY_EVERY: Duration = Duration::from_secs(60);
+
 /// How long to wait for a server's search answer / source list. Servers reply in
 /// well under this or not at all.
 const SEARCH_WAIT: Duration = Duration::from_secs(20);
@@ -226,6 +232,9 @@ pub enum ServerListUpdate {
 struct SearchSession {
     server_addr: SocketAddr,
     combined: Vec<SearchResultFile>,
+    /// ORIGIN_* bits per entry of `combined`, so a page loaded later keeps
+    /// saying where each hit came from.
+    origins: Vec<u8>,
     filters: SearchFilters,
     server_more: bool,
     more_reqs: u8,
@@ -282,8 +291,30 @@ const MAX_INBOUND_PER_IP: u32 = 16;
 /// Total wall-clock budget for the resume-fetch pass in `start()`, and the
 /// per-download cap on source-finding within it. Small so a batch of dead
 /// downloads cannot stall startup (which holds the FFI engine lock).
-const RESUME_BUDGET: Duration = Duration::from_secs(8);
-const RESUME_PER_DL: Duration = Duration::from_secs(4);
+/// How long one resume pass may spend re-driving downloads, and how long any
+/// single download gets. The pass runs while the user waits on the foreground
+/// return, so it stays short; downloads it does not reach are picked up by
+/// `maintain_resume_fetches` rather than being stranded until the next launch.
+const RESUME_BUDGET: Duration = Duration::from_secs(12);
+const RESUME_PER_DL: Duration = Duration::from_secs(6);
+
+/// The budget `add_download` gives source discovery. The user explicitly asked
+/// for this file and is watching a spinner, so it gets the full wait.
+const ADD_SOURCES_BUDGET: Duration = Duration::from_secs(15);
+
+/// How often the heartbeat re-drives ONE download that has gone idle, and the
+/// budget it gets. Before this existed there was NO retry anywhere: a download
+/// that missed its resume window - or whose fetch task simply exhausted its
+/// round budget - sat frozen until the app was relaunched, which is exactly
+/// what "stuck at 34% forever" looked like.
+///
+/// Deliberately small and infrequent: this runs on the 1s heartbeat, which
+/// holds the engine lock, so the budget is the length of a UI hitch. A short
+/// budget is enough in the common case because the SERVER arm answers in well
+/// under a second; Kad contributes only if it is also quick. Getting these
+/// calls off the one serial queue is the real fix (portability Tier 2).
+const RESUME_RETRY_EVERY: Duration = Duration::from_secs(45);
+const RESUME_RETRY_BUDGET: Duration = Duration::from_secs(2);
 
 /// The next free `NNN.part` index in `dir`. aMule numbers part files this way and
 /// `resume_downloads` finds them by that name, so a new download MUST NOT reuse
@@ -1033,6 +1064,8 @@ pub struct Engine {
     state: EngineState,
     /// When the last periodic checkpoint ran (see `maintain_checkpoint`).
     last_checkpoint: Instant,
+    last_share_verify: Instant,
+    last_resume_retry: Instant,
     events: mpsc::UnboundedSender<EngineEvent>,
     /// Persisted Kad contacts (loaded from / saved to `nodes.dat`).
     routing: RoutingTable,
@@ -1136,6 +1169,8 @@ impl Engine {
             config_dir,
             state: EngineState::Stopped,
             last_checkpoint: Instant::now(),
+            last_share_verify: Instant::now(),
+            last_resume_retry: Instant::now(),
             events: tx,
             routing,
             downloads: Arc::new(Mutex::new(Vec::new())),
@@ -2231,6 +2266,48 @@ impl Engine {
         added
     }
 
+    /// Drop shared files whose bytes are no longer on disk, correcting both the
+    /// live library and known.met. Returns how many were dropped.
+    ///
+    /// The downloads directory is the user-visible Files folder and padMule has
+    /// no in-app delete, so the ONLY way a finished file disappears is the user
+    /// removing it - and before this existed, the library was verified just once
+    /// at `start()`. For the rest of the session padMule kept announcing the
+    /// dead hash to the server, told a requesting peer the file was COMPLETE,
+    /// granted it an upload slot, and then dropped the connection when the read
+    /// failed. Same rule as `load_shared_library`: present AND the right size,
+    /// because a different file can be saved under the same name.
+    pub async fn verify_shared_library(&mut self) -> u32 {
+        let missing: Vec<(usize, [u8; 16])> = {
+            let lib = self.shared.lock().await;
+            lib.iter()
+                .enumerate()
+                .filter(|(_, f)| !matches!(std::fs::metadata(&f.path), Ok(m) if m.len() == f.size))
+                .map(|(i, f)| (i, f.hash))
+                .collect()
+        };
+        if missing.is_empty() {
+            return 0;
+        }
+        {
+            let mut lib = self.shared.lock().await;
+            // Remove back-to-front so the earlier indices stay valid.
+            for (i, _) in missing.iter().rev() {
+                lib.remove(*i);
+            }
+        }
+        for (_, hash) in &missing {
+            forget_shared_file(&self.config_dir, *hash);
+        }
+        // Re-announce the corrected library: the server still holds the old one.
+        self.shared_dirty.store(true, Ordering::Relaxed);
+        let n = missing.len() as u32;
+        self.emit(EngineEvent::Server(format!(
+            "{n} shared file(s) no longer on disk - stopped sharing them"
+        )));
+        n
+    }
+
     /// Probe the server list and drop every server that is DEAD and not pinned,
     /// rewriting `config_dir/server.met`. Returns how many were removed.
     pub async fn prune_dead_servers(&mut self) -> u32 {
@@ -2295,6 +2372,13 @@ impl Engine {
         }
         self.connection = None;
         self.emit(EngineEvent::ServerDropped { addr: addr.clone() });
+        // The DURABLE status line too. The app feeds its status row from
+        // `Status` events ALONE and routes `Server` text to a transient banner,
+        // so without this the row keeps claiming the connection we just lost -
+        // the same "an event is not state" bug fixed for connect/disconnect in
+        // 8as, which missed this path. Emitted after `self.server` is cleared,
+        // because `online_status` asks `is_online`.
+        self.emit(EngineEvent::Status(self.online_status()));
         Some(addr)
     }
 
@@ -2590,9 +2674,19 @@ impl Engine {
         // arrive in, so a single catalog pass dedupes across all three by hash.
         let server_more = server_page.more;
         let mut combined = server_page.files;
+        // Track WHERE each row came from, in step with `combined`. The origin is
+        // otherwise destroyed right here - three channels flattened into one
+        // untagged vec before catalog() dedupes - so the UI could never say
+        // whether a hit came from the server, from Kad, or from both.
+        let mut origins: Vec<u8> = vec![crate::catalog::ORIGIN_SERVER; combined.len()];
         combined.extend(kad_files.iter().map(kad_to_search));
+        origins.resize(combined.len(), crate::catalog::ORIGIN_KAD);
         combined.extend(global_files);
-        let ranked = apply_search_filters(catalog(&combined), &filters);
+        origins.resize(combined.len(), crate::catalog::ORIGIN_GLOBAL);
+        let ranked = apply_search_filters(
+            crate::catalog::catalog_with_origins(&combined, &origins),
+            &filters,
+        );
         // Remember this window so "load more" can continue the SERVER query on the
         // same connection (server-only: Kad/global are one-shot). No server -> no
         // session and nothing more to fetch.
@@ -2600,6 +2694,7 @@ impl Engine {
         self.search_session = connected.map(|server_addr| SearchSession {
             server_addr,
             combined,
+            origins,
             filters,
             server_more,
             more_reqs: 0,
@@ -2679,7 +2774,12 @@ impl Engine {
             let ranked = self
                 .search_session
                 .as_ref()
-                .map(|s| apply_search_filters(catalog(&s.combined), &s.filters))
+                .map(|s| {
+                    apply_search_filters(
+                        crate::catalog::catalog_with_origins(&s.combined, &s.origins),
+                        &s.filters,
+                    )
+                })
                 .unwrap_or_default();
             return SearchOutcome::Results {
                 ranked,
@@ -2698,7 +2798,10 @@ impl Engine {
         session.combined.extend(page.files);
         session.server_more = page.more;
         session.more_reqs += 1;
-        let ranked = apply_search_filters(catalog(&session.combined), &session.filters);
+        let ranked = apply_search_filters(
+            crate::catalog::catalog_with_origins(&session.combined, &session.origins),
+            &session.filters,
+        );
         let more_available = session.server_more && session.more_reqs < MAX_MORE_SEARCH_REQ;
         SearchOutcome::Results {
             ranked,
@@ -2754,7 +2857,7 @@ impl Engine {
         // A hands-on simulation caught the old gate: with every server down but
         // Kad up, search returned real hits yet every download was refused
         // "NoServer" - even though Kad had the sources.
-        let (reg, lowids) = self.find_sources(hash, size).await;
+        let (reg, lowids) = self.find_sources(hash, size, ADD_SOURCES_BUDGET).await;
         // A LowID source can only reach us via a SERVER callback, so without a
         // server only directly-connectable (HighID) sources are usable - otherwise
         // a Kad-only client would register a download that can never progress.
@@ -2783,7 +2886,22 @@ impl Engine {
     /// serverless client still gets Kad sources and vice versa. Returns the
     /// registry plus the LowID source IPs worth a server callback (empty unless
     /// WE are HighID - a LowID cannot receive a callback).
-    async fn find_sources(&mut self, hash: [u8; 16], size: u64) -> (SourceRegistry, Vec<u32>) {
+    /// Find sources for `hash`, spending at most `budget` on it.
+    ///
+    /// The budget bounds EACH arm rather than the whole call, which is the
+    /// difference between "best effort" and "all or nothing". The old shape
+    /// wrapped this function in an outer `timeout` at the call site: since the
+    /// two arms are joined (the wait is the SLOWER of the two, not the sum), a
+    /// slow Kad lookup made the outer timeout fire and threw away the server's
+    /// answer - which had arrived in well under a second. Resume therefore only
+    /// worked when Kad was BROKEN. Bounding per-arm means whatever arrived in
+    /// time is always used, and the caller never has to discard a good result.
+    async fn find_sources(
+        &mut self,
+        hash: [u8; 16],
+        size: u64,
+        budget: Duration,
+    ) -> (SourceRegistry, Vec<u32>) {
         let low_id = self.connection.as_ref().map(|c| c.low_id).unwrap_or(true);
         // The two lookups touch disjoint fields (server link vs Kad node), so
         // run them together; the wait is the slower of the two, not the sum.
@@ -2793,7 +2911,7 @@ impl Engine {
             async {
                 match server {
                     Some(link) => link
-                        .get_sources(&hash, size, SOURCES_WAIT)
+                        .get_sources(&hash, size, budget.min(SOURCES_WAIT))
                         .await
                         .unwrap_or_default(),
                     None => Vec::new(),
@@ -2804,7 +2922,7 @@ impl Engine {
                     // Bounded like the search path: a slow lookup contributes
                     // nothing rather than hanging the Get.
                     Some(node) => timeout(
-                        KAD_SEARCH_WAIT,
+                        budget.min(KAD_SEARCH_WAIT),
                         node.resolve_sources(&Kad128::from_hash(&hash), size, 20, KAD_PER_QUERY),
                     )
                     .await
@@ -2956,10 +3074,9 @@ impl Engine {
             let hash = dl.hash().await;
             let size = dl.size().await;
             let name = dl.name().await;
-            let Ok((reg, lowids)) = timeout(RESUME_PER_DL, self.find_sources(hash, size)).await
-            else {
-                continue; // source-finding overran its budget; leave it idle
-            };
+            // Bounded INSIDE find_sources, so a slow Kad arm no longer throws
+            // away the server sources that already arrived.
+            let (reg, lowids) = self.find_sources(hash, size, RESUME_PER_DL).await;
             if reg.is_empty() && lowids.is_empty() {
                 continue;
             }
@@ -3333,6 +3450,64 @@ impl Engine {
     /// Driven by the same 1s `downloads()` heartbeat as the other background
     /// duties, and gated on elapsed time so all but one call in 300 is a clock
     /// comparison.
+    /// Re-drive ONE download that has gone idle. The missing retry: `spawn_fetch`
+    /// is otherwise only ever called from `start()`, `resume()` and
+    /// `add_download`, and a fetch task that exhausts its round budget without
+    /// finishing simply ends - so a download could be registered, incomplete,
+    /// and permanently doing nothing while the UI showed it as a transfer.
+    ///
+    /// One per tick keeps the cost bounded; the oldest-idle-first ordering means
+    /// a set of stalled downloads is worked through round-robin rather than the
+    /// first one hogging every retry.
+    pub async fn maintain_resume_fetches(&mut self) -> bool {
+        if self.state != EngineState::Running
+            || self.last_resume_retry.elapsed() < RESUME_RETRY_EVERY
+            || self.offline
+        {
+            return false;
+        }
+        // Nothing to do is the common case - check before paying for anything.
+        let candidate: Option<Arc<Download>> = {
+            let guard = self.downloads.lock().await;
+            let mut idle: Vec<&Arc<Download>> = guard
+                .iter()
+                .filter(|dl| !dl.is_cancelled() && !dl.is_fetching())
+                .collect();
+            idle.sort_by_key(|dl| std::cmp::Reverse(dl.priority()));
+            idle.first().map(|dl| Arc::clone(dl))
+        };
+        self.last_resume_retry = Instant::now();
+        let Some(dl) = candidate else {
+            return false;
+        };
+        if dl.is_complete().await {
+            return false;
+        }
+        let hash = dl.hash().await;
+        let size = dl.size().await;
+        let name = dl.name().await;
+        let (reg, lowids) = self.find_sources(hash, size, RESUME_RETRY_BUDGET).await;
+        if reg.is_empty() && lowids.is_empty() {
+            return false;
+        }
+        self.request_callbacks(&lowids).await;
+        self.spawn_fetch(dl, hash, size, &name, reg.sources().to_vec());
+        true
+    }
+
+    /// Periodically drop shared files the user deleted (see
+    /// `verify_shared_library`). Runs off the same 1s heartbeat as the other
+    /// maintainers, gated to `SHARE_VERIFY_EVERY`.
+    pub async fn maintain_share_verify(&mut self) -> u32 {
+        if self.state != EngineState::Running
+            || self.last_share_verify.elapsed() < SHARE_VERIFY_EVERY
+        {
+            return 0;
+        }
+        self.last_share_verify = Instant::now();
+        self.verify_shared_library().await
+    }
+
     pub async fn maintain_checkpoint(&mut self) {
         if self.state != EngineState::Running || self.last_checkpoint.elapsed() < CHECKPOINT_EVERY {
             return;
@@ -3437,6 +3612,20 @@ mod tests {
         let gated = gate_loaded_nodes(&contacts, Some(&filter));
         let ips: Vec<u32> = gated.iter().map(|c| c.ip).collect();
         assert_eq!(ips, vec![0x0808_0404, 0x2596_24FA]);
+    }
+
+    /// A REAL file on disk for a `SharedFile` fixture. The serve path verifies a
+    /// shared file still exists at the size we hashed before claiming we have it
+    /// (so a file the user deleted is never advertised), which means a fixture
+    /// path must be real - and makes these tests faithful to a live serve.
+    fn fixture_file(tag: &str, size: usize) -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "padmule-engine-{tag}-{}-{:?}.bin",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&p, vec![0u8; size]).unwrap();
+        p
     }
 
     fn tmp(tag: &str) -> PathBuf {
@@ -4056,6 +4245,251 @@ mod tests {
         addr
     }
 
+    /// THE missing retry. Before this, `spawn_fetch` was only ever reached from
+    /// `start()`, `resume()` and `add_download`, so a download that missed its
+    /// resume window - or whose fetch task simply ran out of rounds - sat
+    /// registered, incomplete and permanently idle while the UI still showed it
+    /// as a transfer. That is what "stuck at 34% forever" was.
+    #[tokio::test]
+    async fn the_idle_download_retry_fires_only_when_due_and_only_when_idle() {
+        use crate::part_store::PartStore;
+        let dir = tmp("resume-retry");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+        engine.set_offline(false);
+        engine.state = EngineState::Running;
+
+        let store = PartStore::create(&dir, 7, [0x33; 16], 5000, b"idle.bin").unwrap();
+        engine.downloads.lock().await.push(Download::new(store));
+
+        // NOT due: it must early-return BEFORE doing any work. The observable
+        // that distinguishes "early-returned" from "ran and found nothing" is
+        // the interval stamp, which only a tick that actually runs updates.
+        // (Asserting the RETURN VALUE would not bite: with no server and no Kad
+        // the answer is false either way - the first version of this test passed
+        // happily with the interval check deleted.)
+        let not_due = Instant::now();
+        engine.last_resume_retry = not_due;
+        let _ = engine.maintain_resume_fetches().await;
+        assert_eq!(
+            engine.last_resume_retry, not_due,
+            "an early return must not consume the interval - it never ran"
+        );
+
+        // Due: it runs, which the refreshed stamp proves, so a tick cannot spin
+        // every second once it has looked.
+        engine.last_resume_retry = Instant::now() - RESUME_RETRY_EVERY - Duration::from_secs(1);
+        let due = engine.last_resume_retry;
+        let _ = engine.maintain_resume_fetches().await;
+        assert!(
+            engine.last_resume_retry > due,
+            "a due tick must run and consume the interval"
+        );
+        let dls = engine.downloads().await;
+        assert_eq!(dls.len(), 1, "the download is still registered");
+        assert!(
+            !dls[0].is_complete().await,
+            "still incomplete, still resumable"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A server that logs in and then NEVER answers a source request, holding
+    /// the connection open - the shape that made the old code burn its whole
+    /// SOURCES_WAIT.
+    async fn spawn_silent_source_server() -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut sfs = crate::framed::FramedStream::new(sock);
+                    if sfs.read_packet().await.is_err() {
+                        return;
+                    }
+                    let _ = sfs
+                        .write_packet(&mule_proto::Packet::new(
+                            mule_proto::PROT_EDONKEY,
+                            crate::server_messages::OP_IDCHANGE,
+                            0x0A00_0001u32.to_le_bytes().to_vec(),
+                        ))
+                        .await;
+                    // Read forever, answer nothing, keep the socket OPEN.
+                    while sfs.read_packet().await.is_ok() {}
+                });
+            }
+        });
+        addr
+    }
+
+    /// Source discovery must honour the budget it is GIVEN, so the caller never
+    /// has to wrap it in a timeout that throws away a good answer. Driven
+    /// against a server that stays connected and never replies: the old code
+    /// spent the full SOURCES_WAIT (10s) here regardless of what the caller
+    /// could afford.
+    #[tokio::test]
+    async fn find_sources_honours_a_short_budget_against_a_silent_server() {
+        let dir = tmp("find-budget");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+
+        let addr = spawn_silent_source_server().await;
+        assert!(
+            engine.connect_to_server(addr).await,
+            "mock login should win"
+        );
+
+        let t0 = tokio::time::Instant::now();
+        let (reg, lowids) = engine
+            .find_sources([0x44; 16], 1000, Duration::from_millis(600))
+            .await;
+        let elapsed = t0.elapsed();
+        assert!(
+            reg.is_empty() && lowids.is_empty(),
+            "the server said nothing"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "must return inside the 600ms budget, not the 10s SOURCES_WAIT; took {elapsed:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A finished file the user DELETED (in the Files app - the downloads dir is
+    /// user-visible, and padMule offers no in-app delete) must stop being
+    /// advertised. Before this fix the library was verified only at `start()`,
+    /// so for the rest of the session padMule kept announcing the dead hash via
+    /// OP_OFFERFILES, told a requesting peer the file was COMPLETE, granted it
+    /// an upload slot, and then died silently when the read failed - the worst
+    /// shape, since the peer had every reason to believe us.
+    #[tokio::test]
+    async fn a_deleted_finished_file_is_dropped_from_the_shared_library() {
+        let dir = tmp("phantom-share");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let downloads = dir.join("dl");
+        std::fs::create_dir_all(&downloads).unwrap();
+
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+        engine.set_downloads_dir(&downloads);
+
+        // Two shared files, both really on disk.
+        let keep = downloads.join("keep.bin");
+        let gone = downloads.join("gone.bin");
+        std::fs::write(&keep, vec![1u8; 64]).unwrap();
+        std::fs::write(&gone, vec![2u8; 64]).unwrap();
+        {
+            let mut lib = engine.shared.lock().await;
+            for (h, p) in [([0xAAu8; 16], &keep), ([0xBBu8; 16], &gone)] {
+                let sf = SharedFile {
+                    hash: h,
+                    size: 64,
+                    name: p
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned()
+                        .into_bytes(),
+                    part_hashes: Vec::new(),
+                    path: p.clone(),
+                    rating: 0,
+                    comment: String::new(),
+                };
+                persist_shared_file(&engine.config_dir, &sf);
+                lib.push(sf);
+            }
+        }
+        assert_eq!(engine.shared_files().await.len(), 2);
+
+        // The user deletes one in the Files app.
+        std::fs::remove_file(&gone).unwrap();
+
+        let dropped = engine.verify_shared_library().await;
+        assert_eq!(dropped, 1, "the deleted file must be dropped");
+
+        let left = engine.shared_files().await;
+        assert_eq!(left.len(), 1, "only the surviving file is still shared");
+        assert_eq!(left[0].1, "keep.bin");
+        assert!(
+            engine.shared_dirty.load(Ordering::Relaxed),
+            "the server must be re-offered the corrected library"
+        );
+        // ...and it must not come back from known.met on the next load.
+        let reloaded = load_shared_library(&engine.config_dir, &downloads);
+        assert_eq!(reloaded.len(), 1, "known.met was corrected too");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A mock server that accepts a login, answers the IDCHANGE, then CLOSES -
+    /// a kick. Used to drive the drop path end to end.
+    async fn spawn_kicking_login_server() -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut sfs = crate::framed::FramedStream::new(sock);
+                    if sfs.read_packet().await.is_err() {
+                        return;
+                    }
+                    let _ = sfs
+                        .write_packet(&mule_proto::Packet::new(
+                            mule_proto::PROT_EDONKEY,
+                            crate::server_messages::OP_IDCHANGE,
+                            0x0A00_0001u32.to_le_bytes().to_vec(),
+                        ))
+                        .await;
+                    // ...and hang up. The socket drops at the end of this task.
+                });
+            }
+        });
+        addr
+    }
+
+    /// A server DROP must refresh the durable Status line, not only raise the
+    /// kick alert. This is the exact mirror of the 2026-08-02 on-device bug
+    /// (build-progress 8as, "an event is not state"): that fix taught
+    /// connect/disconnect/failed-dial to emit Status, but the DROP path was
+    /// missed, so after a kick the Status row kept reading "Connected to ..."
+    /// forever while the Server and ID rows correctly vanished.
+    #[tokio::test]
+    async fn a_server_drop_refreshes_the_status_line() {
+        let dir = tmp("drop-status");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut engine, mut rx) = Engine::new(&dir).unwrap();
+
+        let addr = spawn_kicking_login_server().await;
+        assert!(
+            engine.connect_to_server(addr).await,
+            "mock login should win"
+        );
+        let _ = drain(&mut rx).await; // clear the connect events
+
+        // Give the server's close a moment to land, then poll as the heartbeat does.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            engine.poll_server_drop().await.is_some(),
+            "the closed connection must be detected as a drop"
+        );
+
+        let evs = drain(&mut rx).await;
+        assert!(
+            evs.iter()
+                .any(|e| matches!(e, EngineEvent::ServerDropped { .. })),
+            "the kick alert must still fire; got {evs:?}"
+        );
+        assert!(
+            evs.iter().any(
+                |e| matches!(e, EngineEvent::Status(s) if s == "Not connected - pick a server")
+            ),
+            "the DURABLE status line must stop claiming a connection; got {evs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Like `spawn_mock_login_server`, but RECORDS the opcode of every packet
     /// the client sends after its login, so a test can assert what the connect
     /// burst contains (the shares offer, the OP_GETSERVERLIST ask, ...).
@@ -4311,7 +4745,7 @@ mod tests {
             size: 100,
             name: b"held.bin".to_vec(),
             part_hashes: vec![],
-            path: PathBuf::from("/does/not/matter"),
+            path: fixture_file("held", 100),
             rating: 0,
             comment: String::new(),
         }]));
@@ -4361,7 +4795,7 @@ mod tests {
             size: 100,
             name: b"q.bin".to_vec(),
             part_hashes: vec![],
-            path: PathBuf::from("/does/not/matter"),
+            path: fixture_file("queue", 100),
             rating: 0,
             comment: String::new(),
         }];
@@ -4426,7 +4860,7 @@ mod tests {
             size: 300,
             name: b"g.bin".to_vec(),
             part_hashes: vec![],
-            path: PathBuf::from("/does/not/matter"),
+            path: fixture_file("gated", 300),
             rating: 0,
             comment: String::new(),
         }];
