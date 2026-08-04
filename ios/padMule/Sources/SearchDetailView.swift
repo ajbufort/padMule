@@ -47,7 +47,14 @@ struct SearchDetailView: View {
                     Button {
                         model.relatedSearch(hit)
                         dismiss()
-                    } label: { Label("Search related", systemImage: "magnifyingglass") }
+                    } label: {
+                        HStack {
+                            Label("Search related", systemImage: "magnifyingglass")
+                            Spacer()
+                            if model.searching { ProgressView() }
+                        }
+                    }
+                    .disabled(model.searching)
                 }
             }
             .navigationTitle("Details")

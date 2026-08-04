@@ -38,6 +38,35 @@ let engineLog = Logger(subsystem: "us.ajbconsulting.padMule", category: "padMule
 private let recentsKey = "padMule.recentSearches"
 private let recentsCap = 12
 
+/// Which Servers-screen operation is currently running, if any. Lets each of
+/// the four buttons (Refresh/Update/Prune/Discover) show its OWN spinner
+/// instead of sharing one opaque `loadingServers` flag.
+enum ServerOp: Equatable {
+    case probing, updating, pruning, crawling
+}
+
+/// The factors a user can sort the Transfers list by. Mirrors SortKey's shape
+/// (SearchPresentation.swift) but simpler - transfers have no type/bitrate/length.
+enum TransferSortKey: String, CaseIterable, Identifiable {
+    case name = "Name"
+    case size = "Size"
+    case progress = "Progress"
+    case priority = "Priority"
+    var id: String { rawValue }
+}
+
+/// One finished file as it actually sits in Documents (see boot()'s `docsPath`),
+/// read straight from the filesystem for the Downloaded screen - NOT derived
+/// from `sharedFiles`, which is the seeding library and goes silent on a file
+/// the user unshared even though it is still sitting right there on disk.
+struct DownloadedFile: Identifiable {
+    let id: String
+    let name: String
+    let size: UInt64
+    let url: URL
+    let modified: Date
+}
+
 @MainActor
 final class EngineModel: ObservableObject {
     @Published private(set) var state: EngineStateFfi = .stopped
@@ -69,7 +98,12 @@ final class EngineModel: ObservableObject {
     // kick/drop banner (settable so the alert can clear it). padMule does NOT
     // auto-connect; the user picks a live server here.
     @Published private(set) var servers: [ServerEntryFfi] = []
-    @Published private(set) var loadingServers = false
+    /// Which of Refresh/Update/Prune/Discover is running, if any.
+    @Published private(set) var serverOp: ServerOp?
+    /// True while ANY server-screen op is running. Kept so every existing
+    /// `.disabled(model.loadingServers)` call site keeps working unchanged;
+    /// per-button spinners key off `serverOp` directly.
+    var loadingServers: Bool { serverOp != nil }
     /// The address currently being dialled. connect_to_server blocks up to 12s, so
     /// without this the first real action a new user takes appears to do nothing.
     @Published private(set) var connectingTo: String?
@@ -113,17 +147,58 @@ final class EngineModel: ObservableObject {
     @Published var trustedOnly: Bool = false
     @Published var hideHave: Bool = false
 
+    // Transfers-screen sort inputs (UI-owned; applied client-side over `downloads`).
+    @Published var transferSortKey: TransferSortKey = .name
+    @Published var transferSortAscending = true
+
     /// Whether padMule has any way to find files right now - a connected server
     /// or a populated Kad table. Mirrors the engine's own `can_discover`, and is
     /// what lets the UI say "nobody to ask" instead of "no results".
     var canDiscover: Bool { server != nil || kadContacts > 0 }
+
+    /// A pure connectivity verdict for the Status screen's "Status" row,
+    /// derived entirely here rather than from the engine's free-text `status`
+    /// (the Status screen now shows that separately, as "Activity", only when
+    /// it differs). Collapses state/server/reconnecting/stopping/ready into
+    /// one of: "Starting...", "Stopping...", "Stopped", "Paused",
+    /// "Reconnecting...", "Connected", "Not connected". `stopping` is checked
+    /// first because it means a Start/Stop tap is in flight and overrides
+    /// whatever `state` still reads until it lands - the same distinction the
+    /// Stop section below already draws between "Starting..." and
+    /// "Stopping...".
+    var connectionSummary: String {
+        if stopping { return state == .stopped ? "Starting..." : "Stopping..." }
+        if !ready { return "Starting..." }
+        switch state {
+        case .stopped: return "Stopped"
+        case .paused: return "Paused"
+        case .running:
+            if reconnecting { return "Reconnecting..." }
+            return server != nil ? "Connected" : "Not connected"
+        }
+    }
 
     /// The results after the current sort + filter. Recomputed on demand (cheap:
     /// a few hundred rows) so any input change reorders instantly.
     var presentedResults: [SearchHit] {
         present(results, sort: sortKey, ascending: sortAscending,
                 nameFilter: nameFilter, typeFilter: typeFilter,
-                trustedOnly: trustedOnly, hideHave: hideHave)
+                trustedOnly: trustedOnly, hideHave: hideHave,
+                statusFor: { self.liveStatus(for: $0) })
+    }
+
+    /// The status a search row should DISPLAY, live. `SearchHit.status` is a
+    /// snapshot the engine stamps once at search time and never updates, so on
+    /// its own it goes stale within a second: a completed download still shows
+    /// as not-had, and a file the user just tapped "Get" on reverts to showing
+    /// the Get button (allowing a double-start). `downloadingHashes` /
+    /// `haveHashes` are rebuilt every refresh() poll, so this always prefers the
+    /// live answer; the snapshot remains correct only for a file owned from a
+    /// PREVIOUS session (already in the shared library before this search ran).
+    func liveStatus(for hit: SearchHit) -> HitStatusFfi {
+        if haveHashes.contains(hit.hash) { return .have }
+        if downloadingHashes.contains(hit.hash) { return .downloading }
+        return hit.status
     }
 
     /// Recent search queries, most-recent first, persisted across launches so a
@@ -160,10 +235,20 @@ final class EngineModel: ObservableObject {
     /// SNAPSHOT, like the server login: the engine owns the truth, the UI mirrors
     /// it. Defaults to true so the switch reads correctly before the first poll.
     @Published private(set) var sharing = true
+    /// Finished files as they sit in Documents right now (the Downloaded screen).
+    /// Read straight off the filesystem by `loadDownloadedFiles()` - see that
+    /// method's doc comment for why this is not derived from `sharedFiles`.
+    @Published private(set) var downloadedFiles: [DownloadedFile] = []
 
     private var engine: MuleEngine?
     private var timer: Timer?
     private let work = DispatchQueue(label: "us.ajbconsulting.padMule.engine")
+    /// The background-task assertion held while pause() finishes; see pause().
+    private var pauseBackgroundTask: UIBackgroundTaskIdentifier = .invalid
+    /// The Documents directory `boot()` handed to the engine as `downloadsDir` -
+    /// stashed here so `loadDownloadedFiles()` reads the SAME directory the
+    /// engine finishes downloads into, rather than re-deriving it.
+    private var docsURL: URL?
 
     private var booting = false
 
@@ -184,6 +269,7 @@ final class EngineModel: ObservableObject {
         let dir = base.appendingPathComponent("padMule", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        docsURL = docs
 
         let path = dir.path
         let docsPath = docs.path
@@ -504,6 +590,32 @@ final class EngineModel: ObservableObject {
         return downloads.filter { categoryOf[$0.hash] == f }
     }
 
+    /// `filteredDownloads`, then sorted by the current transfer sort key.
+    /// Progress compares have/size fraction (guarded against size == 0, which
+    /// would otherwise divide by zero for a download with no known size yet).
+    var presentedDownloads: [DownloadInfo] {
+        func threeWay<T: Comparable>(_ a: T, _ b: T) -> ComparisonResult {
+            if a < b { return .orderedAscending }
+            if b < a { return .orderedDescending }
+            return .orderedSame
+        }
+        var xs = filteredDownloads
+        xs.sort { a, b in
+            let cmp: ComparisonResult
+            switch transferSortKey {
+            case .name: cmp = a.name.localizedCaseInsensitiveCompare(b.name)
+            case .size: cmp = threeWay(a.size, b.size)
+            case .progress:
+                let fa = a.size == 0 ? 0 : Double(a.have) / Double(a.size)
+                let fb = b.size == 0 ? 0 : Double(b.have) / Double(b.size)
+                cmp = threeWay(fa, fb)
+            case .priority: cmp = threeWay(a.priority, b.priority)
+            }
+            return transferSortAscending ? cmp == .orderedAscending : cmp == .orderedDescending
+        }
+        return xs
+    }
+
     /// The category assigned to a hash, if any.
     func category(for hash: String) -> Category? {
         guard let id = categoryOf[hash] else { return nil }
@@ -577,11 +689,79 @@ final class EngineModel: ObservableObject {
         }
     }
 
+    // MARK: - Downloaded
+
+    /// Enumerate Documents (the engine's `downloadsDir`, see boot()) for the
+    /// Downloaded screen. Deliberately reads the FILESYSTEM rather than
+    /// `sharedFiles`: `sharedFiles` is the seeding library, so a file the user
+    /// unshared (still on disk) or whose bytes got pruned drops out of it - this
+    /// list stays honest either way. Skips subdirectories and dotfiles, sorted
+    /// most-recently-finished first. Cheap enough to run synchronously - this is
+    /// one directory listing, not a recursive walk - so unlike the engine calls
+    /// above it does not need the work queue.
+    func loadDownloadedFiles() {
+        let dir = docsURL ?? FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let keys: [URLResourceKey] = [.fileSizeKey, .contentModificationDateKey, .isDirectoryKey]
+        guard let items = try? FileManager.default.contentsOfDirectory(
+            at: dir, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles])
+        else {
+            downloadedFiles = []
+            return
+        }
+        let files: [DownloadedFile] = items.compactMap { url in
+            guard let values = try? url.resourceValues(forKeys: Set(keys)), values.isDirectory != true
+            else { return nil }
+            return DownloadedFile(
+                id: url.path,
+                name: url.lastPathComponent,
+                size: UInt64(values.fileSize ?? 0),
+                url: url,
+                modified: values.contentModificationDate ?? .distantPast)
+        }
+        downloadedFiles = files.sorted { $0.modified > $1.modified }
+    }
+
     /// App backgrounded: checkpoint + release sockets. iPadOS would reclaim them
     /// anyway - doing it explicitly is what makes resume honest.
+    ///
+    /// pause() is dispatched onto the same SERIAL `work` queue as every other
+    /// engine call, so it can land behind something slow (a 20s search) and
+    /// miss iOS's ~5s background grace window entirely - losing up to 5
+    /// minutes of unsaved download progress. Two mitigations: a
+    /// beginBackgroundTask assertion asks iOS for real extra time to finish
+    /// (ended on EVERY path - success or expiry - because leaking the
+    /// assertion gets the app killed for overstaying it), and refresh()'s
+    /// in-flight guard (below) keeps the 1s poll timer from stacking up ahead
+    /// of this call in the same queue.
     func pause() {
         engineLog.notice("lifecycle: pause (backgrounded)")
-        run { $0.pause() }
+        guard let e = engine else { return }
+        pauseBackgroundTask = UIApplication.shared.beginBackgroundTask(withName: "padMule.pause") {
+            [weak self] in
+            DispatchQueue.main.async {
+                engineLog.error("lifecycle: pause's background task EXPIRED before it finished")
+                self?.endPauseBackgroundTask()
+            }
+        }
+        work.async { [weak self] in
+            e.pause()
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.refresh()
+                self.endPauseBackgroundTask()
+            }
+        }
+    }
+
+    /// End the background-task assertion pause() took, exactly once. Both the
+    /// success path and the expiration handler call this, and either can win
+    /// the race; guarding on `.invalid` (and resetting to it) is what stops
+    /// the loser from double-ending the same identifier, which iOS treats as
+    /// a misuse.
+    private func endPauseBackgroundTask() {
+        guard pauseBackgroundTask != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(pauseBackgroundTask)
+        pauseBackgroundTask = .invalid
     }
 
     /// App foregrounded: rebuild + reconnect.
@@ -648,12 +828,27 @@ final class EngineModel: ObservableObject {
         timer = t
     }
 
+    /// Hashes backing `liveStatus(for:)`, rebuilt once per refresh() poll - NOT
+    /// per search row - so deriving a row's displayed status stays O(1) instead
+    /// of rescanning `downloads` / `sharedFiles` on every render.
+    private var downloadingHashes: Set<String> = []
+    private var haveHashes: Set<String> = []
+    /// True while a refresh() poll is in flight; see refresh()'s doc comment.
+    private var refreshInFlight = false
+
     /// Pull a fresh snapshot + drain queued events, all off the main thread.
     /// The downloads() call is ALSO the engine's heartbeat (share re-announce,
     /// completion finalize, server-drop detection) - the 1s timer must keep
     /// firing this even when no screen shows transfers.
+    ///
+    /// Guarded by `refreshInFlight` so a slow call ahead of this one on the
+    /// serial `work` queue (e.g. a 20s search) cannot let the 1s timer stack
+    /// dozens of queued jobs in front of something urgent like pause(). The
+    /// heartbeat still fires every ~1s once the in-flight one clears; this
+    /// only caps concurrency at one.
     private func refresh() {
-        guard let e = engine else { return }
+        guard let e = engine, !refreshInFlight else { return }
+        refreshInFlight = true
         work.async { [weak self] in
             let st = e.state()
             let dls = e.downloads()
@@ -667,9 +862,15 @@ final class EngineModel: ObservableObject {
             let evs = e.drainEvents()
             DispatchQueue.main.async {
                 guard let self else { return }
+                self.refreshInFlight = false
                 self.state = st
                 self.downloads = dls
                 self.sharedFiles = shf
+                // A completed-but-still-listed download counts as HAVE (not
+                // downloading); anything shared counts as HAVE too.
+                self.downloadingHashes = Set(dls.filter { !$0.complete }.map { $0.hash })
+                self.haveHashes =
+                    Set(dls.filter { $0.complete }.map { $0.hash }).union(shf.map { $0.hash })
                 self.kadContacts = kad
                 self.ipFilterRanges = ipf
                 self.server = srv
@@ -774,12 +975,12 @@ final class EngineModel: ObservableObject {
     /// thread; the UDP pings take a few seconds).
     func loadServers() {
         guard let e = engine, !loadingServers else { return }
-        loadingServers = true
+        serverOp = .probing
         work.async { [weak self] in
             let list = e.serverList()
             DispatchQueue.main.async {
                 self?.servers = list
-                self?.loadingServers = false
+                self?.serverOp = nil
             }
         }
     }
@@ -823,7 +1024,7 @@ final class EngineModel: ObservableObject {
     func updateAllServerLists() {
         guard let e = engine, !loadingServers else { return }
         let urls = serverListUrls
-        loadingServers = true
+        serverOp = .updating
         engineLog.notice("updating \(urls.count, privacy: .public) server list(s)")
         work.async { [weak self] in
             var added = 0
@@ -841,7 +1042,7 @@ final class EngineModel: ObservableObject {
             }
             DispatchQueue.main.async {
                 guard let self else { return }
-                self.loadingServers = false
+                self.serverOp = nil
                 if failures.count == urls.count {
                     self.notice = "Could not update the server list (\(failures.first ?? "failed"))."
                 } else if failures.isEmpty {
@@ -899,13 +1100,27 @@ final class EngineModel: ObservableObject {
     /// Keep the screen from sleeping while a transfer is active, IF the user opted
     /// in. This is the honest iPadOS translation of eMule's "Prevent Standby":
     /// padMule is foreground-only, so a screen that sleeps mid-transfer suspends
-    /// the app and pauses everything. Gated on there being active transfers so it
-    /// does not hold the screen awake on an idle Search screen.
+    /// the app and pauses everything. Gated on ACTUAL recent throughput, not
+    /// merely a registered incomplete download - a download with zero sources
+    /// sits at 0 bytes/sec forever, and holding the screen on for a transfer
+    /// going nowhere is exactly what "while something is actually transferring"
+    /// promises not to do. `rateHistory`'s most recent point (folded by
+    /// sampleStats() on roughly every poll) is a faithful "is data moving right
+    /// now" signal, and covers uploads too, not just downloads.
     func applyKeepAwake() {
         let want = UserDefaults.standard.bool(forKey: SettingsKey.keepAwakeWhileTransferring)
-        let active = downloads.contains { !$0.complete }
-        UIApplication.shared.isIdleTimerDisabled = want && active
+        // Look at the last few SAMPLES, not just the most recent one. A transfer
+        // legitimately goes quiet for a second between block batches (padMule is
+        // stop-and-wait per batch), and gating on a single zero sample would let
+        // the display sleep mid-transfer - which suspends the app and stops the
+        // very transfer this setting exists to protect. Still activity-based, so
+        // a genuinely stalled download stops holding the screen within seconds.
+        let moving = rateHistory.suffix(keepAwakeWindow).contains { $0.down + $0.up > 0 }
+        UIApplication.shared.isIdleTimerDisabled = want && moving
     }
+
+    /// How many 1s rate samples back `applyKeepAwake` looks for activity.
+    private var keepAwakeWindow: Int { 5 }
 
     /// Connect to a chosen (live) server, then refresh the list + status.
     func connectServer(_ addr: String) {
@@ -950,12 +1165,12 @@ final class EngineModel: ObservableObject {
     /// re-probe. Reports the outcome via the notice banner.
     func updateServerList(_ url: String) {
         guard let e = engine, !loadingServers else { return }
-        loadingServers = true
+        serverOp = .updating
         work.async { [weak self] in
             let result = e.updateServerList(url: url)
             DispatchQueue.main.async {
                 guard let self else { return }
-                self.loadingServers = false
+                self.serverOp = nil
                 switch result {
                 case let .updated(added, total):
                     self.notice = "Server list updated: +\(added) new (\(total) total)."
@@ -987,12 +1202,12 @@ final class EngineModel: ObservableObject {
     /// Drop every dead, unpinned server from the list, then re-probe.
     func pruneDeadServers() {
         guard let e = engine, !loadingServers else { return }
-        loadingServers = true
+        serverOp = .pruning
         work.async { [weak self] in
             let removed = e.pruneDeadServers()
             DispatchQueue.main.async {
                 guard let self else { return }
-                self.loadingServers = false
+                self.serverOp = nil
                 self.notice =
                     removed == 0 ? "No dead servers to prune." : "Pruned \(removed) dead server(s)."
                 self.loadServers()
@@ -1005,14 +1220,14 @@ final class EngineModel: ObservableObject {
     /// Most servers stay silent to this request, so a 0 result is normal.
     func crawlServers() {
         guard let e = engine, !loadingServers else { return }
-        loadingServers = true
+        serverOp = .crawling
         engineLog.notice("crawling for more servers")
         work.async { [weak self] in
             let added = e.crawlServers(rounds: 2)
             engineLog.notice("crawl added \(added, privacy: .public) new server(s)")
             DispatchQueue.main.async {
                 guard let self else { return }
-                self.loadingServers = false
+                self.serverOp = nil
                 self.notice =
                     added == 0
                     ? "No new servers found - most servers do not answer list requests."

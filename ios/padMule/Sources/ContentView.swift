@@ -1,6 +1,6 @@
 // padMule's main screen. An eMule-style FUNCTION STRIP sits under the title and
-// switches a single content area between six screens (Search, Transfers,
-// Servers, Shared, Statistics, Status), instead of one long scroll. Each
+// switches a single content area between seven screens (Search, Transfers,
+// Downloaded, Servers, Shared, Statistics, Status), instead of one long scroll. Each
 // function shows its icon ABOVE its name, the way eMule's toolbar does - but
 // sized and tinted for iOS rather than copied: a ~19pt hierarchical SF Symbol
 // over an 11pt caption, selection carried by the accent tint plus a soft rounded
@@ -16,13 +16,14 @@ import SwiftUI
 
 /// The top-toolbar destinations. Each is one eD2k function, one icon.
 enum Screen: String, CaseIterable, Identifiable {
-    case search, transfers, servers, shared, stats, status
+    case search, transfers, downloaded, servers, shared, stats, status
     var id: String { rawValue }
 
     var title: String {
         switch self {
         case .search: return "Search"
         case .transfers: return "Transfers"
+        case .downloaded: return "Downloaded"
         case .servers: return "Servers"
         case .shared: return "Shared"
         case .stats: return "Statistics"
@@ -31,9 +32,14 @@ enum Screen: String, CaseIterable, Identifiable {
     }
 
     /// The name shown UNDER the icon in the function strip. Mostly `title`, but
-    /// "Statistics" is abbreviated so six labels sit comfortably side by side.
+    /// "Statistics" and "Downloaded" are abbreviated so seven labels sit
+    /// comfortably side by side.
     var shortTitle: String {
-        self == .stats ? "Stats" : title
+        switch self {
+        case .stats: return "Stats"
+        case .downloaded: return "Downloads"
+        default: return title
+        }
     }
 
     /// SF Symbol for the function strip. All ship with iOS 16 (the deployment
@@ -50,6 +56,7 @@ enum Screen: String, CaseIterable, Identifiable {
         case .search: return "magnifyingglass"
         case .transfers:
             return selected ? "arrow.up.arrow.down.circle.fill" : "arrow.up.arrow.down.circle"
+        case .downloaded: return selected ? "tray.and.arrow.down.fill" : "tray.and.arrow.down"
         case .servers: return "server.rack"
         case .shared: return selected ? "folder.fill" : "folder"
         // No .fill variant exists for these; the accent tint marks selection.
@@ -137,6 +144,7 @@ struct ContentView: View {
                 switch screen {
                 case .search: searchScreen
                 case .transfers: transfersScreen
+                case .downloaded: downloadedScreen
                 case .servers: serversScreen
                 case .shared: sharedScreen
                 case .stats: StatsView().environmentObject(model)
@@ -230,7 +238,12 @@ struct ContentView: View {
                     showAddCategory = true
                 } label: {
                     Label("Add category", systemImage: "plus.circle")
-                        .labelStyle(.iconOnly)
+                        .font(.caption)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 4)
+                        .background(Color.secondary.opacity(0.15))
+                        .foregroundStyle(.secondary)
+                        .clipShape(Capsule())
                 }
                 .buttonStyle(.borderless)
                 .accessibilityLabel("Add category")
@@ -326,7 +339,7 @@ struct ContentView: View {
 
     // MARK: - Function strip
 
-    /// The six functions, icon over name, evenly spread across the width. Sits
+    /// The seven functions, icon over name, evenly spread across the width. Sits
     /// directly under the navigation title and above the banners, so the app's
     /// shape is visible at a glance on a screen with no window chrome.
     private var functionStrip: some View {
@@ -348,132 +361,155 @@ struct ContentView: View {
     // MARK: - Search screen
 
     private var searchScreen: some View {
-        List {
-            Section("Search") {
-                HStack {
-                    TextField("Search the eD2k network", text: $query)
-                        .textInputAutocapitalization(.never)
-                        .disableAutocorrection(true)
-                        .onSubmit { model.search(query) }
-                        .submitLabel(.search)
-                    if model.searching {
-                        ProgressView()
-                    } else if !query.isEmpty {
-                        Button {
-                            query = ""
-                            model.clearSearch()
-                        } label: {
-                            Image(systemName: "xmark.circle.fill")
-                                .foregroundStyle(.secondary)
-                                .accessibilityLabel("Clear search")
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-                if model.searching {
-                    Text("Searching... the server can take a few seconds.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                // Pre-search filters: the server applies these to what it returns,
-                // so the capped result set fills with matches instead of junk.
-                Toggle("Complete sources only", isOn: $model.wireCompleteOnly)
-                    .font(.caption)
-                Toggle("Search all servers (global)", isOn: $model.wireGlobal)
-                    .font(.caption)
-                HStack {
-                    Text("Size").font(.caption).foregroundStyle(.secondary)
-                    Spacer()
-                    sizeMenu("Min", selection: $model.wireMinSizeMb)
-                    Text("-").foregroundStyle(.secondary)
-                    sizeMenu("Max", selection: $model.wireMaxSizeMb)
-                }
-                .font(.caption)
-                if model.searched && !model.results.isEmpty {
+        ScrollViewReader { proxy in
+            List {
+                Section("Search") {
                     HStack {
-                        Menu {
-                            Picker("Sort", selection: $model.sortKey) {
-                                ForEach(SortKey.allCases) { Text($0.rawValue).tag($0) }
-                            }
-                            Toggle("Ascending", isOn: $model.sortAscending)
-                        } label: {
-                            Label("Sort: \(model.sortKey.rawValue)", systemImage: "arrow.up.arrow.down")
-                                .font(.caption)
-                        }
-                        Spacer()
-                        Menu {
-                            Button("All types") { model.typeFilter = nil }
-                            ForEach(["Video", "Audio", "Archive", "Document", "Image", "Program"], id: \.self) { t in
-                                Button(t) { model.typeFilter = t }
-                            }
-                        } label: {
-                            Label(model.typeFilter ?? "All types", systemImage: "line.3.horizontal.decrease.circle")
-                                .font(.caption)
-                        }
-                    }
-                    HStack {
-                        Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-                        TextField("Filter these results", text: $model.nameFilter)
+                        TextField("Search the eD2k network", text: $query)
                             .textInputAutocapitalization(.never)
                             .disableAutocorrection(true)
+                            .onSubmit { model.search(query) }
+                            .submitLabel(.search)
+                        if model.searching {
+                            ProgressView()
+                        } else if !query.isEmpty {
+                            Button {
+                                query = ""
+                                model.clearSearch()
+                            } label: {
+                                Image(systemName: "xmark.circle.fill")
+                                    .foregroundStyle(.secondary)
+                                    .accessibilityLabel("Clear search")
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    if model.searching {
+                        Text("Searching... the server can take a few seconds.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    // Pre-search filters: the server applies these to what it returns,
+                    // so the capped result set fills with matches instead of junk.
+                    Toggle("Complete sources only", isOn: $model.wireCompleteOnly)
+                        .font(.caption)
+                    Toggle("Search all servers (global)", isOn: $model.wireGlobal)
+                        .font(.caption)
+                    HStack {
+                        Text("Size").font(.caption).foregroundStyle(.secondary)
+                        Spacer()
+                        sizeMenu("Min", selection: $model.wireMinSizeMb)
+                        Text("-").foregroundStyle(.secondary)
+                        sizeMenu("Max", selection: $model.wireMaxSizeMb)
                     }
                     .font(.caption)
-                    Toggle("Trusted only", isOn: $model.trustedOnly).font(.caption)
-                    Toggle("Hide ones I have", isOn: $model.hideHave).font(.caption)
-                }
-                ForEach(model.presentedResults, id: \.hash) { hit in
-                    resultRow(hit)
-                        .contentShape(Rectangle())
-                        .onTapGesture { detail = hit }
-                }
-                if model.searched, !model.searching {
-                    if model.results.isEmpty {
-                        // "No results" is only true if we actually ASKED someone.
-                        // With no server and no Kad contacts the honest answer is
-                        // about the connection - and this is the screen a new user
-                        // lands on, so it is where they will meet the problem.
-                        Text(model.canDiscover
-                             ? "No results."
-                             : "Not connected yet, so there was nobody to ask. Pick a server on the Servers tab, or give Kad a moment to find contacts.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    } else if model.presentedResults.isEmpty {
-                        // Hits came back but the client-side filters hid them all -
-                        // say so, instead of leaving a blank gap under the filters.
-                        Text("No matches for these filters.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                // The server said it has more pages (#13): fetch the next one and
-                // merge it into this same list. Hidden once the server is tapped out.
-                if model.moreAvailable, !model.searching {
-                    Button {
-                        model.loadMore()
-                    } label: {
-                        Label("Load more results", systemImage: "arrow.down.circle")
-                    }
-                    .font(.callout)
-                }
-            }
-
-            // Recent queries: shown when the box is empty, so you can re-run a
-            // search with one tap instead of retyping. Swipe a row to forget it.
-            if query.isEmpty, !model.recentSearches.isEmpty {
-                Section("Recent") {
-                    ForEach(model.recentSearches, id: \.self) { q in
-                        Button {
-                            query = q
-                            model.search(q)
-                        } label: {
-                            Label(q, systemImage: "clock.arrow.circlepath")
-                                .foregroundStyle(.primary)
-                        }
-                        .swipeActions(edge: .trailing) {
-                            Button(role: .destructive) {
-                                model.removeRecent(q)
+                    if model.searched && !model.results.isEmpty {
+                        HStack {
+                            Menu {
+                                Picker("Sort", selection: $model.sortKey) {
+                                    ForEach(SortKey.allCases) { Text($0.rawValue).tag($0) }
+                                }
+                                Toggle("Ascending", isOn: $model.sortAscending)
                             } label: {
-                                Label("Delete", systemImage: "trash")
+                                Label("Sort: \(model.sortKey.rawValue)", systemImage: "arrow.up.arrow.down")
+                                    .font(.caption)
+                            }
+                            Spacer()
+                            Menu {
+                                Button("All types") { model.typeFilter = nil }
+                                ForEach(["Video", "Audio", "Archive", "Document", "Image", "Program"], id: \.self) { t in
+                                    Button(t) { model.typeFilter = t }
+                                }
+                            } label: {
+                                Label(model.typeFilter ?? "All types", systemImage: "line.3.horizontal.decrease.circle")
+                                    .font(.caption)
+                            }
+                        }
+                        HStack {
+                            Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                            TextField("Filter these results", text: $model.nameFilter)
+                                .textInputAutocapitalization(.never)
+                                .disableAutocorrection(true)
+                        }
+                        .font(.caption)
+                        Toggle("Trusted only", isOn: $model.trustedOnly).font(.caption)
+                        Toggle("Hide ones I have", isOn: $model.hideHave).font(.caption)
+                        // An honest count (client-side filters can hide rows,
+                        // so show both numbers when they differ), plus a way
+                        // back to the top once the list is long enough to need one.
+                        HStack {
+                            Text(model.presentedResults.count == model.results.count
+                                 ? "Results (\(model.results.count))"
+                                 : "Results (\(model.presentedResults.count) of \(model.results.count))")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            if model.presentedResults.count > 20 {
+                                Button {
+                                    withAnimation { proxy.scrollTo("results-top", anchor: .top) }
+                                } label: {
+                                    Label("Top", systemImage: "arrow.up.to.line")
+                                }
+                                .font(.caption)
+                                .buttonStyle(.borderless)
+                            }
+                        }
+                    }
+                    ForEach(Array(model.presentedResults.enumerated()), id: \.element.hash) { idx, hit in
+                        resultRow(hit, number: idx + 1)
+                            .contentShape(Rectangle())
+                            .onTapGesture { detail = hit }
+                    }
+                    if model.searched, !model.searching {
+                        if model.results.isEmpty {
+                            // "No results" is only true if we actually ASKED someone.
+                            // With no server and no Kad contacts the honest answer is
+                            // about the connection - and this is the screen a new user
+                            // lands on, so it is where they will meet the problem.
+                            Text(model.canDiscover
+                                 ? "No results."
+                                 : "Not connected yet, so there was nobody to ask. Pick a server on the Servers tab, or give Kad a moment to find contacts.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        } else if model.presentedResults.isEmpty {
+                            // Hits came back but the client-side filters hid them all -
+                            // say so, instead of leaving a blank gap under the filters.
+                            Text("No matches for these filters.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    // The server said it has more pages (#13): fetch the next one and
+                    // merge it into this same list. Hidden once the server is tapped out.
+                    if model.moreAvailable, !model.searching {
+                        Button {
+                            model.loadMore()
+                        } label: {
+                            Label("Load more results", systemImage: "arrow.down.circle")
+                        }
+                        .font(.callout)
+                    }
+                }
+                .id("results-top")
+
+                // Recent queries: shown when the box is empty, so you can re-run a
+                // search with one tap instead of retyping. Swipe a row to forget it.
+                if query.isEmpty, !model.recentSearches.isEmpty {
+                    Section("Recent") {
+                        ForEach(model.recentSearches, id: \.self) { q in
+                            Button {
+                                query = q
+                                model.search(q)
+                            } label: {
+                                Label(q, systemImage: "clock.arrow.circlepath")
+                                    .foregroundStyle(.primary)
+                            }
+                            .swipeActions(edge: .trailing) {
+                                Button(role: .destructive) {
+                                    model.removeRecent(q)
+                                } label: {
+                                    Label("Delete", systemImage: "trash")
+                                }
                             }
                         }
                     }
@@ -490,11 +526,23 @@ struct ContentView: View {
             // first one can be created (the add button used to be hidden here).
             categoryChips
             Section("Transfers") {
-                let shown = model.filteredDownloads
+                let shown = model.presentedDownloads
                 if shown.isEmpty {
                     Text(model.categoryFilter == nil ? "No transfers" : "None in this category")
                         .foregroundStyle(.secondary)
                 } else {
+                    HStack {
+                        Menu {
+                            Picker("Sort", selection: $model.transferSortKey) {
+                                ForEach(TransferSortKey.allCases) { Text($0.rawValue).tag($0) }
+                            }
+                            Toggle("Ascending", isOn: $model.transferSortAscending)
+                        } label: {
+                            Label("Sort: \(model.transferSortKey.rawValue)", systemImage: "arrow.up.arrow.down")
+                                .font(.caption)
+                        }
+                        Spacer()
+                    }
                     ForEach(shown, id: \.hash) { dl in
                         transferRow(dl)
                             .swipeActions(edge: .trailing) {
@@ -530,8 +578,9 @@ struct ContentView: View {
                 // a backgrounded app; saying otherwise would be a lie.
                 Label(
                     "padMule only transfers while it is open and on screen. "
-                        + "iPadOS suspends background apps, so transfers pause when you "
-                        + "leave and resume when you come back.",
+                        + "iPadOS suspends background apps, so leaving stops the transfer. "
+                        + "Progress is always saved, and it restarts when you come back - "
+                        + "though a transfer that can't find sources again may need a nudge.",
                     systemImage: "info.circle"
                 )
                 .font(.footnote)
@@ -545,6 +594,49 @@ struct ContentView: View {
                 .foregroundStyle(.secondary)
             }
         }
+    }
+
+    // MARK: - Downloaded screen
+
+    /// Finished files exactly as they sit in Documents (On My iPad > padMule),
+    /// read straight off the filesystem by EngineModel.loadDownloadedFiles - so,
+    /// unlike the Shared screen's library, a file the user unshared still shows
+    /// up here as long as its bytes are still on disk. The ShareLink on each row
+    /// is the "Open" affordance: it hands the file to any other app that can
+    /// take it.
+    private var downloadedScreen: some View {
+        List {
+            Section(model.downloadedFiles.isEmpty
+                    ? "Downloaded"
+                    : "Downloaded (\(model.downloadedFiles.count))") {
+                if model.downloadedFiles.isEmpty {
+                    Text("No finished downloads yet. Finished files are saved to the Files app, "
+                         + "under On My iPad > padMule.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(model.downloadedFiles) { file in
+                        HStack {
+                            Image(systemName: "doc")
+                                .foregroundStyle(.secondary)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(file.name).lineLimit(1)
+                                Text("\(bytes(file.size)) - \(file.modified.formatted(date: .abbreviated, time: .shortened))")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            ShareLink(item: file.url) {
+                                Image(systemName: "square.and.arrow.up")
+                            }
+                            .buttonStyle(.borderless)
+                        }
+                    }
+                }
+            }
+        }
+        .onAppear { model.loadDownloadedFiles() }
+        .refreshable { model.loadDownloadedFiles() }
     }
 
     // MARK: - Servers screen
@@ -571,9 +663,13 @@ struct ContentView: View {
                 Button {
                     model.loadServers()
                 } label: {
-                    Label(
-                        model.loadingServers ? "Probing servers..." : "Refresh server list",
-                        systemImage: "arrow.clockwise")
+                    HStack {
+                        Label(
+                            model.loadingServers ? "Probing servers..." : "Refresh server list",
+                            systemImage: "arrow.clockwise")
+                        Spacer()
+                        if model.serverOp == .probing { ProgressView() }
+                    }
                 }
                 .disabled(model.loadingServers)
 
@@ -584,15 +680,26 @@ struct ContentView: View {
                         .textInputAutocapitalization(.never)
                         .disableAutocorrection(true)
                         .font(.caption)
-                    Button("Update") { model.updateServerList(serverListUrl) }
-                        .buttonStyle(.borderless)
-                        .disabled(model.loadingServers)
+                    Button {
+                        model.updateServerList(serverListUrl)
+                    } label: {
+                        HStack(spacing: 4) {
+                            Text("Update")
+                            if model.serverOp == .updating { ProgressView() }
+                        }
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(model.loadingServers)
                 }
                 // Prune: drop every dead, unpinned server (pinned stars survive).
                 Button(role: .destructive) {
                     model.pruneDeadServers()
                 } label: {
-                    Label("Prune dead servers", systemImage: "trash")
+                    HStack {
+                        Label("Prune dead servers", systemImage: "trash")
+                        Spacer()
+                        if model.serverOp == .pruning { ProgressView() }
+                    }
                 }
                 .disabled(model.loadingServers)
 
@@ -601,7 +708,11 @@ struct ContentView: View {
                 Button {
                     model.crawlServers()
                 } label: {
-                    Label("Discover more servers", systemImage: "antenna.radiowaves.left.and.right")
+                    HStack {
+                        Label("Discover more servers", systemImage: "antenna.radiowaves.left.and.right")
+                        Spacer()
+                        if model.serverOp == .crawling { ProgressView() }
+                    }
                 }
                 .disabled(model.loadingServers)
             }
@@ -652,7 +763,8 @@ struct ContentView: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(srv.name.isEmpty ? srv.addr : srv.name)
                             .font(.callout)
-                            .foregroundStyle(srv.alive ? .primary : .secondary)
+                            .fontWeight(srv.connected ? .semibold : .regular)
+                            .foregroundStyle(srv.connected ? .green : (srv.alive ? .primary : .secondary))
                             .lineLimit(1)
                         if !srv.name.isEmpty {
                             Text(srv.addr).font(.caption2).foregroundStyle(.secondary)
@@ -688,9 +800,10 @@ struct ContentView: View {
             // to be disabled, which made padMule unusable on any network that
             // blocks outbound UDP - every row greyed out, no manual-address field,
             // nothing to tap - even though the TCP login would likely have worked.
-            .disabled(srv.connected || model.connectingTo != nil)
+            .disabled(model.connectingTo != nil)
             .foregroundStyle(.primary)
         }
+        .listRowBackground(srv.connected ? Color.green.opacity(0.08) : Color.clear)
     }
 
     // MARK: - Shared screen
@@ -766,14 +879,39 @@ struct ContentView: View {
 
     private var statusScreen: some View {
         List {
+            // At-a-glance health for the two networks padMule depends on,
+            // answered directly rather than making the user infer it from the
+            // Status/Server rows below - eD2k and Kad are independent, and a
+            // user with one up and the other down needs to see that at a
+            // glance instead of reading through connection prose.
+            Section("Network") {
+                networkHealthRow("eD2k network", ed2kHealth)
+                networkHealthRow("Kad network", kadHealth)
+            }
+
             Section("Status") {
                 row("State", String(describing: model.state))
-                row("Status", model.status)
+                // A pure connectivity verdict (EngineModel.connectionSummary),
+                // not the engine's free-text status - that used to duplicate
+                // the Server row below in different words ("Connected to X
+                // (HighID)" here AND "X" there). The Server row now carries
+                // the identity; this row only answers "are we connected".
+                row("Status", model.connectionSummary)
+                // The engine also pushes transient progress text through the
+                // same channel ("Fetching network lists...", "Opening
+                // port...") that the pure verdict above does not capture.
+                // Shown only when it says something new, so a settled
+                // connection does not show the same word twice.
+                if model.status != model.connectionSummary {
+                    row("Activity", model.status)
+                }
                 // The ID type decides whether peers can reach us at all, so it
                 // gets its own row instead of riding on the status line, where a
                 // later event would overwrite it.
                 if let srv = model.server {
-                    row("Server", srv.addr)
+                    // Identity only - name (address) - now that Status above
+                    // no longer repeats "Connected to".
+                    row("Server", srv.name.map { "\($0) (\(srv.addr))" } ?? srv.addr)
                     HStack {
                         Text("ID").foregroundStyle(.secondary)
                         Spacer()
@@ -833,6 +971,48 @@ struct ContentView: View {
         }
     }
 
+    /// "eD2k network" row content: green connected+HighID, orange
+    /// connected-but-LowID (peers cannot reach us directly), red not
+    /// connected. Independent of Kad - the two networks can be up or down on
+    /// their own, which is exactly what a user asking "is Kad working" needs
+    /// to see without inferring it from the Server/Kad-contacts rows.
+    private var ed2kHealth: (color: Color, text: String) {
+        guard let srv = model.server else { return (.red, "Not connected") }
+        if srv.lowId {
+            return (.orange, "Connected, LowID - peers cannot reach you directly")
+        }
+        return (.green, "Connected - \(srv.name ?? srv.addr), HighID")
+    }
+
+    /// "Kad network" row content: stopped when the engine itself is not
+    /// running, else red/amber/green by contact count. The amber
+    /// "Bootstrapping" band exists because a freshly-started Kad table climbs
+    /// from 0 over tens of seconds - "Not connected" would read as broken
+    /// during a normal warm-up.
+    private var kadHealth: (color: Color, text: String) {
+        guard model.state == .running else { return (.secondary, "Stopped") }
+        let n = model.kadContacts
+        if n == 0 { return (.red, "Not connected") }
+        if n < 10 { return (.orange, "Bootstrapping (\(n) contacts)") }
+        return (.green, "OK (\(n) contacts)")
+    }
+
+    /// One network-health row: a small colored dot (echoing `statusDot`'s
+    /// vocabulary of a plain SF Symbol circle) plus the label and its verdict.
+    private func networkHealthRow(_ label: String, _ health: (color: Color, text: String)) -> some View {
+        HStack {
+            Image(systemName: "circle.fill")
+                .font(.caption2)
+                .foregroundStyle(health.color)
+            Text(label)
+            Spacer()
+            Text(health.text)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.trailing)
+        }
+        .font(.callout)
+    }
+
     /// The Stop section's explanation, which must never describe work that did
     /// not happen. Plenty of users have NO port mapping to hand back - on
     /// cellular, behind CGNAT, or on a router without UPnP the mapping never
@@ -867,14 +1047,20 @@ struct ContentView: View {
     /// gradient; padMule keeps the clear binary (0-source = red) and lets the
     /// status dot carry the have/downloading state.
     private func resultColor(_ hit: SearchHit) -> Color {
-        if hit.status == .have { return .green }
+        if model.liveStatus(for: hit) == .have { return .green }
         if hit.sources == 0 { return .red }
         return .primary
     }
 
-    private func resultRow(_ hit: SearchHit) -> some View {
+    private func resultRow(_ hit: SearchHit, number: Int) -> some View {
         HStack(alignment: .top, spacing: 8) {
-            statusDot(hit.status)
+            Text("\(number)")
+                .font(.caption2)
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+                .frame(minWidth: 18, alignment: .trailing)
+                .padding(.top, 5)
+            statusDot(model.liveStatus(for: hit))
                 .padding(.top, 5)
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
@@ -883,7 +1069,14 @@ struct ContentView: View {
                     ratingBadge(hit.rating)
                 }
                 if let meta = metaLine(hit) {
-                    Text(meta).font(.caption).foregroundStyle(.secondary)
+                    HStack(spacing: 6) {
+                        Text(meta)
+                        originBadge(hit.origin)
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                } else {
+                    originBadge(hit.origin)
                 }
                 HStack(spacing: 6) {
                     Text(bytes(hit.size))
@@ -904,7 +1097,7 @@ struct ContentView: View {
                 // Only offer Get for a NEW hit; a file already downloading or
                 // owned shows that state instead of a live button that does
                 // nothing useful (it contradicts the status dot otherwise).
-                switch hit.status {
+                switch model.liveStatus(for: hit) {
                 case .have:
                     Text("Have").foregroundStyle(.green)
                 case .downloading:
@@ -942,6 +1135,22 @@ struct ContentView: View {
                 .padding(.vertical, 1)
                 .background(color.opacity(0.2))
                 .foregroundStyle(color)
+                .clipShape(Capsule())
+        }
+    }
+
+    /// A subtle provenance caption ("kad", "server", "server + kad") next to
+    /// the meta line - metadata, not the headline, so it is a plain secondary
+    /// caption rather than a colored pill like the rating badge above.
+    @ViewBuilder
+    private func originBadge(_ origin: String) -> some View {
+        if !origin.isEmpty {
+            Text(origin)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 5)
+                .padding(.vertical, 1)
+                .background(Color.secondary.opacity(0.12))
                 .clipShape(Capsule())
         }
     }
@@ -1005,9 +1214,12 @@ struct ContentView: View {
                 }
             }
             ProgressView(value: fraction(dl))
-            Text("\(bytes(dl.have)) / \(bytes(dl.size))")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            HStack(spacing: 6) {
+                Text("\(bytes(dl.have)) / \(bytes(dl.size))")
+                Text("\(Int(fraction(dl) * 100))%")
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
         }
     }
 
