@@ -178,6 +178,11 @@ pub struct SourceInfo {
     pub rating: u8,
     /// Its comment on this file (from OP_FILEDESC); empty if none.
     pub comment: String,
+    /// How we DISCOVERED this source - the eD2k server, Kad, or a source
+    /// exchange with another peer. Already known at dial time
+    /// (`fetch::PeerSource::origin`); it just was not carried this far, so the
+    /// UI could show which discovery channel is actually feeding a download.
+    pub origin: crate::fetch::SourceOrigin,
 }
 
 /// One file being pulled from many peers.
@@ -344,12 +349,14 @@ impl Download {
         addr: SocketAddr,
         obfuscated: bool,
         low_id: bool,
+        origin: crate::fetch::SourceOrigin,
     ) {
         let mut g = self.sources.lock().await;
         if let Some(s) = g.iter_mut().find(|s| s.addr == addr) {
             s.software = software;
             s.obfuscated = obfuscated;
             s.low_id = low_id;
+            s.origin = origin;
         } else {
             g.push(SourceInfo {
                 addr,
@@ -359,8 +366,26 @@ impl Download {
                 verified: false,
                 rating: 0,
                 comment: String::new(),
+                origin,
             });
         }
+    }
+
+    /// How many CONNECTED sources came from each discovery channel, as
+    /// `(server, kad, source-exchange)`. Feeds the per-transfer origin badge:
+    /// "which channel is actually feeding this download" is invisible otherwise,
+    /// and it is the question a user asks when one file flies and another crawls.
+    pub async fn source_origins(&self) -> (u32, u32, u32) {
+        let g = self.sources.lock().await;
+        let mut counts = (0u32, 0u32, 0u32);
+        for s in g.iter() {
+            match s.origin {
+                crate::fetch::SourceOrigin::Server => counts.0 += 1,
+                crate::fetch::SourceOrigin::Kad => counts.1 += 1,
+                crate::fetch::SourceOrigin::PeerExchange => counts.2 += 1,
+            }
+        }
+        counts
     }
 
     /// Attach a source's rating + comment (from OP_FILEDESC). No-op if we have no
@@ -1473,7 +1498,32 @@ where
 
         // One hardened receiver validates every reply (raw or compressed) against
         // exactly these blocks - a hostile peer cannot panic or wedge it.
+        //
+        // CONTINUOUS TOP-UP. This used to wait for ALL THREE blocks before
+        // asking for anything more, so every batch boundary cost a full RTT of
+        // dead air - which is worst exactly where padMule runs: cellular, or a
+        // VPN tunnel, where the round trip is ~200ms. Both authorities keep the
+        // window FULL instead: eMule re-requests the moment ONE block completes
+        // (`SendBlockRequests` from the block-finished branch,
+        // DownloadClient.cpp:1270-1276, with `CreateBlockRequests` topping the
+        // pending list back up to 3, :870-892). Depth stays 3 - eMule never
+        // asks for more, and aMule master's [3,24] clamp cites a "pending range"
+        // eMule does not actually request (see CLAUDE.md's authority note).
+        //
+        // DELIBERATE DEVIATION, and it is the safer half of the trade: eMule
+        // re-states its WHOLE window every time, re-naming the blocks still in
+        // flight, which is only harmless because the uploader dedups them
+        // (`AddReqBlock`, UploadClient.cpp:665-680 - the check padMule was
+        // missing until row 8bm). padMule asks for ONLY THE NEW blocks. The
+        // uploader APPENDS requests to its queue rather than replacing them, so
+        // an incremental ask pipelines identically; it halves the request
+        // chatter, and it removes any chance of a peer's re-sent bytes being
+        // counted twice against a block still in flight.
         let mut rx = BlockReceiver::new(hash, size, &blocks);
+        // Set once the download has no further blocks to hand out: the window
+        // then drains rather than being topped up, and the loop ends when the
+        // last in-flight block lands.
+        let mut no_more_blocks = false;
         while !rx.is_done() {
             let pkt = fs.read_packet_unpacked().await?;
             // A secure-ident packet, a late OP_FILEDESC, or an AICH answer can
@@ -1503,11 +1553,29 @@ where
                     .await
                     .map_err(TransferError::Io)?;
             }
+            // Any block that just closed is released immediately (so another
+            // source can take the next one) and replaced, keeping three in
+            // flight across the batch boundary instead of stalling on it.
+            let done = rx.take_completed();
+            if done.is_empty() {
+                continue;
+            }
+            dl.release(&done).await;
+            held.retain(|b| !done.contains(b));
+            if no_more_blocks {
+                continue;
+            }
+            let more = dl.take_blocks(&status, done.len()).await;
+            if more.is_empty() {
+                // Nothing left to reserve (the file is fully claimed, or we were
+                // cancelled). Drain what is in flight and finish honestly.
+                no_more_blocks = true;
+                continue;
+            }
+            held.extend_from_slice(&more);
+            rx.add_blocks(&more);
+            fs.write_packet(&build_request_parts(&hash, &more)).await?;
         }
-
-        // These are delivered; they are no longer ours to hold.
-        dl.release(&blocks).await;
-        held.retain(|b| !blocks.contains(b));
     }
 }
 
@@ -2013,6 +2081,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_block_window_is_topped_up_before_the_batch_finishes() {
+        // THE MECHANISM, measured directly: padMule must ask for a replacement
+        // block as soon as ONE of the three lands, not wait for all three.
+        // eMule re-requests from the block-finished branch
+        // (DownloadClient.cpp:1270-1276); stop-and-wait costs a full RTT at
+        // every batch boundary, which on a cellular or VPN link is ~200ms of
+        // dead air each time.
+        //
+        // The mock is what makes this non-vacuous: it sends ONE block and then
+        // REFUSES to send the rest until a SECOND OP_REQUESTPARTS arrives. Under
+        // the old stop-and-wait driver both sides wait for each other forever,
+        // so a regression DEADLOCKS - which the timeout below turns into a clean
+        // failure instead of a hung suite.
+        use crate::transfer::{
+            build_sending_part, parse_request_parts, OP_REQUESTPARTS, OP_REQUESTPARTS_I64,
+        };
+        use mule_proto::{ed2k_hash, EMBLOCKSIZE};
+
+        let size = (4 * EMBLOCKSIZE) as usize;
+        let data: Vec<u8> = (0..size as u32)
+            .map(|i| (i.wrapping_mul(7)) as u8)
+            .collect();
+        let hash = ed2k_hash(&data);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let served = data.clone();
+        let up = tokio::spawn(async move {
+            let me = HelloInfo::baseline([0xC1; 16], 0, 4662, 4672, "up");
+            let (_p, mut fs) = accept_peer(&listener, &me).await.unwrap();
+            let mut requests = 0usize;
+            let mut sent_first = false;
+            // Serve metadata, then the deliberately-stalled block schedule.
+            while let Ok(pkt) = fs.read_packet_unpacked().await {
+                match pkt.opcode {
+                    OP_REQUESTPARTS | OP_REQUESTPARTS_I64 => {
+                        let (_h, blocks) =
+                            parse_request_parts(&pkt.payload, pkt.opcode == OP_REQUESTPARTS_I64)
+                                .unwrap();
+                        requests += 1;
+                        if !sent_first {
+                            // Exactly ONE block, then silence: the downloader
+                            // must top up off this single completion.
+                            let (s, e) = blocks[0];
+                            let _ = fs
+                                .write_packet(&build_sending_part(
+                                    &hash,
+                                    s,
+                                    e,
+                                    &served[s as usize..e as usize],
+                                ))
+                                .await;
+                            sent_first = true;
+                        } else {
+                            // The top-up arrived - the thing under test. Now
+                            // finish everything so the download can complete.
+                            for (s, e) in blocks {
+                                if e > s {
+                                    let _ = fs
+                                        .write_packet(&build_sending_part(
+                                            &hash,
+                                            s,
+                                            e,
+                                            &served[s as usize..e as usize],
+                                        ))
+                                        .await;
+                                }
+                            }
+                        }
+                    }
+                    // Minimal metadata answers so the driver reaches the block
+                    // phase: name, "I have it all", and a granted slot. The file
+                    // is a single part, so no hashset is requested.
+                    crate::transfer::OP_REQUESTFILENAME => {
+                        let _ = fs
+                            .write_packet(&crate::transfer::build_req_filename_answer(
+                                &hash,
+                                b"topup.bin",
+                            ))
+                            .await;
+                    }
+                    crate::transfer::OP_SETREQFILEID => {
+                        let _ = fs
+                            .write_packet(&crate::transfer::build_file_status_complete(&hash))
+                            .await;
+                    }
+                    crate::transfer::OP_STARTUPLOADREQ => {
+                        let _ = fs
+                            .write_packet(&crate::transfer::build_accept_upload())
+                            .await;
+                    }
+                    _ => {}
+                }
+            }
+            requests
+        });
+
+        let dir = tmpdir("topup");
+        let store = PartStore::create(&dir, 1, hash, size as u64, b"topup.bin").unwrap();
+        let dl = Download::new(store);
+        let me = HelloInfo::baseline([0xC2; 16], 0x0A00_0001, 4663, 4673, "dl");
+        let (_p, mut fs) = connect_peer(addr, &me).await.unwrap();
+
+        // A stop-and-wait regression hangs here; 20s converts that to a failure.
+        let got = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            download_from_peer(&mut fs, &dl, false),
+        )
+        .await
+        .expect("topping up must not deadlock - the driver waited for the whole batch");
+        assert!(got.is_ok(), "download failed: {got:?}");
+        drop(fs);
+        let _ = up.await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
     async fn a_second_corruption_round_re_attributes_instead_of_blaming_the_first_source() {
         // A part can fail MD4 twice before recovery ever runs: a root is only
         // trusted once 10 unique /20s report it, so the early rounds have none
@@ -2206,8 +2391,14 @@ mod tests {
         let dl = Download::new(store);
         let addr: SocketAddr = "9.9.9.9:4662".parse().unwrap();
         // fetch_one records the base source before driving the session.
-        dl.note_source("aMule 3.0.1".into(), addr, true, false)
-            .await;
+        dl.note_source(
+            "aMule 3.0.1".into(),
+            addr,
+            true,
+            false,
+            crate::fetch::SourceOrigin::Server,
+        )
+        .await;
 
         let (client, server) = tokio::io::duplex(8192);
         let mut client_fs = FramedStream::new(client);
@@ -2353,13 +2544,34 @@ mod tests {
         let a: SocketAddr = "1.2.3.4:4662".parse().unwrap();
         let b: SocketAddr = "5.6.7.8:4662".parse().unwrap();
 
-        dl.note_source("aMule 3.0.1".into(), a, true, false).await;
-        dl.note_source("eMule 0.50a".into(), b, false, true).await;
+        dl.note_source(
+            "aMule 3.0.1".into(),
+            a,
+            true,
+            false,
+            crate::fetch::SourceOrigin::Server,
+        )
+        .await;
+        dl.note_source(
+            "eMule 0.50a".into(),
+            b,
+            false,
+            true,
+            crate::fetch::SourceOrigin::Kad,
+        )
+        .await;
         // A comment + a verification land on source a.
         dl.note_source_comment(a, 5, "great".into()).await;
         dl.note_source_verified(a).await;
         // A reconnect to a refreshes the base fields but keeps rating/comment/verified.
-        dl.note_source("aMule 3.0.1".into(), a, true, false).await;
+        dl.note_source(
+            "aMule 3.0.1".into(),
+            a,
+            true,
+            false,
+            crate::fetch::SourceOrigin::Server,
+        )
+        .await;
 
         let mut srcs = dl.sources().await;
         assert_eq!(srcs.len(), 2, "one entry per address");
@@ -2505,7 +2717,14 @@ mod tests {
         let me = HelloInfo::baseline([0xAA; 16], 0x0A00_0001, 4663, 4673, "dl").with_secident();
         let (_p, mut fs) = connect_peer(addr, &me).await.unwrap();
         // Register the source so a verification is recorded against it.
-        dl.note_source("server".into(), addr, false, false).await;
+        dl.note_source(
+            "server".into(),
+            addr,
+            false,
+            false,
+            crate::fetch::SourceOrigin::Server,
+        )
+        .await;
         let sec = Some(SecIdentCtx {
             identity: Arc::new(Identity::generate()),
             peer_supports: true,

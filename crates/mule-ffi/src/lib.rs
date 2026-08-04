@@ -192,6 +192,14 @@ pub struct DownloadInfo {
     /// Bytes available CONTIGUOUSLY from offset 0 - how much of the file a media
     /// player can read right now (see `preview_snapshot`).
     pub contiguous_prefix: u64,
+    /// Connected sources by DISCOVERY CHANNEL: how many came from the eD2k
+    /// server, from Kad, and from a source exchange with another peer. Shown
+    /// beside the percentage, because "which channel is feeding this" is
+    /// otherwise invisible and it is the first thing you want to know when one
+    /// file flies and another crawls.
+    pub sources_server: u32,
+    pub sources_kad: u32,
+    pub sources_exchange: u32,
 }
 
 /// One complete file we are serving to peers (the shared library).
@@ -667,6 +675,7 @@ impl MuleEngine {
                 let size = dl.size().await;
                 let have = size - dl.missing().await;
                 let (rating, has_comment) = dl.rating_summary().await;
+                let origins = dl.source_origins().await;
                 out.push(DownloadInfo {
                     hash: hex::encode(dl.hash().await),
                     name: dl.name().await,
@@ -678,6 +687,9 @@ impl MuleEngine {
                     priority: dl.priority(),
                     preview: dl.is_preview(),
                     contiguous_prefix: dl.contiguous_prefix().await,
+                    sources_server: origins.0,
+                    sources_kad: origins.1,
+                    sources_exchange: origins.2,
                 });
             }
             // The 1s downloads() poll is the engine's heartbeat: drain any pending
