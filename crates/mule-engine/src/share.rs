@@ -378,6 +378,21 @@ pub fn is_upload_request(op: u8) -> bool {
             | OP_STARTUPLOADREQ
             | OP_MULTIPACKET
             | OP_MULTIPACKET_EXT
+            // The AICH asks OPEN a session too, because eMule dials us to make
+            // them. `SendAICHRequest` hands the packet to
+            // `SafeConnectAndSendPacket`, which - when no socket is connected -
+            // queues it and calls `TryToConnect` (BaseClient.cpp:2402-2414), so
+            // 0x9B is the FIRST packet after the hello on a brand-new
+            // connection. And that is the COMMON case, not an edge one:
+            // `CPartFile::RequestAICHRecovery` picks a RANDOM client out of the
+            // whole `srclist` (PartFile.cpp:6087-6106), filtering only on AICH
+            // support / matching root / HighID-preferred - never on whether the
+            // socket is up. Leaving these out of the classifier dropped exactly
+            // those connections unanswered, which is the 8ad/8ae bug again:
+            // padMule advertises the AICH bit, so it must honour the request
+            // wherever the request actually arrives.
+            | OP_AICHREQUEST
+            | OP_AICHFILEHASHREQ
     )
 }
 
@@ -1783,6 +1798,41 @@ mod tests {
         }
         // A called-back source stays silent; a data opcode is not an opener.
         assert!(!is_upload_request(0x46)); // OP_SENDINGPART
+    }
+
+    #[tokio::test]
+    async fn an_aich_ask_opens_a_serve_session_through_the_real_classifier() {
+        // The path a REAL eMule takes to ask us for recovery data: it dials a
+        // source it is not currently connected to and its FIRST packet after
+        // the hello is OP_AICHREQUEST (SendAICHRequest ->
+        // SafeConnectAndSendPacket -> queue + TryToConnect,
+        // BaseClient.cpp:2402-2414; the source is picked at RANDOM from srclist
+        // with no connection filter, PartFile.cpp:6087-6106).
+        //
+        // This drives `classify_inbound` - the PRODUCTION gate the engine's
+        // listener uses - rather than calling serve_shared directly, which is
+        // the whole reason the gap was invisible: every other AICH serve test
+        // hands serve_shared its packet and never asks whether the connection
+        // would have survived long enough to reach it. `InboundKind::Other` is
+        // dropped silently by start_listener, so a miss here is a feature that
+        // simply never answers.
+        use crate::transfer::{build_aich_file_hash_req, build_aich_request};
+        use tokio::io::duplex;
+
+        for first in [
+            build_aich_request(&[9u8; 16], 0, &[0xA5; 20]),
+            build_aich_file_hash_req(&[9u8; 16]),
+        ] {
+            let want = first.opcode;
+            let (client, server) = duplex(8192);
+            let mut server_fs = FramedStream::plaintext_with_prefix(server, &[]);
+            let mut client_fs = FramedStream::plaintext_with_prefix(client, &[]);
+            client_fs.write_packet(&first).await.unwrap();
+            match classify_inbound(&mut server_fs, None, Duration::from_millis(200)).await {
+                InboundKind::Leecher { first, .. } => assert_eq!(first.opcode, want),
+                _ => panic!("opcode 0x{want:02x} must open a serve session, not be dropped"),
+            }
+        }
     }
 
     #[tokio::test]
