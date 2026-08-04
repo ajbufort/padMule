@@ -1882,6 +1882,11 @@ impl Engine {
                                     // it for sources is free and it may know
                                     // others holding the file.
                                     ask_sources: dl.mark_asked_sources(peer.ip()),
+                                    // ...and it can vote a root / serve AICH
+                                    // recovery like any outbound source (eMule
+                                    // considers LowID sources too, preferring
+                                    // HighID, PartFile.cpp:6083-6133).
+                                    peer_aich,
                                     ..Default::default()
                                 };
                                 match timeout(

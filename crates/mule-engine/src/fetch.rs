@@ -293,10 +293,13 @@ async fn fetch_one(
         .map(|c| c.source_ex2 || c.source_exchange > 1)
         .unwrap_or(false);
     let ask_sources = peer_does_sx && dl.mark_asked_sources(src.addr.ip());
+    // The peer's AICH version gates the root ask + recovery requests.
+    let peer_aich = peer.capabilities().map(|c| c.aich).unwrap_or(0);
     let session = PeerSession {
         sec,
         credit,
         ask_sources,
+        peer_aich,
     };
     // Multi-source manager: bail the instant this peer queues us and try another
     // source rather than burning `per_peer` in its queue. Pass the addr so a
