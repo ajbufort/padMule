@@ -231,7 +231,7 @@ struct ContentView: View {
                      ? "Transfers stop and the router port is released. Your progress is saved, and you can start again from the toolbar or the Status screen."
                      : "Transfers stop. Your progress is saved, and you can start again from the toolbar or the Status screen.")
             }
-            .navigationTitle("padMule")
+            .navigationTitle("\\__ p a d M u l e __/")
             .navigationBarTitleDisplayMode(.inline)
             .sheet(item: $detail) { hit in
                 SearchDetailView(hit: hit).environmentObject(model)
