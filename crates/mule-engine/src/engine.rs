@@ -4128,7 +4128,7 @@ mod tests {
         let dir = tmp("has-mapping");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+        let (engine, _rx) = Engine::new(&dir).unwrap();
 
         assert!(
             !engine.has_port_mapping(),
