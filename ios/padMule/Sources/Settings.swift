@@ -82,7 +82,15 @@ enum SettingsDefaults {
             SettingsKey.listenPort: 5999,
             SettingsKey.advertisedPort: 5999,
             SettingsKey.kadPort: 5999,
-            SettingsKey.upnpEnabled: true,
+            // OFF by default, to match the 5999 ports above. Those defaults say
+            // "this build expects a VPN to forward a port into the tunnel", and
+            // on a VPN a LAN router mapping accomplishes nothing - it maps a
+            // port on the local gateway for traffic that never traverses it, so
+            // the only thing it can produce is a misleading Port-mapping row.
+            // The honest "UPnP: off - port forwarding is handled outside
+            // padMule" status line names the setting, so a user NOT behind a
+            // VPN can find and enable it.
+            SettingsKey.upnpEnabled: false,
         ])
     }
 }
