@@ -2099,6 +2099,12 @@ async fn cmd_link(link: &str, out: Option<&str>) {
                 }
             };
             let dl = Download::new(store);
+            // A link-carried AICH root is part of the file's IDENTITY: VERIFIED
+            // outright (eMule PartFile.cpp:197-201), enabling block recovery
+            // with no source vote needed.
+            if let Some(root) = f.aich {
+                dl.set_aich_master_verified(root);
+            }
             let me = HelloInfo::baseline(demo_user_hash(), 0, 4662, 4672, "padMule");
             println!("downloading from {} embedded source(s)...", sources.len());
             let cfg = ManagerConfig::Fixed {
