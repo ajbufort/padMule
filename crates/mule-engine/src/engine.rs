@@ -1777,6 +1777,7 @@ impl Engine {
                         obf_accept(&mut stream, &me.user_hash),
                     )
                     .await;
+                    let peer_obf = matches!(detect, Ok(Ok(ObfDetect::Obfuscated(_))));
                     let mut fs = match detect {
                         Ok(Ok(ObfDetect::Obfuscated(c))) => FramedStream::obfuscated(stream, *c),
                         Ok(Ok(ObfDetect::Plaintext { first })) => {
@@ -1794,6 +1795,8 @@ impl Engine {
                         peer_sx1,
                         peer_aich,
                         peer_ext_requests,
+                        peer_software,
+                        peer_is_low_id,
                     ) = match timeout(Duration::from_secs(8), peer_handshake_inbound(&mut fs, &me))
                         .await
                     {
@@ -1822,7 +1825,17 @@ impl Engine {
                                 // ExtReq-2 layout every AICH-era client sends
                                 // (only read when the peer advertised AICH).
                                 .unwrap_or((0, 0, None, 0, 0, 2));
-                            (h.user_hash, ac, si, crypt, sx1, aich, extreq)
+                            (
+                                h.user_hash,
+                                ac,
+                                si,
+                                crypt,
+                                sx1,
+                                aich,
+                                extreq,
+                                h.client_software(),
+                                h.client_id < 0x0100_0000,
+                            )
                         }
                         _ => return,
                     };
@@ -1894,6 +1907,26 @@ impl Engine {
                                 if dl.is_complete().await || dl.is_banned(&peer) {
                                     continue;
                                 }
+                                // RECORD IT. Only the outbound sweep called
+                                // note_source, so a peer that reached us by
+                                // CALLBACK delivered bytes while appearing in
+                                // neither the per-source sheet nor the origin
+                                // badge - a transfer visibly progressing with no
+                                // source listed at all. Origin is Server because
+                                // that is the only channel that can produce a
+                                // callback here: `lowids` is built from the
+                                // server's OP_FOUNDSOURCES list and the poke goes
+                                // over the server link (find_sources /
+                                // request_callbacks); padMule implements no
+                                // Kad-mediated callback.
+                                dl.note_source(
+                                    peer_software.clone(),
+                                    peer,
+                                    peer_obf,
+                                    peer_is_low_id,
+                                    crate::fetch::SourceOrigin::Server,
+                                )
+                                .await;
                                 // Credit this called-back source for what it gives us.
                                 let session = crate::multi_source::PeerSession {
                                     credit: Some((Arc::clone(&credit_store), peer_hash)),

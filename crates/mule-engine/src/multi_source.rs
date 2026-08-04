@@ -2537,6 +2537,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn source_origin_counts_split_by_discovery_channel() {
+        // The badge's data. A source that reached us by CALLBACK must be counted
+        // too: only the outbound sweep called note_source, so a called-back peer
+        // delivered bytes while appearing in neither the per-source sheet nor the
+        // badge - a transfer visibly progressing with NO source listed, which is
+        // exactly what Anthony saw on glass (676 KB of 787.6 MB, no indicator).
+        // A callback is Server-origin because that is the only channel that can
+        // produce one here.
+        let dir = tmpdir("origins");
+        let store = PartStore::create(&dir, 1, [0x33; 16], 400_000, b"o.bin").unwrap();
+        let dl = Download::new(store);
+        let srv: SocketAddr = "1.2.3.4:4662".parse().unwrap();
+        let kad: SocketAddr = "5.6.7.8:4662".parse().unwrap();
+        let sx: SocketAddr = "9.9.9.9:4662".parse().unwrap();
+        let cb: SocketAddr = "7.7.7.7:5001".parse().unwrap();
+
+        assert_eq!(
+            dl.source_origins().await,
+            (0, 0, 0),
+            "nothing connected yet"
+        );
+        dl.note_source(
+            "a".into(),
+            srv,
+            false,
+            false,
+            crate::fetch::SourceOrigin::Server,
+        )
+        .await;
+        dl.note_source(
+            "b".into(),
+            kad,
+            false,
+            false,
+            crate::fetch::SourceOrigin::Kad,
+        )
+        .await;
+        dl.note_source(
+            "c".into(),
+            sx,
+            false,
+            false,
+            crate::fetch::SourceOrigin::PeerExchange,
+        )
+        .await;
+        // The called-back LowID peer - the case that was missing entirely.
+        dl.note_source(
+            "d".into(),
+            cb,
+            false,
+            true,
+            crate::fetch::SourceOrigin::Server,
+        )
+        .await;
+        assert_eq!(
+            dl.source_origins().await,
+            (2, 1, 1),
+            "server (incl. the callback), kad, source-exchange"
+        );
+
+        // A reconnect UPDATES rather than double-counting.
+        dl.note_source(
+            "a2".into(),
+            srv,
+            true,
+            false,
+            crate::fetch::SourceOrigin::Server,
+        )
+        .await;
+        assert_eq!(dl.source_origins().await, (2, 1, 1), "upsert, not append");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
     async fn note_source_upserts_and_preserves_learned_fields() {
         let dir = tmpdir("srcinfo");
         let store = PartStore::create(&dir, 1, [0x11; 16], 400_000, b"s.bin").unwrap();
