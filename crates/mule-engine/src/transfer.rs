@@ -644,6 +644,127 @@ impl BlockReceiver {
     }
 }
 
+// AICH block recovery (Wave 11). eMule 0.50a opcodes.h:271-274, all PROT_EMULE.
+// The "*DEPRECATED*" comment there is misleading: 0x9B/0x9C are the live (and,
+// for aMule-lineage peers, the only) recovery transport in 0.50a; what the
+// FileIdentifier era actually deprecated is the 0x9E/0x9D root exchange, which
+// every non-FileIdentifier peer (all of aMule) still speaks.
+pub const OP_AICHREQUEST: u8 = 0x9B; // C5 <hash 16><part u16><root 20>
+pub const OP_AICHANSWER: u8 = 0x9C; // C5 <hash 16>[<part u16><root 20><recovery data>]
+pub const OP_AICHFILEHASHANS: u8 = 0x9D; // C5 <hash 16><root 20>
+pub const OP_AICHFILEHASHREQ: u8 = 0x9E; // C5 <hash 16>
+
+fn read_hash20(r: &mut Reader) -> Result<[u8; 20], IoError> {
+    let mut h = [0u8; 20];
+    h.copy_from_slice(&r.read_bytes(20)?);
+    Ok(h)
+}
+
+/// OP_AICHFILEHASHREQ: ask a peer for its AICH master root for this file
+/// (standalone form, eMule DownloadClient.cpp:471-479).
+pub fn build_aich_file_hash_req(hash: &[u8; 16]) -> Packet {
+    Packet::new(PROT_EMULE, OP_AICHFILEHASHREQ, hash.to_vec())
+}
+
+/// Parse OP_AICHFILEHASHREQ: the bare file hash.
+pub fn parse_aich_file_hash_req(payload: &[u8]) -> Result<[u8; 16], IoError> {
+    let mut r = Reader::new(payload);
+    read_hash16(&mut r)
+}
+
+/// OP_AICHFILEHASHANS: `<hash 16><AICH root 20>` (eMule
+/// ListenSocket.cpp:1920-1926).
+pub fn build_aich_file_hash_ans(hash: &[u8; 16], root: &[u8; 20]) -> Packet {
+    let mut w = Writer::new();
+    w.write_bytes(hash);
+    w.write_bytes(root);
+    Packet::new(PROT_EMULE, OP_AICHFILEHASHANS, w.into_inner())
+}
+
+/// Parse OP_AICHFILEHASHANS: `(file hash, AICH master root)`.
+pub fn parse_aich_file_hash_ans(payload: &[u8]) -> Result<([u8; 16], [u8; 20]), IoError> {
+    let mut r = Reader::new(payload);
+    Ok((read_hash16(&mut r)?, read_hash20(&mut r)?))
+}
+
+/// OP_AICHREQUEST: `<hash 16><part u16><master root 20>` - ask the peer for
+/// the recovery block hashes of one part (eMule SendAICHRequest,
+/// DownloadClient.cpp:2276-2278).
+pub fn build_aich_request(hash: &[u8; 16], part: u16, root: &[u8; 20]) -> Packet {
+    let mut w = Writer::new();
+    w.write_bytes(hash);
+    w.write_u16(part);
+    w.write_bytes(root);
+    Packet::new(PROT_EMULE, OP_AICHREQUEST, w.into_inner())
+}
+
+/// Parse OP_AICHREQUEST, STRICT: eMule throws on any size other than exactly
+/// 16+2+20 (ProcessAICHRequest, DownloadClient.cpp:2329-2330), so trailing
+/// bytes are an error here too.
+pub fn parse_aich_request(payload: &[u8]) -> Result<([u8; 16], u16, [u8; 20]), IoError> {
+    let mut r = Reader::new(payload);
+    let hash = read_hash16(&mut r)?;
+    let part = r.read_u16()?;
+    let root = read_hash20(&mut r)?;
+    if r.remaining() != 0 {
+        return Err(IoError::UnexpectedEof);
+    }
+    Ok((hash, part, root))
+}
+
+/// OP_AICHANSWER carrying recovery data:
+/// `<hash 16><part u16><root 20><recovery payload>` (eMule
+/// DownloadClient.cpp:2344-2349).
+pub fn build_aich_answer(hash: &[u8; 16], part: u16, root: &[u8; 20], recovery: &[u8]) -> Packet {
+    let mut w = Writer::new();
+    w.write_bytes(hash);
+    w.write_u16(part);
+    w.write_bytes(root);
+    w.write_bytes(recovery);
+    Packet::new(PROT_EMULE, OP_AICHANSWER, w.into_inner())
+}
+
+/// The refusal form of OP_AICHANSWER: exactly the 16-byte file hash and
+/// nothing else (eMule DownloadClient.cpp:2371-2374). The receiver's failure
+/// test is `size <= 16`.
+pub fn build_aich_answer_failure(hash: &[u8; 16]) -> Packet {
+    Packet::new(PROT_EMULE, OP_AICHANSWER, hash.to_vec())
+}
+
+/// A parsed OP_AICHANSWER.
+pub enum AichAnswer {
+    /// The peer refused or could not serve (a NORMAL outcome - the asker just
+    /// retries another source; eMule ClientAICHRequestFailed).
+    Failure([u8; 16]),
+    /// Recovery data for one part; `recovery` is the raw payload for
+    /// `AichTree::read_recovery_data`.
+    Recovery {
+        hash: [u8; 16],
+        part: u16,
+        root: [u8; 20],
+        recovery: Vec<u8>,
+    },
+}
+
+/// Parse OP_AICHANSWER: `size <= 16` is the explicit failure form (eMule
+/// ProcessAICHAnswer, DownloadClient.cpp:2294-2297).
+pub fn parse_aich_answer(payload: &[u8]) -> Result<AichAnswer, IoError> {
+    let mut r = Reader::new(payload);
+    let hash = read_hash16(&mut r)?;
+    if payload.len() <= 16 {
+        return Ok(AichAnswer::Failure(hash));
+    }
+    let part = r.read_u16()?;
+    let root = read_hash20(&mut r)?;
+    let recovery = r.read_bytes(r.remaining())?;
+    Ok(AichAnswer::Recovery {
+        hash,
+        part,
+        root,
+        recovery,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1012,5 +1133,66 @@ mod tests {
 
         let ranking = [0x0A, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         assert_eq!(parse_queue_ranking(&ranking).unwrap(), 10);
+    }
+
+    #[test]
+    fn aich_packets_round_trip_with_pinned_layout() {
+        let root = [0xA5u8; 20];
+
+        // 0x9E: bare hash, PROT_EMULE
+        let req = build_aich_file_hash_req(&H);
+        assert_eq!((req.protocol, req.opcode), (PROT_EMULE, OP_AICHFILEHASHREQ));
+        assert_eq!(req.payload, H.to_vec());
+        assert_eq!(parse_aich_file_hash_req(&req.payload).unwrap(), H);
+
+        // 0x9D: <hash 16><root 20>
+        let ans = build_aich_file_hash_ans(&H, &root);
+        assert_eq!((ans.protocol, ans.opcode), (PROT_EMULE, OP_AICHFILEHASHANS));
+        assert_eq!(ans.payload.len(), 36);
+        assert_eq!(parse_aich_file_hash_ans(&ans.payload).unwrap(), (H, root));
+
+        // 0x9B: <hash 16><part u16 LE><root 20>, exactly 38 bytes
+        let req = build_aich_request(&H, 0x0102, &root);
+        assert_eq!((req.protocol, req.opcode), (PROT_EMULE, OP_AICHREQUEST));
+        assert_eq!(req.payload.len(), 38);
+        assert_eq!(&req.payload[16..18], &[0x02, 0x01], "part is LE");
+        assert_eq!(parse_aich_request(&req.payload).unwrap(), (H, 0x0102, root));
+    }
+
+    #[test]
+    fn aich_request_parse_is_strict_like_emule() {
+        // eMule ProcessAICHRequest throws on size != 16+2+20
+        // (DownloadClient.cpp:2329-2330): short AND oversize both refused.
+        let good = build_aich_request(&H, 3, &[0xBB; 20]).payload;
+        assert!(parse_aich_request(&good[..37]).is_err());
+        let mut long = good.clone();
+        long.push(0);
+        assert!(parse_aich_request(&long).is_err());
+    }
+
+    #[test]
+    fn aich_answer_failure_is_16_bytes_and_parses_as_failure() {
+        let fail = build_aich_answer_failure(&H);
+        assert_eq!((fail.protocol, fail.opcode), (PROT_EMULE, OP_AICHANSWER));
+        assert_eq!(fail.payload.len(), 16, "refusal is EXACTLY the hash");
+        match parse_aich_answer(&fail.payload).unwrap() {
+            AichAnswer::Failure(h) => assert_eq!(h, H),
+            _ => panic!("16-byte answer must parse as Failure"),
+        }
+
+        let recovery_bytes = vec![0x01, 0x00, 0x02, 0x00];
+        let ok = build_aich_answer(&H, 7, &[0xCC; 20], &recovery_bytes);
+        match parse_aich_answer(&ok.payload).unwrap() {
+            AichAnswer::Recovery {
+                hash,
+                part,
+                root,
+                recovery,
+            } => {
+                assert_eq!((hash, part, root), (H, 7, [0xCC; 20]));
+                assert_eq!(recovery, recovery_bytes);
+            }
+            _ => panic!("payload > 16 bytes must parse as Recovery"),
+        }
     }
 }
