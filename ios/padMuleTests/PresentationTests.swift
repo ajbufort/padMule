@@ -58,6 +58,23 @@ final class PresentationTests: XCTestCase {
             statusFor: statusFor)
     }
 
+    /// Alphanumeric ordering: runs of digits compare as NUMBERS. With a plain
+    /// localizedCaseInsensitiveCompare "part 10" sorts before "part 2", which is
+    /// precisely what asking for an alphanumeric sort is asking to fix.
+    func testNameSortIsAlphanumericNotPlainLexicographic() {
+        let hits = [
+            hit(name: "part 10.bin"), hit(name: "part 2.bin"), hit(name: "part 1.bin"),
+        ]
+        let out = p(hits, sort: .name, ascending: true)
+        XCTAssertEqual(
+            out.map(\.name),
+            ["part 1.bin", "part 2.bin", "part 10.bin"],
+            "10 must sort AFTER 2")
+        // Case-insensitivity is not lost in the swap.
+        let mixed = p([hit(name: "Beta"), hit(name: "alpha")], sort: .name, ascending: true)
+        XCTAssertEqual(mixed.map(\.name), ["alpha", "Beta"])
+    }
+
     // The regression this guards: a descending sort written as `!(a < b)` is NOT a
     // strict weak ordering (it returns true for equal elements), which Swift's
     // `sort(by:)` contract forbids. The fix uses a 3-way compare; verify order AND

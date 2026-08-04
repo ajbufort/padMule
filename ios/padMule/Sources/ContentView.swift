@@ -177,6 +177,19 @@ struct ContentView: View {
                 }
             }
             .toolbar {
+                // Straight to the finished files. Declared FIRST so it sits to
+                // the left of Settings. `folder` is the Files app's own visual
+                // language (its icon is a folder), and it matches the outline
+                // weight of the other toolbar glyphs rather than the filled
+                // variant.
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button {
+                        model.openDownloadsInFiles()
+                    } label: {
+                        Image(systemName: "folder")
+                    }
+                    .accessibilityLabel("Open downloads in the Files app")
+                }
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button {
                         showSettings = true
@@ -735,7 +748,22 @@ struct ContentView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 } else {
-                    ForEach(model.downloadedFiles) { file in
+                    // Same sort idiom as Transfers, so the two lists behave alike.
+                    HStack {
+                        Menu {
+                            Picker("Sort", selection: $model.downloadedSortKey) {
+                                ForEach(DownloadedSortKey.allCases) { Text($0.rawValue).tag($0) }
+                            }
+                            Toggle("Ascending", isOn: $model.downloadedSortAscending)
+                        } label: {
+                            Label(
+                                "Sort: \(model.downloadedSortKey.rawValue)",
+                                systemImage: "arrow.up.arrow.down")
+                                .font(.caption)
+                        }
+                        Spacer()
+                    }
+                    ForEach(model.presentedDownloadedFiles) { file in
                         HStack {
                             // Tapping the row OPENS the file in the system
                             // viewer (video, audio, PDF, images, documents).
@@ -760,13 +788,18 @@ struct ContentView: View {
                                 }
                             }
                             .buttonStyle(.plain)
-                            .accessibilityLabel("Open \(file.name)")
-                            // Explicit share stays alongside: "open here" and
-                            // "send it to another app" are different intents.
-                            ShareLink(item: file.url) {
-                                Image(systemName: "square.and.arrow.up")
-                            }
-                            .buttonStyle(.borderless)
+                            .accessibilityLabel("Preview \(file.name)")
+                            // TWO different intents, and the labels now say so.
+                            // The row PREVIEWS inside padMule (QuickLook); this
+                            // hands the file to another app entirely - a video
+                            // opens in a video app, full screen - which
+                            // backgrounds padMule and therefore pauses
+                            // transfers. Sharing is still reachable from
+                            // QuickLook's own toolbar, so nothing is lost by
+                            // replacing the share arrow with the clearer action.
+                            Button("Open") { model.openInAnotherApp(file) }
+                                .buttonStyle(.borderless)
+                                .accessibilityLabel("Open \(file.name) in another app")
                         }
                     }
                 }
@@ -880,10 +913,14 @@ struct ContentView: View {
             }
 
             Section("Servers (\(model.servers.count))") {
+                // Tappable column headers, the table convention: tap to sort by
+                // that column, tap the active one again to reverse it. The arrow
+                // shows on the active column only, so the current order is
+                // readable at a glance rather than remembered.
                 HStack {
-                    Text("Server").frame(maxWidth: .infinity, alignment: .leading)
-                    Text("Users").frame(width: 70, alignment: .trailing)
-                    Text("Files").frame(width: 84, alignment: .trailing)
+                    serverHeader(.name, width: nil, alignment: .leading)
+                    serverHeader(.users, width: 70, alignment: .trailing)
+                    serverHeader(.files, width: 84, alignment: .trailing)
                 }
                 .font(.caption2).foregroundStyle(.secondary)
 
@@ -893,12 +930,44 @@ struct ContentView: View {
                 }
                 // Index-keyed: server.met is not deduped, so addresses are not a
                 // unique identity (duplicate rows would collide on \.addr).
-                ForEach(Array(model.servers.enumerated()), id: \.offset) { _, srv in
+                ForEach(Array(model.presentedServers.enumerated()), id: \.offset) { _, srv in
                     serverRow(srv)
                 }
             }
         }
         .onAppear { if model.servers.isEmpty { model.loadServers() } }
+    }
+
+    /// One tappable column header. Tapping the ACTIVE column reverses it, which
+    /// is what a second tap means in every table users have met.
+    @ViewBuilder
+    private func serverHeader(
+        _ key: ServerSortKey, width: CGFloat?, alignment: Alignment
+    ) -> some View {
+        Button {
+            if model.serverSortKey == key {
+                model.serverSortAscending.toggle()
+            } else {
+                model.serverSortKey = key
+                // Names read naturally A-Z; counts are most useful biggest-first.
+                model.serverSortAscending = (key == .name)
+            }
+        } label: {
+            HStack(spacing: 2) {
+                if alignment == .trailing { Spacer(minLength: 0) }
+                Text(key.rawValue)
+                if model.serverSortKey == key {
+                    Image(systemName: model.serverSortAscending ? "chevron.up" : "chevron.down")
+                        .font(.system(size: 8, weight: .bold))
+                }
+                if alignment == .leading { Spacer(minLength: 0) }
+            }
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(model.serverSortKey == key ? Color.accentColor : .secondary)
+        .frame(maxWidth: width == nil ? .infinity : nil, alignment: alignment)
+        .frame(width: width)
+        .accessibilityLabel("Sort by \(key.rawValue)")
     }
 
     /// One server row: name/address, live user/file counts, and connection state.
