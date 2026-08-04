@@ -64,4 +64,5 @@ AICH block recovery - the single remaining PARTIAL - SHIPPED 2026-08-03 as wave
 11 (row 8bj), live-proven against real amuled, so the scorecard is 24/0/2 with no
 PARTIAL rows left - and an independent sweep of that finished branch (row 8bk)
 then found its serve half UNREACHABLE on the path real clients use, which is why
-the row carries a reachability note. Wave 9 seedbox mode is the open v1.1 item.)
+the row carries a reachability note. Wave 9 seedbox mode was DROPPED 2026-08-04 -
+foreground-only is padMule's permanent posture, not a limitation awaiting a fix.)

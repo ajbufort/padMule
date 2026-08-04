@@ -1,6 +1,7 @@
 # Lifecycle Status + Clean Reactivation (hard requirement)
 
-Updated: 2026-08-02 (the M4 target-change annotations)
+Updated: 2026-08-04 (seedbox mode DROPPED - foreground-only is now the PERMANENT
+posture, so the research below is retained as background, not as a roadmap)
 
 padMule is foreground-only ([[ipados-constraints]]): iPadOS suspends the app
 ~30s after backgrounding and reclaims every TCP/UDP socket (EBADF). When focus
@@ -96,7 +97,12 @@ strongest (verified in the iPadOS research, docs/raw/ipados-constraints-*):
    outright TERMINATION (jetsam) - so background memory MUST stay under ~100MB;
    heavy battery cost; audio-interruption re-arm needed. Verdict: genuinely
    defeats the pause for hours of active screen-off use; can still be killed.
-2. **Foreground seedbox mode - the fully-supported always-on path.** Auto-Lock =
+2. **Foreground seedbox mode - the fully-supported always-on path.**
+   [DROPPED 2026-08-04 as a padMule FEATURE - see [[decisions-and-lessons]]. The
+   mechanism below is still simply TRUE of iPadOS, and a user who wants it can
+   already have it by setting Auto-Lock to Never themselves and leaving padMule
+   open, which is exactly what "Keep screen awake while transferring" assists.
+   What is dropped is padMule shipping a MODE around it.] Auto-Lock =
    Never + plugged in keeps the app foreground with the screen on: UNLIMITED,
    fully supported, sockets alive. The cost is only that the screen is on. Best
    for "leave it downloading on my desk" and for seeding.
@@ -117,7 +123,11 @@ survives suspension) is HTTP/HTTPS-only and cannot carry the eD2k/Kad wire
 protocol. So there is no "free" always-on.
 
 **Decision:** v1 stays foreground-only with the clean pause/resume above (it is
-honest, simple, and always correct). Add background persistence as a LATER,
+honest, simple, and always correct). [SUPERSEDED 2026-08-04: the "add background
+persistence later" half is DROPPED. Foreground-only is the permanent posture, so
+the tiered feature described next is research, not a plan. The paragraph is kept
+in place because the ANALYSIS stays accurate and is why the decision is safe.]
+Add background persistence as a LATER,
 OPT-IN, tiered feature (a "Keep active in background" toggle = the audio
 keepalive with a clear battery warning + the <100MB memory discipline; a
 "Seedbox mode" = Auto-Lock=Never; use BGContinuedProcessingTask on iPadOS 26 to

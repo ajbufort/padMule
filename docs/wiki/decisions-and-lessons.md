@@ -64,7 +64,19 @@ bullet each; Locked decisions newest first, Lessons in the order learned.
   server.met, nodes.dat, prefs, clients.met, ipfilter.dat) so downloads move
   between padMule and desktop aMule/eMule. Doubles as a differential test
   (load upstream file, re-emit, diff bytes). See [[protocol-reference]].
-- 2026-07-12 **Seeding: foreground-only v1, seedbox toggle in v1.1.** Given the
+- 2026-08-04 **Seedbox mode DROPPED - foreground-only is permanent.** Anthony cut
+  it from the roadmap rather than deferring it again. This retires the "v1.1
+  toggle" half of the 2026-07-12 decision below; the foreground-only half stands
+  and is now the FINAL posture, not a limitation waiting on a fix. Practical
+  effect: the honest pause/resume, the readiness-gated splash, keep-screen-awake,
+  the "padMule only transfers while it is open" copy, and Stop releasing the
+  forwarded port all stop being stopgaps and become the design. Nothing gets
+  removed; what changes is that no doc should promise an always-on mode is
+  coming. See [[lifecycle-and-reactivation]].
+
+- 2026-07-12 **Seeding: foreground-only v1, seedbox toggle in v1.1.** [SUPERSEDED
+  IN PART 2026-08-04: the v1.1 seedbox toggle is DROPPED, see the entry above;
+  the foreground-only decision itself stands and is now permanent.] Given the
   ~30s background suspension ([[ipados-constraints]]), v1 is honestly
   foreground-only (transfers pause on background, resume + Kad re-bootstrap on
   foreground). A supported "seedbox mode" (Auto-Lock=Never, plugged in, screen

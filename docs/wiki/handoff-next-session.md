@@ -21,6 +21,12 @@ this handoff carried as the biggest remaining are BOTH now addressed:
 - **The fourth port field (Kad advertise vs bind)** - DONE, row 8bo. The
   handoff predicted it would be needed "only if a remap is needed"; it was.
 
+**Wave 9 seedbox mode is DROPPED** (Anthony, 2026-08-04) - cut, not deferred
+again. Foreground-only is now padMule's PERMANENT posture rather than a v1
+limitation, which makes the honest pause/resume, the readiness-gated splash,
+keep-screen-awake and Stop-releases-the-port the final design instead of
+stopgaps. Nothing to remove; just stop promising an always-on mode.
+
 Device-proven this session: HighID over AirVPN (the cause was the provider's
 "Local port" field, which CANNOT be blank - it silently keeps the old value),
 the resume fix, the source-origin badge, and the server column sorting.
