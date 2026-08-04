@@ -38,6 +38,12 @@ struct HelpView: View {
                 }
 
                 Section {
+                    Text("A transfer row turns amber while it is ACTUALLY receiving bytes. A row with no tint is registered but moving nothing right now - it may be waiting in a queue, hunting for sources, or simply have none online. That is normal on eD2k and not a fault; padMule keeps retrying.")
+                } header: {
+                    Text("Reading the Transfers list")
+                }
+
+                Section {
                     Text("Tapping a finished file PREVIEWS it inside padMule. padMule stays running, so anything still downloading keeps going.")
                     Text("Open hands the file to another app instead - a video opens in a video app, a PDF in a reader - full screen, as if you had opened it from the Files app. iOS has no notion of a default app per file type, so it asks which app to use; if only one can open that kind of file, that is the only choice offered.")
                     Text("Because that other app comes to the front, padMule goes to the BACKGROUND, and iPadOS pauses your transfers until you come back to it. That is the same rule as leaving padMule for any other reason - nothing is lost, and progress is saved - but it is worth knowing before you open a film halfway through a download.")
