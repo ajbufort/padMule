@@ -1,237 +1,127 @@
 # HANDOFF - start here next session
 
-Updated: 2026-08-03 (a long session: reanalysis -> doc-drift round ->
-OP_GETSERVERLIST -> two-bug fix round -> device pass -> the RECURSIVE UDP CRAWL
--> server NAMES -> and finally the USAGE-FEEDBACK ROUND, which is the important
-one. Everything below is verified, not assumed, and what is NOT verified says
-so.)
+Updated: 2026-08-03 (one very long session: reanalysis -> doc-drift round ->
+OP_GETSERVERLIST -> the RECURSIVE UDP CRAWL -> server names -> the SEVEN-BUG
+USAGE-FEEDBACK ROUND -> VPN readiness -> on-glass fixes. Everything below is
+verified, not assumed, and what is NOT verified says so.)
 
 Living doc: replace it wholesale next time. Full narrative in [[build-progress]]
-rows 8av-8bb + the [[log]] entries for 2026-08-03 + [[feature-server-hunter]].
-
-## THE HEADLINE: Anthony used the app properly, and it found 7 real bugs
-
-The first extended usage session produced 18 items; four parallel
-investigations turned them into SEVEN CONFIRMED BUGS (build-progress 8bb), all
-now fixed, TDD RED-first and mutation-checked. Two are worth carrying forward:
-
-1. **Resume was broken - and ONLY when Kad was HEALTHY.** `find_sources` joins
-   its server and Kad arms, so it returns in max(), and the Kad arm carries a
-   15s budget; `resume_fetches` wrapped the call in a 4s timeout that DISCARDED
-   everything on expiry, including server sources that had arrived in under a
-   second. A populated Kad table guaranteed the discard; an empty one let
-   resume work. `add_download` calls the SAME function with no outer timeout -
-   which is exactly why adding a file worked and resuming the identical file
-   did not. That asymmetry was the smoking gun. The budget is now a PARAMETER
-   bounding each arm, so partial results always survive. Two siblings fixed
-   with it: only 2 downloads were attempted per foreground return, and there
-   was NO retry anywhere (spawn_fetch was reachable only from
-   start/resume/add_download), so a stalled download stayed stalled until
-   relaunch.
-2. **Phantom shared files - an INTEROP bug.** The shared library is verified
-   against disk only at `start()`, and the serve path looked up purely in
-   memory. A file deleted in the Files app was still announced via
-   OP_OFFERFILES, answered "COMPLETE" to a requesting peer, granted an upload
-   slot, then dropped the connection when the read failed. Now refused at the
-   serve path (honest FNF) plus a 60s prune of library + known.met.
-
-A LESSON THAT COST ME TWO ATTEMPTS: my first two resume tests PASSED under
-mutation and were worthless - one asserted a return value that was false for
-other reasons, the other never exercised the Kad arm because the test had no
-Kad node. A test can exercise the right CALLER and still not exercise the
-MECHANISM. Rewritten, they fail under mutation, and the budget one measures
-the original bug exactly (10.001s against a 600ms budget).
+rows 8av-8bh + the [[log]] entries for 2026-08-03.
 
 ## State of the tree
 
 - All work committed AND pushed; tree clean; branch even with origin/main at
-  **47974b9**. This session: 37eeac4 (doc-drift), 4949f25 (OP_GETSERVERLIST),
-  fff31dc (magnet + Kad gate), c0de43a + 58d31f8 (device passes), 6d99fd4 (the
-  RECURSIVE UDP CRAWL), c79caf6 (server names), ee780b6 (the SEVEN feedback
-  bugs), e744bbf (the UI half), 47974b9 (a CI-caught test fixture).
-- **Gate**: 559 Rust tests, clippy WARNING-FREE, fmt clean, ASCII clean.
-- CI: all three workflows GREEN on 47974b9.
+  **89d8a2c**.
+- **Gate**: 564 Rust tests, clippy WARNING-FREE, fmt clean, ASCII clean.
+- CI: all three workflows GREEN on the last code commit.
 - ALL FOUR ORACLES re-run and PASS after the serve-path change: amuled
   differential (byte-for-byte, 3 files), the REVERSE oracle (real amuled
-  downloads FROM padMule + serve-side secure-ident - the one that proves the
-  new "is this file still on disk" check does not refuse a legitimate upload),
-  the isolated eserver login, and the Kad verify oracle.
+  downloads FROM padMule + serve-side secure-ident), the isolated eserver
+  login, and the Kad verify oracle.
 - [[security-model]] scorecard unchanged: **23 OPERATIONAL / 1 PARTIAL / 2
   documented opt-outs**. The PARTIAL is AICH block recovery (wave 11).
-- A CI lesson worth keeping: the iOS app BUILT while the test bundle failed to
-  compile, because `SearchHit` gained a field after the test helpers were
-  written. Swift is type-checked ONLY in CI on this box, so grep-and-read
-  verifies symbols exist but cannot catch a changed initializer signature -
-  always wait for the iOS TEST workflow, not just the build.
+- Latest build staged for install:
+  `C:\Users\ajbuf\Downloads\padMule-INSTALL-THIS-unsigned-89d8a2c.ipa`.
 
 ## THE HARD DEADLINE
 
-**The free signing cert + provisioning profiles EXPIRE 2026-08-10** (now days
-away). After that, no new build installs until renewed via Sideloadly (Apple ID
-auth, App ID + device registration, cert issuance), then re-pull the profile
-with `ideviceprovision copy`. Plan a build/install pass before then, or renew
-early.
+**The free signing cert + provisioning profiles EXPIRE 2026-08-10.** After
+that, no new build installs until renewed via Sideloadly (Apple ID auth, App
+ID + device registration, cert issuance), then re-pull the profile with
+`ideviceprovision copy`.
 
-## FIRST THINGS TO DO
+## Where things actually stand
 
-[BOTH DONE same session: Anthony installed the fff31dc build via Sideloadly,
-and the agent-driven device pass verified the batch on glass - see the
-DEVICE-VERIFIED section below.] The next session starts at the ranked open
-tasks; the only install-related task left is the CERT RENEWAL before
-2026-08-10.
+**The app is in daily-driver shape.** Anthony's first extended usage session
+produced 18 items; four parallel investigations turned them into SEVEN
+confirmed bugs (8bb), all fixed TDD-first and mutation-checked, plus the whole
+UI batch (8bg). Two findings are worth carrying forward as lessons:
 
-## THE HEADLINE: server discovery is COMPLETE (crawl + ask both shipped)
+1. **Resume was broken - and ONLY when Kad was HEALTHY.** `find_sources` joins
+   its server and Kad arms so it returns in max(), and the Kad arm carries a
+   15s budget; `resume_fetches` wrapped the call in a 4s timeout that DISCARDED
+   everything, including server sources that had already arrived. `add_download`
+   calls the same function with no outer timeout, which is why adding worked and
+   resuming did not. Now bounded per-arm so partial results always survive.
+2. **Phantom shared files** - a file deleted in the Files app was still
+   announced, answered "COMPLETE" to peers, given an upload slot, then dropped
+   the connection. Verified at the serve path plus a 60s prune.
 
-The Server Hunter is now feature-complete as designed ([[feature-server-hunter]]):
-multi-URL lists + gzip/zip unwrap, the UDP health probe, the connect-time gossip
-harvest WITH its OP_GETSERVERLIST ask, and - new in 6d99fd4 - the RECURSIVE UDP
-CRAWL, which asks servers we are NOT connected to and then asks the ones that
-answer. LIVE: 10 seeds -> asked 33 -> 28 answered -> 25 new servers (10 -> 35),
-and a 3-round run converged on the same 25, so it terminates rather than running
-away. Whole-net scanning stays deliberately out of scope.
-
-Anthony then caught that discovered servers showed only IPs - discovery yields
-ip:port and carries no name. Fixed the same session with PARITY (c79caf6):
-`OP_SERVER_DESC_REQ` (0xA2), which both authorities already send after a status
-answer, now rides along with the Servers-screen probe; both answer forms are
-handled and the learned name is persisted into server.met. LIVE: 33 of 35
-servers named after a crawl, the only two unnamed being the two that answered
-nothing at all.
-
-METHOD NOTE that should outlive this session: the wire question was settled by
-PROBING BEFORE CODING. Both authorities' opcode tables define
-OP_SERVER_LIST_REQ2 (0xA4) / OP_SERVER_LIST_RES (0xA1) but NEITHER EVER SENDS OR
-PARSES THEM, so padMule sending it is a documented deviation - justified by
-measurement, with a 0xA2 DESC control to tell silence from a dead host. The
-obvious guess was then killed too: the vendored Lugdunum eserver 17.15 oracle
-does NOT answer 0xA4 either, so support is implementation-specific and SILENCE
-IS A NORMAL ANSWER (28 of 33 live servers did answer). The crawl is bounded on
-every axis and its merge shares ONE safety gate with the harvest.
-
-## The gossip harvest is LIVE (OP_GETSERVERLIST shipped)
-
-The 8ay device pass proved modern servers do NOT volunteer OP_SERVERLIST; the
-ask now ships (row 8az): a fresh login sends the bodiless 0x14 right after the
-shares offer - BOTH authorities' send site - on connect AND resume, gated on
-eMule's AddServersFromServer pref (Settings toggle "Ask connected servers for
-more servers"; both authorities default OFF, padMule defaults ON as a
-documented deviation). **LIVE-PROVEN from the dev box**: the isolated eserver
-oracle accepts the ask through a full lifecycle, and a real public server
-(85.17.116.222:6082, HighID, 3210 users) answered `[serverlist] 33 servers`
-via `mule-cli login`. Ride-along fix: the event forwarder stashes a ServerList
-BEFORE its flood limiter, so a connect-burst answer cannot be dropped.
-
-## What else landed this session (all pushed)
-
-- **Full reanalysis** (5 parallel area explorers + gate run): code sound, every
-  prior-handoff claim verified; findings folded into the wiki + the list below.
-- **Doc-drift fix round** (37eeac4): portability-audit Tier-1 items annotated
-  FIXED; wave-10 row marked COMPLETE; build-progress rows 8av-8ay added; index
-  caught up (log.md now listed); security-model tally chain joined; AltStore
-  marked SUPERSEDED everywhere; six stale Updated: headers; four misattached
-  code doc comments.
-- **Magnet-link fix** (fff31dc): a flag-style parameter or trailing `&` no
-  longer aborts the whole parse (it skipped-not-fatal, like the ed2k path).
-- **Kad bootstrap gate** (fff31dc): the dial list now passes gate_loaded_nodes
-  (ipfilter/routability/port-53/Kad1) exactly like the table load - a poisoned
-  nodes.dat can no longer aim the bootstrap sweep at loopback/LAN/DNS.
-
-## DEVICE-VERIFIED (2026-08-03, fff31dc install, agent-driven pass)
-
-Anthony installed the fff31dc build via Sideloadly the same session, and the
-WebDriverAgent pass verified on glass: the new Settings toggle "Ask connected
-servers for more servers" renders and defaults ON; tapping the live ed2k-rust
-server produced **"Discovered 24 server(s) from the network"** and "Refresh
-server list" grew the table from **"Servers (10)" to "Servers (34)"** - the
-gossip harvest working end to end ON THE DEVICE; the Status row reads
-**"Connected to ed2k-rust (85.17.116.222:6082)"** (the 26cc9f8 name change,
-verified); ID row HighID; "UPnP: mapped port 4662". As predicted, the
-Servers-screen header still shows the bare IP (`ServerInfoFfi` has no `name`
-field - open task below). NB the Servers list does NOT auto-refresh after a
-harvest - the count updates on the next "Refresh server list" probe; whether
-it SHOULD auto-refresh is a small UX question for the next slice.
-
-## DEVICE-VERIFIED (2026-08-03, c79caf6 install, agent-driven)
-
-The whole discovery engine, on glass: "Discover more servers" produced
-**"Crawl asked 33 server(s), 30 answered - 25 new"**, the table grew
-**Servers (10) -> Servers (35)**, and scrolling the full list showed **32 of 34
-rows NAMED** (only the two servers that answered nothing are unnamed). So the
-crawl, the merge, the description-request name learning and its persistence all
-work on the device. NB the iOS accessibility tree exposes only VISIBLE cells, so
-a full-list assertion needs scrolling + dedup.
-
-## Still NOT device-verified
-
-The metered-sharing pause (needs a cellular/hotspot link; rests on its unit
-truth-table), keep-screen-awake, and the multi-URL merge RESULT. Also: the
-`idevicesyslog -p padMule -m padMule.engine` capture came up EMPTY during this
-pass (only its connect marker) while the same command worked 2026-08-02/03 -
-unresolved harness quirk, retry before trusting it as the only evidence
-channel.
+**VPN readiness is complete but UNPROVEN.** Anthony is moving padMule behind
+AirVPN. Ports are configurable (listen vs ADVERTISED - they differ under
+remote-to-local forwarding), UPnP can be switched off, and a public-address
+CHANGE pauses sharing and warns loudly, since stock iOS has no kill switch.
+See [[net-highid-and-port-forwarding]] for the AirVPN specifics, including
+that **port 4662 is NOT obtainable** (another subscriber holds it), which is
+what turned the port override from a nicety into a prerequisite.
 
 ## Open tasks (ranked)
 
-1. **DEVICE-VERIFY THE FEEDBACK ROUND.** Everything in 8bb is CI-green and
-   unit/oracle-proven but NOT on glass. The install to check: resume actually
-   restarting transfers after a background/foreground cycle (the headline fix -
-   and the one thing only a device can really show), the Downloaded tab +
-   Share, the Status/Server collapse, the two-network health panel, the search
-   provenance badge, per-op spinners, result numbering and back-to-top.
-2. **Get blocking engine calls OFF the one serial queue** (portability Tier 2,
-   and now the biggest remaining structural risk). "Reconnecting..." still
-   cannot render; pause() starvation is MITIGATED (a beginBackgroundTask
-   assertion + a refresh in-flight guard) but not eliminated; the ~10s crawl
-   and ~20s search still freeze the UI. The periodic re-drive and share-verify
-   both had to be kept deliberately small for this reason.
-3. **Remaining Tier 2**: NAT-PMP is dead code in the engine; the 4s
-   offer_files timeout silently drops uploads on a slow link; no bandwidth
-   limiting anywhere. [The failed-initial-map bug that was listed here is
-   FIXED - build-progress 8bc.]
-4. **Settings Tier 1/2 engine work**, with **PORT OVERRIDE promoted**: the
-   listening port is hardcoded to 4662, which BLOCKS the VPN story entirely -
-   a provider-assigned forwarded port cannot earn HighID until the port is
-   settable ([[net-highid-and-port-forwarding]], VPN section). Then nickname
-   (hardcoded "padMule"), obfuscation policy tri-state, ipfilter controls,
-   UPnP toggle, upload slots, bandwidth caps (`upload_queue.rs` holds dead
-   kbps logic to revive-or-delete), See-My-Shared-Files.
-5. **AICH block recovery** (wave 11, the last scorecard PARTIAL).
-6. **Continuous block-request top-up** - padMule is stop-and-wait per 3-block
+1. **Prove the VPN path on device.** Reserve one port with BOTH TCP+UDP, leave
+   "Local" EMPTY (same-port), set padMule's listen = advertised = kad = that
+   port, UPnP off, RESTART padMule. Then AirVPN's Test open (only meaningful
+   with padMule running) and Status -> HighID. Expect the public-address guard
+   to fire once as the tunnel comes up; that is correct.
+   KNOWN LIMIT: the advertised/listen split covers the TCP port only - Kad's
+   UDP port is a single value used for both bind and advertise, so a
+   remote-to-local REMAP would break Kad's inbound reachability. Same-port
+   forwarding sidesteps it. Add a fourth field only if a remap becomes
+   necessary.
+2. **Device-verify what the photos have not shown**: the resume fix (needs a
+   background/foreground cycle with an active download - the headline fix of
+   the whole session), the Downloaded tab's QuickLook Open, and the
+   metered-sharing pause (needs a cellular link).
+3. **Get blocking engine calls OFF the one serial queue** - the biggest
+   remaining structural risk. "Reconnecting..." still cannot render; pause()
+   starvation is MITIGATED (background-task assertion + refresh in-flight
+   guard) but not eliminated; a ~10s crawl and ~20s search still freeze the UI.
+   The periodic re-drive and share-verify were both kept deliberately small for
+   exactly this reason.
+4. **Remaining Tier 2** ([[portability-audit]]): NAT-PMP is dead code in the
+   engine; the 4s offer_files timeout silently drops uploads on a slow link; no
+   bandwidth limiting anywhere.
+5. **Settings Tier 1/2 engine work** - nickname (hardcoded "padMule"),
+   obfuscation policy tri-state, ipfilter controls, upload slots, bandwidth
+   caps (`upload_queue.rs` holds dead kbps logic to revive-or-delete),
+   See-My-Shared-Files.
+6. **AICH block recovery** (wave 11, the last scorecard PARTIAL).
+7. **Continuous block-request top-up** - padMule is stop-and-wait per 3-block
    batch, shallower than both authorities; no wire change, big win at cellular
-   RTT. (This is also why keep-awake now looks at a WINDOW of rate samples
-   rather than the last one - a batch boundary reads as zero.)
-7. **Smaller items still open** (from the reanalysis and the feedback round):
-   harvest queue lost if the server.met write fails; no thin-file guard on
-   nodes.dat writes (aMule refuses < 25 contacts); `hash-file` exits 0 on
-   failure and two oracle scripts consume it without `-e`; MSRV declared but
-   unenforced in CI; request_callbacks has no cap/pacing; the related-search
-   fallback still pollutes Recent Searches; Settings accepts https:// list
-   URLs the engine rejects (http-only); the kick alert may not surface while a
-   sheet is open.
+   RTT. (Also why keep-awake watches a WINDOW of rate samples: a batch boundary
+   legitimately reads zero.)
+8. **Smaller open items**: harvest queue lost if the server.met write fails; no
+   thin-file guard on nodes.dat writes (aMule refuses < 25 contacts); the
+   related-search fallback pollutes Recent Searches; Settings accepts https://
+   list URLs the engine rejects (http-only); the kick alert may not surface
+   while a sheet is open; `hash-file` exits 0 on failure and two oracle scripts
+   consume it without `-e`; MSRV declared but unenforced in CI.
 
 ## Discipline reminders that earned their keep THIS session
 
-- **Fix the payload path before the ask.** The flood limiter would have eaten
-  the OP_SERVERLIST answer the new ask solicits - found by reanalysis BEFORE
-  the send existed, fixed in the same commit, RED-first.
-- **A single-server universe cannot prove a list answer.** The isolated
-  eserver accepted the ask but advertises nothing (it knows no other servers);
-  only the live public server could show `[serverlist] 33`. Match the oracle
-  to the claim.
-- **A test that exercises a HELPER is not evidence about the CALLER** (again).
-  The Kad dial-gate RED was driven through start_kad itself: 3.6s of doomed
-  dialing before the fix, a 0.02s honest bail after.
-- **Both authorities default AddServersFromServer OFF; padMule ships ON.**
-  Deviations are fine when wire-identical, justified, and written down with
-  citations on both sides - that is the replicate-then-improve boundary.
-- **Live servers churn.** The server the 8ay device pass used now refuses
-  logins from this box entirely; the live check had to find a fresh one via
-  login-any. Never hardcode a "known good" server into a test or doc.
+- **User testing finds what tests cannot.** One real session produced seven
+  bugs that a green 550-test suite, clean clippy and four passing oracles had
+  all missed - including a resume path that only worked when Kad was BROKEN.
+- **A test can reach the right CALLER and still not exercise the MECHANISM.**
+  Two resume tests passed with the fix deleted. MUTATION-CHECK anything
+  load-bearing; if it stays green it is decoration. Now standard practice.
+- **A fake fixture hides a missing check.** Nine serve tests used
+  `/does/not/matter` as a shared-file path; adding the correct disk check broke
+  all nine, which WAS the check working. They now write real files.
+- **Verify the RENDERED result, not the source.** The title-bar literal decoded
+  correctly as a Swift string and still rendered wrong, because
+  `.navigationTitle` reinterprets a literal as a LocalizedStringKey. Read the
+  compiled binary, or the screen.
+- **Ordering bugs are invisible to CI.** The port override shipped INERT
+  because `boot()` applied settings after `start()`; it compiled, the suite
+  stayed green, and only reading the call sequence caught it.
+- **Attach global UI at the root.** The Stop confirmation lived on the Status
+  screen, so the new toolbar button would have silently done nothing anywhere
+  else.
 
 ## Related
 
-- [[feature-server-hunter]] - the now-LIVE gossip crawl; the recursive-crawl
-  next step.
-- [[ipad-usb-tooling]] - device runbook, touch control, signing, the traps.
+- [[net-highid-and-port-forwarding]] - HighID, the AirVPN setup, the kill-switch gap.
 - [[portability-audit]] - Tier 2/3 open work.
-- [[build-progress]] / [[security-model]] / [[log]].
+- [[ipad-usb-tooling]] - device runbook; NB `unbind` (not `detach`) frees the
+  iPad for Sideloadly on this box.
+- [[build-progress]] / [[security-model]] / [[log]] / [[feature-server-hunter]].
