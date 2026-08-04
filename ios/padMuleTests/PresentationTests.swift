@@ -21,6 +21,7 @@ final class PresentationTests: XCTestCase {
         status: HitStatusFfi = .new
     ) -> SearchHit {
         SearchHit(
+            origin: "server",
             hash: "0123456789abcdef0123456789abcdef",
             name: name,
             size: size,

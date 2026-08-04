@@ -8,6 +8,7 @@ import XCTest
 final class OutcomeTests: XCTestCase {
     private func hit(_ name: String) -> SearchHit {
         SearchHit(
+            origin: "server",
             hash: "0123456789abcdef0123456789abcdef",
             name: name, size: 1, sources: 1, completeSources: 0, fileType: "Other",
             artist: "", album: "", title: "", lengthSecs: 0, bitrate: 0, codec: "",
