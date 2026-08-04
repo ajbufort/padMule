@@ -50,6 +50,10 @@ enum SettingsKey {
     /// the ordinary home-router case; different behind a VPN forwarder.
     static let advertisedPort = "padMule.advertisedPort"
     static let kadPort = "padMule.kadPort"
+    /// The Kad UDP port peers are TOLD to dial, when a provider forwards a
+    /// remote port to a different local one. Equal to `kadPort` in the ordinary
+    /// same-port case; the eD2k TCP side has had this split since 8bd.
+    static let kadAdvertisedPort = "padMule.kadAdvertisedPort"
     /// Attempt a UPnP mapping on the LAN router. Off is correct on a VPN, where
     /// the provider does the forwarding and a LAN-router mapping is a no-op the
     /// tunnel bypasses anyway.
@@ -82,6 +86,7 @@ enum SettingsDefaults {
             SettingsKey.listenPort: 5999,
             SettingsKey.advertisedPort: 5999,
             SettingsKey.kadPort: 5999,
+            SettingsKey.kadAdvertisedPort: 5999,
             // OFF by default, to match the 5999 ports above. Those defaults say
             // "this build expects a VPN to forward a port into the tunnel", and
             // on a VPN a LAN router mapping accomplishes nothing - it maps a

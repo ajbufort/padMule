@@ -639,9 +639,16 @@ impl MuleEngine {
     /// forwarder maps one port to another - a VPN with remote-to-local port
     /// forwarding - and then peers must dial the EXTERNAL port while padMule
     /// listens on the local one.
-    pub fn set_ports(&self, listen: u16, advertised: u16, kad: u16) {
-        self.rt
-            .block_on(async { self.inner.lock().await.set_ports(listen, advertised, kad) });
+    /// `kad_advertised` is the same split for Kad's UDP port: `kad` is BOUND
+    /// (it must equal the local port the provider forwards TO) and this is what
+    /// peers are told to dial. Pass it equal to `kad` for the same-port case.
+    pub fn set_ports(&self, listen: u16, advertised: u16, kad: u16, kad_advertised: u16) {
+        self.rt.block_on(async {
+            self.inner
+                .lock()
+                .await
+                .set_ports(listen, advertised, kad, kad_advertised)
+        });
     }
 
     /// Turn the UPnP port-mapping attempt on or off. Off is correct on a VPN,

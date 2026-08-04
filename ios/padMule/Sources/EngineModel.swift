@@ -308,7 +308,8 @@ final class EngineModel: ObservableObject {
                 e.setPorts(
                     listen: storedPort(SettingsKey.listenPort, 5999),
                     advertised: storedPort(SettingsKey.advertisedPort, 5999),
-                    kad: storedPort(SettingsKey.kadPort, 5999))
+                    kad: storedPort(SettingsKey.kadPort, 5999),
+                    kadAdvertised: storedPort(SettingsKey.kadAdvertisedPort, 5999))
                 e.setUpnpEnabled(on: d.bool(forKey: SettingsKey.upnpEnabled))
                 e.start()
                 engineLog.notice("boot OK; engine started")
@@ -1163,9 +1164,15 @@ final class EngineModel: ObservableObject {
         let listen = UInt16(clamping: d.integer(forKey: SettingsKey.listenPort))
         let advertised = UInt16(clamping: d.integer(forKey: SettingsKey.advertisedPort))
         let kad = UInt16(clamping: d.integer(forKey: SettingsKey.kadPort))
+        // Falls back to the BOUND port, not to 5999: same-port is the ordinary
+        // case, and a stored 0 here must not silently advertise a wrong number.
+        let kadAdvRaw = UInt16(clamping: d.integer(forKey: SettingsKey.kadAdvertisedPort))
+        let kadAdvertised = kadAdvRaw == 0 ? kad : kadAdvRaw
         let upnp = d.bool(forKey: SettingsKey.upnpEnabled)
         work.async {
-            e.setPorts(listen: listen, advertised: advertised, kad: kad)
+            e.setPorts(
+                listen: listen, advertised: advertised, kad: kad,
+                kadAdvertised: kadAdvertised)
             e.setUpnpEnabled(on: upnp)
         }
     }
