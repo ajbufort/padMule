@@ -1,12 +1,46 @@
 # HANDOFF - start here next session
 
-Updated: 2026-08-03 (second session that day: full reanalysis -> doc-drift fix
-round -> OP_GETSERVERLIST shipped + live-proven -> two-bug fix round -> device
-pass -> the RECURSIVE UDP CRAWL. Everything below is verified, not assumed, and
-what is NOT verified says so.)
+Updated: 2026-08-03 (a long session: reanalysis -> doc-drift round ->
+OP_GETSERVERLIST -> two-bug fix round -> device pass -> the RECURSIVE UDP CRAWL
+-> server NAMES -> and finally the USAGE-FEEDBACK ROUND, which is the important
+one. Everything below is verified, not assumed, and what is NOT verified says
+so.)
 
 Living doc: replace it wholesale next time. Full narrative in [[build-progress]]
-rows 8av-8ba + the [[log]] entries for 2026-08-03 + [[feature-server-hunter]].
+rows 8av-8bb + the [[log]] entries for 2026-08-03 + [[feature-server-hunter]].
+
+## THE HEADLINE: Anthony used the app properly, and it found 7 real bugs
+
+The first extended usage session produced 18 items; four parallel
+investigations turned them into SEVEN CONFIRMED BUGS (build-progress 8bb), all
+now fixed, TDD RED-first and mutation-checked. Two are worth carrying forward:
+
+1. **Resume was broken - and ONLY when Kad was HEALTHY.** `find_sources` joins
+   its server and Kad arms, so it returns in max(), and the Kad arm carries a
+   15s budget; `resume_fetches` wrapped the call in a 4s timeout that DISCARDED
+   everything on expiry, including server sources that had arrived in under a
+   second. A populated Kad table guaranteed the discard; an empty one let
+   resume work. `add_download` calls the SAME function with no outer timeout -
+   which is exactly why adding a file worked and resuming the identical file
+   did not. That asymmetry was the smoking gun. The budget is now a PARAMETER
+   bounding each arm, so partial results always survive. Two siblings fixed
+   with it: only 2 downloads were attempted per foreground return, and there
+   was NO retry anywhere (spawn_fetch was reachable only from
+   start/resume/add_download), so a stalled download stayed stalled until
+   relaunch.
+2. **Phantom shared files - an INTEROP bug.** The shared library is verified
+   against disk only at `start()`, and the serve path looked up purely in
+   memory. A file deleted in the Files app was still announced via
+   OP_OFFERFILES, answered "COMPLETE" to a requesting peer, granted an upload
+   slot, then dropped the connection when the read failed. Now refused at the
+   serve path (honest FNF) plus a 60s prune of library + known.met.
+
+A LESSON THAT COST ME TWO ATTEMPTS: my first two resume tests PASSED under
+mutation and were worthless - one asserted a return value that was false for
+other reasons, the other never exercised the Kad arm because the test had no
+Kad node. A test can exercise the right CALLER and still not exercise the
+MECHANISM. Rewritten, they fail under mutation, and the budget one measures
+the original bug exactly (10.001s against a 600ms budget).
 
 ## State of the tree
 
@@ -131,41 +165,40 @@ channel.
 
 ## Open tasks (ranked)
 
-1. **Portability Tier 2 + the reanalysis siblings** (was task 2; the crawl is
-   now DEVICE-VERIFIED, see below).
-   ([[portability-audit]]) plus the reanalysis findings that belong with it: "Reconnecting..." can never render (events drain behind
-   the blocking call on one serial queue; a second drain queue fixes it) AND
-   its dangerous sibling - **pause() can be LOST on backgrounding** behind a
-   long call on that same queue (no beginBackgroundTask anywhere; the 300s
-   checkpoint is the only mitigation); **a failed initial UPnP map permanently
-   disables refresh/release** (both early-return on public_ip=None - a
-   transient SSDP failure at start means LowID all session with no retry);
-   NAT-PMP is dead code in the engine; the 4s offer_files timeout silently
-   drops uploads on a slow link; RESUME_PER_DL(4s) < SOURCES_WAIT(10s).
-3. **FFI/UI catch-up slice**: thread `name` into ServerInfoFfi (finish
-   26cc9f8); Settings accepts https:// list URLs the engine rejects
-   (update_server_list is http-only - either fetch https or validate
-   consistently); the old single-URL field on the Servers screen bypasses the
-   persisted multi-URL model; the related-search fallback pollutes Recent
-   Searches.
+1. **DEVICE-VERIFY THE FEEDBACK ROUND.** Everything in 8bb is CI-green and
+   unit/oracle-proven but NOT on glass. The install to check: resume actually
+   restarting transfers after a background/foreground cycle (the headline fix -
+   and the one thing only a device can really show), the Downloaded tab +
+   Share, the Status/Server collapse, the two-network health panel, the search
+   provenance badge, per-op spinners, result numbering and back-to-top.
+2. **Get blocking engine calls OFF the one serial queue** (portability Tier 2,
+   and now the biggest remaining structural risk). "Reconnecting..." still
+   cannot render; pause() starvation is MITIGATED (a beginBackgroundTask
+   assertion + a refresh in-flight guard) but not eliminated; the ~10s crawl
+   and ~20s search still freeze the UI. The periodic re-drive and share-verify
+   both had to be kept deliberately small for this reason.
+3. **Remaining Tier 2**: a failed initial UPnP map permanently disables
+   refresh/release (both early-return on public_ip=None - a transient SSDP
+   failure at start means LowID all session); NAT-PMP is dead code in the
+   engine; the 4s offer_files timeout silently drops uploads on a slow link;
+   no bandwidth limiting anywhere.
 4. **Settings Tier 1/2 engine work** - nickname (hardcoded "padMule"),
    obfuscation policy tri-state, ipfilter controls, UPnP toggle, upload slots;
-   then bandwidth caps (eMule's anti-leech up/down coupling
-   `Preferences.cpp:758-770`; `upload_queue.rs` holds dead kbps logic to
+   then bandwidth caps (`upload_queue.rs` holds dead kbps logic to
    revive-or-delete), port override, See-My-Shared-Files.
-5. **AICH block recovery** (wave 11, the last scorecard PARTIAL). Do NOT port
-   the vendored racy `known2_64.met` orphan-prune; route `localize_corruption`
-   into block recovery; ship the AICH rate limit + O(1) index together.
+5. **AICH block recovery** (wave 11, the last scorecard PARTIAL).
 6. **Continuous block-request top-up** - padMule is stop-and-wait per 3-block
    batch, shallower than both authorities; no wire change, big win at cellular
-   RTT.
-7. **Smaller reanalysis findings** (recorded in [[log]] 2026-08-03): harvest
-   queue lost if the server.met write fails (mem::take before write); no
-   thin-file guard on nodes.dat writes (aMule refuses < 25 contacts,
-   RoutingZone.cpp:304 - and padMule now writes every 300s); `hash-file` exits
-   0 on failure and two oracle scripts consume it without `-e`; MSRV declared
-   (1.96) but unenforced in CI; request_callbacks has no cap/pacing; ipfilter
-   drops a 2-field line aMule accepts; resume() failure emits no ServerDropped.
+   RTT. (This is also why keep-awake now looks at a WINDOW of rate samples
+   rather than the last one - a batch boundary reads as zero.)
+7. **Smaller items still open** (from the reanalysis and the feedback round):
+   harvest queue lost if the server.met write fails; no thin-file guard on
+   nodes.dat writes (aMule refuses < 25 contacts); `hash-file` exits 0 on
+   failure and two oracle scripts consume it without `-e`; MSRV declared but
+   unenforced in CI; request_callbacks has no cap/pacing; the related-search
+   fallback still pollutes Recent Searches; Settings accepts https:// list
+   URLs the engine rejects (http-only); the kick alert may not surface while a
+   sheet is open.
 
 ## Discipline reminders that earned their keep THIS session
 

@@ -141,7 +141,7 @@ struct SettingsView: View {
         } header: {
             Text("Device")
         } footer: {
-            Text("padMule only transfers while it is open and on screen (iPadOS suspends background apps). Keeping the screen awake during an active transfer stops it pausing when the display would otherwise sleep. It only holds the screen on while something is actually transferring.")
+            Text("padMule only transfers while it is open and on screen (iPadOS suspends background apps). Keeping the screen awake during an active transfer stops it pausing when the display would otherwise sleep. It only holds the screen on while bytes are actually moving - a stalled transfer with no sources will not keep the screen on.")
         }
     }
 

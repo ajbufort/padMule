@@ -16,6 +16,11 @@ enum SortKey: String, CaseIterable, Identifiable {
 /// The UI holds the inputs; this has no SwiftUI or engine dependency, so its
 /// behavior is obvious from reading it and cheap to run on every input change
 /// (a search yields at most a few hundred hits).
+/// `statusFor` resolves the status a hit should be filtered on for `hideHave`.
+/// Defaults to the hit's own baked snapshot; callers with live download/shared
+/// data (EngineModel.liveStatus) inject a fresher answer. Kept as an injected
+/// function - not `hit.status` directly - so this stays pure and testable
+/// without a live engine.
 func present(
     _ hits: [SearchHit],
     sort: SortKey,
@@ -23,14 +28,15 @@ func present(
     nameFilter: String,
     typeFilter: String?,  // nil = all types
     trustedOnly: Bool,
-    hideHave: Bool
+    hideHave: Bool,
+    statusFor: (SearchHit) -> HitStatusFfi = { $0.status }
 ) -> [SearchHit] {
     let needle = nameFilter.trimmingCharacters(in: .whitespaces).lowercased()
     var xs = hits.filter { h in
         (needle.isEmpty || h.name.lowercased().contains(needle))
             && (typeFilter == nil || h.fileType == typeFilter)
             && (!trustedOnly || h.trusted)
-            && (!hideHave || h.status != .have)
+            && (!hideHave || statusFor(h) != .have)
     }
     xs.sort { a, b in
         let cmp: ComparisonResult

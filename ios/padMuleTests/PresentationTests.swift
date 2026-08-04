@@ -48,11 +48,13 @@ final class PresentationTests: XCTestCase {
         nameFilter: String = "",
         typeFilter: String? = nil,
         trustedOnly: Bool = false,
-        hideHave: Bool = false
+        hideHave: Bool = false,
+        statusFor: (SearchHit) -> HitStatusFfi = { $0.status }
     ) -> [SearchHit] {
         present(
             hits, sort: sort, ascending: ascending, nameFilter: nameFilter,
-            typeFilter: typeFilter, trustedOnly: trustedOnly, hideHave: hideHave)
+            typeFilter: typeFilter, trustedOnly: trustedOnly, hideHave: hideHave,
+            statusFor: statusFor)
     }
 
     // The regression this guards: a descending sort written as `!(a < b)` is NOT a
@@ -105,6 +107,22 @@ final class PresentationTests: XCTestCase {
         ]
         XCTAssertEqual(Set(p(hits, hideHave: true).map(\.name)), ["new", "dl"])
         XCTAssertEqual(p(hits, hideHave: false).count, 3)
+    }
+
+    // The regression this guards: `hit.status` is a search-time snapshot the
+    // engine bakes in once and never updates (EngineModel.liveStatus derives a
+    // live answer from polled download/shared-library data instead). Prove the
+    // pure hideHave filter honors an INJECTED status resolver, in both
+    // directions, when it disagrees with the baked snapshot.
+    func testHideHaveHonorsInjectedStatusWhenOn() {
+        let hits = [hit(name: "baked-new", status: .new)]
+        XCTAssertTrue(p(hits, hideHave: true, statusFor: { _ in .have }).isEmpty)
+    }
+
+    func testHideHaveHonorsInjectedStatusWhenOff() {
+        let hits = [hit(name: "baked-new", status: .new)]
+        XCTAssertEqual(
+            p(hits, hideHave: false, statusFor: { _ in .have }).map(\.name), ["baked-new"])
     }
 
     // All filters AND together, then the survivors sort.
