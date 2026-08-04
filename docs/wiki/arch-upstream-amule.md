@@ -3,7 +3,7 @@
 Updated: 2026-07-18
 
 Source: `amule-3.0.1/` at the repo root (extracted from the pristine zip at
-`/mnt/c/Users/ajbuf/Downloads/amule-3.0.1.zip`). GPL-2.0-or-later. Role today:
+`reference-archives/amule-3.0.1.zip`, gitignored). GPL-2.0-or-later. Role today:
 vendored read-only REFERENCE ORACLE for differential testing (the engine is a
 Rust rewrite - [[decisions-and-lessons]]); never linked or shipped.
 

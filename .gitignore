@@ -9,3 +9,11 @@ refs/
 
 # Windows "mark of the web" alternate-data-stream remnants (WSL)
 *:Zone.Identifier
+
+# Upstream source archives + protocol-archaeology material Anthony keeps
+# alongside the tree. NOT vendored, deliberately: the SANS paper is no-repost
+# and the MetaMachine binaries are proprietary (see docs/wiki/log.md 2026-07-20,
+# which recorded that decision), so committing them to a PUBLIC repo would be a
+# copyright problem, not merely 28MB of bloat. refs/ is ignored for the same
+# reason; this is where the ZIPS those trees were extracted from now live.
+/reference-archives/
