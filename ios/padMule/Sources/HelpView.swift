@@ -32,9 +32,18 @@ struct HelpView: View {
                     label(2, "Status", "Check it says Connected, and look at ID (see below).")
                     label(3, "Search", "Type a word and search. Results come from the connected server and from Kad at the same time.")
                     label(4, "Get", "Tap Get on a result. It appears in Transfers.")
-                    label(5, "Downloaded", "Finished files land here. Tap one to open it; the share button sends it to another app.")
+                    label(5, "Downloaded", "Finished files land here, and the folder button at the top opens the same files in the Files app.")
                 } header: {
                     Text("Getting a file, start to finish")
+                }
+
+                Section {
+                    Text("Tapping a finished file PREVIEWS it inside padMule. padMule stays running, so anything still downloading keeps going.")
+                    Text("Open hands the file to another app instead - a video opens in a video app, a PDF in a reader - full screen, as if you had opened it from the Files app. iOS has no notion of a default app per file type, so it asks which app to use; if only one can open that kind of file, that is the only choice offered.")
+                    Text("Because that other app comes to the front, padMule goes to the BACKGROUND, and iPadOS pauses your transfers until you come back to it. That is the same rule as leaving padMule for any other reason - nothing is lost, and progress is saved - but it is worth knowing before you open a film halfway through a download.")
+                    Text("Sharing a file to another app or service is still available from the preview's own share button.")
+                } header: {
+                    Text("Preview vs Open")
                 }
 
                 Section {
