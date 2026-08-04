@@ -820,6 +820,144 @@ fn part_hashes(data: &[u8]) -> Vec<[u8; 16]> {
 /// Serves every connection until killed. With the optional
 /// `<eserver-host> <eserver-port>` pair it also logs into that server and
 /// OP_OFFERFILES the file, so the server can relay us as a source.
+/// aich-hash <path> [entry-out.bin]: compute a file's AICH tree; print the
+/// ed2k hash, size and master root, and optionally write the known2_64.met
+/// ENTRY bytes so an oracle can byte-compare them against real amuled's store.
+fn cmd_aich_hash(path: &str, out: Option<&str>) {
+    let data = match std::fs::read(path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("cannot read {path}: {e}");
+            std::process::exit(1);
+        }
+    };
+    let Some(tree) = mule_proto::AichTree::from_file_data(&data) else {
+        eprintln!("cannot hash (empty file?)");
+        std::process::exit(1);
+    };
+    let (Some(root), Some(leaves)) = (tree.master_hash(), tree.leaves()) else {
+        eprintln!("tree incomplete");
+        std::process::exit(1);
+    };
+    println!("ed2k={}", hex16(&ed2k_hash(&data)));
+    println!("size={}", data.len());
+    println!("blocks={}", leaves.len());
+    let hx: String = root.iter().map(|b| format!("{b:02x}")).collect();
+    println!("aich_root_hex={hx}");
+    println!("aich_root_b32={}", mule_proto::aich_base32(&root));
+    if let Some(out) = out {
+        let entry = mule_files::known2_entry_bytes(&root, &leaves);
+        if let Err(e) = std::fs::write(out, &entry) {
+            eprintln!("cannot write {out}: {e}");
+            std::process::exit(1);
+        }
+        println!("entry_bytes={} -> {out}", entry.len());
+    }
+}
+
+/// aich-probe <addr> <ed2k-hash> <size> <part>: the LIVE differential check of
+/// the AICH exchange against a real peer (amuled sharing the file): ask its
+/// master root (0x9E/0x9D), then part recovery data (0x9B/0x9C), and verify
+/// the payload against that root with the SAME code the engine runs. Exits
+/// non-zero unless the recovery data verifies.
+async fn cmd_aich_probe(addr: SocketAddr, hash: [u8; 16], size: u64, part: u16) {
+    use mule_engine::transfer::{
+        build_aich_file_hash_req, build_aich_request, parse_aich_answer, parse_aich_file_hash_ans,
+        AichAnswer, OP_AICHANSWER, OP_AICHFILEHASHANS,
+    };
+    let me = HelloInfo::baseline(demo_user_hash(), 0, 4662, 4672, "padMule");
+    let (_peer, mut fs) = match connect_peer(addr, &me).await {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("connect/handshake failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    println!("handshake OK with {addr}");
+    let deadline = Duration::from_secs(15);
+
+    // Root ask.
+    if fs
+        .write_packet(&build_aich_file_hash_req(&hash))
+        .await
+        .is_err()
+    {
+        eprintln!("cannot send 0x9E");
+        std::process::exit(1);
+    }
+    let root = tokio::time::timeout(deadline, async {
+        loop {
+            let pkt = fs.read_packet_unpacked().await.ok()?;
+            if pkt.opcode == OP_AICHFILEHASHANS {
+                if let Ok((h, root)) = parse_aich_file_hash_ans(&pkt.payload) {
+                    if h == hash {
+                        return Some(root);
+                    }
+                }
+            }
+        }
+    })
+    .await;
+    let Ok(Some(root)) = root else {
+        eprintln!("no OP_AICHFILEHASHANS (peer refused or timed out)");
+        std::process::exit(1);
+    };
+    let hx: String = root.iter().map(|b| format!("{b:02x}")).collect();
+    println!("peer aich root = {hx}");
+
+    // Recovery ask for the requested part, verified against that root.
+    if fs
+        .write_packet(&build_aich_request(&hash, part, &root))
+        .await
+        .is_err()
+    {
+        eprintln!("cannot send 0x9B");
+        std::process::exit(1);
+    }
+    let outcome = tokio::time::timeout(deadline, async {
+        loop {
+            let pkt = fs.read_packet_unpacked().await.ok()?;
+            if pkt.opcode == OP_AICHANSWER {
+                return parse_aich_answer(&pkt.payload).ok();
+            }
+        }
+    })
+    .await;
+    match outcome {
+        Ok(Some(AichAnswer::Recovery {
+            hash: h,
+            part: p,
+            root: r,
+            recovery,
+        })) if h == hash && p == part && r == root => {
+            let verified = mule_proto::AichTree::with_master(size, root)
+                .filter(|_| u64::from(part) * mule_proto::PARTSIZE < size)
+                .map(|mut t| {
+                    t.read_recovery_data(u64::from(part) * mule_proto::PARTSIZE, &recovery)
+                })
+                .unwrap_or(false);
+            if verified {
+                println!(
+                    "recovery data verified against the root ({} bytes)",
+                    recovery.len()
+                );
+                println!("AICH_PROBE=PASS");
+            } else {
+                eprintln!("recovery data did NOT verify against the announced root");
+                std::process::exit(1);
+            }
+        }
+        Ok(Some(AichAnswer::Failure(_))) => {
+            eprintln!("peer sent the 16-byte refusal (hashset unavailable?)");
+            std::process::exit(1);
+        }
+        _ => {
+            eprintln!("no valid OP_AICHANSWER (mismatch or timeout)");
+            std::process::exit(1);
+        }
+    }
+}
+
 async fn cmd_serve_file(port: u16, path: &str, eserver: Option<(String, u16)>) {
     let data = match std::fs::read(path) {
         Ok(d) => d,
@@ -2606,6 +2744,27 @@ async fn main() {
                 (_, Err(_)) => eprintln!("bad size: {}", args[4]),
             }
         }
+        Some("aich-hash") if args.len() == 3 || args.len() == 4 => {
+            cmd_aich_hash(&args[2], args.get(3).map(String::as_str))
+        }
+        Some("aich-probe") if args.len() == 7 => {
+            let hostport = format!("{}:{}", args[2], args[3]);
+            let addr = hostport.to_socket_addrs().ok().and_then(|mut it| it.next());
+            match (
+                addr,
+                parse_hex16(&args[4]),
+                args[5].parse::<u64>(),
+                args[6].parse::<u16>(),
+            ) {
+                (Some(addr), Some(hash), Ok(size), Ok(part)) => {
+                    cmd_aich_probe(addr, hash, size, part).await
+                }
+                (None, ..) => eprintln!("cannot resolve {hostport}"),
+                (_, None, ..) => eprintln!("bad hash (need 32 hex chars): {}", args[4]),
+                (_, _, Err(_), _) => eprintln!("bad size: {}", args[5]),
+                (_, _, _, Err(_)) => eprintln!("bad part: {}", args[6]),
+            }
+        }
         Some("search-download") if args.len() == 5 => {
             cmd_search_download(&args[2], &args[3], &args[4]).await
         }
@@ -2636,6 +2795,10 @@ async fn main() {
             eprintln!("  mule-cli kad-search <nodes.dat> <ed2k-hash-hex> <size>");
             eprintln!("  mule-cli kad-fetch <nodes.dat> <ed2k-hash-hex> <size> <out>");
             eprintln!("  mule-cli kad-keyword <nodes.dat> <keyword>");
+            eprintln!("  mule-cli aich-hash <path> [entry-out.bin]");
+            eprintln!(
+                "  mule-cli aich-probe <host> <port> <hash> <size> <part>   (live 0x9E/0x9B check)"
+            );
             eprintln!("  mule-cli link <ed2k-or-magnet-link> [out]");
             eprintln!("  mule-cli ipfilter <ipfilter.dat|.p2p> [test-ip]");
             eprintln!(
