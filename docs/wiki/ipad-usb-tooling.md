@@ -142,6 +142,30 @@ proceeds. No `sudo`, no `tunneld`. Verified on iPadOS 26.5.2.
   Sideloadly cannot see the iPad. Run `usbipd detach` before a Sideloadly
   install, and re-attach afterwards. This is the single most likely source of
   confusion.
+- **...AND `detach` IS NOT ENOUGH ON THIS BOX (found 2026-08-03).** Because
+  USBPcap is installed here, the iPad had to be bound with `bind --force`
+  (gotcha 1 below), which leaves it permanently in state `Shared (forced)`.
+  A forced bind hands the device to the USB/IP stub driver at the WINDOWS
+  level, so the Apple Mobile Device Service - and therefore Sideloadly and
+  iTunes - cannot see it EVEN WHEN IT IS NOT ATTACHED TO WSL. The symptom is
+  exactly the confusing one: `lsusb`/`idevice_id -l` show nothing in WSL
+  (so it looks like Windows should have it) while Sideloadly still refuses to
+  acknowledge the iPad. Diagnose with `usbipd list` and look at the STATE
+  column for the `05ac:12ab` row.
+
+  ```powershell
+  usbipd list                       # STATE = "Shared (forced)" is the problem
+  usbipd unbind --busid 7-12        # ADMINISTRATOR; returns it to Windows
+  ```
+
+  `unbind` (NOT `detach`) is the release, it needs an ADMINISTRATOR
+  PowerShell, and the bind PERSISTS ACROSS REBOOTS - so this will recur every
+  time the box is used for WSL device work and then Sideloadly. A physical
+  replug may still be needed afterwards for Windows to re-enumerate. To go
+  back to agent-driven device work: `usbipd bind --force --busid 7-12` then
+  `usbipd attach --wsl --busid 7-12`. NB the BUSID is not stable across
+  ports/reboots - read it from `usbipd list` each time (it was 2-4 in the
+  original write-up and 7-12 on 2026-08-03).
 - Re-attach is needed after every unplug, host reboot, or device re-enumeration
   (locking/unlocking can trigger one).
 - The pair record lives in `/var/lib/lockdown/`; deleting it forces a new Trust
