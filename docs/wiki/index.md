@@ -60,5 +60,6 @@ opt-out ([[obfuscation-posture]]). The Kad hard-verify send-side is DONE,
 terminal-proven (a log-patched real amuled verifies padMule via the v8
 HELLO_RES_ACK handshake, [[kad-verify-oracle]]), key-capture-complete (8ak), and
 wave-10 Batch B LANDED (8ao) - the Kad verified bit is now ENFORCED in routing.
-The single remaining PARTIAL is AICH block recovery, an OPTIMIZATION rather than
-an integrity gap, queued as wave 11. Wave 9 seedbox mode is the open v1.1 item.)
+AICH block recovery - the single remaining PARTIAL - SHIPPED 2026-08-03 as wave
+11 (row 8bj), live-proven against real amuled, so the scorecard is 24/0/2 with no
+PARTIAL rows left. Wave 9 seedbox mode is the open v1.1 item.)
