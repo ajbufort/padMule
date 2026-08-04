@@ -6,7 +6,7 @@ USAGE-FEEDBACK ROUND -> VPN readiness -> on-glass fixes. Everything below is
 verified, not assumed, and what is NOT verified says so.)
 
 Living doc: replace it wholesale next time. Full narrative in [[build-progress]]
-rows 8av-8bh + the [[log]] entries for 2026-08-03.
+rows 8av-8bi + the [[log]] entries for 2026-08-03.
 
 ## State of the tree
 
