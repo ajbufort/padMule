@@ -1780,11 +1780,12 @@ impl Engine {
                         peer_crypt,
                         peer_sx1,
                         peer_aich,
+                        peer_ext_requests,
                     ) = match timeout(Duration::from_secs(8), peer_handshake_inbound(&mut fs, &me))
                         .await
                     {
                         Ok(Ok(h)) => {
-                            let (ac, si, crypt, sx1, aich) = h
+                            let (ac, si, crypt, sx1, aich, extreq) = h
                                 .capabilities()
                                 .map(|c| {
                                     // Re-encode the peer's crypt bits as the
@@ -1801,10 +1802,14 @@ impl Engine {
                                         Some(b),
                                         c.source_exchange,
                                         c.aich,
+                                        c.ext_requests,
                                     )
                                 })
-                                .unwrap_or((0, 0, None, 0, 0));
-                            (h.user_hash, ac, si, crypt, sx1, aich)
+                                // No capabilities tag at all: assume the
+                                // ExtReq-2 layout every AICH-era client sends
+                                // (only read when the peer advertised AICH).
+                                .unwrap_or((0, 0, None, 0, 0, 2));
+                            (h.user_hash, ac, si, crypt, sx1, aich, extreq)
                         }
                         _ => return,
                     };
@@ -1854,6 +1859,7 @@ impl Engine {
                                     peer_crypt,
                                     peer_sx1,
                                     peer_aich,
+                                    peer_ext_requests,
                                     aich: Some(Arc::clone(&known2)),
                                 },
                             )

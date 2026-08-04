@@ -72,21 +72,50 @@ pub const BADCLIENTBAN: u32 = 4;
 pub struct RequestCounter {
     /// file hash -> (last asked at, bad-request score)
     files: HashMap<[u8; 16], (u64, u32)>,
+    /// Requests scored on this connection across ALL hashes. The per-file map
+    /// alone is dodgeable: the hash comes off the wire, so a peer that rotates
+    /// it lands a fresh record every time and is never scored - while each ask
+    /// still costs us a real answer. This counter is what a hash-rotating peer
+    /// actually runs into.
+    total: u32,
 }
+
+/// Distinct file hashes one connection may accumulate before we stop tracking
+/// new ones. Bounds the map against a peer that rotates the hash to grow it
+/// (~48 bytes an entry, and iPadOS has no memory to spare); well past what a
+/// real multi-file session touches.
+const MAX_TRACKED_FILES: usize = 64;
+/// Scored requests one connection may make in total. A legitimate session asks
+/// a handful per file; this only bites a peer making hundreds.
+const MAX_SCORED_REQUESTS: u32 = 200;
 
 impl RequestCounter {
     /// Score a request for `hash` at `now_secs` and report whether to ANSWER it.
     pub fn allow(&mut self, hash: &[u8; 16], now_secs: u64) -> bool {
-        let e = self.files.entry(*hash).or_insert((now_secs, 0));
+        self.total = self.total.saturating_add(1);
+        if self.total > MAX_SCORED_REQUESTS {
+            return false;
+        }
+        // A peer past the tracking cap gets no new records - it has already
+        // named more files on one connection than any real session does.
+        if !self.files.contains_key(hash) && self.files.len() >= MAX_TRACKED_FILES {
+            return false;
+        }
+        // The very FIRST ask for a file is always polite (upstream inserts a
+        // fresh record with badrequests = 0 and returns); every later ask is
+        // scored. Upstream keys `lastasked` in MILLISECONDS, so a repeat
+        // inside the same second scores there - our seconds resolution used to
+        // let an unbounded burst inside one second ride free, which is exactly
+        // the shape a flooder sends.
+        let Some(e) = self.files.get_mut(hash) else {
+            self.files.insert(*hash, (now_secs, 0));
+            return true;
+        };
         let (last, score) = *e;
-        // The very first ask for a file is always polite (upstream inserts a
-        // fresh record with badrequests = 0 and returns).
-        if last != now_secs || score > 0 {
-            if now_secs.saturating_sub(last) < MIN_REQUESTTIME_SECS {
-                e.1 = score.saturating_add(1);
-            } else {
-                e.1 = score.saturating_sub(1);
-            }
+        if now_secs.saturating_sub(last) < MIN_REQUESTTIME_SECS {
+            e.1 = score.saturating_add(1);
+        } else {
+            e.1 = score.saturating_sub(1);
         }
         e.0 = now_secs;
         e.1 < BADCLIENTBAN
@@ -369,16 +398,22 @@ fn is_secident(op: u8) -> bool {
 /// Whether a multipacket request bundles the OP_AICHFILEHASHREQ sub-op.
 ///
 /// Walks the sub-opcode tail exactly as eMule's reader does
-/// (ListenSocket.cpp:1178-1287): OP_REQUESTFILENAME carries the extended
-/// requester info the sender wrote for OUR advertised
-/// ExtendedRequestsVersion 2 (u16 part count, the availability bitfield when
-/// non-zero, u16 complete sources - UploadClient.cpp ProcessExtendedInfo);
-/// OP_SETREQFILEID and OP_REQUESTSOURCES are bare; OP_REQUESTSOURCES2 carries
-/// u8 version + u16 options; OP_AICHFILEHASHREQ is bare. eMule THROWS on an
-/// unknown sub-op; we stop walking instead (keeping anything already found),
-/// which preserves the pre-AICH tolerance for malformed tails - the answer is
-/// never desynced by what we could not parse.
-fn multipacket_wants_aich(payload: &[u8], ext: bool) -> bool {
+/// (ListenSocket.cpp:1178-1287). The `OP_REQUESTFILENAME` sub-op is followed
+/// by extended requester info whose SHAPE depends on the version the SENDER
+/// advertised in its hello, not on ours: `ProcessExtendedInfo`
+/// (UploadClient.cpp:397-449) reads nothing at version 0, the part count +
+/// bitfield at >= 1, and the complete-source count only at > 1 - so
+/// `peer_ext_requests` must come from the peer's own MISCOPTIONS1. The
+/// availability bitfield is skipped by the count actually on the wire
+/// (`ceil(pc/8)`, what WritePartStatus wrote), which is also what keeps this
+/// walker correct where eMule's own reader would desync (it counts by its
+/// LOCAL part count). OP_SETREQFILEID and OP_REQUESTSOURCES are bare;
+/// OP_REQUESTSOURCES2 carries u8 version + u16 options; OP_AICHFILEHASHREQ is
+/// bare. eMule THROWS on an unknown sub-op; we stop walking instead (keeping
+/// anything already found), which preserves the pre-AICH tolerance for
+/// malformed tails - the answer is never desynced by what we could not parse,
+/// since the name/status answer is built regardless.
+fn multipacket_wants_aich(payload: &[u8], ext: bool, peer_ext_requests: u8) -> bool {
     let mut pos = 16 + if ext { 8 } else { 0 };
     let mut found = false;
     let take = |pos: &mut usize, n: usize, len: usize| -> bool {
@@ -393,6 +428,10 @@ fn multipacket_wants_aich(payload: &[u8], ext: bool) -> bool {
         pos += 1;
         match op {
             OP_REQUESTFILENAME => {
+                // Version 0 writes NOTHING after the sub-op byte.
+                if peer_ext_requests == 0 {
+                    continue;
+                }
                 if pos + 2 > payload.len() {
                     return found;
                 }
@@ -401,7 +440,8 @@ fn multipacket_wants_aich(payload: &[u8], ext: bool) -> bool {
                 if pc > 0 && !take(&mut pos, pc.div_ceil(8), payload.len()) {
                     return found;
                 }
-                if !take(&mut pos, 2, payload.len()) {
+                // The complete-source count exists only past version 1.
+                if peer_ext_requests > 1 && !take(&mut pos, 2, payload.len()) {
                     return found;
                 }
             }
@@ -631,6 +671,12 @@ pub struct ServeSession {
     /// Root answers are gated on bit 0, eMule's own IsSupportingAICH test
     /// (updownclient.h:407).
     pub peer_aich: u8,
+    /// The peer's announced ExtendedRequestsVersion (hello MISCOPTIONS1 bits
+    /// 8-11). Decides the SHAPE of the ext info inside a bundled multipacket
+    /// OP_REQUESTFILENAME (UploadClient.cpp ProcessExtendedInfo), so the
+    /// sub-op walker needs the SENDER's version, not ours. Defaults to 2
+    /// (what every AICH-era client advertises).
+    pub peer_ext_requests: u8,
     /// The known2_64.met hashset store, for serving OP_AICHREQUEST recovery
     /// data. `None` (tests without AICH) refuses recovery honestly.
     pub aich: Option<Arc<crate::known2_store::Known2Store>>,
@@ -668,6 +714,7 @@ where
         peer_crypt,
         peer_sx1,
         peer_aich,
+        peer_ext_requests,
         aich,
     } = session;
     // Unregisters this peer from the file's served list on EVERY exit path.
@@ -746,7 +793,16 @@ where
         // downloader streams OP_REQUESTPARTS and must not be penalised for it.
         // A peer already holding a slot is exempt, mirroring upstream's
         // `GetDownloadState() != DS_DOWNLOADING` carve-out.
-        if permit.is_none()
+        // The AICH opcodes are scored EVEN FOR A SLOT HOLDER. Upstream's
+        // carve-out is `GetDownloadState() != DS_DOWNLOADING` (eMule
+        // UploadClient.cpp:901, aMule :662) - a peer WE are downloading FROM,
+        // which a hostile peer cannot elect. Exempting a peer holding OUR
+        // upload slot is not the same rule, and it is electable by anyone:
+        // ask for a slot, then never request a block and hammer 0x9B instead.
+        // That path is the most expensive answer we serve (a store read plus a
+        // tree rebuild), so it is the one exemption we do not extend.
+        let aich_op = matches!(pkt.opcode, OP_AICHFILEHASHREQ | OP_AICHREQUEST);
+        let slot_exempt_op = permit.is_none()
             && matches!(
                 pkt.opcode,
                 OP_REQUESTFILENAME
@@ -756,10 +812,8 @@ where
                     | OP_HASHSETREQUEST
                     | OP_REQUESTSOURCES
                     | OP_REQUESTSOURCES2
-                    | OP_AICHFILEHASHREQ
-                    | OP_AICHREQUEST
-            )
-        {
+            );
+        if aich_op || slot_exempt_op {
             // Score against the file the packet names; a request with no usable
             // hash is left to the individual arms to reject.
             let asked = head_hash(&pkt.payload)
@@ -832,12 +886,13 @@ where
                         // three-way gate (ListenSocket.cpp:1203-1217). This is
                         // the only root channel a multipacket peer ever uses.
                         let ext = pkt.opcode == OP_MULTIPACKET_EXT;
-                        let root =
-                            if peer_aich & 1 != 0 && multipacket_wants_aich(&pkt.payload, ext) {
-                                f.aich_root
-                            } else {
-                                None
-                            };
+                        let root = if peer_aich & 1 != 0
+                            && multipacket_wants_aich(&pkt.payload, ext, peer_ext_requests)
+                        {
+                            f.aich_root
+                        } else {
+                            None
+                        };
                         fs.write_packet(&build_multipacket_answer(
                             &f.hash,
                             &f.name,
@@ -934,8 +989,7 @@ where
                     {
                         return None;
                     }
-                    let leaves = aich.as_ref()?.lookup(&root, f.size)?;
-                    let mut tree = mule_proto::AichTree::from_leaves(f.size, &leaves)?;
+                    let mut tree = aich.as_ref()?.lookup(&root, f.size)?;
                     let rec = tree.create_part_recovery_data(part_start)?;
                     Some(build_aich_answer(&h, part, &root, &rec))
                 });
@@ -1125,6 +1179,7 @@ mod tests {
         tag: &str,
         peer_aich: u8,
         with_store: bool,
+        peer_ext_requests: u8,
     ) -> (
         Vec<u8>,
         [u8; 16],
@@ -1162,6 +1217,7 @@ mod tests {
             if let Ok((_p, mut fs)) = accept_peer(&listener, &me).await {
                 let session = ServeSession {
                     peer_aich,
+                    peer_ext_requests,
                     aich: with_store.then_some(store),
                     ..Default::default()
                 };
@@ -1178,7 +1234,7 @@ mod tests {
         use crate::transfer::{
             build_aich_file_hash_req, build_aich_request, parse_aich_file_hash_ans, AichAnswer,
         };
-        let (data, hash, root, mut fs, up, dir) = aich_serve_fixture("aichserve", 1, true).await;
+        let (data, hash, root, mut fs, up, dir) = aich_serve_fixture("aichserve", 1, true, 2).await;
 
         // 0x9E -> 0x9D with our master root.
         fs.write_packet(&build_aich_file_hash_req(&hash))
@@ -1224,7 +1280,8 @@ mod tests {
     #[tokio::test]
     async fn aich_unservable_requests_draw_the_explicit_refusal() {
         use crate::transfer::{build_aich_request, AichAnswer};
-        let (_data, hash, root, mut fs, up, dir) = aich_serve_fixture("aichrefuse", 1, true).await;
+        let (_data, hash, root, mut fs, up, dir) =
+            aich_serve_fixture("aichrefuse", 1, true, 2).await;
 
         let expect_refusal =
             |ans: mule_proto::Packet, why: &str| match crate::transfer::parse_aich_answer(
@@ -1267,7 +1324,7 @@ mod tests {
         // gate), but recovery data is NOT aich-gated in eMule - a valid 0x9B is
         // still answered. Prove the silence by ordering: 0x9E then 0x9B, and the
         // FIRST thing back is the 0x9B answer.
-        let (_d, hash, root, mut fs, up, dir) = aich_serve_fixture("aichgate", 0, true).await;
+        let (_d, hash, root, mut fs, up, dir) = aich_serve_fixture("aichgate", 0, true, 2).await;
         fs.write_packet(&build_aich_file_hash_req(&hash))
             .await
             .unwrap();
@@ -1303,16 +1360,25 @@ mod tests {
     #[tokio::test]
     async fn multipacket_bundles_the_aich_root_only_when_asked() {
         use mule_proto::{Packet, Writer, PROT_EMULE};
-        // Round 1: multipacket WITH the 0x9E sub-op -> the answer ends with
-        // <0x9D><root 20>. Round 2 (fresh connection): WITHOUT it -> no 0x9D.
-        for want_aich in [true, false] {
-            let tag = if want_aich { "mpaich1" } else { "mpaich0" };
-            let (_d, hash, root, mut fs, up, dir) = aich_serve_fixture(tag, 1, true).await;
+        // The 0x9D sub-answer must appear IFF the request bundled 0x9E - and
+        // finding that sub-op means walking the ext info the sender wrote,
+        // whose SHAPE is the SENDER's ExtendedRequestsVersion (v0 writes none,
+        // v1 omits the complete-source count, v2 has both). Reading it at OUR
+        // version desyncs the walk against any other sender.
+        for (want_aich, ext_ver) in [(true, 2u8), (false, 2), (true, 0), (true, 1)] {
+            let tag = format!("mpaich-{want_aich}-{ext_ver}");
+            let (_d, hash, root, mut fs, up, dir) =
+                aich_serve_fixture(&tag, 1, true, ext_ver).await;
             let mut w = Writer::new();
             w.write_bytes(&hash);
             w.write_u8(OP_REQUESTFILENAME);
-            w.write_u16(0); // ext info: we hold no parts
-            w.write_u16(0); // complete sources (our advertised ExtReq v2)
+            // Exactly what a sender at THIS version writes.
+            if ext_ver >= 1 {
+                w.write_u16(0); // part count: we hold no parts
+            }
+            if ext_ver > 1 {
+                w.write_u16(0); // complete sources
+            }
             w.write_u8(OP_SETREQFILEID);
             if want_aich {
                 w.write_u8(crate::transfer::OP_AICHFILEHASHREQ);
@@ -1327,7 +1393,7 @@ mod tests {
                 && ans.payload[ans.payload.len() - 20..] == root[..];
             assert_eq!(
                 tail_is_root, want_aich,
-                "0x9D sub-answer present iff the request bundled 0x9E (want_aich={want_aich})"
+                "0x9D present iff 0x9E was bundled (want_aich={want_aich}, ExtReq v{ext_ver})"
             );
             drop(fs);
             up.await.unwrap();
