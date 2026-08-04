@@ -156,27 +156,7 @@ fn hex_nib(c: u8) -> Option<u8> {
 /// Decode a 32-char RFC 4648 base32 string (A-Z, 2-7) to 20 bytes - the AICH
 /// root hash form used in ed2k links / magnet `urn:aich`.
 fn base32_20(s: &str) -> Option<[u8; 20]> {
-    if s.len() != 32 {
-        return None;
-    }
-    let mut bits: u64 = 0;
-    let mut nbits = 0u32;
-    let mut out = Vec::with_capacity(20);
-    for c in s.bytes() {
-        let v = match c {
-            b'A'..=b'Z' => c - b'A',
-            b'a'..=b'z' => c - b'a',
-            b'2'..=b'7' => c - b'2' + 26,
-            _ => return None,
-        } as u64;
-        bits = (bits << 5) | v;
-        nbits += 5;
-        if nbits >= 8 {
-            nbits -= 8;
-            out.push((bits >> nbits) as u8);
-        }
-    }
-    out.try_into().ok()
+    crate::aich::aich_from_base32(s)
 }
 
 /// Percent-decode (and `+` -> space) a link field.

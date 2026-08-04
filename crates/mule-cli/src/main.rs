@@ -839,6 +839,19 @@ async fn cmd_serve_file(port: u16, path: &str, eserver: Option<(String, u16)>) {
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "file.bin".into());
+    // AICH: compute the tree and stage it in a scratch known2_64.met store, so
+    // a real downloader can learn our root (multipacket / OP_AICHFILEHASHREQ)
+    // and pull recovery data (OP_AICHREQUEST) - the serve half the reverse
+    // oracle validates against real amuled.
+    let aich_dir = std::env::temp_dir().join(format!("padmule-serve-aich-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&aich_dir);
+    let known2 = Arc::new(mule_engine::Known2Store::load(&aich_dir));
+    let aich_root = mule_proto::AichTree::from_file_data(&data).and_then(|t| {
+        let root = t.master_hash()?;
+        known2.append(&root, &t.leaves()?).ok()?;
+        println!("aich root {}", mule_proto::aich_base32(&root));
+        Some(root)
+    });
 
     let listener = match TcpListener::bind(("0.0.0.0", port)).await {
         Ok(l) => l,
@@ -934,6 +947,7 @@ async fn cmd_serve_file(port: u16, path: &str, eserver: Option<(String, u16)>) {
         let phs = phs.clone();
         let name = name.clone();
         let path_buf = path_buf.clone();
+        let known2 = Arc::clone(&known2);
         tokio::spawn(async move {
             let mut stream = stream;
             // Auto-detect obfuscation (real aMule requests it by default) keyed
@@ -951,8 +965,11 @@ async fn cmd_serve_file(port: u16, path: &str, eserver: Option<(String, u16)>) {
                     return;
                 }
             };
-            let peer_secident = match peer_handshake_inbound(&mut fs, &me).await {
-                Ok(h) => h.capabilities().map(|c| c.sec_ident).unwrap_or(0),
+            let (peer_secident, peer_aich) = match peer_handshake_inbound(&mut fs, &me).await {
+                Ok(h) => h
+                    .capabilities()
+                    .map(|c| (c.sec_ident, c.aich))
+                    .unwrap_or((0, 0)),
                 Err(e) => {
                     eprintln!("  handshake failed: {e}");
                     return;
@@ -988,6 +1005,7 @@ async fn cmd_serve_file(port: u16, path: &str, eserver: Option<(String, u16)>) {
                 path: path_buf,
                 rating: 0,
                 comment: String::new(),
+                aich_root,
             }];
             match serve_shared(
                 &mut fs,
@@ -998,6 +1016,8 @@ async fn cmd_serve_file(port: u16, path: &str, eserver: Option<(String, u16)>) {
                 mule_engine::ServeSession {
                     sec,
                     peer: Some(peer),
+                    peer_aich,
+                    aich: Some(Arc::clone(&known2)),
                     ..Default::default()
                 },
             )

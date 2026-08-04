@@ -767,6 +767,52 @@ impl AichLeafHasher {
     }
 }
 
+/// Encode an AICH hash as its canonical 32-char uppercase RFC 4648 base32
+/// string (eMule `CAICHHash::GetString` / `EncodeBase32`) - the form used in
+/// ed2k links, magnet `urn:aich` and the known.met FT_AICH_HASH tag. 20 bytes
+/// = 160 bits = exactly 32 chars, no padding.
+pub fn aich_base32(hash: &[u8; 20]) -> String {
+    const ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    let mut out = String::with_capacity(32);
+    let mut bits: u64 = 0;
+    let mut nbits = 0u32;
+    for &b in hash {
+        bits = (bits << 8) | u64::from(b);
+        nbits += 8;
+        while nbits >= 5 {
+            nbits -= 5;
+            out.push(ALPHABET[((bits >> nbits) & 0x1F) as usize] as char);
+        }
+    }
+    out
+}
+
+/// Decode a 32-char RFC 4648 base32 string (A-Z, 2-7, case-insensitive) to a
+/// 20-byte AICH hash.
+pub fn aich_from_base32(s: &str) -> Option<[u8; 20]> {
+    if s.len() != 32 {
+        return None;
+    }
+    let mut bits: u64 = 0;
+    let mut nbits = 0u32;
+    let mut out = Vec::with_capacity(20);
+    for c in s.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a',
+            b'2'..=b'7' => c - b'2' + 26,
+            _ => return None,
+        } as u64;
+        bits = (bits << 5) | v;
+        nbits += 5;
+        if nbits >= 8 {
+            nbits -= 8;
+            out.push((bits >> nbits) as u8);
+        }
+    }
+    out.try_into().ok()
+}
+
 /// The AICH master hash (20-byte SHA-1 tree root) of a file's bytes. Returns
 /// `None` for an empty file or one past the eD2k size ceiling.
 pub fn aich_master_hash(data: &[u8]) -> Option<[u8; 20]> {
@@ -1028,6 +1074,23 @@ mod tests {
         assert!(aich_master_hash(&[]).is_none());
         assert!(AichTree::new_for_size(0).is_none());
         assert!(AichLeafHasher::new(0).is_none());
+    }
+
+    #[test]
+    fn base32_round_trips_and_matches_known_form() {
+        // The golden root's documented base32 form: 32 chars, A-Z/2-7 only.
+        let h: [u8; 20] = [
+            0xbc, 0x30, 0x1c, 0x26, 0xff, 0x3c, 0xc6, 0xd9, 0x8e, 0x80, 0x49, 0x01, 0x60, 0x3a,
+            0x0a, 0x32, 0x88, 0x35, 0x11, 0x00,
+        ];
+        let s = aich_base32(&h);
+        assert_eq!(s.len(), 32);
+        assert!(s
+            .bytes()
+            .all(|c| c.is_ascii_uppercase() || (b'2'..=b'7').contains(&c)));
+        assert_eq!(aich_from_base32(&s).unwrap(), h);
+        assert_eq!(aich_from_base32(&s.to_lowercase()).unwrap(), h);
+        assert!(aich_from_base32("short").is_none());
     }
 
     /// Byte-validation against the REAL amuled AICH, not a self-consistent

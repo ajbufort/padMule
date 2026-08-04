@@ -360,6 +360,7 @@ pub fn build_multipacket_answer(
     hash: &[u8; 16],
     name: &[u8],
     available: Option<&[bool]>,
+    aich_root: Option<&[u8; 20]>,
 ) -> Packet {
     let mut w = Writer::new();
     w.write_bytes(hash);
@@ -369,6 +370,16 @@ pub fn build_multipacket_answer(
     match available {
         Some(parts) => w.write_bytes(&write_part_status(parts)),
         None => w.write_u16(0),
+    }
+    // The bundled AICH root answer, appended only when the REQUEST carried the
+    // OP_AICHFILEHASHREQ sub-op (eMule answers it inside the multipacket loop,
+    // ListenSocket.cpp:1203-1217: sub-op byte + the bare 20-byte root). Both
+    // authorities' answer readers handle sub-answer 0x9D, so this is safe to
+    // emit - and it is the ONLY way a multipacket-capable peer (all of aMule)
+    // ever learns our root, since such peers never send the standalone 0x9E.
+    if let Some(root) = aich_root {
+        w.write_u8(OP_AICHFILEHASHANS);
+        w.write_bytes(root);
     }
     Packet::new(PROT_EMULE, OP_MULTIPACKETANSWER, w.into_inner())
 }
@@ -799,7 +810,7 @@ mod tests {
         //                    <0x50 FILESTATUS><u16 0>. This mirrors the pair of
         // sub-answers eMule bundles for a file-request multipacket
         // (ListenSocket.cpp:1199/1225) and the downloader reads leniently.
-        let pkt = build_multipacket_answer(&H, b"movie.bin", None);
+        let pkt = build_multipacket_answer(&H, b"movie.bin", None, None);
         assert_eq!(pkt.protocol, PROT_EMULE);
         assert_eq!(pkt.opcode, OP_MULTIPACKETANSWER);
         let mut r = Reader::new(&pkt.payload);
@@ -812,7 +823,7 @@ mod tests {
 
         // A PARTIAL source writes the part-status bitmap instead of the 0 count.
         let parts = [true, false, true];
-        let pkt = build_multipacket_answer(&H, b"x", Some(&parts));
+        let pkt = build_multipacket_answer(&H, b"x", Some(&parts), None);
         let mut r = Reader::new(&pkt.payload);
         let _ = read_hash16(&mut r).unwrap();
         assert_eq!(r.read_u8().unwrap(), OP_REQFILENAMEANSWER);

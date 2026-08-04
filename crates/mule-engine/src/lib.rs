@@ -15,6 +15,7 @@ pub mod fetch;
 pub mod framed;
 pub mod identity;
 pub mod kad_live;
+pub mod known2_store;
 pub mod link;
 pub mod multi_source;
 pub mod obf_handshake;
@@ -52,6 +53,7 @@ pub use fetch::{
 pub use framed::{FrameError, FramedStream};
 pub use identity::NodeIdentity;
 pub use kad_live::{KadError, KadNode, ResolveOutcome};
+pub use known2_store::{Known2Store, KNOWN2_MET};
 pub use link::ServerLink;
 pub use multi_source::{
     download_from_peer, download_from_peer_at, Download, PeerSession, SecIdentCtx,
