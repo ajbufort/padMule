@@ -108,12 +108,17 @@ impl Known2Store {
         Ok(())
     }
 
-    /// The leaf hashes for `root`, VALIDATED the way eMule's LoadHashSet is
+    /// The rebuilt tree for `root`, VALIDATED the way eMule's LoadHashSet is
     /// (SHAHashSet.cpp:872-893): the stored count must match what `file_size`
     /// demands, and the tree recomputed from the leaves must reproduce `root` -
     /// a corrupted store serves nothing rather than serving lies. The count
     /// check precedes the allocation, so a corrupt count cannot balloon it.
-    pub fn lookup(&self, root: &[u8; 20], file_size: u64) -> Option<Vec<[u8; 20]>> {
+    ///
+    /// Returns the TREE, not the leaves: validating already builds one, and
+    /// the serve path needs exactly that - handing back leaves made the
+    /// caller rebuild an identical tree, doubling the CPU of the single most
+    /// expensive answer we serve.
+    pub fn lookup(&self, root: &[u8; 20], file_size: u64) -> Option<AichTree> {
         let off = *self.index.lock().unwrap().get(root)?;
         let mut f = std::fs::File::open(&self.path).ok()?;
         f.seek(SeekFrom::Start(off)).ok()?;
@@ -137,7 +142,7 @@ impl Known2Store {
             })
             .collect();
         let tree = AichTree::from_leaves(file_size, &leaves)?;
-        (tree.master_hash()? == *root).then_some(leaves)
+        (tree.master_hash()? == *root).then_some(tree)
     }
 
     /// Remove the hashset for `root` (a file was unshared). Atomic rewrite;
@@ -221,7 +226,7 @@ mod tests {
         let (size, root, leaves) = real_set(1, 3);
         store.append(&root, &leaves).unwrap();
         store.append(&root, &leaves).unwrap(); // dedup: no duplicate entry
-        assert_eq!(store.lookup(&root, size).unwrap(), leaves);
+        assert_eq!(store.lookup(&root, size).unwrap().leaves().unwrap(), leaves);
         // exactly one entry on disk
         let bytes = std::fs::read(dir.join(KNOWN2_MET)).unwrap();
         assert_eq!(bytes.len(), 1 + 24 + leaves.len() * 20);
@@ -231,7 +236,10 @@ mod tests {
         assert!(store.lookup(&root, size + EMBLOCKSIZE_B).is_none());
         // survives a reload (index rebuilt from disk)
         let store2 = Known2Store::load(&dir);
-        assert_eq!(store2.lookup(&root, size).unwrap(), leaves);
+        assert_eq!(
+            store2.lookup(&root, size).unwrap().leaves().unwrap(),
+            leaves
+        );
     }
 
     #[test]
@@ -279,13 +287,13 @@ mod tests {
         store.append(&rc, &lc).unwrap();
         store.remove(&rb);
         assert!(!store.has(&rb));
-        assert_eq!(store.lookup(&ra, sa).unwrap(), la);
-        assert_eq!(store.lookup(&rc, sc).unwrap(), lc);
+        assert_eq!(store.lookup(&ra, sa).unwrap().leaves().unwrap(), la);
+        assert_eq!(store.lookup(&rc, sc).unwrap().leaves().unwrap(), lc);
         // prune down to only rc
         let live: HashSet<[u8; 20]> = [rc].into_iter().collect();
         store.prune_orphans(&live);
         assert!(!store.has(&ra));
-        assert_eq!(store.lookup(&rc, sc).unwrap(), lc);
+        assert_eq!(store.lookup(&rc, sc).unwrap().leaves().unwrap(), lc);
     }
 
     #[test]
