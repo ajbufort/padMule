@@ -266,8 +266,14 @@ async fn fetch_one(
     // for the per-source UI. Report the connection we ACTUALLY made, so the
     // SourcesView lock reflects the wire rather than merely knowing a hash.
     let low_id = peer.client_id < 0x0100_0000;
-    dl.note_source(peer.client_software(), src.addr, obfuscate, low_id)
-        .await;
+    dl.note_source(
+        peer.client_software(),
+        src.addr,
+        obfuscate,
+        low_id,
+        src.origin,
+    )
+    .await;
     // Secure-ident: run it inline with the transfer when we have an identity.
     // `peer_supports` (from the peer's advertised MISCOPTIONS1) tells us whether
     // to proactively ask it to prove itself. Verifying it marks the source's blue

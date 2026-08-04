@@ -513,27 +513,78 @@ pub struct BlockReceiver {
     file_size: u64,
     /// requested `(start, end_exclusive)` blocks
     blocks: Vec<(u64, u64)>,
-    /// real (decompressed) bytes still expected across the batch
-    remaining: u64,
+    /// real (decompressed) bytes still expected, PER BLOCK, keyed by start. Was
+    /// one aggregate counter, which could only answer "is the whole batch
+    /// done?". Per-block is what lets the driver keep a rolling window: it can
+    /// see block A land while B and C are still in flight, release A, and top
+    /// the window back up - eMule's own behaviour (DownloadClient.cpp:1270-1276
+    /// re-requests the instant ONE block completes, never waiting for three).
+    left: std::collections::HashMap<u64, u64>,
+    /// Blocks that finished since the driver last asked, in completion order.
+    completed: Vec<(u64, u64)>,
     /// streaming inflate state for blocks that arrive compressed, keyed by start
     packed: std::collections::HashMap<u64, PackedBlock>,
 }
 
 impl BlockReceiver {
     pub fn new(hash: [u8; 16], file_size: u64, blocks: &[(u64, u64)]) -> Self {
-        let remaining = blocks.iter().map(|(s, e)| e - s).sum();
+        let left = blocks.iter().map(|&(s, e)| (s, e - s)).collect();
+        let completed = Vec::new();
         BlockReceiver {
             hash,
             file_size,
             blocks: blocks.to_vec(),
-            remaining,
+            left,
+            completed,
             packed: std::collections::HashMap::new(),
         }
     }
 
     /// True once every requested byte has been received.
     pub fn is_done(&self) -> bool {
-        self.remaining == 0
+        self.left.is_empty()
+    }
+
+    /// Blocks finished since the last call, in completion order. The driver
+    /// releases these and requests replacements, keeping the window full.
+    pub fn take_completed(&mut self) -> Vec<(u64, u64)> {
+        std::mem::take(&mut self.completed)
+    }
+
+    /// Blocks still in flight - what a re-stated OP_REQUESTPARTS must name, so
+    /// the request the peer sees is always the CURRENT window.
+    pub fn outstanding(&self) -> Vec<(u64, u64)> {
+        self.blocks
+            .iter()
+            .copied()
+            .filter(|(s, _)| self.left.contains_key(s))
+            .collect()
+    }
+
+    /// Extend the window with newly reserved blocks (the top-up).
+    pub fn add_blocks(&mut self, blocks: &[(u64, u64)]) {
+        for &(s, e) in blocks {
+            if e > s && !self.left.contains_key(&s) {
+                self.blocks.push((s, e));
+                self.left.insert(s, e - s);
+            }
+        }
+    }
+
+    /// Credit `n` real bytes to the block starting at `start`, recording it as
+    /// completed once its last byte lands.
+    fn credit(&mut self, start: u64, n: u64) {
+        let Some(rem) = self.left.get_mut(&start) else {
+            return;
+        };
+        *rem = rem.saturating_sub(n);
+        if *rem == 0 {
+            self.left.remove(&start);
+            self.packed.remove(&start);
+            if let Some(&b) = self.blocks.iter().find(|&&(s, _)| s == start) {
+                self.completed.push(b);
+            }
+        }
     }
 
     /// Feed one received packet. Non-data opcodes (queue ranking, etc.) yield no
@@ -584,7 +635,13 @@ impl BlockReceiver {
         {
             return Err(BlockError::BadRange);
         }
-        self.remaining = self.remaining.saturating_sub(data.len() as u64);
+        // Credit the OWNING block, not a batch total: a raw packet may deliver
+        // only part of a block, and the driver needs to know which block closed.
+        let owner = self
+            .containing_block(start, end)
+            .map(|(s, _)| s)
+            .ok_or(BlockError::BadRange)?;
+        self.credit(owner, data.len() as u64);
         Ok(vec![BlockWrite {
             offset: start,
             data,
@@ -650,7 +707,9 @@ impl BlockReceiver {
         let offset = start + pb.written;
         let data = pb.out[before..].to_vec();
         pb.written += produced;
-        self.remaining = self.remaining.saturating_sub(produced);
+        // A compressed packet always names the block's start, so that IS the
+        // owner. `credit` drops the inflate state once the block closes.
+        self.credit(start, produced);
         Ok(vec![BlockWrite { offset, data }])
     }
 }

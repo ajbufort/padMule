@@ -1235,8 +1235,17 @@ async fn cmd_peer_download(
     // Register the source so a secure-ident verification (and any rating/comment)
     // is recorded against it - the engine's fetch_one does this; the CLI must too.
     let low_id = peer.client_id < 0x0100_0000;
-    dl.note_source(peer.client_software(), addr, obf_target.is_some(), low_id)
-        .await;
+    // The CLI dials an address given on the command line, so there is no
+    // discovery channel behind it; Server is the honest default for a
+    // hand-supplied peer (it is how a server-found source reaches us too).
+    dl.note_source(
+        peer.client_software(),
+        addr,
+        obf_target.is_some(),
+        low_id,
+        mule_engine::SourceOrigin::Server,
+    )
+    .await;
 
     // Secure-ident: carry a fresh RSA identity and run the exchange inline. The
     // peer initiates because we advertised support; we also proactively verify it.
