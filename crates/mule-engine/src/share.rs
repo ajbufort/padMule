@@ -734,6 +734,30 @@ where
     } = session;
     // Unregisters this peer from the file's served list on EVERY exit path.
     let mut served: Option<ServedGuard> = None;
+    // Ranges already streamed on this connection, so a re-stated request does
+    // not re-send bytes the peer already has.
+    //
+    // THIS IS NOT AN OPTIMISATION, it is required to talk to a real eMule.
+    // A downloader keeps a 3-block window and re-states the WHOLE window every
+    // time one block completes (`SendBlockRequests` -> `CreateBlockRequests`
+    // tops the pending list back up to 3 and re-sends all three,
+    // DownloadClient.cpp:870-892,:1270-1276). The uploader is what makes that
+    // sane: `AddReqBlock` drops any block already in `m_DoneBlocks_list` or
+    // `m_BlockRequests_queue` (UploadClient.cpp:665-680). padMule had no such
+    // check and served every restatement, so each block went out up to THREE
+    // times - pure wasted upload, invisible to the oracles because duplicate
+    // bytes still verify byte-for-byte at the far end.
+    //
+    // DELIBERATE DEVIATION: eMule's done-list is unbounded for the session and
+    // cleared on file change; we keep a bounded FIFO instead. iPadOS has no
+    // memory to spare and 8 slots x an unbounded list is a real cost, while the
+    // window being deduped is only 3 blocks deep - 64 is 20x that. The bound
+    // also means a genuine LATER re-request (a peer re-fetching a part it found
+    // corrupt) is eventually honoured again rather than refused forever, which
+    // upstream's unbounded list would refuse for the whole session.
+    const DEDUP_DEPTH: usize = 64;
+    let mut recently_sent: std::collections::VecDeque<([u8; 16], u64, u64)> =
+        std::collections::VecDeque::with_capacity(DEDUP_DEPTH);
     // A shared file counts as OURS only while its bytes are still on disk at the
     // size we hashed. The downloads directory is the user-visible Files folder,
     // so a finished file can be deleted (or replaced) under us at any moment,
@@ -1084,7 +1108,19 @@ where
                 for (s, e) in blocks {
                     // The range came off the network: never read past the file.
                     if s <= e && e <= f.size {
+                        // Already streamed on this connection: the peer is
+                        // re-stating its 3-block window (see `recently_sent`),
+                        // not asking again. Sending it a second time is pure
+                        // waste, so skip - exactly what eMule's AddReqBlock
+                        // does with its done-list.
+                        if recently_sent.contains(&(f.hash, s, e)) {
+                            continue;
+                        }
                         let data = read_range(&f.path, s, e).map_err(FrameError::Io)?;
+                        if recently_sent.len() == DEDUP_DEPTH {
+                            recently_sent.pop_front();
+                        }
+                        recently_sent.push_back((f.hash, s, e));
                         fs.write_packet(&build_sending_part(&f.hash, s, e, &data))
                             .await?;
                         crate::stats::add_uploaded(data.len() as u64);
@@ -2160,6 +2196,84 @@ mod tests {
         assert_eq!(ans.opcode, OP_MULTIPACKETANSWER);
         assert_eq!(&ans.payload[..16], &hash);
         assert_eq!(ans.payload[16], OP_REQFILENAMEANSWER);
+
+        drop(fs);
+        up.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_restated_block_window_is_not_served_twice() {
+        // A real eMule keeps 3 blocks pending and re-states the WHOLE window
+        // every time one completes (SendBlockRequests -> CreateBlockRequests
+        // tops back up to 3 and re-sends all three, DownloadClient.cpp:870-892,
+        // :1270-1276). The uploader is what stops that being a disaster:
+        // AddReqBlock drops a block already sent or queued
+        // (UploadClient.cpp:665-680). Without the same check padMule served
+        // every restatement, sending each block up to THREE times.
+        //
+        // This drives the real serve loop, because the waste is a property of
+        // that loop, not of a helper - and the oracles cannot see it, since
+        // duplicate bytes still verify byte-for-byte at the far end.
+        use crate::transfer::{build_request_parts, OP_SENDINGPART};
+        use mule_proto::{Packet, PROT_EMULE};
+        let hash = [0x7C; 16];
+        let size = 4 * 1000u64;
+        let shared = vec![SharedFile {
+            hash,
+            size,
+            name: b"restate.bin".to_vec(),
+            part_hashes: vec![],
+            path: fixture_file("restate", size as usize),
+            rating: 0,
+            comment: String::new(),
+            aich_root: None,
+        }];
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let up = tokio::spawn(async move {
+            let me = HelloInfo::baseline([0xBB; 16], 0, 4662, 4672, "seed");
+            if let Ok((_p, mut fs)) = accept_peer(&listener, &me).await {
+                let _ = serve_shared(&mut fs, &shared, None, None, 0, Default::default()).await;
+            }
+        });
+        let me = HelloInfo::baseline([0xAA; 16], 0x0A00_0001, 4663, 4673, "dl");
+        let (_p, mut fs) = connect_peer(addr, &me).await.unwrap();
+
+        // Latch the file, then ask for blocks 0,1,2.
+        fs.write_packet(&Packet::new(PROT_EMULE, OP_SETREQFILEID, hash.to_vec()))
+            .await
+            .unwrap();
+        let b = [(0u64, 1000u64), (1000, 2000), (2000, 3000)];
+        fs.write_packet(&build_request_parts(&hash, &b))
+            .await
+            .unwrap();
+        // Skip the OP_SETREQFILEID answer; count only data packets.
+        let mut starts = Vec::new();
+        while starts.len() < 3 {
+            let p = fs.read_packet_unpacked().await.unwrap();
+            if p.opcode == OP_SENDINGPART {
+                starts.push(u32::from_le_bytes(p.payload[16..20].try_into().unwrap()) as u64);
+            }
+        }
+        assert_eq!(
+            starts,
+            vec![0, 1000, 2000],
+            "the first window streams whole"
+        );
+
+        // Block 0 completed -> eMule re-states [1,2,3]. Only block 3 is new.
+        let b2 = [(1000u64, 2000u64), (2000, 3000), (3000, 4000)];
+        fs.write_packet(&build_request_parts(&hash, &b2))
+            .await
+            .unwrap();
+        let p = fs.read_packet_unpacked().await.unwrap();
+        assert_eq!(p.opcode, OP_SENDINGPART);
+        let start = u32::from_le_bytes(p.payload[16..20].try_into().unwrap()) as u64;
+        assert_eq!(
+            start, 3000,
+            "the re-stated blocks 1 and 2 must be SKIPPED - only the new block 3 is sent"
+        );
 
         drop(fs);
         up.await.unwrap();
