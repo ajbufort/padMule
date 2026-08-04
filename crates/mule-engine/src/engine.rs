@@ -240,6 +240,40 @@ struct SearchSession {
     more_reqs: u8,
 }
 
+/// What the port-mapping maintenance triggers (a foreground resume, or a server
+/// answering LowID) should actually DO.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MappingAction {
+    /// We hold a mapping: verify it still exists and re-open only if it is gone
+    /// (eMule's CheckAndRefresh).
+    Refresh,
+    /// We hold NO mapping and we are supposed to: try to make one.
+    ///
+    /// This is the case the first version got wrong. Both triggers early-returned
+    /// when there was no mapping, on the reasoning that "there is nothing to
+    /// refresh" - but the initial `map_port` at `start()` can simply have FAILED
+    /// (a dropped SSDP answer, a gateway busy for a moment), and then the two
+    /// triggers designed to recover a missing mapping were exactly the two that
+    /// refused to run. The session stayed LowID with no retry short of a full
+    /// Stop/Start, on the path padMule's whole HighID story runs through.
+    Map,
+    /// Do nothing: not running, offline, or deliberately stopped.
+    None,
+}
+
+/// Decide the action from the facts. Pure, so the rule is testable without a
+/// gateway - the live layer only performs what this returns.
+pub fn port_mapping_action(running: bool, offline: bool, have_mapping: bool) -> MappingAction {
+    if !running || offline {
+        return MappingAction::None;
+    }
+    if have_mapping {
+        MappingAction::Refresh
+    } else {
+        MappingAction::Map
+    }
+}
+
 /// Seconds a caller must wait before the next server search, or `None` if it may
 /// search now. Rounds UP so "wait 1s" never displays 0. Pure (takes `now`), so it
 /// is unit-testable without a real clock.
@@ -1125,7 +1159,9 @@ pub struct Engine {
     /// a stale value only disables the echo (the key-echo gate is IP-equality),
     /// never mis-verifies. Host order (first octet = MSByte), matching
     /// `udp_verify_key`. Never emitted - it is our public IP verbatim.
-    public_ip: Option<Ipv4Addr>,
+    /// Shared so the spawned mapping-retry task can record a mapping it
+    /// creates; a plain field could only ever be written on the engine task.
+    public_ip: Arc<std::sync::Mutex<Option<Ipv4Addr>>>,
     /// The inbound peer listener's accept loop (dropping it frees port 4662).
     listener: Option<JoinHandle<()>>,
     /// Sender handed to each ServerLink; its forwarder task is spawned once.
@@ -1186,7 +1222,7 @@ impl Engine {
             server: None,
             connection: None,
             kad: None,
-            public_ip: None,
+            public_ip: Arc::new(std::sync::Mutex::new(None)),
             listener: None,
             server_tx: None,
             last_server_search: None,
@@ -1279,7 +1315,7 @@ impl Engine {
     /// Exposed as a BOOLEAN on purpose - the address itself is our public IP and
     /// must never reach the screen.
     pub fn has_port_mapping(&self) -> bool {
-        self.public_ip.is_some()
+        self.public_ip.lock().map(|g| g.is_some()).unwrap_or(false)
     }
 
     /// The number of Kad contacts currently held.
@@ -1712,7 +1748,9 @@ impl Engine {
                 // this reaches the UI, and that is our public IP verbatim. It IS
                 // kept internally: the Kad node keys its UDP-verify-key echo on it
                 // (see `public_ip`), which is how a peer verifies us faster.
-                self.public_ip = Some(ip);
+                if let Ok(mut g) = self.public_ip.lock() {
+                    *g = Some(ip);
+                }
                 self.emit(EngineEvent::Server(format!("UPnP: mapped port {TCP_PORT}")));
             }
             Err(e) => {
@@ -2532,7 +2570,8 @@ impl Engine {
         // (no mapping) leaves it 0, which disables the echo (the proven baseline).
         // On resume the last-learned value persists; a stale one only skips the
         // optimization (the echo gate is IP-equality), it never mis-verifies.
-        node.set_public_ip(self.public_ip.map_or(0, u32::from));
+        let pub_ip = self.public_ip.lock().ok().and_then(|g| *g);
+        node.set_public_ip(pub_ip.map_or(0, u32::from));
         // Cap the OVERALL bootstrap: 40 contacts * 1200ms is ~48s worst case, and
         // start_kad runs while the single shared engine lock is held (start/resume
         // via the FFI), so an uncapped bootstrap would block pause()'s socket
@@ -3340,21 +3379,48 @@ impl Engine {
     /// result reaches the UI as the same durable "UPnP:" row that start() writes,
     /// so a change still surfaces - just a moment later.
     fn refresh_port_mapping(&self) {
-        // Nothing to refresh if we never had a mapping (no gateway, or the user is
-        // on a network where it failed) - start()'s attempt already said so.
-        if self.public_ip.is_none() || self.offline {
+        let action = port_mapping_action(
+            self.state == EngineState::Running,
+            self.offline,
+            self.has_port_mapping(),
+        );
+        if action == MappingAction::None {
             return;
         }
         let events = self.events.clone();
+        let public_ip = self.public_ip.clone();
         tokio::spawn(async move {
-            let msg = match crate::upnp::refresh_and_remap(TCP_PORT, "padMule").await {
-                // Silent on the common case: saying "still mapped" every time the
-                // user switches apps is noise, and the row already says it.
-                Ok(crate::upnp::RefreshOutcome::Intact) => return,
-                Ok(crate::upnp::RefreshOutcome::Remapped) => {
-                    format!("UPnP: re-mapped port {TCP_PORT} after resume")
+            let msg = match action {
+                MappingAction::Refresh => {
+                    match crate::upnp::refresh_and_remap(TCP_PORT, "padMule").await {
+                        // Silent on the common case: saying "still mapped" every
+                        // time the user switches apps is noise, and the row
+                        // already says it.
+                        Ok(crate::upnp::RefreshOutcome::Intact) => return,
+                        Ok(crate::upnp::RefreshOutcome::Remapped) => {
+                            format!("UPnP: re-mapped port {TCP_PORT} after resume")
+                        }
+                        Err(e) => format!("UPnP: could not refresh port {TCP_PORT} ({e})"),
+                    }
                 }
-                Err(e) => format!("UPnP: could not refresh port {TCP_PORT} ({e})"),
+                // The RETRY: start()'s attempt failed, so try again on the very
+                // triggers that exist to recover a missing mapping. Silent on a
+                // repeated failure - a user with no UPnP gateway would otherwise
+                // get the same line on every foreground return.
+                MappingAction::Map => {
+                    match crate::upnp::map_port(TCP_PORT, "padMule", crate::upnp::PERMANENT_LEASE)
+                        .await
+                    {
+                        Ok(ip) => {
+                            if let Ok(mut g) = public_ip.lock() {
+                                *g = Some(ip);
+                            }
+                            format!("UPnP: mapped port {TCP_PORT} on retry")
+                        }
+                        Err(_) => return,
+                    }
+                }
+                MappingAction::None => return,
             };
             let _ = events.send(EngineEvent::Server(msg));
         });
@@ -3403,12 +3469,14 @@ impl Engine {
     /// Awaited rather than spawned: the user asked to stop, so it is honest to
     /// finish the work (and report a failure) before saying we did.
     async fn release_port_mapping(&mut self) {
-        if self.offline || self.public_ip.is_none() {
+        if self.offline || !self.has_port_mapping() {
             return;
         }
         match crate::upnp::unmap_port(TCP_PORT).await {
             Ok(()) => {
-                self.public_ip = None;
+                if let Ok(mut g) = self.public_ip.lock() {
+                    *g = None;
+                }
                 self.emit(EngineEvent::Server(format!(
                     "UPnP: released port {TCP_PORT}"
                 )));
@@ -4066,9 +4134,9 @@ mod tests {
             !engine.has_port_mapping(),
             "a client that never mapped a port must not be told one was released"
         );
-        engine.public_ip = Some(std::net::Ipv4Addr::new(203, 0, 113, 5));
+        *engine.public_ip.lock().unwrap() = Some(std::net::Ipv4Addr::new(203, 0, 113, 5));
         assert!(engine.has_port_mapping());
-        engine.public_ip = None; // what release_port_mapping does on success
+        *engine.public_ip.lock().unwrap() = None; // what release does on success
         assert!(!engine.has_port_mapping());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4243,6 +4311,34 @@ mod tests {
             }
         });
         addr
+    }
+
+    /// The two triggers that exist to RECOVER a missing port mapping both used
+    /// to early-return when there was no mapping - so a start() map that simply
+    /// failed (a dropped SSDP answer, a momentarily busy gateway) left the
+    /// session LowID with no retry short of a full Stop/Start, on the path
+    /// padMule's whole HighID story runs through.
+    #[test]
+    fn a_missing_mapping_is_retried_not_ignored() {
+        // Running, online, no mapping yet -> TRY, do not shrug.
+        assert_eq!(
+            port_mapping_action(true, false, false),
+            MappingAction::Map,
+            "a failed initial map must be retried on resume / on a LowID answer"
+        );
+        // Running, online, mapping held -> verify it, do not blindly re-add.
+        assert_eq!(
+            port_mapping_action(true, false, true),
+            MappingAction::Refresh
+        );
+        // Never touch the gateway when stopped or offline, either way round.
+        assert_eq!(
+            port_mapping_action(false, false, false),
+            MappingAction::None
+        );
+        assert_eq!(port_mapping_action(false, false, true), MappingAction::None);
+        assert_eq!(port_mapping_action(true, true, false), MappingAction::None);
+        assert_eq!(port_mapping_action(true, true, true), MappingAction::None);
     }
 
     /// THE missing retry. Before this, `spawn_fetch` was only ever reached from
