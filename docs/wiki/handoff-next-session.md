@@ -7,6 +7,28 @@ says so explicitly.
 Living doc - replace it wholesale next time. Full narrative:
 [[build-progress]] rows 8av-8bk and the [[log]] entries for 2026-08-03/04.
 
+## STATE AT THE CLOSE OF 2026-08-04
+
+Ten PRs merged, main linear throughout. Wave 11 (AICH) is IN. The two items
+this handoff carried as the biggest remaining are BOTH now addressed:
+
+- **The serial queue (was open item 4)** - CLOSED for the symptom that mattered
+  (row 8bq). UI polls no longer take the engine lock, so the transfer list keeps
+  moving during a ~20s search. HONEST REMAINDER: the Status scalars (state,
+  server info, Kad contacts) still lag, because they genuinely live in the
+  engine; closing that needs `server`/`kad` made independently shareable and is
+  NOT required for a responsive UI.
+- **The fourth port field (Kad advertise vs bind)** - DONE, row 8bo. The
+  handoff predicted it would be needed "only if a remap is needed"; it was.
+
+Device-proven this session: HighID over AirVPN (the cause was the provider's
+"Local port" field, which CANNOT be blank - it silently keeps the old value),
+the resume fix, the source-origin badge, and the server column sorting.
+
+Bugs found by USING it, none of which any test or oracle caught: the serve side
+sending every block up to three times, called-back sources tracked nowhere, and
+a single lost UDP datagram marking a live server dead.
+
 ## THE SWEEP FOUND A HOLE THE BRANCH'S OWN GATE COULD NOT SEE (row 8bk)
 
 An independent reanalysis of the FINISHED wave-11 branch - read as an outsider,
