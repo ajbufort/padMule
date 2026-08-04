@@ -346,13 +346,54 @@ const ADD_SOURCES_BUDGET: Duration = Duration::from_secs(15);
 /// round budget - sat frozen until the app was relaunched, which is exactly
 /// what "stuck at 34% forever" looked like.
 ///
-/// Deliberately small and infrequent: this runs on the 1s heartbeat, which
-/// holds the engine lock, so the budget is the length of a UI hitch. A short
-/// budget is enough in the common case because the SERVER arm answers in well
-/// under a second; Kad contributes only if it is also quick. Getting these
-/// calls off the one serial queue is the real fix (portability Tier 2).
+/// [REVISED 2026-08-04 - the constraint this was sized for is GONE, and the old
+/// sizing was the second half of Anthony's "downloads stall" report.]
+///
+/// It used to read: "deliberately small and infrequent: this runs on the 1s
+/// heartbeat, which holds the engine lock, so the budget is the length of a UI
+/// hitch... getting these calls off the one serial queue is the real fix". That
+/// fix LANDED (row 8bq) - UI polls no longer take the engine lock - so the
+/// budget no longer buys a frozen screen.
+///
+/// MEASURED, not guessed: with a 2s budget, 4 of 4 traced retries consumed the
+/// ENTIRE budget and were cut off mid-discovery (`took=2.002s`, `2.001s`,
+/// `2.001s`, `2.000s`), finding 0-6 sources and leaving 3-6 LowID peers
+/// un-called-back. `add_download` gets 15s for identical work, and the Kad arm
+/// carries a 15s budget of its own - so Kad could NEVER contribute to a retry.
+/// A download whose sources dried up was getting a truncated 2s hunt.
+///
+/// 8s lets the server arm finish and gives Kad a real chance, while staying
+/// under `ADD_SOURCES_BUDGET`. It is still bounded because `heartbeat()` does
+/// hold the engine lock, and `pause()` waits behind it - which on iPadOS must
+/// stay prompt.
+const RESUME_RETRY_BUDGET: Duration = Duration::from_secs(6);
+
+/// Base cadence, DIVIDED by how many downloads are idle (clamped), so a big
+/// queue rotates in bounded time instead of linearly worse.
+///
+/// The old fixed 45s meant one retry per 45s TOTAL: with 9 stalled downloads
+/// each got rediscovery once every ~7 minutes, and with 30 queued, once every
+/// 22. That is indistinguishable from "stopped". Dividing keeps the per-file
+/// period roughly constant as the queue grows, with a floor so a huge queue
+/// cannot turn the heartbeat into a source-discovery treadmill.
 const RESUME_RETRY_EVERY: Duration = Duration::from_secs(45);
-const RESUME_RETRY_BUDGET: Duration = Duration::from_secs(2);
+/// The gap is floored at this MULTIPLE of the budget, which bounds how much of
+/// the time the retry holds the engine lock.
+///
+/// MEASURED THE HARD WAY: a first attempt paired an 8s budget with a 9s floor
+/// and produced ~89% lock occupancy - `find_sources` joins the server and Kad
+/// arms and WAITS FOR BOTH, and the Kad arm essentially always uses its whole
+/// budget, so a retry always costs the full amount. At that duty cycle
+/// `pause()` waits behind the lock, which on iPadOS risks losing the checkpoint
+/// at suspension. A cure worse than the disease.
+///
+/// x4 caps occupancy at ~25%. With a queue of 9 that gives each file
+/// rediscovery every ~3.6 minutes instead of the old ~7, without starving
+/// pause. The REAL fix is getting `find_sources` off the engine lock (the same
+/// ownership change row 8bq deliberately stopped short of); until then this
+/// ratio is the honest limit.
+const RESUME_RETRY_DUTY: u32 = 4;
+const RESUME_RETRY_SPREAD: u32 = 5;
 
 /// The next free `NNN.part` index in `dir`. aMule numbers part files this way and
 /// `resume_downloads` finds them by that name, so a new download MUST NOT reuse
@@ -3298,7 +3339,9 @@ impl Engine {
         // A hands-on simulation caught the old gate: with every server down but
         // Kad up, search returned real hits yet every download was refused
         // "NoServer" - even though Kad had the sources.
-        let (reg, lowids) = self.find_sources(hash, size, ADD_SOURCES_BUDGET).await;
+        let (reg, lowids) = self
+            .find_sources(hash, size, ADD_SOURCES_BUDGET, false)
+            .await;
         // A LowID source can only reach us via a SERVER callback, so without a
         // server only directly-connectable (HighID) sources are usable - otherwise
         // a Kad-only client would register a download that can never progress.
@@ -3337,15 +3380,42 @@ impl Engine {
     /// answer - which had arrived in well under a second. Resume therefore only
     /// worked when Kad was BROKEN. Bounding per-arm means whatever arrived in
     /// time is always used, and the caller never has to discard a good result.
+    /// `stop_when_server_answers` makes the budget a CEILING instead of a fixed
+    /// cost. `join!` waits for BOTH arms, and a Kad lookup essentially always
+    /// uses its whole budget, so every call cost the full amount even when the
+    /// server had already answered in under a second - traced live as
+    /// `found=1 ... took=6.001s`. That is what made the retry sweep expensive
+    /// enough to need a duty-cycle cap, since it runs under the engine lock.
+    ///
+    /// Retries pass `true`: getting SOME sources now beats getting more in six
+    /// seconds. `add_download` passes `false` - the user is watching a spinner
+    /// for that one file and wants the widest net, and it is not on the
+    /// heartbeat's lock budget.
     async fn find_sources(
         &mut self,
         hash: [u8; 16],
         size: u64,
         budget: Duration,
+        stop_when_server_answers: bool,
     ) -> (SourceRegistry, Vec<u32>) {
         let low_id = self.connection.as_ref().map(|c| c.low_id).unwrap_or(true);
         // The two lookups touch disjoint fields (server link vs Kad node), so
         // run them together; the wait is the slower of the two, not the sum.
+        // FAST PATH: ask the server alone first. It answers in well under a
+        // second when it answers at all, so a retry that gets what it needs
+        // returns immediately instead of waiting out Kad.
+        if stop_when_server_answers {
+            let found = match self.server.as_mut() {
+                Some(link) => link
+                    .get_sources(&hash, size, budget.min(SOURCES_WAIT))
+                    .await
+                    .unwrap_or_default(),
+                None => Vec::new(),
+            };
+            if !found.is_empty() {
+                return self.registry_from(found, low_id, &[]);
+            }
+        }
         let server = self.server.as_mut();
         let kad = self.kad.as_mut();
         let (found, kad_sources) = tokio::join!(
@@ -3375,9 +3445,21 @@ impl Engine {
                 }
             }
         );
+        self.registry_from(found, low_id, &kad_sources)
+    }
+
+    /// Build the registry + LowID callback list from raw arm results. Shared by
+    /// the full path and the server-first fast path so the ipfilter gate and the
+    /// LowID rule cannot drift apart between them.
+    fn registry_from(
+        &self,
+        found: Vec<crate::FoundSource>,
+        low_id: bool,
+        kad_sources: &[mule_kad::Source],
+    ) -> (SourceRegistry, Vec<u32>) {
         let mut reg = SourceRegistry::new();
         reg.add_found(&found);
-        reg.add_kad(&kad_sources);
+        reg.add_kad(kad_sources);
         // Never dial a blocklisted peer. LowID callback sources are gated on the
         // inbound side instead (they dial US), so only direct sources are dropped
         // here.
@@ -3524,7 +3606,7 @@ impl Engine {
             let name = dl.name().await;
             // Bounded INSIDE find_sources, so a slow Kad arm no longer throws
             // away the server sources that already arrived.
-            let (reg, lowids) = self.find_sources(hash, size, RESUME_PER_DL).await;
+            let (reg, lowids) = self.find_sources(hash, size, RESUME_PER_DL, true).await;
             if reg.is_empty() && lowids.is_empty() {
                 continue;
             }
@@ -3953,10 +4035,27 @@ impl Engine {
     /// a set of stalled downloads is worked through round-robin rather than the
     /// first one hogging every retry.
     pub async fn maintain_resume_fetches(&mut self) -> bool {
-        if self.state != EngineState::Running
-            || self.last_resume_retry.elapsed() < RESUME_RETRY_EVERY
-            || self.offline
-        {
+        if self.state != EngineState::Running || self.offline {
+            return false;
+        }
+        // Cadence scales with the QUEUE: one retry per 45s total meant a file in
+        // a queue of 9 waited ~7 minutes for rediscovery, and one in a queue of
+        // 30 waited 22. Dividing by the idle count keeps the PER-FILE period
+        // roughly constant as the queue grows, with a floor so a large queue
+        // cannot turn the heartbeat into a discovery treadmill.
+        let idle_count = {
+            let guard = self.downloads.lock().await;
+            guard
+                .iter()
+                .filter(|dl| !dl.is_cancelled() && !dl.is_fetching())
+                .count() as u32
+        };
+        if idle_count == 0 {
+            return false;
+        }
+        let gap = (RESUME_RETRY_EVERY / idle_count.clamp(1, RESUME_RETRY_SPREAD))
+            .max(RESUME_RETRY_BUDGET * RESUME_RETRY_DUTY);
+        if self.last_resume_retry.elapsed() < gap {
             return false;
         }
         // Nothing to do is the common case - check before paying for anything.
@@ -3995,7 +4094,9 @@ impl Engine {
         let hash = dl.hash().await;
         let size = dl.size().await;
         let name = dl.name().await;
-        let (reg, lowids) = self.find_sources(hash, size, RESUME_RETRY_BUDGET).await;
+        let (reg, lowids) = self
+            .find_sources(hash, size, RESUME_RETRY_BUDGET, true)
+            .await;
         if reg.is_empty() && lowids.is_empty() {
             return false;
         }
@@ -5108,7 +5209,7 @@ mod tests {
 
         let t0 = tokio::time::Instant::now();
         let (reg, lowids) = engine
-            .find_sources([0x44; 16], 1000, Duration::from_millis(600))
+            .find_sources([0x44; 16], 1000, Duration::from_millis(600), false)
             .await;
         let elapsed = t0.elapsed();
         assert!(
