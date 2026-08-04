@@ -104,7 +104,10 @@ private struct FunctionButton: View {
 
 struct ContentView: View {
     @EnvironmentObject var model: EngineModel
-    @State private var screen: Screen = .search
+    // Servers, not Search: padMule deliberately does not auto-connect, so
+    // picking a server IS the first thing to do - landing on Search offered a
+    // box that could not answer yet.
+    @State private var screen: Screen = .servers
     /// The finished file being previewed, if any (the Downloaded tab's Open).
     @State private var quickLook: QuickLookItem?
     @State private var query = ""
@@ -151,6 +154,9 @@ struct ContentView: View {
                     banner("Starting padMule... searching and downloading will work in a moment.",
                            systemImage: "hourglass", tint: .orange)
                 }
+                // Action feedback stays global - it must appear where the user
+                // is. Server NEWS (MOTD, discovery results) is Servers-only; see
+                // EngineModel.serverNotice.
                 if let notice = model.notice {
                     banner(notice, systemImage: "info.circle", tint: .blue)
                 }
@@ -748,6 +754,28 @@ struct ContentView: View {
 
     private var serversScreen: some View {
         List {
+            // Server news lives HERE, not above every screen. It is often a
+            // dozen-line MOTD and it persists, so parked globally it pushed the
+            // actual content down on tabs it had nothing to do with. Dismissable,
+            // because a MOTD has been read once.
+            if let news = model.serverNotice {
+                Section {
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: "info.circle")
+                        Text(news).font(.footnote)
+                        Spacer(minLength: 8)
+                        Button {
+                            model.serverNotice = nil
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                        }
+                        .buttonStyle(.borderless)
+                        .accessibilityLabel("Dismiss server message")
+                    }
+                    .foregroundStyle(.white)
+                    .listRowBackground(Color.blue.gradient)
+                }
+            }
             Section {
                 if let s = model.server {
                     HStack {
@@ -1384,12 +1412,19 @@ struct ContentView: View {
         mb >= 1024 ? "\(mb / 1024) GB" : "\(mb) MB"
     }
 
+    /// A full-width status banner. Solid tint with white text - the treatment
+    /// Anthony picked out on the server-message banner - rather than the washed
+    /// 15%-opacity fill these used to have, which was legible only in the blue
+    /// case. The COLOUR still carries meaning (blue informational, orange needs
+    /// attention, red broken); only the weight changed.
     private func banner(_ text: String, systemImage: String, tint: Color) -> some View {
         Label(text, systemImage: systemImage)
             .font(.footnote)
+            .foregroundStyle(.white)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(8)
-            .background(tint.opacity(0.15))
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .background(tint.gradient)
     }
 }
 

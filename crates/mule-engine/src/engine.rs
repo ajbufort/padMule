@@ -1838,6 +1838,13 @@ impl Engine {
     /// them to a durable row instead of the transient notice.
     async fn map_port(&mut self) {
         if !self.upnp_enabled {
+            // SAY SO. Returning silently left the UI's durable "Port mapping"
+            // row showing whatever the last UPnP attempt said - which, after
+            // switching to a VPN, was a stale failure naming the OLD port and
+            // looked like the new settings had not taken.
+            self.emit(EngineEvent::Server(
+                "UPnP: off - port forwarding is handled outside padMule".to_string(),
+            ));
             return;
         }
         let port = self.listen_port;

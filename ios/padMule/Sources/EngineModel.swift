@@ -119,6 +119,12 @@ final class EngineModel: ObservableObject {
     /// alert and drives a persistent banner + the Shared-screen caption.
     @Published private(set) var sharingPausedForIpChange = false
 
+    /// News from the engine's server side - a MOTD, a discovery result. Shown
+    /// ONLY on the Servers tab: these are long, they persist, and they are not
+    /// about whatever screen the user happens to be on. Distinct from `notice`,
+    /// which is feedback for an action the user just took and follows them.
+    @Published var serverNotice: String?
+
     @Published private(set) var results: [SearchHit] = []
     /// The connected server has more result pages ("Load more results", #13).
     @Published private(set) var moreAvailable = false
@@ -300,9 +306,9 @@ final class EngineModel: ObservableObject {
                     return v == 0 ? fallback : v
                 }
                 e.setPorts(
-                    listen: storedPort(SettingsKey.listenPort, 4662),
-                    advertised: storedPort(SettingsKey.advertisedPort, 4662),
-                    kad: storedPort(SettingsKey.kadPort, 4672))
+                    listen: storedPort(SettingsKey.listenPort, 5999),
+                    advertised: storedPort(SettingsKey.advertisedPort, 5999),
+                    kad: storedPort(SettingsKey.kadPort, 5999))
                 e.setUpnpEnabled(on: d.bool(forKey: SettingsKey.upnpEnabled))
                 e.start()
                 engineLog.notice("boot OK; engine started")
@@ -970,13 +976,18 @@ final class EngineModel: ObservableObject {
             if text.hasPrefix("UPnP:") {
                 upnpStatus = text
             } else {
-                // News ("Saved 'x'", a server MOTD), NOT the connection status.
-                // Writing these to `status` would clobber the
-                // "Connected to <server> (HighID|LowID)" line, which arrives as
-                // its own `.status` event. NB that line is EVENT-fed, not polled:
-                // the engine must emit `Status` on every connect/disconnect or
-                // this row goes stale (it did - see engine.rs connect_to_server).
-                notice = text
+                // News from the SERVER side (a MOTD, "Discovered N servers",
+                // "Saved 'x'") goes to its own field, shown only on the Servers
+                // tab. A server MOTD is often a dozen lines and it PERSISTS -
+                // parked at the top of every screen it pushed the actual content
+                // down and had nothing to do with what the user was looking at.
+                // Action feedback the user just triggered still uses `notice`
+                // and stays global, because that must appear where they are.
+                //
+                // NOT `status`: that would clobber the "Connected to <server>"
+                // line, which arrives as its own `.status` event (event-fed, not
+                // polled - see engine.rs connect_to_server).
+                serverNotice = text
             }
         case .serverDropped(let addr):
             // The server kicked/dropped us: raise a prominent dialog and refresh

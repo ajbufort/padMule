@@ -76,11 +76,12 @@ enum SettingsDefaults {
             SettingsKey.askServersForServers: true,
             SettingsKey.defaultPriority: 1, // Normal
             SettingsKey.rememberSearchFilters: true,
-            // Match the engine's own defaults (see EngineModel.applyPortSettings),
-            // so an untouched Settings screen changes nothing.
-            SettingsKey.listenPort: 4662,
-            SettingsKey.advertisedPort: 4662,
-            SettingsKey.kadPort: 4672,
+            // 5999 for all three: the port Anthony reserved on AirVPN,
+            // forwarded same-port with TCP+UDP. eD2k's 4662/4672 remain the
+            // engine's own constants for anything not driven by this screen.
+            SettingsKey.listenPort: 5999,
+            SettingsKey.advertisedPort: 5999,
+            SettingsKey.kadPort: 5999,
             SettingsKey.upnpEnabled: true,
         ])
     }
