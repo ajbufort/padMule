@@ -71,6 +71,19 @@ padMule's four port fields all that number, UPnP OFF (now the default).
 
 ## Open work (ranked)
 
+0. **THE QUEUE-BAIL POLICY - the root cause of "downloads stall", found 2026-08-04
+   and deliberately NOT fixed.** `OP_QUEUERANKING if bail_on_queue =>
+   Err(TransferError::Queued)` makes padMule bail the INSTANT a peer queues it.
+   That came from the three-file HUNT, where sitting in a queue is dead time.
+   But eD2k is a QUEUE-BASED network - peers ration upload slots and you rise
+   over minutes - so a client that never waits can only be served by a source
+   with a free slot at that exact instant. MEASURED: 15 of 17 retries found 2-7
+   usable sources, and only 5 of 20 downloads ever received a byte.
+   The fix is a hot-path policy change (bail only when other untried sources
+   remain; otherwise hold position) entangled with padMule being foreground-only,
+   since it cannot hold a queue slot for an hour the way desktop eMule does.
+   Reproduce with `cargo run --release -p mule-ffi --example stress`.
+
 1. **The Status scalars still lag during a long search.** The serial-queue fix
    freed the transfer list (UI polls no longer take the engine lock), but
    `state`, `server_info` and `kad_contacts` genuinely live in the engine, so
