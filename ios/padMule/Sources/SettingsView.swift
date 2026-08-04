@@ -155,11 +155,11 @@ struct SettingsView: View {
                 set: { upnpEnabled = $0; model.applyPortSettings() }
             ))
             DisclosureGroup("Advanced (behind a VPN)") {
-                portRow("Listening port (TCP)", text: $listenText, field: .listen, hint: "4662")
+                portRow("Listening port (TCP)", text: $listenText, field: .listen, hint: "5999")
                 portRow(
                     "Port peers are told (advertised)", text: $advertisedText,
-                    field: .advertised, hint: "4662")
-                portRow("Kad port (UDP)", text: $kadText, field: .kad, hint: "4672")
+                    field: .advertised, hint: "5999")
+                portRow("Kad port (UDP)", text: $kadText, field: .kad, hint: "5999")
             }
         } header: {
             Text("Network / VPN")
@@ -205,9 +205,9 @@ struct SettingsView: View {
     /// Store all three, then write back what was ACTUALLY stored so a rejected
     /// entry visibly snaps to the value in force instead of lying about it.
     private func commitPorts() {
-        let l = sanitizedPort(listenText, fallback: 4662)
-        let a = sanitizedPort(advertisedText, fallback: 4662)
-        let k = sanitizedPort(kadText, fallback: 4672)
+        let l = sanitizedPort(listenText, fallback: 5999)
+        let a = sanitizedPort(advertisedText, fallback: 5999)
+        let k = sanitizedPort(kadText, fallback: 5999)
         let d = UserDefaults.standard
         d.set(l, forKey: SettingsKey.listenPort)
         d.set(a, forKey: SettingsKey.advertisedPort)
