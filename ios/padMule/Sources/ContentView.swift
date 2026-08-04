@@ -773,7 +773,10 @@ struct ContentView: View {
                         .accessibilityLabel("Dismiss server message")
                     }
                     .foregroundStyle(.white)
-                    .listRowBackground(Color.blue.gradient)
+                    // Rectangle().fill(...) because listRowBackground needs a
+                    // VIEW: Color.blue.gradient is an AnyGradient (a ShapeStyle),
+                    // which .background accepts but this modifier does not.
+                    .listRowBackground(Rectangle().fill(Color.blue.gradient))
                 }
             }
             Section {
