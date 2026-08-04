@@ -267,6 +267,41 @@ server's ad, not a vetted recommendation).
   so a VPN is a privacy choice that COSTS connectivity unless the forwarding
   is real and the port is settable.
 
+### AirVPN specifically - researched 2026-08-03 (Anthony asked)
+
+Verified against AirVPN's own FAQ and iOS guide, not from memory:
+
+- **Ports are USER-CHOSEN, not randomly assigned**: "You can use ports >= 2048.
+  Lower ports are already reserved", up to 5 forwarded simultaneously, held as
+  long as the subscription is active. **4662 is >= 2048, so the eD2k default is
+  itself requestable** - if it is free, same-port forwarding works and padMule
+  needs no port change at all.
+- **TCP and UDP both supported**, per-port ("TCP, UDP or both, according to
+  your selection") - so Kad's UDP port can be forwarded too, as a second port.
+- **Remote-to-local mapping is supported**: leaving the "Local" field empty
+  forwards port n to local port n; filling it forwards remote n to a DIFFERENT
+  local port x. This is the case that forces the advertised-vs-listen split.
+- **Forwarding is configured SERVER-SIDE** in Client Area -> Ports -> Manage,
+  independent of the client app - which is what makes it usable on an iPad at
+  all. A port can be bound to a specific device or to all devices.
+- **iPadOS path**: the official WireGuard app from the App Store, fed a config
+  from AirVPN's Config Generator by QR code or `.conf` import. Note the port
+  forwarding is NOT set in the Config Generator - it is managed separately in
+  the Ports panel, which is a documented source of confusion in their forums.
+- Sources: <https://airvpn.org/faq/port_forwarding/>,
+  <https://airvpn.org/ios/wireguard/appstore/>
+
+### What padMule needed for this, and now has (build-progress 8bd)
+
+- `set_ports(listen, advertised, kad)`: the LISTEN port is what we bind, the
+  ADVERTISED port is what servers and peers are told. They are equal in the
+  ordinary home case and differ under remote-to-local forwarding. Getting this
+  wrong is INVISIBLE on the dev box - everything still binds and connects
+  locally while every real peer dials a port nothing listens on - which is
+  exactly what the mutation test showed before a wire-level assertion was added.
+- `set_upnp_enabled(false)`: on a VPN the LAN-router mapping accomplishes
+  nothing and its failure line actively misleads, so it must be switchable off.
+
 ## Related
 
 - [[protocol-understanding]] - login flow, LowID callbacks, client-ID encoding.

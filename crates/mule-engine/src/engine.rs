@@ -69,6 +69,8 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 /// The ports padMule advertises and listens on (eD2k TCP, Kad UDP).
+/// The eD2k defaults. Both are now overridable (see `Engine::set_ports`):
+/// a VPN that forwards an ASSIGNED remote port is the case that needs it.
 const TCP_PORT: u16 = 4662;
 const KAD_UDP_PORT: u16 = 4672;
 
@@ -1159,6 +1161,21 @@ pub struct Engine {
     /// a stale value only disables the echo (the key-echo gate is IP-equality),
     /// never mis-verifies. Host order (first octet = MSByte), matching
     /// `udp_verify_key`. Never emitted - it is our public IP verbatim.
+    /// The port we BIND for inbound peer connections.
+    listen_port: u16,
+    /// The port we ADVERTISE to servers and peers. Differs from `listen_port`
+    /// only when something OUTSIDE the app forwards a different external port
+    /// to us - which is exactly what a VPN doing remote->local port forwarding
+    /// does (AirVPN, for one, lets a remote port n reach a different local port
+    /// x). Peers dial what the server hands out, so the advertised port must be
+    /// the EXTERNAL one even though we listen on the local one.
+    advertised_port: u16,
+    /// The Kad UDP bind port.
+    kad_port: u16,
+    /// Whether to attempt UPnP at all. Pointless - and its failure line
+    /// misleading - when a VPN tunnel is carrying the traffic, because the
+    /// mapping would be made on the LAN router the tunnel bypasses.
+    upnp_enabled: bool,
     /// Shared so the spawned mapping-retry task can record a mapping it
     /// creates; a plain field could only ever be written on the engine task.
     public_ip: Arc<std::sync::Mutex<Option<Ipv4Addr>>>,
@@ -1222,6 +1239,10 @@ impl Engine {
             server: None,
             connection: None,
             kad: None,
+            listen_port: TCP_PORT,
+            advertised_port: TCP_PORT,
+            kad_port: KAD_UDP_PORT,
+            upnp_enabled: true,
             public_ip: Arc::new(std::sync::Mutex::new(None)),
             listener: None,
             server_tx: None,
@@ -1373,6 +1394,26 @@ impl Engine {
 
     /// Where completed files land. The iOS app points this at its Documents dir
     /// so finished downloads show up in the Files app.
+    /// Override the ports. Takes effect on the next `start()`.
+    ///
+    /// `advertised` is what we tell servers and peers; pass the same value as
+    /// `listen` for the ordinary case (a home router forwarding port N to port
+    /// N). They differ when an external forwarder maps one port to another -
+    /// the VPN case - and getting this wrong is invisible locally but means
+    /// every peer dials a port nothing is listening on.
+    pub fn set_ports(&mut self, listen: u16, advertised: u16, kad: u16) {
+        self.listen_port = listen;
+        self.advertised_port = advertised;
+        self.kad_port = kad;
+    }
+
+    /// Turn the UPnP attempt on or off. Takes effect on the next `start()` /
+    /// mapping trigger. Off is correct on a VPN, where the forward is done by
+    /// the provider and a LAN-router mapping accomplishes nothing.
+    pub fn set_upnp_enabled(&mut self, on: bool) {
+        self.upnp_enabled = on;
+    }
+
     pub fn set_downloads_dir(&mut self, dir: impl AsRef<Path>) {
         self.downloads_dir = dir.as_ref().to_path_buf();
     }
@@ -1530,10 +1571,11 @@ impl Engine {
         if self.listener.is_some() {
             return;
         }
-        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), TCP_PORT);
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), self.listen_port);
         let Ok(listener) = TcpListener::bind(bind).await else {
             self.emit(EngineEvent::Server(format!(
-                "port {TCP_PORT} unavailable - expect LowID"
+                "port {} unavailable - expect LowID",
+                self.listen_port
             )));
             return;
         };
@@ -1541,9 +1583,15 @@ impl Engine {
         // secure-ident so a leecher challenges us (the precondition for verifying
         // IT - the exchange is mutual). The accept loop wires the matching inbound
         // obf-accept and the secure-ident drain (all halves land together).
-        let me = HelloInfo::baseline(self.identity.userhash, 0, TCP_PORT, KAD_UDP_PORT, "padMule")
-            .with_crypt_supported()
-            .with_secident();
+        let me = HelloInfo::baseline(
+            self.identity.userhash,
+            0,
+            self.advertised_port,
+            self.kad_port,
+            "padMule",
+        )
+        .with_crypt_supported()
+        .with_secident();
         let identity = Arc::clone(&self.identity.rsa);
         let credit_store = Arc::clone(&self.credit_store);
         let downloads = Arc::clone(&self.downloads);
@@ -1742,7 +1790,11 @@ impl Engine {
     /// port did or did not open. Messages are prefixed "UPnP:" so the UI can pin
     /// them to a durable row instead of the transient notice.
     async fn map_port(&mut self) {
-        match crate::upnp::map_port(TCP_PORT, "padMule", crate::upnp::PERMANENT_LEASE).await {
+        if !self.upnp_enabled {
+            return;
+        }
+        let port = self.listen_port;
+        match crate::upnp::map_port(port, "padMule", crate::upnp::PERMANENT_LEASE).await {
             Ok(ip) => {
                 // The external IP the gateway reports is deliberately NOT emitted:
                 // this reaches the UI, and that is our public IP verbatim. It IS
@@ -1751,11 +1803,11 @@ impl Engine {
                 if let Ok(mut g) = self.public_ip.lock() {
                     *g = Some(ip);
                 }
-                self.emit(EngineEvent::Server(format!("UPnP: mapped port {TCP_PORT}")));
+                self.emit(EngineEvent::Server(format!("UPnP: mapped port {port}")));
             }
             Err(e) => {
                 self.emit(EngineEvent::Server(format!(
-                    "UPnP: could not map port {TCP_PORT} ({e})"
+                    "UPnP: could not map port {port} ({e})"
                 )));
             }
         }
@@ -1834,7 +1886,7 @@ impl Engine {
         let login = LoginRequest {
             user_hash: self.identity.userhash,
             client_id: 0,
-            tcp_port: TCP_PORT,
+            tcp_port: self.advertised_port,
             nick: "padMule".to_string(),
             server_flags: DEFAULT_SERVER_FLAGS,
         };
@@ -2547,13 +2599,13 @@ impl Engine {
             self.emit(EngineEvent::Server("no Kad contacts to bootstrap".into()));
             return;
         }
-        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), KAD_UDP_PORT);
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), self.kad_port);
         // The PERSISTED identity, so our Kad ID and the UDP verify keys peers
         // stored for us survive a restart (identity.rs names re-keying Kad on
         // every start as the failure a stable identity exists to prevent).
         let Ok(mut node) = KadNode::bind_with_identity(
             bind,
-            TCP_PORT,
+            self.advertised_port,
             self.identity.kad_id,
             self.identity.kad_udp_key,
         )
@@ -3028,8 +3080,14 @@ impl Engine {
         }
         // Advertise SecureIdent v1 in the fetch HELLO so a source will initiate
         // the exchange toward us; pass our RSA identity so we can respond + verify.
-        let me = HelloInfo::baseline(self.identity.userhash, 0, TCP_PORT, KAD_UDP_PORT, "padMule")
-            .with_secident();
+        let me = HelloInfo::baseline(
+            self.identity.userhash,
+            0,
+            self.advertised_port,
+            self.kad_port,
+            "padMule",
+        )
+        .with_secident();
         let identity = Arc::clone(&self.identity.rsa);
         let credit_store = Arc::clone(&self.credit_store);
         // Sources learned mid-sweep via source exchange are filtered too.
@@ -3380,7 +3438,7 @@ impl Engine {
     /// so a change still surfaces - just a moment later.
     fn refresh_port_mapping(&self) {
         let action = port_mapping_action(
-            self.state == EngineState::Running,
+            self.state == EngineState::Running && self.upnp_enabled,
             self.offline,
             self.has_port_mapping(),
         );
@@ -3389,18 +3447,19 @@ impl Engine {
         }
         let events = self.events.clone();
         let public_ip = self.public_ip.clone();
+        let port = self.listen_port;
         tokio::spawn(async move {
             let msg = match action {
                 MappingAction::Refresh => {
-                    match crate::upnp::refresh_and_remap(TCP_PORT, "padMule").await {
+                    match crate::upnp::refresh_and_remap(port, "padMule").await {
                         // Silent on the common case: saying "still mapped" every
                         // time the user switches apps is noise, and the row
                         // already says it.
                         Ok(crate::upnp::RefreshOutcome::Intact) => return,
                         Ok(crate::upnp::RefreshOutcome::Remapped) => {
-                            format!("UPnP: re-mapped port {TCP_PORT} after resume")
+                            format!("UPnP: re-mapped port {port} after resume")
                         }
-                        Err(e) => format!("UPnP: could not refresh port {TCP_PORT} ({e})"),
+                        Err(e) => format!("UPnP: could not refresh port {port} ({e})"),
                     }
                 }
                 // The RETRY: start()'s attempt failed, so try again on the very
@@ -3408,14 +3467,13 @@ impl Engine {
                 // repeated failure - a user with no UPnP gateway would otherwise
                 // get the same line on every foreground return.
                 MappingAction::Map => {
-                    match crate::upnp::map_port(TCP_PORT, "padMule", crate::upnp::PERMANENT_LEASE)
-                        .await
+                    match crate::upnp::map_port(port, "padMule", crate::upnp::PERMANENT_LEASE).await
                     {
                         Ok(ip) => {
                             if let Ok(mut g) = public_ip.lock() {
                                 *g = Some(ip);
                             }
-                            format!("UPnP: mapped port {TCP_PORT} on retry")
+                            format!("UPnP: mapped port {port} on retry")
                         }
                         Err(_) => return,
                     }
@@ -3472,19 +3530,18 @@ impl Engine {
         if self.offline || !self.has_port_mapping() {
             return;
         }
-        match crate::upnp::unmap_port(TCP_PORT).await {
+        let port = self.listen_port;
+        match crate::upnp::unmap_port(port).await {
             Ok(()) => {
                 if let Ok(mut g) = self.public_ip.lock() {
                     *g = None;
                 }
-                self.emit(EngineEvent::Server(format!(
-                    "UPnP: released port {TCP_PORT}"
-                )));
+                self.emit(EngineEvent::Server(format!("UPnP: released port {port}")));
             }
             // Non-fatal: the stop itself still succeeded, and saying so is more
             // useful than silence - a mapping left behind is what strands a port.
             Err(e) => self.emit(EngineEvent::Server(format!(
-                "UPnP: could not release port {TCP_PORT} ({e})"
+                "UPnP: could not release port {port} ({e})"
             ))),
         }
     }
@@ -4311,6 +4368,96 @@ mod tests {
             }
         });
         addr
+    }
+
+    /// ...and the split must be asserted ON THE WIRE, not just on the struct.
+    /// A mutation that made the login advertise the BIND port instead of the
+    /// ADVERTISED one passed the whole suite: everything still binds and
+    /// connects locally, while every real peer would dial a port nothing is
+    /// listening on. The login request carries it at a fixed offset
+    /// (userhash 16 | client_id 4 | tcp_port 2), so read it back.
+    #[tokio::test]
+    async fn the_login_tells_the_server_our_advertised_port() {
+        let dir = tmp("advertised-port");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+        // The VPN shape: bind locally on 4662, but the provider forwards 51234.
+        engine.set_ports(4662, 51234, 4672);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen: Arc<std::sync::Mutex<Option<u16>>> = Arc::new(std::sync::Mutex::new(None));
+        let rec = seen.clone();
+        tokio::spawn(async move {
+            if let Ok((sock, _)) = listener.accept().await {
+                let mut sfs = crate::framed::FramedStream::new(sock);
+                if let Ok(p) = sfs.read_packet().await {
+                    if p.payload.len() >= 22 {
+                        *rec.lock().unwrap() =
+                            Some(u16::from_le_bytes([p.payload[20], p.payload[21]]));
+                    }
+                }
+                let _ = sfs
+                    .write_packet(&mule_proto::Packet::new(
+                        mule_proto::PROT_EDONKEY,
+                        crate::server_messages::OP_IDCHANGE,
+                        0x0A00_0001u32.to_le_bytes().to_vec(),
+                    ))
+                    .await;
+                while sfs.read_packet().await.is_ok() {}
+            }
+        });
+
+        assert!(
+            engine.connect_to_server(addr).await,
+            "mock login should win"
+        );
+        let port = seen.lock().unwrap().expect("the server saw a login");
+        assert_eq!(
+            port, 51234,
+            "the server must be told the port the PROVIDER forwards, not the one we bind"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// VPN readiness: the port we ADVERTISE and the port we BIND are different
+    /// facts. A provider that forwards an assigned remote port to a different
+    /// local one (AirVPN allows exactly that) means peers must be told the
+    /// EXTERNAL port while we listen on the local one - and getting it wrong is
+    /// invisible on this box, because everything still binds and connects
+    /// locally while every real peer dials a port nothing is listening on.
+    #[test]
+    fn ports_default_to_ed2k_and_can_be_split_for_a_vpn() {
+        let dir = tmp("ports");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+
+        // Untouched, padMule is a stock eD2k client.
+        assert_eq!(engine.listen_port, 4662);
+        assert_eq!(engine.advertised_port, 4662);
+        assert_eq!(engine.kad_port, 4672);
+        assert!(engine.upnp_enabled, "UPnP is on by default (home router)");
+
+        // The VPN shape: the provider forwards remote 51234 to our local 4662.
+        engine.set_ports(4662, 51234, 4672);
+        assert_eq!(engine.listen_port, 4662, "we still BIND the local port");
+        assert_eq!(
+            engine.advertised_port, 51234,
+            "but peers must be told the port the PROVIDER forwards"
+        );
+
+        // On a VPN the LAN router mapping accomplishes nothing, so it must be
+        // possible to switch it off rather than emit a misleading failure.
+        engine.set_upnp_enabled(false);
+        assert!(!engine.upnp_enabled);
+        assert_eq!(
+            port_mapping_action(true, false, false),
+            MappingAction::Map,
+            "the policy itself is unchanged - the engine gates on the toggle"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The two triggers that exist to RECOVER a missing port mapping both used

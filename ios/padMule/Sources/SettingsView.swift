@@ -21,6 +21,7 @@ struct SettingsView: View {
     @AppStorage(SettingsKey.askServersForServers) private var askServers = true
     @AppStorage(SettingsKey.defaultPriority) private var defaultPriority = 1
     @AppStorage(SettingsKey.rememberSearchFilters) private var rememberFilters = true
+    @AppStorage(SettingsKey.upnpEnabled) private var upnpEnabled = true
 
     @State private var newUrl = ""
 
@@ -29,6 +30,7 @@ struct SettingsView: View {
             Form {
                 sharingSection
                 serverListSection
+                networkSection
                 downloadsSection
                 deviceSection
                 identitySection
@@ -111,6 +113,80 @@ struct SettingsView: View {
         } footer: {
             Text("padMule merges every list, so adding more sources builds one comprehensive server list rather than replacing it. server.met is a single shared format - lists published for eMule and for aMule are the same files and both work. With \"Ask connected servers\" on, every server you connect to is also asked for the servers it knows - discovering servers no published list carries.")
         }
+    }
+
+    // MARK: - Network / VPN
+    //
+    // Why "advertised" is separate from "listening": a VPN (e.g. AirVPN) REPLACES
+    // the router-forwarding padMule normally relies on - the provider forwards an
+    // assigned remote port into the tunnel, so (a) UPnP on the LAN router
+    // accomplishes nothing and its failure line is misleading, and (b) the
+    // provider may forward that remote port to a DIFFERENT local port, in which
+    // case peers must be told the EXTERNAL port while padMule actually listens on
+    // the local one. Kept behind a disclosure group so the default experience -
+    // a normal home user who should never touch this - stays a single toggle.
+
+    private var networkSection: some View {
+        Section {
+            Toggle("Use UPnP port mapping", isOn: Binding(
+                get: { upnpEnabled },
+                set: { upnpEnabled = $0; model.applyPortSettings() }
+            ))
+            DisclosureGroup("Advanced (behind a VPN)") {
+                HStack {
+                    Text("Listening port (TCP)")
+                    Spacer()
+                    TextField("4662", text: portBinding(SettingsKey.listenPort, defaultPort: 4662))
+                        .keyboardType(.numberPad)
+                        .multilineTextAlignment(.trailing)
+                        .frame(maxWidth: 100)
+                        .onSubmit { model.applyPortSettings() }
+                }
+                HStack {
+                    Text("Port peers are told (advertised)")
+                    Spacer()
+                    TextField(
+                        "4662", text: portBinding(SettingsKey.advertisedPort, defaultPort: 4662)
+                    )
+                    .keyboardType(.numberPad)
+                    .multilineTextAlignment(.trailing)
+                    .frame(maxWidth: 100)
+                    .onSubmit { model.applyPortSettings() }
+                }
+                HStack {
+                    Text("Kad port (UDP)")
+                    Spacer()
+                    TextField("4672", text: portBinding(SettingsKey.kadPort, defaultPort: 4672))
+                        .keyboardType(.numberPad)
+                        .multilineTextAlignment(.trailing)
+                        .frame(maxWidth: 100)
+                        .onSubmit { model.applyPortSettings() }
+                }
+            }
+        } header: {
+            Text("Network / VPN")
+        } footer: {
+            Text("Most people should leave these alone. Behind a VPN, the provider forwards a port into the tunnel: turn UPnP off above, and set the advertised port to the one the provider assigned you (and the listening port to whatever local port it actually forwards to, if different from that). Changes take effect the next time padMule starts.")
+        }
+    }
+
+    /// A text-field binding for one port setting, reading/writing UserDefaults
+    /// directly (not through @AppStorage, so it can reject a bad keystroke
+    /// without losing the field's current valid value). Non-digit characters
+    /// are stripped; a value over 65535 is ignored outright; a blank or zero
+    /// entry restores `defaultPort`.
+    private func portBinding(_ key: String, defaultPort: Int) -> Binding<String> {
+        Binding<String>(
+            get: { String(UserDefaults.standard.integer(forKey: key)) },
+            set: { newValue in
+                let digits = newValue.filter { $0.isNumber }
+                guard let n = Int(digits), n <= 65535 else {
+                    if digits.isEmpty { UserDefaults.standard.set(defaultPort, forKey: key) }
+                    return
+                }
+                UserDefaults.standard.set(n == 0 ? defaultPort : n, forKey: key)
+            }
+        )
     }
 
     // MARK: - Downloads
