@@ -1357,6 +1357,10 @@ struct ContentView: View {
             HStack(spacing: 6) {
                 Text("\(bytes(dl.have)) / \(bytes(dl.size))")
                 Text("\(Int(fraction(dl) * 100))%")
+                if let origins = sourceOrigins(dl) {
+                    Text(origins)
+                        .accessibilityLabel("Sources: \(origins)")
+                }
             }
             .font(.caption)
             .foregroundStyle(.secondary)
@@ -1365,6 +1369,23 @@ struct ContentView: View {
 
     private func fraction(_ dl: DownloadInfo) -> Double {
         dl.size == 0 ? 0 : Double(dl.have) / Double(dl.size)
+    }
+
+    /// Connected sources by DISCOVERY CHANNEL, e.g. "4 ed2k / 2 kad" - which
+    /// channel is actually feeding this transfer. Invisible otherwise, and it is
+    /// the first question when one file flies and another crawls. Channels with
+    /// no sources are omitted rather than shown as zeros, and the whole badge
+    /// disappears when nothing is connected, so a stalled row stays quiet
+    /// instead of asserting "0 ed2k".
+    private func sourceOrigins(_ dl: DownloadInfo) -> String? {
+        var parts: [String] = []
+        if dl.sourcesServer > 0 { parts.append("\(dl.sourcesServer) ed2k") }
+        if dl.sourcesKad > 0 { parts.append("\(dl.sourcesKad) kad") }
+        // Source exchange is a THIRD channel, not a flavour of the other two -
+        // naming it "sx" keeps the badge honest rather than folding peer-learned
+        // sources into the server count.
+        if dl.sourcesExchange > 0 { parts.append("\(dl.sourcesExchange) sx") }
+        return parts.isEmpty ? nil : parts.joined(separator: " / ")
     }
 
     private func bytes(_ n: UInt64) -> String {
