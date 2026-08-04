@@ -42,6 +42,18 @@ enum SettingsKey {
     static let wireGlobal = "padMule.wire.global"
     static let wireMinSizeMb = "padMule.wire.minSizeMb"
     static let wireMaxSizeMb = "padMule.wire.maxSizeMb"
+    /// eD2k TCP port padMule listens on. Distinct from `advertisedPort` because a
+    /// VPN's remote-forwarder can map an external port to a different local one -
+    /// see the Network / VPN settings section for the full story.
+    static let listenPort = "padMule.listenPort"
+    /// The port padMule tells servers and peers to dial. Equal to `listenPort` in
+    /// the ordinary home-router case; different behind a VPN forwarder.
+    static let advertisedPort = "padMule.advertisedPort"
+    static let kadPort = "padMule.kadPort"
+    /// Attempt a UPnP mapping on the LAN router. Off is correct on a VPN, where
+    /// the provider does the forwarding and a LAN-router mapping is a no-op the
+    /// tunnel bypasses anyway.
+    static let upnpEnabled = "padMule.upnpEnabled"
 }
 
 /// Registers the DEFAULTS, so a first launch behaves correctly before the user
@@ -64,6 +76,12 @@ enum SettingsDefaults {
             SettingsKey.askServersForServers: true,
             SettingsKey.defaultPriority: 1, // Normal
             SettingsKey.rememberSearchFilters: true,
+            // Match the engine's own defaults (see EngineModel.applyPortSettings),
+            // so an untouched Settings screen changes nothing.
+            SettingsKey.listenPort: 4662,
+            SettingsKey.advertisedPort: 4662,
+            SettingsKey.kadPort: 4672,
+            SettingsKey.upnpEnabled: true,
         ])
     }
 }

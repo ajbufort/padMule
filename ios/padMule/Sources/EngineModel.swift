@@ -1085,6 +1085,7 @@ final class EngineModel: ObservableObject {
             updateAllServerLists()
         }
         applyAskServersForServers()
+        applyPortSettings()
         applyKeepAwake()
     }
 
@@ -1095,6 +1096,29 @@ final class EngineModel: ObservableObject {
         guard let e = engine else { return }
         let on = UserDefaults.standard.bool(forKey: SettingsKey.askServersForServers)
         work.async { e.setAddServersFromServer(on: on) }
+    }
+
+    /// Push the listen/advertised/kad ports and the UPnP toggle into the engine.
+    ///
+    /// These take effect on the NEXT start() - changing them mid-session does
+    /// NOT move a live listener. The split between "listen" and "advertised"
+    /// exists for VPN use (AirVPN and similar): the provider forwards an
+    /// assigned remote port into the tunnel, and may forward it to a LOCAL port
+    /// different from the remote one, so peers must be told the external port
+    /// while padMule actually listens on the local one. UPnP on the LAN router
+    /// is meaningless in that setup - the tunnel bypasses it - so it can be
+    /// turned off rather than fail with a misleading line.
+    func applyPortSettings() {
+        guard let e = engine else { return }
+        let d = UserDefaults.standard
+        let listen = UInt16(clamping: d.integer(forKey: SettingsKey.listenPort))
+        let advertised = UInt16(clamping: d.integer(forKey: SettingsKey.advertisedPort))
+        let kad = UInt16(clamping: d.integer(forKey: SettingsKey.kadPort))
+        let upnp = d.bool(forKey: SettingsKey.upnpEnabled)
+        work.async {
+            e.setPorts(listen: listen, advertised: advertised, kad: kad)
+            e.setUpnpEnabled(on: upnp)
+        }
     }
 
     /// Keep the screen from sleeping while a transfer is active, IF the user opted

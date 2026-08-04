@@ -610,6 +610,26 @@ impl MuleEngine {
             .block_on(async { self.inner.lock().await.set_sharing(on) });
     }
 
+    /// Override the eD2k ports. Takes effect on the NEXT start().
+    ///
+    /// `advertised` is what servers and peers are told; pass it equal to
+    /// `listen` for the ordinary home-router case. They differ when an external
+    /// forwarder maps one port to another - a VPN with remote-to-local port
+    /// forwarding - and then peers must dial the EXTERNAL port while padMule
+    /// listens on the local one.
+    pub fn set_ports(&self, listen: u16, advertised: u16, kad: u16) {
+        self.rt
+            .block_on(async { self.inner.lock().await.set_ports(listen, advertised, kad) });
+    }
+
+    /// Turn the UPnP port-mapping attempt on or off. Off is correct on a VPN,
+    /// where the provider does the forwarding and a mapping on the LAN router
+    /// the tunnel bypasses accomplishes nothing.
+    pub fn set_upnp_enabled(&self, on: bool) {
+        self.rt
+            .block_on(async { self.inner.lock().await.set_upnp_enabled(on) });
+    }
+
     /// The "update server list when connecting" pref (eMule AddServersFromServer):
     /// a fresh login asks the server for its own server list (OP_GETSERVERLIST),
     /// feeding the gossip harvest. Defaults ON in the engine; takes effect on the
