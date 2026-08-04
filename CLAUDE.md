@@ -20,7 +20,7 @@ current build state is `docs/wiki/build-progress.md`.
 - The author is **Anthony Bufort** (`ajbufort@ajbconsulting.us`). Never "Alex".
 - **ASCII only in files.** No arrow glyphs and no em/en dashes. Use `->` and `-`.
 - The working tree is `crates/` + `ios/`. `amule-3.0.1/` is the vendored
-  upstream reference (pristine zip at `/mnt/c/Users/ajbuf/Downloads/amule-3.0.1.zip`);
+  upstream reference (pristine zip at `reference-archives/amule-3.0.1.zip`, gitignored);
   treat it as read-only.
 - aMule is GPL-2.0-or-later; padMule is too (root `LICENSE` + `NOTICE`).
   Anything borrowed from other forks (e.g. eMule AI) stays GPL-compatible.
