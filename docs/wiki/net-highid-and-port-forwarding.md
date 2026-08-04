@@ -273,9 +273,27 @@ Verified against AirVPN's own FAQ and iOS guide, not from memory:
 
 - **Ports are USER-CHOSEN, not randomly assigned**: "You can use ports >= 2048.
   Lower ports are already reserved", up to 5 forwarded simultaneously, held as
-  long as the subscription is active. **4662 is >= 2048, so the eD2k default is
-  itself requestable** - if it is free, same-port forwarding works and padMule
-  needs no port change at all.
+  long as the subscription is active. 4662 is >= 2048 so the eD2k default is
+  requestable in principle - but **TESTED 2026-08-03 and it is NOT available**:
+  AirVPN answered "The requested port is not available", i.e. another subscriber
+  already holds the most famous eD2k port. Do not plan around getting it, and
+  note this makes the port override (8bd) a hard PREREQUISITE rather than a
+  nicety - without it padMule could not have used AirVPN at all.
+
+  **The clean setup, given that:** reserve ONE available port X with BOTH TCP
+  and UDP enabled, leave the "Local" field EMPTY (same-port forwarding), and set
+  padMule's listen = advertised = kad = X. One number for TCP and UDP is fine -
+  they are separate namespaces, and nothing in the eD2k protocol requires a
+  client's UDP port to differ from its TCP port; the 4662/4672 split is only
+  convention. That covers peer connections AND Kad from a single reservation,
+  leaving four of the five spare. The alternative - Local = 4662, so remote X
+  reaches local 4662 - is exactly what the advertised-vs-listen split exists
+  for, and is the right shape if a local port must stay fixed.
+
+  NB padMule binds its transient UDP sockets (status probe, global search, the
+  crawl) on EPHEMERAL ports, so nothing else shifts when the TCP port moves:
+  there is no local "TCP+3" socket to keep in step, despite the eD2k convention
+  noted in [[protocol-reference]].
 - **TCP and UDP both supported**, per-port ("TCP, UDP or both, according to
   your selection") - so Kad's UDP port can be forwarded too, as a second port.
 - **Remote-to-local mapping is supported**: leaving the "Local" field empty
