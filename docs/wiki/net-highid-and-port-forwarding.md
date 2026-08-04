@@ -291,6 +291,43 @@ Verified against AirVPN's own FAQ and iOS guide, not from memory:
 - Sources: <https://airvpn.org/faq/port_forwarding/>,
   <https://airvpn.org/ios/wireguard/appstore/>
 
+### The iOS kill-switch gap, and padMule's answer (build-progress 8be)
+
+AirVPN's own iOS page carries a footnote worth reading twice: Apple processes
+and apps "can bypass any VPN tunnel at will" (and separately, App Store terms
+conflict with the GPL, which is why they ship no iOS app - the same friction
+that makes padMule sideload-only). The GPL half is a non-issue for a user: the
+official WireGuard app is the client. The bypass half is real but does NOT
+affect padMule's own traffic, which is ordinary app-level TCP/UDP to eD2k
+servers and peers, not an Apple system service.
+
+**The consequence that DOES matter is the missing kill switch.** Stock iOS has
+none (Always-On VPN is MDM/supervised-only), so if the tunnel drops, iOS
+silently falls back to the normal interface - and padMule would keep seeding
+from the REAL address, with the advertised port now wrong, and nothing on
+screen to say so. That is a privacy exposure and a LowID at the same moment.
+
+padMule now defends against it, using a fact it already receives: **a HighID
+client id IS our public address.** `note_public_id` compares it across logins
+and, on a CHANGE, PAUSES SHARING and raises a loud alert. Anthony chose both
+behaviours (auto-pause + warn) when asked.
+
+- The address is compared internally and NEVER emitted. `EngineEvent::
+  PublicAddressChanged` is deliberately PAYLOAD-FREE, for the same reason
+  `connect_to_server` refuses to record the client id in user-visible text.
+- A LowID login carries no public address, so it neither trips the guard nor
+  overwrites what we knew - otherwise every LowID server would false-pause.
+- The latch is cleared when the user turns sharing back on: the app keeps
+  saying WHY sharing is off until they decide.
+- Wired at BOTH login sites (connect and resume); a resume is a fresh login and
+  is exactly when a tunnel is most likely to have gone. Mutation-checked at the
+  caller, not just the helper: removing the call from `connect_to_server`, or
+  removing the LowID exemption, each turns the right test red.
+- HONEST LIMIT: this fires on ANY public-address change, so switching VPN exit
+  servers or moving Wi-Fi-to-cellular also trips it. That is the safe direction
+  - the action is a pause plus an explanation, never a silent continue - but it
+  is a false positive from the user's point of view, and the wording says so.
+
 ### What padMule needed for this, and now has (build-progress 8bd)
 
 - `set_ports(listen, advertised, kad)`: the LISTEN port is what we bind, the

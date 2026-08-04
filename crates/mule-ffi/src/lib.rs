@@ -64,6 +64,11 @@ pub enum EngineEventFfi {
     ServerDropped {
         addr: String,
     },
+    /// Our public address changed between two logins - on a VPN, the tunnel
+    /// dropping. Sharing has ALREADY been paused by the engine; the UI must say
+    /// so loudly. Deliberately payload-free: the address is exactly what must
+    /// never reach the screen.
+    PublicAddressChanged,
     Kad {
         contacts: u32,
     },
@@ -81,6 +86,7 @@ impl From<EngineEvent> for EngineEventFfi {
             EngineEvent::Status(text) => EngineEventFfi::Status { text },
             EngineEvent::Server(text) => EngineEventFfi::Server { text },
             EngineEvent::ServerDropped { addr } => EngineEventFfi::ServerDropped { addr },
+            EngineEvent::PublicAddressChanged => EngineEventFfi::PublicAddressChanged,
             EngineEvent::Kad { contacts } => EngineEventFfi::Kad {
                 contacts: contacts as u32,
             },
@@ -608,6 +614,14 @@ impl MuleEngine {
     pub fn set_sharing(&self, on: bool) {
         self.rt
             .block_on(async { self.inner.lock().await.set_sharing(on) });
+    }
+
+    /// True while sharing is off BECAUSE the public address changed under us
+    /// (a dropped VPN tunnel, a network switch). The UI keeps saying why until
+    /// the user turns sharing back on, which clears it.
+    pub fn sharing_paused_for_ip_change(&self) -> bool {
+        self.rt
+            .block_on(async { self.inner.lock().await.sharing_paused_for_ip_change() })
     }
 
     /// Override the eD2k ports. Takes effect on the NEXT start().

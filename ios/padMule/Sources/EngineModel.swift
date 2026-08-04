@@ -108,6 +108,16 @@ final class EngineModel: ObservableObject {
     /// without this the first real action a new user takes appears to do nothing.
     @Published private(set) var connectingTo: String?
     @Published var serverKick: String?
+    /// Our public address (the HighID client id) changed between two logins -
+    /// the engine has ALREADY paused sharing by the time this arrives, since a
+    /// change usually means a VPN tunnel dropped and stock iOS has no kill
+    /// switch. Settable so the alert can dismiss; the address itself never
+    /// reaches the screen - see the .publicAddressChanged case in apply(_:).
+    @Published var publicAddressAlert: Bool = false
+    /// True while sharing is paused because of that address change. Polled as a
+    /// SNAPSHOT (like `sharing`/`server`) so it survives past the one-shot
+    /// alert and drives a persistent banner + the Shared-screen caption.
+    @Published private(set) var sharingPausedForIpChange = false
 
     @Published private(set) var results: [SearchHit] = []
     /// The connected server has more result pages ("Load more results", #13).
@@ -873,6 +883,7 @@ final class EngineModel: ObservableObject {
             let ipf = e.ipFilterRanges()
             let srv = e.serverInfo()
             let shr = e.isSharing()
+            let ipPause = e.sharingPausedForIpChange()
             let stats = e.transferStats()
             let mapped = e.hasPortMapping()
             let evs = e.drainEvents()
@@ -891,6 +902,7 @@ final class EngineModel: ObservableObject {
                 self.ipFilterRanges = ipf
                 self.server = srv
                 self.sharing = shr
+                self.sharingPausedForIpChange = ipPause
                 self.portMapped = mapped
                 self.sampleStats(stats)
                 for ev in evs { self.apply(ev) }
@@ -973,6 +985,16 @@ final class EngineModel: ObservableObject {
             serverKick = addr
             server = nil
             loadServers()
+        case .publicAddressChanged:
+            // Our public address (the HighID client id) IS our route out. A
+            // change usually means a VPN tunnel dropped, or the device jumped
+            // networks - either way our traffic would otherwise keep leaving
+            // by a route the user did not choose, with nothing on screen to
+            // say so. Error-level: this is a privacy event, not routine
+            // status. The engine has ALREADY paused sharing by the time this
+            // arrives; the address itself must never appear here or on screen.
+            engineLog.error("public address changed - sharing paused by the engine")
+            publicAddressAlert = true
         case .kad(let contacts):
             // Only on CHANGE: this one can arrive on every poll, and a log that
             // repeats itself once a second is a log nobody reads.

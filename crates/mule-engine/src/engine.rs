@@ -1020,6 +1020,12 @@ pub enum EngineState {
 /// UniFFI layer can carry it to Swift directly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EngineEvent {
+    /// Our public address changed between two HighID logins - most importantly,
+    /// a VPN tunnel that dropped. Carries NO payload: the address is exactly
+    /// what must not reach the screen (see `connect_to_server`, which refuses to
+    /// record the client id for the same reason). Sharing has already been
+    /// paused by the time this is emitted.
+    PublicAddressChanged,
     /// The coarse lifecycle state changed.
     State(EngineState),
     /// A human-readable status line ("Reconnecting...", "Connected", "Paused").
@@ -1161,6 +1167,12 @@ pub struct Engine {
     /// a stale value only disables the echo (the key-echo gate is IP-equality),
     /// never mis-verifies. Host order (first octet = MSByte), matching
     /// `udp_verify_key`. Never emitted - it is our public IP verbatim.
+    /// The last HighID client id we were assigned, which IS our public address.
+    /// Kept ONLY to notice a change; never emitted, never rendered.
+    last_public_id: Option<u32>,
+    /// True while sharing is off BECAUSE the address changed, so the UI can keep
+    /// saying why and `set_sharing(true)` can clear it.
+    sharing_paused_for_ip_change: bool,
     /// The port we BIND for inbound peer connections.
     listen_port: u16,
     /// The port we ADVERTISE to servers and peers. Differs from `listen_port`
@@ -1239,6 +1251,8 @@ impl Engine {
             server: None,
             connection: None,
             kad: None,
+            last_public_id: None,
+            sharing_paused_for_ip_change: false,
             listen_port: TCP_PORT,
             advertised_port: TCP_PORT,
             kad_port: KAD_UDP_PORT,
@@ -1426,8 +1440,41 @@ impl Engine {
 
     /// Turn uploading on or off. Off is the download-only "Leech Mode"; the
     /// listener consults this per connection, so it takes effect immediately.
-    pub fn set_sharing(&self, on: bool) {
+    pub fn set_sharing(&mut self, on: bool) {
         self.sharing.store(on, Ordering::Relaxed);
+        if on {
+            // The user has decided; stop saying we paused for them.
+            self.sharing_paused_for_ip_change = false;
+        }
+    }
+
+    /// True while sharing is off because the public address changed under us.
+    pub fn sharing_paused_for_ip_change(&self) -> bool {
+        self.sharing_paused_for_ip_change
+    }
+
+    /// Note the client id from a login. A HighID id IS our public address, so a
+    /// CHANGE between logins means our traffic is now leaving by a different
+    /// route - on a VPN, that is the tunnel having dropped, and stock iOS has no
+    /// kill switch to stop it. Pause sharing (uploads are what publish us most
+    /// loudly) and warn.
+    ///
+    /// A LowID login carries no public address, so it neither trips the guard
+    /// nor overwrites what we knew. The address itself is compared here and
+    /// never leaves this function.
+    pub fn note_public_id(&mut self, id: u32, low_id: bool) {
+        if low_id {
+            return;
+        }
+        match self.last_public_id {
+            Some(prev) if prev != id => {
+                self.sharing.store(false, Ordering::Relaxed);
+                self.sharing_paused_for_ip_change = true;
+                self.emit(EngineEvent::PublicAddressChanged);
+            }
+            _ => {}
+        }
+        self.last_public_id = Some(id);
     }
 
     /// The "update server list when connecting" pref (eMule AddServersFromServer;
@@ -1893,11 +1940,15 @@ impl Engine {
         let tx = self.server_sender();
         let mut link = ServerLink::new(addr, login, tx);
         if let Ok(Ok(ServerState::Connected {
+            id,
             low_id,
             related_search,
-            ..
         })) = timeout(Duration::from_secs(12), link.connect()).await
         {
+            // A HighID id IS our public address: notice if it changed under us
+            // (a dropped VPN tunnel, a network switch) and pause sharing if so.
+            // The value is compared internally and never recorded for display.
+            self.note_public_id(id, low_id);
             // The client id is deliberately NOT recorded here: a HighID id encodes
             // our public IP and this text reaches the screen.
             let addr_str = addr.to_string();
@@ -3369,13 +3420,16 @@ impl Engine {
             // Re-run the handshake on the existing link, or find a new server if
             // we never had one (or the old one is gone). Correct across an IP
             // change, which is the whole point on a mobile device.
+            // Captured inside the &mut self.server borrow, applied after it ends.
+            let mut new_public_id: Option<(u32, bool)> = None;
             let resumed = match &mut self.server {
                 Some(s) => match timeout(Duration::from_secs(12), s.resume()).await {
                     Ok(Ok(ServerState::Connected {
+                        id,
                         low_id,
                         related_search,
-                        ..
                     })) => {
+                        new_public_id = Some((id, low_id));
                         // Re-record: the ID can flip across an IP change, which
                         // is exactly what resume() exists to survive. The server's
                         // related-search capability comes back on the fresh
@@ -3396,6 +3450,11 @@ impl Engine {
                 },
                 None => false,
             };
+            if let Some((id, low_id)) = new_public_id {
+                // Same guard as connect_to_server: a resume is a FRESH login, and
+                // a resume is exactly when a tunnel is most likely to have gone.
+                self.note_public_id(id, low_id);
+            }
             if !resumed {
                 // The server we were on did not come back. Do NOT auto-pick
                 // another (eMule does not either); drop it and let the user
@@ -4419,6 +4478,133 @@ mod tests {
             "the server must be told the port the PROVIDER forwards, not the one we bind"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A HighID client id IS our public address, so a CHANGE in it between two
+    /// logins means our traffic is leaving by a different route than before -
+    /// most importantly, a VPN tunnel that dropped. Stock iOS has no kill
+    /// switch, so padMule would otherwise keep seeding from the real address
+    /// with nothing on screen to say so. Sharing is therefore paused and the
+    /// user is warned LOUDLY.
+    ///
+    /// PRIVACY: the address is compared internally and NEVER emitted - the
+    /// event carries no payload at all, for the same reason `connect_to_server`
+    /// refuses to record the client id in any user-visible text.
+    #[test]
+    fn a_changed_public_address_pauses_sharing_and_warns() {
+        let dir = tmp("ip-change");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut engine, mut rx) = Engine::new(&dir).unwrap();
+        assert!(engine.is_sharing(), "sharing is on by default");
+
+        // First HighID login: nothing to compare against yet.
+        engine.note_public_id(0x0102_0304, false);
+        assert!(
+            engine.is_sharing(),
+            "the first login must not trip the guard"
+        );
+        assert!(!engine.sharing_paused_for_ip_change());
+
+        // Same address again (a reconnect to the same server): still fine.
+        engine.note_public_id(0x0102_0304, false);
+        assert!(engine.is_sharing(), "an unchanged address is not a leak");
+
+        // A LowID login tells us nothing about our public address, so it must
+        // neither trip the guard nor overwrite what we knew.
+        engine.note_public_id(7, true);
+        assert!(engine.is_sharing(), "LowID carries no public address");
+
+        // The address changed -> the tunnel may have dropped.
+        engine.note_public_id(0x0506_0708, false);
+        assert!(!engine.is_sharing(), "sharing must be paused");
+        assert!(engine.sharing_paused_for_ip_change());
+
+        let evs = drain_sync(&mut rx);
+        assert!(
+            evs.iter()
+                .any(|e| matches!(e, EngineEvent::PublicAddressChanged)),
+            "a loud, payload-free warning must reach the UI; got {evs:?}"
+        );
+        for e in &evs {
+            if let EngineEvent::Server(t) | EngineEvent::Status(t) = e {
+                assert!(
+                    !t.contains("1.2.3.4") && !t.contains("5.6.7.8"),
+                    "the address must never reach a user-visible string: {t}"
+                );
+            }
+        }
+
+        // The user turning sharing back on clears the latch - otherwise the
+        // warning state would be permanent for the session.
+        engine.set_sharing(true);
+        assert!(!engine.sharing_paused_for_ip_change());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ...and the guard must run on the REAL login path, not merely as a helper.
+    /// A mock server that hands out a DIFFERENT HighID on the second connect is
+    /// the exact shape of a tunnel dropping between sessions.
+    #[tokio::test]
+    async fn a_reconnect_with_a_different_high_id_pauses_sharing() {
+        let dir = tmp("ip-change-live");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut engine, mut rx) = Engine::new(&dir).unwrap();
+
+        // Hands out id 0x0A000001 first, then 0x0B000002 - two different public
+        // addresses, as a dropped tunnel would produce.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let ids = [0x0A00_0001u32, 0x0B00_0002u32];
+            let mut n = 0usize;
+            while let Ok((sock, _)) = listener.accept().await {
+                let id = ids[n.min(ids.len() - 1)];
+                n += 1;
+                tokio::spawn(async move {
+                    let mut sfs = crate::framed::FramedStream::new(sock);
+                    if sfs.read_packet().await.is_err() {
+                        return;
+                    }
+                    let _ = sfs
+                        .write_packet(&mule_proto::Packet::new(
+                            mule_proto::PROT_EDONKEY,
+                            crate::server_messages::OP_IDCHANGE,
+                            id.to_le_bytes().to_vec(),
+                        ))
+                        .await;
+                    while sfs.read_packet().await.is_ok() {}
+                });
+            }
+        });
+
+        assert!(engine.connect_to_server(addr).await);
+        assert!(engine.is_sharing(), "first login: nothing to compare");
+        let _ = drain(&mut rx).await;
+
+        assert!(engine.connect_to_server(addr).await);
+        assert!(
+            !engine.is_sharing(),
+            "a different public address on reconnect must pause sharing"
+        );
+        assert!(engine.sharing_paused_for_ip_change());
+        let evs = drain(&mut rx).await;
+        assert!(
+            evs.iter()
+                .any(|e| matches!(e, EngineEvent::PublicAddressChanged)),
+            "and warn; got {evs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Drain without awaiting (the sender is synchronous here).
+    fn drain_sync(rx: &mut mpsc::UnboundedReceiver<EngineEvent>) -> Vec<EngineEvent> {
+        let mut out = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            out.push(e);
+        }
+        out
     }
 
     /// VPN readiness: the port we ADVERTISE and the port we BIND are different
