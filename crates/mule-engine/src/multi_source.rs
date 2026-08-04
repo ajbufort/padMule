@@ -17,7 +17,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -212,6 +212,18 @@ pub struct Download {
     /// of one that is still running (pause() does not abort the old task), which
     /// would multiply outbound peer connections every background/foreground cycle.
     fetching: AtomicBool,
+    /// When the idle-retry sweep last PICKED this download, as engine-uptime
+    /// seconds. Starvation guard: the sweep used to sort by priority and take
+    /// `.first()`, and Rust's sort is STABLE, so with every download at the same
+    /// (Normal) priority it returned the SAME one every single time and every
+    /// other download was never retried at all. With dozens queued that is not
+    /// "slow", it is "never".
+    last_retry_at: AtomicU64,
+    /// Wall-clock second at which this download last COMMITTED bytes. Drives the
+    /// "actually receiving right now" indicator: a row can be registered, hold
+    /// sources and still be moving nothing, and the screen could not tell those
+    /// apart.
+    last_byte_at: AtomicU64,
     /// Which source IP(s) contributed to each AICH BLOCK (keyed by the block's
     /// lattice start offset), recorded as data commits. On a part-hash failure
     /// the union over the part's blocks gives the old per-part view; after
@@ -271,6 +283,8 @@ impl Download {
             preview: AtomicBool::new(false),
             finalizing: AtomicBool::new(false),
             fetching: AtomicBool::new(false),
+            last_retry_at: AtomicU64::new(0),
+            last_byte_at: AtomicU64::new(0),
             block_sources: StdMutex::new(HashMap::new()),
             aich: StdMutex::new(AichState {
                 status: AichStatus::Empty,
@@ -321,6 +335,26 @@ impl Download {
     }
 
     /// True while a fetch task is live for this download.
+    /// True if bytes landed within the last `window_secs`. Deliberately a TIME
+    /// window rather than an instantaneous rate: at a block boundary, or between
+    /// blocks on a slow link, a rate legitimately reads zero, and an indicator
+    /// that blinks off every few seconds is worse than none. Same reasoning as
+    /// keep-awake watching a WINDOW of rate samples.
+    pub fn is_receiving(&self, now_secs: u64, window_secs: u64) -> bool {
+        let last = self.last_byte_at.load(Ordering::Relaxed);
+        last != 0 && now_secs.saturating_sub(last) <= window_secs
+    }
+
+    /// When the retry sweep last picked this download (engine-uptime seconds).
+    pub fn last_retry_at(&self) -> u64 {
+        self.last_retry_at.load(Ordering::Relaxed)
+    }
+
+    /// Stamp it as picked, so the sweep moves on to someone else next time.
+    pub fn mark_retried(&self, at_secs: u64) {
+        self.last_retry_at.store(at_secs, Ordering::Relaxed);
+    }
+
     pub fn is_fetching(&self) -> bool {
         self.fetching.load(Ordering::Acquire)
     }
@@ -614,6 +648,13 @@ impl Download {
         data: &[u8],
         source: Option<SocketAddr>,
     ) -> io::Result<()> {
+        // Bytes really arrived. This is what the activity indicator reads - a
+        // row can be registered, hold sources and still be moving nothing, and
+        // until now the screen could not tell those apart.
+        self.last_byte_at.store(
+            u64::from(crate::credit_store::now_secs()),
+            Ordering::Relaxed,
+        );
         // Remember which source fed each AICH block this write touches, so a
         // later failure can be attributed - per part without AICH
         // (localize_corruption), per BLOCK with it (apply_aich_recovery).
@@ -2078,6 +2119,79 @@ mod tests {
             "the ban catches the same IP on a new port (LowID callback case)"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_idle_retry_sweep_rotates_instead_of_starving() {
+        // THE BUG behind "many files partially download and then stop or crawl"
+        // with dozens queued. The sweep picked ONE idle download per 45s using
+        // `sort_by_key(Reverse(priority))` then `.first()`. Rust's sort is
+        // STABLE, so with every download at the same Normal priority it returned
+        // the SAME one on every sweep, forever - the rest were never retried at
+        // all. Not slow: never.
+        //
+        // This drives the same selection the sweep uses. Priority still wins;
+        // within a tier the least-recently-retried goes next, and the stamp is
+        // applied on SELECTION so a retry that finds no sources still yields.
+        struct D {
+            name: &'static str,
+            priority: u8,
+            last: u64,
+        }
+        fn pick(ds: &mut [D], now: u64) -> &'static str {
+            let i = ds
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, d)| (std::cmp::Reverse(d.priority), d.last))
+                .map(|(i, _)| i)
+                .unwrap();
+            ds[i].last = now;
+            ds[i].name
+        }
+
+        // Six equal-priority downloads, as a real queue looks.
+        let mut ds: Vec<D> = ["a", "b", "c", "d", "e", "f"]
+            .iter()
+            .map(|n| D {
+                name: n,
+                priority: 1,
+                last: 0,
+            })
+            .collect();
+        let picked: Vec<&str> = (1..=6).map(|t| pick(&mut ds, t)).collect();
+        assert_eq!(
+            picked,
+            vec!["a", "b", "c", "d", "e", "f"],
+            "every download must get a turn - the old code returned 'a' six times"
+        );
+        // Seventh sweep wraps to the oldest again.
+        assert_eq!(pick(&mut ds, 7), "a", "rotation wraps");
+
+        // Priority still wins, but cannot starve its own tier.
+        let mut ds = vec![
+            D {
+                name: "high1",
+                priority: 2,
+                last: 0,
+            },
+            D {
+                name: "high2",
+                priority: 2,
+                last: 0,
+            },
+            D {
+                name: "normal",
+                priority: 1,
+                last: 0,
+            },
+        ];
+        assert_eq!(pick(&mut ds, 1), "high1");
+        assert_eq!(
+            pick(&mut ds, 2),
+            "high2",
+            "the other High goes next, not High1 again"
+        );
+        assert_eq!(pick(&mut ds, 3), "high1", "then back round the High tier");
     }
 
     #[tokio::test]

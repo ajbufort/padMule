@@ -197,6 +197,11 @@ pub struct DownloadInfo {
     /// beside the percentage, because "which channel is feeding this" is
     /// otherwise invisible and it is the first thing you want to know when one
     /// file flies and another crawls.
+    /// True if bytes landed in the last few seconds - "actually receiving right
+    /// now", as opposed to merely registered and hopeful. A TIME window, not an
+    /// instantaneous rate: at a block boundary the rate legitimately reads zero,
+    /// and an indicator that blinks off every few seconds is worse than none.
+    pub receiving: bool,
     pub sources_server: u32,
     pub sources_kad: u32,
     pub sources_exchange: u32,
@@ -415,6 +420,11 @@ async fn ranked_to_hits(g: &Engine, ranked: Vec<RankedFile>) -> Vec<SearchHit> {
 
 /// The single object the native UI holds. Thread-safe; drive it with the
 /// lifecycle methods and poll [`MuleEngine::drain_events`].
+/// How recently bytes must have landed for a row to read as ACTIVE. Three
+/// seconds spans an ordinary gap between blocks without holding the light on
+/// through a real stall.
+const RECEIVING_WINDOW_SECS: u64 = 3;
+
 #[derive(uniffi::Object)]
 pub struct MuleEngine {
     rt: Runtime,
@@ -684,6 +694,7 @@ impl MuleEngine {
     pub fn downloads(&self) -> Vec<DownloadInfo> {
         self.rt.block_on(async {
             let mut out = Vec::new();
+            let now = u64::from(mule_engine::credit_store::now_secs());
             for dl in self.handles.downloads().await {
                 let size = dl.size().await;
                 let have = size - dl.missing().await;
@@ -700,6 +711,7 @@ impl MuleEngine {
                     priority: dl.priority(),
                     preview: dl.is_preview(),
                     contiguous_prefix: dl.contiguous_prefix().await,
+                    receiving: dl.is_receiving(now, RECEIVING_WINDOW_SECS),
                     sources_server: origins.0,
                     sources_kad: origins.1,
                     sources_exchange: origins.2,
