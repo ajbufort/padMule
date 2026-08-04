@@ -118,7 +118,16 @@ pub struct KadNode {
     kad_id: Kad128,
     udp_key: u32,
     tcp_port: u16,
+    /// The UDP port we actually BOUND.
     udp_port: u16,
+    /// The UDP port to ADVERTISE, when it differs from the bound one. A VPN
+    /// forwarder that maps a remote port to a DIFFERENT local port makes these
+    /// two genuinely different numbers: we must bind the local one to receive,
+    /// but tell peers the remote one or they dial a port nobody forwards. The
+    /// eD2k TCP side has had this split since 8bd; Kad used one value for both,
+    /// which is the gap that split predicted would need closing "only if a
+    /// remap is needed" - it is.
+    advertised_udp_port: Option<u16>,
     routing: RoutingTable,
     /// The user IP blocklist (ipfilter.dat/.p2p), if loaded. eMule consults it on
     /// every Kad routing insert (RoutingZone.cpp:477); padMule threads the engine's
@@ -165,10 +174,22 @@ impl KadNode {
             udp_key,
             tcp_port,
             udp_port,
+            advertised_udp_port: None,
             routing: RoutingTable::new(kad_id),
             ip_filter: None,
             current_public_ip: 0,
         })
+    }
+
+    /// Advertise a UDP port different from the one we bound (a VPN remote->local
+    /// remap). `None` restores "advertise what we bound".
+    pub fn set_advertised_udp_port(&mut self, port: Option<u16>) {
+        self.advertised_udp_port = port.filter(|&p| p != 0);
+    }
+
+    /// The UDP port peers should dial us on.
+    fn advertised_udp(&self) -> u16 {
+        self.advertised_udp_port.unwrap_or(self.udp_port)
     }
 
     /// Set our current public IPv4 (from the UPnP/SSDP HighID path), against which
@@ -406,7 +427,12 @@ impl KadNode {
         // HELLO_RES_ACK" and is the RESPONDER's to set in its HELLO_RES (eMule
         // SendMyDetails, KademliaUDPListener.cpp:139). Setting it on a REQUEST is
         // wrong (it trips aMule's AddContact2 wxFAIL) and earns nothing.
-        let (op, payload) = build_hello_req(&self.kad_id, self.tcp_port, Some(self.udp_port), None);
+        let (op, payload) = build_hello_req(
+            &self.kad_id,
+            self.tcp_port,
+            Some(self.advertised_udp()),
+            None,
+        );
         let frame = pack_kad(op, payload);
         let dest = contact_addr(contact.ip, contact.udp_port);
         let (res_payload, verified, peer_vk) = self
