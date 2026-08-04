@@ -4,6 +4,7 @@
 
 pub mod clients_met;
 pub mod ipfilter;
+pub mod known2_met;
 pub mod known_met;
 pub mod nodes_dat;
 pub mod part_met;
@@ -16,6 +17,10 @@ pub use clients_met::{
     CREDIT_FILE_VERSION,
 };
 pub use ipfilter::{IpFilter, DEFAULT_IPFILTER_LEVEL};
+pub use known2_met::{
+    empty_known2_met, known2_entry_bytes, read_known2_entry, read_known2_met, remove_known2_entry,
+    scan_known2_met, Known2Entry, Known2Index, KNOWN2_MET_VERSION,
+};
 pub use known_met::{
     read_known_met, write_known_met, KnownFileEntry, KnownMet, MET_HEADER,
     MET_HEADER_WITH_LARGEFILES,
