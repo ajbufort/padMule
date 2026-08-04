@@ -42,6 +42,24 @@ final class SettingsTests: XCTestCase {
         XCTAssertTrue(d.bool(forKey: SettingsKey.pauseSharingOnCellular))
     }
 
+    /// UPnP must default OFF, and this asserts the REAL registration rather than
+    /// a restatement of it - `SettingsDefaults.register()` is what actually runs
+    /// at launch, and it is what `@AppStorage` reads. The pairing matters: the
+    /// port defaults are 5999 (a VPN-forwarded port), and on a VPN a LAN-router
+    /// mapping is a no-op the tunnel bypasses, so leaving UPnP on could only
+    /// produce a misleading Port-mapping row. If someone flips this back, the
+    /// two must move together.
+    func testUpnpDefaultsOffToMatchTheVpnPortDefaults() {
+        SettingsDefaults.register()
+        let d = UserDefaults.standard
+        XCTAssertFalse(
+            d.bool(forKey: SettingsKey.upnpEnabled),
+            "UPnP must default OFF - the 5999 port defaults assume a VPN forwards the port")
+        XCTAssertEqual(d.integer(forKey: SettingsKey.listenPort), 5999)
+        XCTAssertEqual(d.integer(forKey: SettingsKey.advertisedPort), 5999)
+        XCTAssertEqual(d.integer(forKey: SettingsKey.kadPort), 5999)
+    }
+
     func testServerListUrlValidationAndDedup() {
         // The rule the model applies before accepting a URL: http/https only, and
         // no duplicates. Re-stated here to pin the contract.

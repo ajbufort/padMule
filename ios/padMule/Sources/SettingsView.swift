@@ -21,7 +21,11 @@ struct SettingsView: View {
     @AppStorage(SettingsKey.askServersForServers) private var askServers = true
     @AppStorage(SettingsKey.defaultPriority) private var defaultPriority = 1
     @AppStorage(SettingsKey.rememberSearchFilters) private var rememberFilters = true
-    @AppStorage(SettingsKey.upnpEnabled) private var upnpEnabled = true
+    // Must agree with the registered default in Settings.register (false):
+    // this initializer is what SwiftUI uses when no default is registered, and
+    // a disagreement shows the toggle in one state while the engine is in the
+    // other.
+    @AppStorage(SettingsKey.upnpEnabled) private var upnpEnabled = false
 
     @State private var newUrl = ""
 
