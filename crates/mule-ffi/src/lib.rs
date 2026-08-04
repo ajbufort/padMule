@@ -419,6 +419,10 @@ async fn ranked_to_hits(g: &Engine, ranked: Vec<RankedFile>) -> Vec<SearchHit> {
 pub struct MuleEngine {
     rt: Runtime,
     inner: Mutex<Engine>,
+    /// Read-only handles that do NOT need the engine lock. This is what stops a
+    /// long `search`/`crawl` - which holds `&mut Engine` across its whole
+    /// network wait - from freezing the 1s UI poll behind it.
+    handles: mule_engine::engine::EngineHandles,
     events: Mutex<UnboundedReceiver<EngineEvent>>,
 }
 
@@ -443,8 +447,10 @@ impl MuleEngine {
             .map_err(|e| FfiError::Io {
                 message: e.to_string(),
             })?;
+        let handles = engine.handles();
         Ok(Arc::new(MuleEngine {
             rt,
+            handles,
             inner: Mutex::new(engine),
             events: Mutex::new(rx),
         }))
@@ -601,20 +607,17 @@ impl MuleEngine {
     /// Cumulative session transfer totals (down, up) in bytes. Polled by the UI
     /// to draw the rate history + ratio; monotonic, so sampling is race-free.
     pub fn transfer_stats(&self) -> TransferStats {
-        self.rt.block_on(async {
-            let (total_down, total_up) = self.inner.lock().await.transfer_totals();
-            TransferStats {
-                total_down,
-                total_up,
-            }
-        })
+        let (total_down, total_up) = self.handles.transfer_totals();
+        TransferStats {
+            total_down,
+            total_up,
+        }
     }
 
     /// Whether padMule serves the files it has to other peers. `false` is
     /// "Leech Mode": downloading still works, but nothing is uploaded.
     pub fn is_sharing(&self) -> bool {
-        self.rt
-            .block_on(async { self.inner.lock().await.is_sharing() })
+        self.handles.is_sharing()
     }
 
     /// Turn uploading on or off. Off is the download-only "Leech Mode"; it takes
@@ -668,17 +671,20 @@ impl MuleEngine {
             .block_on(async { self.inner.lock().await.set_add_servers_from_server(on) });
     }
 
-    /// Snapshots of every in-progress download. This is ALSO the engine's
-    /// heartbeat: each call drains pending share re-announces, finalizes
-    /// downloads that completed outside a fetch task, detects a server
-    /// drop/kick, runs the periodic checkpoint, and merges gossip-harvested
-    /// servers into server.met. The UI's 1s poll must keep calling it - if this
-    /// ever stops, those five background duties silently stop with it.
+    /// Snapshots of every in-progress download - NO ENGINE LOCK.
+    ///
+    /// This reads the downloads `Arc` and each `Download`'s own lock, so it
+    /// keeps answering while a ~20s search or ~10s crawl holds `&mut Engine`.
+    /// That is the whole point: the progress numbers are what the user watches,
+    /// and they used to freeze for the entire search.
+    ///
+    /// It used to ALSO be the engine's heartbeat. That is now `heartbeat()` -
+    /// reading is not maintenance, and bundling them is what forced the read to
+    /// take the lock in the first place.
     pub fn downloads(&self) -> Vec<DownloadInfo> {
         self.rt.block_on(async {
-            let mut g = self.inner.lock().await;
             let mut out = Vec::new();
-            for dl in g.downloads().await {
+            for dl in self.handles.downloads().await {
                 let size = dl.size().await;
                 let have = size - dl.missing().await;
                 let (rating, has_comment) = dl.rating_summary().await;
@@ -699,32 +705,35 @@ impl MuleEngine {
                     sources_exchange: origins.2,
                 });
             }
-            // The 1s downloads() poll is the engine's heartbeat: drain any pending
-            // share change here, so a download that finished mid-session gets
-            // re-announced to the server (OP_OFFERFILES) within about a second.
-            g.maintain_shares().await;
-            // Finalize any download that reached 100% outside a fetch task (a LowID
-            // callback served the last bytes, or completion after the sweep budget),
-            // so it gets verified + moved + shared instead of sitting complete.
-            g.finalize_completed().await;
-            // Detect a server drop/kick within ~1s and emit ServerDropped (the UI
-            // shows a dialog). Cancel-safe peek, so this never disturbs framing.
-            g.poll_server_drop().await;
-            // Re-checkpoint every few minutes so a suspend-kill that never
-            // delivers .background (and so never reaches pause()) cannot cost the
-            // whole session's download progress, Kad table and credits. Gated on
-            // elapsed time, so almost every call here is just a clock comparison.
-            g.maintain_checkpoint().await;
-            // Stop sharing anything the user deleted in the Files app.
-            g.maintain_share_verify().await;
-            // Re-drive a download that went idle (the missing retry).
-            g.maintain_resume_fetches().await;
-            // Merge any servers a connected server advertised (OP_SERVERLIST) into
-            // server.met - the gossip crawl's first step. A no-op (one lock check)
-            // unless a server actually gossiped since the last poll.
-            g.maintain_server_harvest().await;
             out
         })
+    }
+
+    /// THE ENGINE'S HEARTBEAT. The UI must call this about once a second.
+    ///
+    /// It drains pending share re-announces, finalizes downloads that completed
+    /// outside a fetch task, detects a server drop/kick, runs the periodic
+    /// checkpoint, unshares files deleted in the Files app, re-drives idle
+    /// downloads, and merges gossip-harvested servers into server.met.
+    ///
+    /// IF THIS STOPS BEING CALLED, all seven stop SILENTLY - nothing errors and
+    /// nothing on screen changes; downloads simply stall, finished files are
+    /// never shared, and a kick goes unnoticed. It used to be a side effect of
+    /// `downloads()`, which made it impossible to forget but also forced every
+    /// progress read to queue behind a 20s search. Split deliberately; the
+    /// coupling is now a caller obligation, stated here because that is the
+    /// price of the split.
+    pub fn heartbeat(&self) {
+        self.rt.block_on(async {
+            let mut g = self.inner.lock().await;
+            g.maintain_shares().await;
+            g.finalize_completed().await;
+            g.poll_server_drop().await;
+            g.maintain_checkpoint().await;
+            g.maintain_share_verify().await;
+            g.maintain_resume_fetches().await;
+            g.maintain_server_harvest().await;
+        });
     }
 
     /// The sources connected for one download (per-source detail). Empty for an
@@ -775,16 +784,13 @@ impl MuleEngine {
     /// "handed back" would describe work that never happened. A boolean, never
     /// the address - that is our public IP.
     pub fn has_port_mapping(&self) -> bool {
-        self.rt
-            .block_on(async { self.inner.lock().await.has_port_mapping() })
+        self.handles.has_port_mapping()
     }
 
     /// Snapshots of the shared library - the complete files we serve to peers.
     pub fn shared_files(&self) -> Vec<SharedFileInfo> {
         self.rt.block_on(async {
-            self.inner
-                .lock()
-                .await
+            self.handles
                 .shared_files()
                 .await
                 .into_iter()
@@ -975,11 +981,63 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
+        let handles = engine.handles();
         Arc::new(MuleEngine {
             rt,
+            handles,
             inner: Mutex::new(engine),
             events: Mutex::new(rx),
         })
+    }
+
+    #[test]
+    fn the_ui_polls_answer_while_the_engine_lock_is_held() {
+        // THE POINT OF THE SPLIT. Engine::search holds `&mut Engine` across its
+        // whole tokio::join! of the server, Kad and global arms - up to ~20s -
+        // and every UI poll used to queue behind that, so the transfer numbers
+        // froze for the entire search.
+        //
+        // Hold the engine lock explicitly and prove the five read-only polls
+        // still answer. If any of them regresses to taking `inner`, this test
+        // does not fail slowly - it DEADLOCKS, which the timeout below turns
+        // into a clean failure.
+        let dir = tmp("lockfree");
+        let _ = std::fs::create_dir_all(&dir);
+        let e = offline_engine(&dir, &dir);
+        let e2 = Arc::clone(&e);
+
+        // A thread parks on the engine mutex, standing in for a long search.
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            e2.rt.block_on(async {
+                let _guard = e2.inner.lock().await;
+                tx.send(()).unwrap();
+                // Keep holding until the reads are done.
+                let _ = done_rx.recv();
+            });
+        });
+        rx.recv().unwrap(); // the lock is now held
+
+        let reads = std::thread::spawn(move || {
+            let _ = e.downloads();
+            let _ = e.shared_files();
+            let _ = e.is_sharing();
+            let _ = e.transfer_stats();
+            let _ = e.has_port_mapping();
+            "read"
+        });
+        // Generous: this either returns in microseconds or never.
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        assert!(
+            reads.is_finished(),
+            "a UI poll blocked on the engine lock - the split regressed"
+        );
+        assert_eq!(reads.join().unwrap(), "read");
+
+        done_tx.send(()).unwrap();
+        holder.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
