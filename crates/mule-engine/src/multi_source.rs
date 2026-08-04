@@ -727,10 +727,26 @@ impl Download {
                 if union.len() == 1 {
                     banned.extend(union);
                 }
-                a.pending.entry(*p).or_insert(PendingRecovery {
-                    claim: None,
-                    contributors,
-                });
+                // A part can fail MD4 AGAIN before its recovery ever runs (a
+                // root only becomes trusted once 10 unique /20s agree, so the
+                // early rounds have none). The blocks just re-fetched are the
+                // ones that failed this time, so their contributors REPLACE
+                // the previous round's; blocks nobody re-sent keep the
+                // evidence we already had. An `or_insert` here dropped the
+                // fresh map wholesale and left the stale one to be blamed -
+                // which would ban the EARLIER source for bytes it never sent,
+                // the one thing the sole-contributor rule exists to prevent.
+                match a.pending.entry(*p) {
+                    std::collections::hash_map::Entry::Occupied(mut o) => {
+                        o.get_mut().contributors.extend(contributors);
+                    }
+                    std::collections::hash_map::Entry::Vacant(v) => {
+                        v.insert(PendingRecovery {
+                            claim: None,
+                            contributors,
+                        });
+                    }
+                }
             }
         }
         true
@@ -969,10 +985,14 @@ impl Download {
             // so a failure here leaves the file in the same honest state a
             // plain MD4 failure would. `None` = no part hash to check against,
             // which is not a verdict.
-            let agrees = matches!(g.store.verify_part(part), Ok(Some(false)));
+            // NAME THE VERDICT IT HOLDS: `Ok(Some(false))` is verify_part
+            // saying the part does NOT match. This read as `agrees` before,
+            // which is the exact inversion a later reader "corrects" into a
+            // real bug.
+            let disagrees = matches!(g.store.verify_part(part), Ok(Some(false)));
             let _ = g.store.save_met();
             drop(g);
-            if agrees {
+            if disagrees {
                 let mut a = self.aich.lock().unwrap();
                 a.status = AichStatus::Error;
                 a.master = None;
@@ -1989,6 +2009,58 @@ mod tests {
             dl.is_banned(&bad_callback),
             "the ban catches the same IP on a new port (LowID callback case)"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_second_corruption_round_re_attributes_instead_of_blaming_the_first_source() {
+        // A part can fail MD4 twice before recovery ever runs: a root is only
+        // trusted once 10 unique /20s report it, so the early rounds have none
+        // and `pending` just accumulates. Round 2's contributors must REPLACE
+        // round 1's for the blocks that were re-fetched - otherwise the stale
+        // map is what the recovery pass blames, and it bans a source for bytes
+        // it never sent, breaking the sole-contributor no-false-positive rule.
+        let dir = tmpdir("localize-reattribute");
+        let size = (PARTSIZE + 300_000) as usize;
+        let good: Vec<u8> = (0..size as u32)
+            .map(|i| (i.wrapping_mul(23)) as u8)
+            .collect();
+        let hash = ed2k_hash(&good);
+        let ph = vec![
+            md4(&good[..PARTSIZE as usize]),
+            md4(&good[PARTSIZE as usize..]),
+        ];
+        let store = PartStore::create(&dir, 1, hash, size as u64, b"reattr.bin").unwrap();
+        let dl = Download::new(store);
+        dl.set_hashset(ph).await;
+
+        let a: SocketAddr = "1.1.1.1:4662".parse().unwrap();
+        let b: SocketAddr = "2.2.2.2:4662".parse().unwrap();
+        dl.commit(0, &good[..PARTSIZE as usize], Some(a))
+            .await
+            .unwrap();
+        let mut bad = good[PARTSIZE as usize..].to_vec();
+        bad[0] ^= 0xFF;
+
+        // Round 1: A alone feeds the bad part.
+        dl.commit(PARTSIZE, &bad, Some(a)).await.unwrap();
+        assert!(dl.localize_corruption().await);
+        // Round 2: the re-gapped part comes back from B, still bad.
+        dl.commit(PARTSIZE, &bad, Some(b)).await.unwrap();
+        assert!(dl.localize_corruption().await);
+
+        let a2 = dl.aich.lock().unwrap();
+        let pend = a2.pending.get(&1).expect("part 1 queued for recovery");
+        let blamed: HashSet<IpAddr> = pend.contributors.values().flatten().copied().collect();
+        assert!(
+            blamed.contains(&b.ip()),
+            "the source that actually re-sent the bad blocks must be on the hook"
+        );
+        assert!(
+            !blamed.contains(&a.ip()),
+            "round 1's source must not be blamed for round 2's bytes"
+        );
+        drop(a2);
         std::fs::remove_dir_all(&dir).ok();
     }
 
