@@ -1,128 +1,174 @@
 # HANDOFF - start here next session
 
-Updated: 2026-08-03 (one very long session: reanalysis -> doc-drift round ->
-OP_GETSERVERLIST -> the RECURSIVE UDP CRAWL -> server names -> the SEVEN-BUG
-USAGE-FEEDBACK ROUND -> VPN readiness -> on-glass fixes. Everything below is
-verified, not assumed, and what is NOT verified says so.)
+Updated: 2026-08-04 (written fresh at the close of a very long 2026-08-03
+session). Everything below is verified, not assumed; anything NOT verified
+says so explicitly.
 
-Living doc: replace it wholesale next time. Full narrative in [[build-progress]]
-rows 8av-8bi + the [[log]] entries for 2026-08-03.
+Living doc - replace it wholesale next time. Full narrative:
+[[build-progress]] rows 8av-8bi and the [[log]] entries for 2026-08-03.
 
-## State of the tree
+## READ THIS FIRST: there is unmerged AICH work in a worktree
 
-- All work committed AND pushed; tree clean; branch even with origin/main at
-  **d7d555a**.
+`.claude/worktrees/wave11-aich` (branch `worktree-wave11-aich`, LOCKED) holds
+**6 unmerged commits implementing wave 11 - AICH block recovery**, the last
+PARTIAL on the security scorecard, plus 4 files with uncommitted changes. It
+is ~3,400 lines across `aich.rs`, a new `known2_met.rs` codec, the 0x9B-0x9E
+packet codecs, serve-side root/recovery answers, download-side recovery with
+per-BLOCK corruption attribution, and an end-to-end wire-loop repair proof.
+
+It is **12 commits behind main** and mid-flight (uncommitted edits in
+`engine.rs`, `known2_store.rs`, `multi_source.rs`, `share.rs`). Do NOT delete
+the worktree and do not treat wave 11 as unstarted. Decide deliberately
+whether to rebase and finish it or park it; either way, the state above is
+what you inherit.
+
+## State of the tree (main)
+
+- Tree clean, all pushed. HEAD **0e65157**; last CODE commit **d7d555a**.
 - **Gate**: 564 Rust tests, clippy WARNING-FREE, fmt clean, ASCII clean.
-- CI: all three workflows GREEN on the last code commit.
-- ALL FOUR ORACLES re-run and PASS after the serve-path change: amuled
-  differential (byte-for-byte, 3 files), the REVERSE oracle (real amuled
-  downloads FROM padMule + serve-side secure-ident), the isolated eserver
-  login, and the Kad verify oracle.
-- [[security-model]] scorecard unchanged: **23 OPERATIONAL / 1 PARTIAL / 2
-  documented opt-outs**. The PARTIAL is AICH block recovery (wave 11).
-- Latest build staged for install:
+- **CI**: all three workflows green on d7d555a.
+- **All four oracles re-run and PASS** after this session's serve-path change:
+  amuled differential (byte-for-byte, 3 files), the REVERSE oracle (real
+  amuled downloads FROM padMule + serve-side secure-ident), the isolated
+  eserver login, and the Kad verify oracle.
+- [[security-model]]: **23 OPERATIONAL / 1 PARTIAL / 2 documented opt-outs**.
+  The PARTIAL is AICH block recovery - see the worktree note above.
+- Build staged for install:
   `C:\Users\ajbuf\Downloads\padMule-INSTALL-THIS-unsigned-d7d555a.ipa`.
 
 ## THE HARD DEADLINE
 
-**The free signing cert + provisioning profiles EXPIRE 2026-08-10.** After
-that, no new build installs until renewed via Sideloadly (Apple ID auth, App
-ID + device registration, cert issuance), then re-pull the profile with
-`ideviceprovision copy`.
+**The free signing cert + provisioning profiles EXPIRE 2026-08-10** - about
+six days out. After that, no new build installs until renewed through
+Sideloadly (Apple ID auth, App ID + device registration, cert issuance), then
+re-pull the profile with `ideviceprovision copy`. Renew early rather than
+discovering it mid-debug.
 
-## Where things actually stand
+## Where the project actually is
 
-**The app is in daily-driver shape.** Anthony's first extended usage session
-produced 18 items; four parallel investigations turned them into SEVEN
-confirmed bugs (8bb), all fixed TDD-first and mutation-checked, plus the whole
-UI batch (8bg). Two findings are worth carrying forward as lessons:
+padMule is a **daily driver**, not a demo: search (server + Kad merged),
+hash-verified downloads, uploads with credits and secure identity, four ways
+of discovering servers, and an honest iPadOS lifecycle. This session added:
 
-1. **Resume was broken - and ONLY when Kad was HEALTHY.** `find_sources` joins
-   its server and Kad arms so it returns in max(), and the Kad arm carries a
-   15s budget; `resume_fetches` wrapped the call in a 4s timeout that DISCARDED
-   everything, including server sources that had already arrived. `add_download`
-   calls the same function with no outer timeout, which is why adding worked and
-   resuming did not. Now bounded per-arm so partial results always survive.
-2. **Phantom shared files** - a file deleted in the Files app was still
-   announced, answered "COMPLETE" to peers, given an upload slot, then dropped
-   the connection. Verified at the serve path plus a 60s prune.
+- **A usage-feedback round that found SEVEN real bugs** (8bb) which a green
+  550-test suite, clean clippy and four passing oracles had all missed.
+- **Server discovery completed** (8az/8ba): the OP_GETSERVERLIST ask plus the
+  recursive UDP crawl. Device-verified: 10 seeds -> 35 servers, 32 named.
+- **VPN readiness** (8bd/8be): configurable ports with ADVERTISED separate
+  from LISTEN, a UPnP toggle, and a public-address-change guard that pauses
+  sharing because stock iOS has no kill switch.
+- **A large UI batch** (8bf-8bi) driven entirely by Anthony using the app.
 
-**VPN readiness is complete but UNPROVEN.** Anthony is moving padMule behind
-AirVPN. Ports are configurable (listen vs ADVERTISED - they differ under
-remote-to-local forwarding), UPnP can be switched off, and a public-address
-CHANGE pauses sharing and warns loudly, since stock iOS has no kill switch.
-See [[net-highid-and-port-forwarding]] for the AirVPN specifics, including
-that **port 4662 is NOT obtainable** (another subscriber holds it), which is
-what turned the port override from a nicety into a prerequisite.
+The two engine bugs worth carrying forward:
+
+1. **Resume was broken - and ONLY when Kad was HEALTHY.** `find_sources`
+   joins its server and Kad arms so it returns in max(), and the Kad arm
+   carries a 15s budget; `resume_fetches` wrapped the call in a 4s timeout
+   that DISCARDED everything, including server sources that had already
+   arrived. `add_download` calls the same function with no outer timeout -
+   which is exactly why adding a file worked and resuming the identical file
+   did not. Now bounded per-arm so partial results always survive.
+2. **Phantom shared files.** A file deleted in the Files app was still
+   announced via OP_OFFERFILES, answered "COMPLETE" to a requesting peer,
+   given an upload slot, then dropped the connection when the read failed.
+   Now refused at the serve path (honest FNF) plus a 60s prune.
+
+## DEVICE-VERIFIED vs not
+
+**Verified on glass** (2026-08-03 photos + an agent-driven WebDriverAgent
+pass): the function strip in its new order; Status reading Connected /
+HighID / 146 Kad contacts against a real Lugdunum server; the two-network
+health panel green on both; the gossip crawl ("Discovered 24 servers", table
+10 -> 35); server NAMES on discovered rows; Settings and its toggles; Stop
+releasing the router port and Start reclaiming it.
+
+**NOT verified on device**:
+- **The resume fix** (needs a background/foreground cycle with an active
+  download). Headline fix of the session; only the device can show it.
+- **The whole VPN path** - unprovable until the tunnel is up.
+- The Downloaded tab's QuickLook **Open**, the toolbar **Stop/Start**, the
+  **help** screen, the rewritten **port fields**, the banner changes, and the
+  **Servers** landing tab - all shipped after the last device pass.
+- The **metered-sharing pause** (needs a cellular link; rests on its unit
+  truth-table).
 
 ## Open tasks (ranked)
 
-1. **Prove the VPN path on device.** The AirVPN side is DONE: port 5999
-   reserved, TCP+UDP, All devices, "Local" cleared for same-port forwarding,
-   and the app now DEFAULTS all three ports to 5999. Remaining: UPnP off,
-   RESTART padMule (ports bind when the listener starts). Then AirVPN's Test open (only meaningful
-   with padMule running) and Status -> HighID. Expect the public-address guard
-   to fire once as the tunnel comes up; that is correct.
-   KNOWN LIMIT: the advertised/listen split covers the TCP port only - Kad's
-   UDP port is a single value used for both bind and advertise, so a
+1. **Finish and prove the VPN path.** AirVPN side is DONE: port **5999**
+   reserved, TCP+UDP, All devices, "Local" cleared so it forwards same-port;
+   the app now DEFAULTS all three port fields to 5999. Remaining on device:
+   **UPnP off**, **restart padMule** (ports bind when the listener starts),
+   then AirVPN's **Test open** (only meaningful with padMule running) and
+   Status -> **HighID**. Expect the public-address guard to fire once as the
+   tunnel comes up and pause sharing - that is correct; re-enable after
+   confirming HighID.
+   KNOWN LIMIT: the advertised/listen split covers the **TCP** port only.
+   Kad's UDP port is one value used for both bind and advertise, so a
    remote-to-local REMAP would break Kad's inbound reachability. Same-port
-   forwarding sidesteps it. Add a fourth field only if a remap becomes
-   necessary.
-2. **Device-verify what the photos have not shown**: the resume fix (needs a
-   background/foreground cycle with an active download - the headline fix of
-   the whole session), the Downloaded tab's QuickLook Open, and the
-   metered-sharing pause (needs a cellular link).
-3. **Get blocking engine calls OFF the one serial queue** - the biggest
-   remaining structural risk. "Reconnecting..." still cannot render; pause()
-   starvation is MITIGATED (background-task assertion + refresh in-flight
-   guard) but not eliminated; a ~10s crawl and ~20s search still freeze the UI.
-   The periodic re-drive and share-verify were both kept deliberately small for
-   exactly this reason.
-4. **Remaining Tier 2** ([[portability-audit]]): NAT-PMP is dead code in the
-   engine; the 4s offer_files timeout silently drops uploads on a slow link; no
-   bandwidth limiting anywhere.
-5. **Settings Tier 1/2 engine work** - nickname (hardcoded "padMule"),
+   forwarding sidesteps it; add a fourth field only if a remap is needed.
+2. **Device-verify the unproven list above**, starting with resume.
+3. **Decide the fate of the AICH worktree** (see the top). Rebase onto main
+   and finish, or park it explicitly - but do not let it rot silently 12
+   commits behind.
+4. **Get blocking engine calls OFF the one serial queue** - the biggest
+   remaining structural risk. "Reconnecting..." still cannot render;
+   `pause()` starvation is MITIGATED (background-task assertion + refresh
+   in-flight guard) but not eliminated; a ~10s crawl and ~20s search still
+   freeze the UI. The periodic re-drive and share-verify were both kept
+   deliberately small as workarounds for exactly this.
+5. **Remaining portability Tier 2** ([[portability-audit]]): NAT-PMP is dead
+   code in the engine; the 4s `offer_files` timeout silently drops uploads on
+   a slow link; no bandwidth limiting anywhere.
+6. **Settings Tier 1/2 engine work**: nickname (hardcoded "padMule"),
    obfuscation policy tri-state, ipfilter controls, upload slots, bandwidth
    caps (`upload_queue.rs` holds dead kbps logic to revive-or-delete),
    See-My-Shared-Files.
-6. **AICH block recovery** (wave 11, the last scorecard PARTIAL).
 7. **Continuous block-request top-up** - padMule is stop-and-wait per 3-block
-   batch, shallower than both authorities; no wire change, big win at cellular
-   RTT. (Also why keep-awake watches a WINDOW of rate samples: a batch boundary
-   legitimately reads zero.)
-8. **Smaller open items**: harvest queue lost if the server.met write fails; no
-   thin-file guard on nodes.dat writes (aMule refuses < 25 contacts); the
-   related-search fallback pollutes Recent Searches; Settings accepts https://
-   list URLs the engine rejects (http-only); the kick alert may not surface
-   while a sheet is open; `hash-file` exits 0 on failure and two oracle scripts
-   consume it without `-e`; MSRV declared but unenforced in CI.
+   batch, shallower than both authorities. No wire change, big win at
+   cellular RTT. (Also why keep-awake watches a WINDOW of rate samples: a
+   batch boundary legitimately reads zero.)
+8. **Smaller open items**: the harvest queue is lost if the server.met write
+   fails; no thin-file guard on nodes.dat writes (aMule refuses < 25
+   contacts, and padMule now writes every 300s); the related-search fallback
+   pollutes Recent Searches; Settings accepts `https://` list URLs the engine
+   rejects (http-only); the kick alert may not surface while a sheet is open;
+   `hash-file` exits 0 on failure and two oracle scripts consume it without
+   `-e`; MSRV declared but unenforced in CI.
 
-## Discipline reminders that earned their keep THIS session
+## Discipline that earned its keep, and should survive this session
 
-- **User testing finds what tests cannot.** One real session produced seven
-  bugs that a green 550-test suite, clean clippy and four passing oracles had
-  all missed - including a resume path that only worked when Kad was BROKEN.
-- **A test can reach the right CALLER and still not exercise the MECHANISM.**
-  Two resume tests passed with the fix deleted. MUTATION-CHECK anything
-  load-bearing; if it stays green it is decoration. Now standard practice.
+- **User testing finds what tests cannot.** One real usage session produced
+  seven confirmed bugs the whole automated gate had missed. Green measures
+  what you thought to check.
+- **MUTATION-CHECK anything load-bearing.** Two resume tests PASSED with the
+  fix deleted - one asserted a value false for other reasons, the other never
+  exercised the Kad arm. A test can reach the right CALLER and still miss the
+  MECHANISM. If breaking the fix leaves it green, it is decoration.
 - **A fake fixture hides a missing check.** Nine serve tests used
-  `/does/not/matter` as a shared-file path; adding the correct disk check broke
-  all nine, which WAS the check working. They now write real files.
-- **Verify the RENDERED result, not the source.** The title-bar literal decoded
-  correctly as a Swift string and still rendered wrong, because
-  `.navigationTitle` reinterprets a literal as a LocalizedStringKey. Read the
-  compiled binary, or the screen.
+  `/does/not/matter` as a shared-file path; adding the correct disk check
+  broke all nine, which was the check WORKING. They write real files now.
+- **Verify the RENDERED result, not the source.** The title-bar literal
+  decoded correctly as a Swift string and still rendered wrong, because
+  `.navigationTitle` reinterprets a literal as a `LocalizedStringKey`. Read
+  the compiled binary, or the screen.
+- **Swift type-checks ONLY in CI on this box.** Three separate breakages this
+  session survived a careful grep-and-read pass. Wait for the iOS BUILD and
+  TEST workflows before calling a Swift change good.
 - **Ordering bugs are invisible to CI.** The port override shipped INERT
-  because `boot()` applied settings after `start()`; it compiled, the suite
-  stayed green, and only reading the call sequence caught it.
-- **Attach global UI at the root.** The Stop confirmation lived on the Status
-  screen, so the new toolbar button would have silently done nothing anywhere
-  else.
+  because `boot()` applied settings after `start()`. It compiled, the suite
+  stayed green; only reading the call sequence caught it.
+- **A silent path must still speak.** Twice this session a durable UI row
+  went stale because the code feeding it began early-returning (UPnP
+  disabled; a mapping that never existed).
+- **Attach global UI at the root.** A confirmationDialog on one screen is
+  dead from a toolbar button on every other.
 
 ## Related
 
-- [[net-highid-and-port-forwarding]] - HighID, the AirVPN setup, the kill-switch gap.
+- [[net-highid-and-port-forwarding]] - HighID, the AirVPN setup, the iOS
+  kill-switch gap and padMule's guard.
+- [[feature-server-hunter]] - all four discovery parts, shipped.
 - [[portability-audit]] - Tier 2/3 open work.
-- [[ipad-usb-tooling]] - device runbook; NB `unbind` (not `detach`) frees the
-  iPad for Sideloadly on this box.
-- [[build-progress]] / [[security-model]] / [[log]] / [[feature-server-hunter]].
+- [[ipad-usb-tooling]] - device runbook. NB on this box `usbipd unbind` (not
+  `detach`) is what frees the iPad for Sideloadly.
+- [[build-progress]] / [[security-model]] / [[log]] / [[decisions-and-lessons]].
