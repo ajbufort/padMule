@@ -28,6 +28,7 @@ use crate::fetch::{download_file, ManagerConfig, PeerSource, SourceRegistry};
 use crate::framed::FramedStream;
 use crate::identity::NodeIdentity;
 use crate::kad_live::KadNode;
+use crate::known2_store::Known2Store;
 use crate::link::ServerLink;
 use crate::multi_source::{download_from_peer_at, resume_downloads, Download};
 use crate::obf_handshake::{obf_accept, ObfDetect};
@@ -428,6 +429,9 @@ const FT_FILENAME: u8 = 0x01;
 const FT_FILESIZE: u8 = 0x02;
 const FT_FILERATING: u8 = 0xF7;
 const FT_FILECOMMENT: u8 = 0xF6;
+/// The AICH master root as a base32 STRING tag - both authorities' known.met
+/// form (eMule opcodes.h:373 + KnownFile.cpp:930; aMule KnownFile.cpp:833-836).
+const FT_AICH_HASH: u8 = 0x27;
 
 /// Load the IP blocklist from the config dir if present. Reads `ipfilter.dat`
 /// then `.p2p`/`guarding.p2p` (both text line-forms parse the same), at the
@@ -496,6 +500,8 @@ fn load_shared_library(config_dir: &Path, downloads_dir: &Path) -> Vec<SharedFil
             // the known.met entry). Served to leechers via OP_FILEDESC.
             rating: tag_u64(&e.tags, FT_FILERATING).unwrap_or(0).min(5) as u8,
             comment: tag_str(&e.tags, FT_FILECOMMENT).unwrap_or_default(),
+            aich_root: tag_str(&e.tags, FT_AICH_HASH)
+                .and_then(|s| mule_proto::aich_from_base32(&s)),
         });
     }
     out
@@ -547,6 +553,12 @@ fn persist_shared_file(config_dir: &Path, sf: &SharedFile) {
             TagValue::Str(sf.comment.clone().into_bytes()),
         ));
     }
+    if let Some(root) = sf.aich_root {
+        tags.push(Tag::id(
+            FT_AICH_HASH,
+            TagValue::Str(mule_proto::aich_base32(&root).into_bytes()),
+        ));
+    }
     met.entries.push(mule_files::KnownFileEntry {
         date,
         file_hash: sf.hash,
@@ -557,6 +569,23 @@ fn persist_shared_file(config_dir: &Path, sf: &SharedFile) {
     // cannot leave a torn file that load_shared_library would read as empty and
     // silently reset the whole library.
     write_known_met_atomic(&path, &met);
+}
+
+/// Every AICH root the catalog (known.met) claims - the live set the startup
+/// hashset prune keeps. Read from the FILE, not the loaded library, so an
+/// entry whose file is momentarily missing from disk keeps its hashset.
+fn known_met_aich_roots(config_dir: &Path) -> std::collections::HashSet<[u8; 20]> {
+    std::fs::read(config_dir.join(KNOWN_MET))
+        .ok()
+        .and_then(|b| mule_files::read_known_met(&b).ok())
+        .map(|met| {
+            met.entries
+                .iter()
+                .filter_map(|e| tag_str(&e.tags, FT_AICH_HASH))
+                .filter_map(|s| mule_proto::aich_from_base32(&s))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Remove one file (by hash) from `known.met` so it is not re-shared on restart.
@@ -636,6 +665,9 @@ struct FinishCtx {
     /// Serializes the known.met read-modify-write across concurrently-finishing
     /// downloads (each runs in its own task) so no entry is lost to a race.
     known_met_lock: Arc<Mutex<()>>,
+    /// The AICH hashset store: a finished file's tree (built in the verify
+    /// pass) is appended here so recovery requests can be served.
+    known2: Arc<Known2Store>,
     events: mpsc::UnboundedSender<EngineEvent>,
 }
 
@@ -707,10 +739,13 @@ async fn finish_download(
         shared_dirty,
         config_dir,
         known_met_lock,
+        known2,
         events,
     } = ctx;
     let name = dl.name().await;
-    let verified = dl.verify_whole_file(size, hash).await;
+    // One streaming pass verifies the MD4 AND builds the AICH tree the shared
+    // file will serve recovery data from.
+    let (verified, aich_set) = dl.verify_whole_file_and_aich(size, hash).await;
     if !verified {
         // Blame the individual corrupt part(s) against the hashset and re-open only
         // those, so one bad source does not force re-downloading the WHOLE file
@@ -764,6 +799,14 @@ async fn finish_download(
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or(name.clone());
+            // Store the AICH hashset first, so the known.met root tag never
+            // points at a hashset that failed to persist (append is
+            // dedup + rollback-safe; a failure just leaves aich_root None and
+            // recovery requests draw the honest refusal).
+            let aich_root = match &aich_set {
+                Some((root, leaves)) => known2.append(root, leaves).is_ok().then_some(*root),
+                None => None,
+            };
             let sf = SharedFile {
                 hash,
                 size,
@@ -772,6 +815,7 @@ async fn finish_download(
                 path: dest.clone(),
                 rating: 0, // the user can rate it later
                 comment: String::new(),
+                aich_root,
             };
             {
                 // Serialize the known.met read-modify-write against other
@@ -1151,6 +1195,9 @@ pub struct Engine {
     upload_gate: Arc<UploadGate>,
     /// Serializes known.met writes across concurrently-finishing downloads.
     known_met_lock: Arc<Mutex<()>>,
+    /// The known2_64.met AICH hashset store (append on finish, serve on
+    /// OP_AICHREQUEST, prune at start against the catalog).
+    known2: Arc<Known2Store>,
     /// Per-peer credit history (bytes moved + verified key), keyed by userhash.
     /// Loaded from `clients.met` on `new`, written back on `pause`. Shared with
     /// the listener so it can accrue upload bytes + bind a verified leecher.
@@ -1228,6 +1275,8 @@ impl Engine {
             Ok(bytes) => CreditStore::load(&bytes, now_secs(), true),
             Err(_) => CreditStore::empty(true),
         });
+        // The AICH hashset store: index built in one scan, torn tail truncated.
+        let known2 = Arc::new(Known2Store::load(&config_dir));
         let engine = Engine {
             identity,
             downloads_dir: config_dir.join("downloads"),
@@ -1246,6 +1295,7 @@ impl Engine {
             sharing: Arc::new(AtomicBool::new(true)),
             upload_gate: Arc::new(UploadGate::new(MAX_UPLOAD_SLOTS, UPLOAD_QUEUE_CAP)),
             known_met_lock: Arc::new(Mutex::new(())),
+            known2,
             credit_store,
             ip_filter: None,
             server: None,
@@ -1577,6 +1627,16 @@ impl Engine {
         let library = load_shared_library(&self.config_dir, &self.downloads_dir);
         *self.shared.lock().await = library;
 
+        // STARTUP-ONLY orphan prune of the AICH hashset store, against the
+        // CATALOG (known.met) rather than the loaded library, so a file that is
+        // merely missing from disk right now does not lose its hashset. This is
+        // aMule master's prune discipline (ThreadTasks.h:136-144) - 3.0.1 also
+        // pruned after every mid-session hashing batch and raced its own
+        // catalog registration, destroying fresh hashsets; running only here,
+        // on the one engine task, that race class cannot exist.
+        self.known2
+            .prune_orphans(&known_met_aich_roots(&self.config_dir));
+
         // Go live. ORDER MATTERS: the inbound listener must exist BEFORE we log
         // in, because the server decides HighID vs LowID by connecting back to
         // the port we advertise. No listener = LowID = a second-class peer.
@@ -1646,6 +1706,7 @@ impl Engine {
         let sharing = Arc::clone(&self.sharing);
         let gate = Arc::clone(&self.upload_gate);
         let ip_filter = self.ip_filter.clone();
+        let known2 = Arc::clone(&self.known2);
         let inbound = Arc::new(Semaphore::new(MAX_INBOUND_CONNS));
         let per_ip: PerIpConns = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         let handle = tokio::spawn(async move {
@@ -1686,6 +1747,7 @@ impl Engine {
                 let sharing = Arc::clone(&sharing);
                 let gate = Arc::clone(&gate);
                 let ip_filter = ip_filter.clone();
+                let known2 = Arc::clone(&known2);
                 tokio::spawn(async move {
                     let _permit = permit;
                     let _ip_slot = ip_slot;
@@ -1711,29 +1773,41 @@ impl Engine {
                     };
                     // A bare connect+close (the server's HighID probe) ends here:
                     // it never sends OP_HELLO, so the handshake errors and we bail.
-                    let (peer_hash, peer_accept_comment, peer_secident, peer_crypt, peer_sx1) =
-                        match timeout(Duration::from_secs(8), peer_handshake_inbound(&mut fs, &me))
-                            .await
-                        {
-                            Ok(Ok(h)) => {
-                                let (ac, si, crypt, sx1) = h
-                                    .capabilities()
-                                    .map(|c| {
-                                        // Re-encode the peer's crypt bits as the
-                                        // connect-options byte source exchange
-                                        // carries (SetConnectOptions layout), so a
-                                        // peer we name to others can be dialed
-                                        // obfuscated by them.
-                                        let b = (c.supports_crypt as u8)
-                                            | ((c.requests_crypt as u8) << 1)
-                                            | ((c.requires_crypt as u8) << 2);
-                                        (c.accept_comment, c.sec_ident, Some(b), c.source_exchange)
-                                    })
-                                    .unwrap_or((0, 0, None, 0));
-                                (h.user_hash, ac, si, crypt, sx1)
-                            }
-                            _ => return,
-                        };
+                    let (
+                        peer_hash,
+                        peer_accept_comment,
+                        peer_secident,
+                        peer_crypt,
+                        peer_sx1,
+                        peer_aich,
+                    ) = match timeout(Duration::from_secs(8), peer_handshake_inbound(&mut fs, &me))
+                        .await
+                    {
+                        Ok(Ok(h)) => {
+                            let (ac, si, crypt, sx1, aich) = h
+                                .capabilities()
+                                .map(|c| {
+                                    // Re-encode the peer's crypt bits as the
+                                    // connect-options byte source exchange
+                                    // carries (SetConnectOptions layout), so a
+                                    // peer we name to others can be dialed
+                                    // obfuscated by them.
+                                    let b = (c.supports_crypt as u8)
+                                        | ((c.requests_crypt as u8) << 1)
+                                        | ((c.requires_crypt as u8) << 2);
+                                    (
+                                        c.accept_comment,
+                                        c.sec_ident,
+                                        Some(b),
+                                        c.source_exchange,
+                                        c.aich,
+                                    )
+                                })
+                                .unwrap_or((0, 0, None, 0, 0));
+                            (h.user_hash, ac, si, crypt, sx1, aich)
+                        }
+                        _ => return,
+                    };
                     // Record the contact so its credit record exists + last_seen is
                     // fresh (mirrors eMule's GetCredit at hello).
                     credit_store.touch(peer_hash, now_secs());
@@ -1779,6 +1853,8 @@ impl Engine {
                                     peer: Some(peer),
                                     peer_crypt,
                                     peer_sx1,
+                                    peer_aich,
+                                    aich: Some(Arc::clone(&known2)),
                                 },
                             )
                             .await;
@@ -2437,15 +2513,23 @@ impl Engine {
         if missing.is_empty() {
             return 0;
         }
+        let mut dropped_roots: Vec<[u8; 20]> = Vec::new();
         {
             let mut lib = self.shared.lock().await;
             // Remove back-to-front so the earlier indices stay valid.
             for (i, _) in missing.iter().rev() {
-                lib.remove(*i);
+                if let Some(r) = lib.remove(*i).aich_root {
+                    dropped_roots.push(r);
+                }
             }
         }
         for (_, hash) in &missing {
             forget_shared_file(&self.config_dir, *hash);
+        }
+        // The catalog no longer claims these files, so their AICH hashsets go
+        // with them (same rule as the startup prune, applied incrementally).
+        for r in &dropped_roots {
+            self.known2.remove(r);
         }
         // Re-announce the corrected library: the server still holds the old one.
         self.shared_dirty.store(true, Ordering::Relaxed);
@@ -2637,6 +2721,7 @@ impl Engine {
                 shared_dirty: Arc::clone(&self.shared_dirty),
                 config_dir: self.config_dir.clone(),
                 known_met_lock: Arc::clone(&self.known_met_lock),
+                known2: Arc::clone(&self.known2),
                 events: self.events.clone(),
             };
             tokio::spawn(finish_download(dl, ctx, hash, size, dest));
@@ -3158,6 +3243,7 @@ impl Engine {
             shared_dirty: Arc::clone(&self.shared_dirty),
             config_dir: self.config_dir.clone(),
             known_met_lock: Arc::clone(&self.known_met_lock),
+            known2: Arc::clone(&self.known2),
             events: events.clone(),
         };
         let dl_task = dl;
@@ -3269,15 +3355,24 @@ impl Engine {
     /// from the live library AND from `known.met`, so it does not re-share on the
     /// next start. Returns false if we were not sharing that hash.
     pub async fn unshare_file(&mut self, hash: [u8; 16]) -> bool {
-        let removed = {
+        let removed_root = {
             let mut guard = self.shared.lock().await;
             let before = guard.len();
+            let root = guard
+                .iter()
+                .find(|s| s.hash == hash)
+                .and_then(|s| s.aich_root);
             guard.retain(|s| s.hash != hash);
-            before != guard.len()
+            (before != guard.len()).then_some(root)
         };
-        if removed {
+        let removed = removed_root.is_some();
+        if let Some(root) = removed_root {
             let _g = self.known_met_lock.lock().await;
             forget_shared_file(&self.config_dir, hash);
+            // An unshared file's AICH hashset leaves the store with it.
+            if let Some(r) = root {
+                self.known2.remove(&r);
+            }
             self.emit(EngineEvent::Server("Stopped sharing a file".into()));
         }
         removed
@@ -4832,6 +4927,7 @@ mod tests {
                     path: p.clone(),
                     rating: 0,
                     comment: String::new(),
+                    aich_root: None,
                 };
                 persist_shared_file(&engine.config_dir, &sf);
                 lib.push(sf);
@@ -5161,6 +5257,7 @@ mod tests {
             path: dir.join("b.bin"),
             rating: 0,
             comment: String::new(),
+            aich_root: None,
         });
         assert_eq!(engine.hit_status([0xBB; 16]).await, HitStatus::Have);
 
@@ -5184,6 +5281,7 @@ mod tests {
             path: fixture_file("held", 100),
             rating: 0,
             comment: String::new(),
+            aich_root: None,
         }]));
         let sharing = Arc::new(AtomicBool::new(false)); // Leech Mode
         let gate = Arc::new(UploadGate::new(MAX_UPLOAD_SLOTS, UPLOAD_QUEUE_CAP));
@@ -5234,6 +5332,7 @@ mod tests {
             path: fixture_file("queue", 100),
             rating: 0,
             comment: String::new(),
+            aich_root: None,
         }];
 
         let (client, server) = tokio::io::duplex(8192);
@@ -5299,6 +5398,7 @@ mod tests {
             path: fixture_file("gated", 300),
             rating: 0,
             comment: String::new(),
+            aich_root: None,
         }];
         let gate = Arc::new(UploadGate::new(MAX_UPLOAD_SLOTS, UPLOAD_QUEUE_CAP));
 
@@ -5363,6 +5463,7 @@ mod tests {
             path,
             rating: 0,
             comment: String::new(),
+            aich_root: None,
         }]));
         let sharing = Arc::new(AtomicBool::new(true));
         let gate = Arc::new(UploadGate::new(MAX_UPLOAD_SLOTS, UPLOAD_QUEUE_CAP));
@@ -5875,6 +5976,7 @@ mod tests {
             path: downloads.join("kept.bin"),
             rating: 0,
             comment: String::new(),
+            aich_root: None,
         };
         let gone = SharedFile {
             hash: [0x22; 16],
@@ -5884,6 +5986,7 @@ mod tests {
             path: downloads.join("gone.bin"), // never written to disk
             rating: 0,
             comment: String::new(),
+            aich_root: None,
         };
         persist_shared_file(&dir, &kept);
         persist_shared_file(&dir, &gone);
@@ -5933,6 +6036,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn aich_root_round_trips_through_known_met() {
+        let dir = tmp("aichtag");
+        let _ = std::fs::remove_dir_all(&dir);
+        let downloads = dir.join("downloads");
+        std::fs::create_dir_all(&downloads).unwrap();
+        std::fs::write(downloads.join("a.bin"), b"abc").unwrap();
+        let root = [0x5A; 20];
+        let sf = SharedFile {
+            hash: [0xAB; 16],
+            size: 3,
+            name: b"a.bin".to_vec(),
+            part_hashes: vec![],
+            path: downloads.join("a.bin"),
+            rating: 0,
+            comment: String::new(),
+            aich_root: Some(root),
+        };
+        persist_shared_file(&dir, &sf);
+        // The tag written is the base32 STRING form both authorities use, so
+        // a reload recovers the exact root - and the catalog root set (which
+        // drives the startup hashset prune) contains it.
+        let lib = load_shared_library(&dir, &downloads);
+        assert_eq!(lib.len(), 1);
+        assert_eq!(lib[0].aich_root, Some(root));
+        assert!(known_met_aich_roots(&dir).contains(&root));
+        // An entry saved WITHOUT a root loads as None (pre-AICH library).
+        let sf2 = SharedFile {
+            hash: [0xCD; 16],
+            size: 3,
+            name: b"b.bin".to_vec(),
+            part_hashes: vec![],
+            path: downloads.join("b.bin"),
+            rating: 0,
+            comment: String::new(),
+            aich_root: None,
+        };
+        std::fs::write(downloads.join("b.bin"), b"xyz").unwrap();
+        persist_shared_file(&dir, &sf2);
+        let lib = load_shared_library(&dir, &downloads);
+        assert_eq!(
+            lib.iter().find(|f| f.hash == [0xCD; 16]).unwrap().aich_root,
+            None
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn unshare_removes_from_the_library_and_known_met() {
         let dir = tmp("unshare");
         let _ = std::fs::remove_dir_all(&dir);
@@ -5948,6 +6098,7 @@ mod tests {
             path: downloads.join("keep.bin"),
             rating: 0,
             comment: String::new(),
+            aich_root: None,
         };
         let drop = SharedFile {
             hash: [0xBB; 16],
@@ -5957,6 +6108,7 @@ mod tests {
             path: downloads.join("drop.bin"),
             rating: 0,
             comment: String::new(),
+            aich_root: None,
         };
         persist_shared_file(&dir, &keep);
         persist_shared_file(&dir, &drop);
@@ -6001,6 +6153,7 @@ mod tests {
             path: downloads.join("rate.bin"),
             rating: 0,
             comment: String::new(),
+            aich_root: None,
         };
         persist_shared_file(&dir, &sf);
 

@@ -625,6 +625,50 @@ impl Download {
         matches!(got, Ok(Ok(g)) if g == want)
     }
 
+    /// Like [`Self::verify_whole_file`], but ALSO builds the file's AICH tree
+    /// in the SAME streaming pass - eMule computes MD4 and AICH in one disk
+    /// pass too (KnownFile.cpp:1053-1137), and a finished file is about to be
+    /// shared, so this is where its recovery hashset comes from for free.
+    /// Returns `(md4_ok, Some((master_root, leaf_hashes)))`; the AICH half is
+    /// best-effort and never affects the verification verdict, and is `None`
+    /// whenever the MD4 failed (the bytes are wrong - hashing them again after
+    /// repair produces the real hashset).
+    pub async fn verify_whole_file_and_aich(
+        &self,
+        size: u64,
+        want: [u8; 16],
+    ) -> (bool, Option<([u8; 20], Vec<[u8; 20]>)>) {
+        let path = {
+            let g = self.inner.lock().await;
+            g.store.part_path().to_path_buf()
+        };
+        let got = tokio::task::spawn_blocking(move || {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut f = std::fs::File::open(&path)?;
+            let mut aich = mule_proto::AichLeafHasher::new(size);
+            let md4 = mule_proto::ed2k_hash_parts(size, |p| {
+                let mut buf = vec![0u8; crate::part_file::part_size(p, size) as usize];
+                f.seek(SeekFrom::Start(p * mule_proto::PARTSIZE))?;
+                f.read_exact(&mut buf)?;
+                // Parts arrive in order, so the leaf hasher sees the file
+                // sequentially; a feed error just yields no tree at finish().
+                if let Some(h) = aich.as_mut() {
+                    h.update(&buf);
+                }
+                io::Result::Ok(buf)
+            })?;
+            let set = aich
+                .and_then(|h| h.finish())
+                .and_then(|t| Some((t.master_hash()?, t.leaves()?)));
+            io::Result::Ok((md4, set))
+        })
+        .await;
+        match got {
+            Ok(Ok((md4, set))) if md4 == want => (true, set),
+            _ => (false, None),
+        }
+    }
+
     /// Take the finished store back out (to move the file into place).
     pub async fn into_store(self: Arc<Self>) -> Option<PartStore> {
         Arc::try_unwrap(self)
@@ -1046,6 +1090,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[tokio::test]
+    async fn verify_pass_also_builds_the_aich_tree() {
+        // finish_download persists what THIS returns, so the tree built in the
+        // verify pass must equal one built independently from the same bytes.
+        let dir = tmpdir("aichpass");
+        let size = (PARTSIZE + 300_000) as usize;
+        let good: Vec<u8> = (0..size as u32)
+            .map(|i| (i.wrapping_mul(23)) as u8)
+            .collect();
+        let hash = ed2k_hash(&good);
+        let store = PartStore::create(&dir, 1, hash, size as u64, b"a.bin").unwrap();
+        let dl = Download::new(store);
+        dl.commit(0, &good[..PARTSIZE as usize], None)
+            .await
+            .unwrap();
+        dl.commit(PARTSIZE, &good[PARTSIZE as usize..], None)
+            .await
+            .unwrap();
+        let (ok, set) = dl.verify_whole_file_and_aich(size as u64, hash).await;
+        assert!(ok, "md4 verifies");
+        let (root, leaves) = set.expect("aich set built in the same pass");
+        let want = mule_proto::AichTree::from_file_data(&good).unwrap();
+        assert_eq!(root, want.master_hash().unwrap());
+        assert_eq!(leaves, want.leaves().unwrap());
+        // An MD4 mismatch yields NO aich set - wrong bytes must not be hashed
+        // into a servable tree.
+        let (ok2, set2) = dl.verify_whole_file_and_aich(size as u64, [0xEE; 16]).await;
+        assert!(!ok2 && set2.is_none());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

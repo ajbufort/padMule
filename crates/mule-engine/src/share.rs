@@ -41,10 +41,12 @@ use crate::sources::{
     OP_REQUESTSOURCES, OP_REQUESTSOURCES2, SOURCE_EXCHANGE_VERSION,
 };
 use crate::transfer::{
-    build_accept_upload, build_file_desc, build_file_req_ans_no_fil, build_file_status_complete,
-    build_hashset_answer, build_multipacket_answer, build_queue_ranking, build_req_filename_answer,
-    build_sending_part, parse_request_parts, OP_HASHSETREQUEST, OP_MULTIPACKET, OP_MULTIPACKET_EXT,
-    OP_REQUESTFILENAME, OP_REQUESTPARTS, OP_REQUESTPARTS_I64, OP_SETREQFILEID, OP_STARTUPLOADREQ,
+    build_accept_upload, build_aich_answer, build_aich_answer_failure, build_aich_file_hash_ans,
+    build_file_desc, build_file_req_ans_no_fil, build_file_status_complete, build_hashset_answer,
+    build_multipacket_answer, build_queue_ranking, build_req_filename_answer, build_sending_part,
+    parse_aich_request, parse_request_parts, EMBLOCKSIZE, OP_AICHFILEHASHREQ, OP_AICHREQUEST,
+    OP_HASHSETREQUEST, OP_MULTIPACKET, OP_MULTIPACKET_EXT, OP_REQUESTFILENAME, OP_REQUESTPARTS,
+    OP_REQUESTPARTS_I64, OP_SETREQFILEID, OP_STARTUPLOADREQ,
 };
 
 /// Re-asking for the SAME file sooner than this is an "aggressive" request
@@ -324,6 +326,10 @@ pub struct SharedFile {
     /// pushed to a leecher (OP_FILEDESC) that accepts comments.
     pub rating: u8,
     pub comment: String,
+    /// The file's AICH master root, when its full hashset is in the known2
+    /// store (computed at finish; None for pre-AICH library entries, which
+    /// honestly refuse recovery requests until re-completed).
+    pub aich_root: Option<[u8; 20]>,
 }
 
 /// True if `op` is a packet a peer sends when it wants to download FROM us. The
@@ -358,6 +364,58 @@ pub fn head_hash(payload: &[u8]) -> Option<[u8; 16]> {
 
 fn is_secident(op: u8) -> bool {
     matches!(op, OP_SECIDENTSTATE | OP_PUBLICKEY | OP_SIGNATURE)
+}
+
+/// Whether a multipacket request bundles the OP_AICHFILEHASHREQ sub-op.
+///
+/// Walks the sub-opcode tail exactly as eMule's reader does
+/// (ListenSocket.cpp:1178-1287): OP_REQUESTFILENAME carries the extended
+/// requester info the sender wrote for OUR advertised
+/// ExtendedRequestsVersion 2 (u16 part count, the availability bitfield when
+/// non-zero, u16 complete sources - UploadClient.cpp ProcessExtendedInfo);
+/// OP_SETREQFILEID and OP_REQUESTSOURCES are bare; OP_REQUESTSOURCES2 carries
+/// u8 version + u16 options; OP_AICHFILEHASHREQ is bare. eMule THROWS on an
+/// unknown sub-op; we stop walking instead (keeping anything already found),
+/// which preserves the pre-AICH tolerance for malformed tails - the answer is
+/// never desynced by what we could not parse.
+fn multipacket_wants_aich(payload: &[u8], ext: bool) -> bool {
+    let mut pos = 16 + if ext { 8 } else { 0 };
+    let mut found = false;
+    let take = |pos: &mut usize, n: usize, len: usize| -> bool {
+        if *pos + n > len {
+            return false;
+        }
+        *pos += n;
+        true
+    };
+    while pos < payload.len() {
+        let op = payload[pos];
+        pos += 1;
+        match op {
+            OP_REQUESTFILENAME => {
+                if pos + 2 > payload.len() {
+                    return found;
+                }
+                let pc = u16::from_le_bytes([payload[pos], payload[pos + 1]]) as usize;
+                pos += 2;
+                if pc > 0 && !take(&mut pos, pc.div_ceil(8), payload.len()) {
+                    return found;
+                }
+                if !take(&mut pos, 2, payload.len()) {
+                    return found;
+                }
+            }
+            OP_SETREQFILEID | OP_REQUESTSOURCES => {}
+            OP_REQUESTSOURCES2 => {
+                if !take(&mut pos, 3, payload.len()) {
+                    return found;
+                }
+            }
+            OP_AICHFILEHASHREQ => found = true,
+            _ => return found,
+        }
+    }
+    found
 }
 
 /// The credit-accounting context for a serve connection: the shared store plus the
@@ -569,6 +627,13 @@ pub struct ServeSession {
     /// carries no version, so upstream answers with the version the ASKER
     /// announced; 0 means "no SX1" and such a request goes unanswered.
     pub peer_sx1: u8,
+    /// The peer's announced AICH version (hello MISCOPTIONS1 bits 29-31).
+    /// Root answers are gated on bit 0, eMule's own IsSupportingAICH test
+    /// (updownclient.h:407).
+    pub peer_aich: u8,
+    /// The known2_64.met hashset store, for serving OP_AICHREQUEST recovery
+    /// data. `None` (tests without AICH) refuses recovery honestly.
+    pub aich: Option<Arc<crate::known2_store::Known2Store>>,
 }
 
 /// Keeps the file's served-peer list honest: registered on latch, removed on
@@ -602,6 +667,8 @@ where
         peer,
         peer_crypt,
         peer_sx1,
+        peer_aich,
+        aich,
     } = session;
     // Unregisters this peer from the file's served list on EVERY exit path.
     let mut served: Option<ServedGuard> = None;
@@ -689,6 +756,8 @@ where
                     | OP_HASHSETREQUEST
                     | OP_REQUESTSOURCES
                     | OP_REQUESTSOURCES2
+                    | OP_AICHFILEHASHREQ
+                    | OP_AICHREQUEST
             )
         {
             // Score against the file the packet names; a request with no usable
@@ -758,8 +827,24 @@ where
                 // name/status/AICH).
                 match lookup(&pkt.payload) {
                     Some(f) => {
-                        fs.write_packet(&build_multipacket_answer(&f.hash, &f.name, None))
-                            .await?;
+                        // Bundle the AICH root iff the request asked for it, the
+                        // peer supports AICH, and we know the root - eMule's own
+                        // three-way gate (ListenSocket.cpp:1203-1217). This is
+                        // the only root channel a multipacket peer ever uses.
+                        let ext = pkt.opcode == OP_MULTIPACKET_EXT;
+                        let root =
+                            if peer_aich & 1 != 0 && multipacket_wants_aich(&pkt.payload, ext) {
+                                f.aich_root
+                            } else {
+                                None
+                            };
+                        fs.write_packet(&build_multipacket_answer(
+                            &f.hash,
+                            &f.name,
+                            None,
+                            root.as_ref(),
+                        ))
+                        .await?;
                         // Latch it so a following OP_STARTUPLOADREQ/OP_REQUESTPARTS
                         // knows which file this peer is after.
                         file = Some(f);
@@ -810,6 +895,52 @@ where
                     fs.write_packet(&build_hashset_answer(&f.hash, &f.part_hashes))
                         .await?;
                 }
+            }
+            OP_AICHFILEHASHREQ => {
+                // The standalone root ask (non-multipacket peers,
+                // ListenSocket.cpp:1902-1929). Answer only when the peer
+                // advertised AICH and we share the file AND know its root;
+                // silence otherwise, like every unknown-hash metadata ask.
+                if peer_aich & 1 != 0 {
+                    if let Some(root) = lookup(&pkt.payload).and_then(|f| f.aich_root) {
+                        if let Some(h) = head_hash(&pkt.payload) {
+                            fs.write_packet(&build_aich_file_hash_ans(&h, &root))
+                                .await?;
+                        }
+                    }
+                }
+            }
+            OP_AICHREQUEST => {
+                // Recovery-data ask. STRICT parse first: eMule throws on any
+                // size other than 38 (DownloadClient.cpp:2329-2330), so a
+                // malformed packet costs the connection, exactly upstream.
+                let (h, part, want_root) = match parse_aich_request(&pkt.payload) {
+                    Ok(v) => v,
+                    Err(e) => return Err(FrameError::Protocol(e)),
+                };
+                // Serve conditions transcribed from ProcessAICHRequest
+                // (DownloadClient.cpp:2337-2341): shared + hashset available +
+                // requested root equals ours + part in range + file AND part
+                // bigger than one block. ANY miss draws the explicit 16-byte
+                // refusal (:2371-2374) - never silence, the asker uses it to
+                // retry another source.
+                let answer = lookup(&pkt.payload).and_then(|f| {
+                    let root = f.aich_root?;
+                    let part_start = u64::from(part) * mule_proto::PARTSIZE;
+                    if root != want_root
+                        || f.size <= EMBLOCKSIZE
+                        || part_start >= f.size
+                        || mule_proto::PARTSIZE.min(f.size - part_start) <= EMBLOCKSIZE
+                    {
+                        return None;
+                    }
+                    let leaves = aich.as_ref()?.lookup(&root, f.size)?;
+                    let mut tree = mule_proto::AichTree::from_leaves(f.size, &leaves)?;
+                    let rec = tree.create_part_recovery_data(part_start)?;
+                    Some(build_aich_answer(&h, part, &root, &rec))
+                });
+                fs.write_packet(&answer.unwrap_or_else(|| build_aich_answer_failure(&h)))
+                    .await?;
             }
             OP_STARTUPLOADREQ => {
                 // Only queue a peer that has named a file we serve (aMule ignores
@@ -988,6 +1119,222 @@ mod tests {
         d
     }
 
+    /// A shared multi-block file with its AICH hashset staged, plus a client
+    /// connection to a serve task running with the given AICH session halves.
+    async fn aich_serve_fixture(
+        tag: &str,
+        peer_aich: u8,
+        with_store: bool,
+    ) -> (
+        Vec<u8>,
+        [u8; 16],
+        [u8; 20],
+        crate::framed::FramedStream<tokio::net::TcpStream>,
+        tokio::task::JoinHandle<()>,
+        PathBuf,
+    ) {
+        let dir = tmpdir(tag);
+        // 4+ blocks, single eD2k part: recovery-servable (part > EMBLOCKSIZE).
+        let data: Vec<u8> = (0..(4 * EMBLOCKSIZE as usize + 123) as u32)
+            .map(|i| (i.wrapping_mul(31)) as u8)
+            .collect();
+        let hash = ed2k_hash(&data);
+        let path = dir.join("movie.bin");
+        std::fs::write(&path, &data).unwrap();
+        let tree = mule_proto::AichTree::from_file_data(&data).unwrap();
+        let root = tree.master_hash().unwrap();
+        let store = Arc::new(crate::known2_store::Known2Store::load(&dir));
+        store.append(&root, &tree.leaves().unwrap()).unwrap();
+        let shared = vec![SharedFile {
+            hash,
+            size: data.len() as u64,
+            name: b"movie.bin".to_vec(),
+            part_hashes: vec![],
+            path,
+            rating: 0,
+            comment: String::new(),
+            aich_root: Some(root),
+        }];
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let up = tokio::spawn(async move {
+            let me = HelloInfo::baseline([0xBB; 16], 0, 4662, 4672, "seed");
+            if let Ok((_p, mut fs)) = accept_peer(&listener, &me).await {
+                let session = ServeSession {
+                    peer_aich,
+                    aich: with_store.then_some(store),
+                    ..Default::default()
+                };
+                let _ = serve_shared(&mut fs, &shared, None, None, 0, session).await;
+            }
+        });
+        let me = HelloInfo::baseline([0xAA; 16], 0x0A00_0001, 4663, 4673, "dl");
+        let (_p, fs) = connect_peer(addr, &me).await.unwrap();
+        (data, hash, root, fs, up, dir)
+    }
+
+    #[tokio::test]
+    async fn aich_root_and_recovery_data_are_served() {
+        use crate::transfer::{
+            build_aich_file_hash_req, build_aich_request, parse_aich_file_hash_ans, AichAnswer,
+        };
+        let (data, hash, root, mut fs, up, dir) = aich_serve_fixture("aichserve", 1, true).await;
+
+        // 0x9E -> 0x9D with our master root.
+        fs.write_packet(&build_aich_file_hash_req(&hash))
+            .await
+            .unwrap();
+        let ans = fs.read_packet_unpacked().await.unwrap();
+        assert_eq!(ans.opcode, crate::transfer::OP_AICHFILEHASHANS);
+        assert_eq!(
+            parse_aich_file_hash_ans(&ans.payload).unwrap(),
+            (hash, root)
+        );
+
+        // 0x9B part 0 -> 0x9C recovery data that VERIFIES against the root.
+        fs.write_packet(&build_aich_request(&hash, 0, &root))
+            .await
+            .unwrap();
+        let ans = fs.read_packet_unpacked().await.unwrap();
+        assert_eq!(ans.opcode, crate::transfer::OP_AICHANSWER);
+        match crate::transfer::parse_aich_answer(&ans.payload).unwrap() {
+            AichAnswer::Recovery {
+                hash: h,
+                part,
+                root: r,
+                recovery,
+            } => {
+                assert_eq!((h, part, r), (hash, 0, root));
+                let mut rx = mule_proto::AichTree::with_master(data.len() as u64, root).unwrap();
+                assert!(rx.read_recovery_data(0, &recovery), "verifies against root");
+                let want = mule_proto::AichTree::from_file_data(&data).unwrap();
+                assert_eq!(
+                    rx.part_block_hashes(0).unwrap(),
+                    want.part_block_hashes(0).unwrap(),
+                    "receiver holds the exact block hashes"
+                );
+            }
+            AichAnswer::Failure(_) => panic!("expected recovery data, got the refusal"),
+        }
+        drop(fs);
+        up.await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn aich_unservable_requests_draw_the_explicit_refusal() {
+        use crate::transfer::{build_aich_request, AichAnswer};
+        let (_data, hash, root, mut fs, up, dir) = aich_serve_fixture("aichrefuse", 1, true).await;
+
+        let expect_refusal =
+            |ans: mule_proto::Packet, why: &str| match crate::transfer::parse_aich_answer(
+                &ans.payload,
+            )
+            .unwrap()
+            {
+                AichAnswer::Failure(_) => {}
+                _ => panic!("expected the 16-byte refusal: {why}"),
+            };
+        // Unknown file: eMule still answers (the empty form), never silence.
+        fs.write_packet(&build_aich_request(&[0xEE; 16], 0, &root))
+            .await
+            .unwrap();
+        expect_refusal(fs.read_packet_unpacked().await.unwrap(), "unknown hash");
+        // Wrong master root.
+        let mut bad_root = root;
+        bad_root[0] ^= 0xFF;
+        fs.write_packet(&build_aich_request(&hash, 0, &bad_root))
+            .await
+            .unwrap();
+        expect_refusal(fs.read_packet_unpacked().await.unwrap(), "wrong root");
+        // Part out of range.
+        fs.write_packet(&build_aich_request(&hash, 7, &root))
+            .await
+            .unwrap();
+        expect_refusal(
+            fs.read_packet_unpacked().await.unwrap(),
+            "part 7 of a 1-part file",
+        );
+        drop(fs);
+        up.await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn aich_malformed_request_drops_the_connection_and_non_aich_peer_gets_no_root() {
+        use crate::transfer::{build_aich_file_hash_req, build_aich_request, AichAnswer};
+        // peer_aich = 0: the standalone root ask draws SILENCE (IsSupportingAICH
+        // gate), but recovery data is NOT aich-gated in eMule - a valid 0x9B is
+        // still answered. Prove the silence by ordering: 0x9E then 0x9B, and the
+        // FIRST thing back is the 0x9B answer.
+        let (_d, hash, root, mut fs, up, dir) = aich_serve_fixture("aichgate", 0, true).await;
+        fs.write_packet(&build_aich_file_hash_req(&hash))
+            .await
+            .unwrap();
+        fs.write_packet(&build_aich_request(&hash, 0, &root))
+            .await
+            .unwrap();
+        let first = fs.read_packet_unpacked().await.unwrap();
+        assert_eq!(
+            first.opcode,
+            crate::transfer::OP_AICHANSWER,
+            "0x9E drew silence; the first answer is the 0x9B recovery"
+        );
+        match crate::transfer::parse_aich_answer(&first.payload).unwrap() {
+            AichAnswer::Recovery { .. } => {}
+            _ => panic!("valid 0x9B is served regardless of the peer's aich bit"),
+        }
+        // A malformed (37-byte) 0x9B costs the connection, like eMule's throw.
+        let short = mule_proto::Packet::new(
+            mule_proto::PROT_EMULE,
+            crate::transfer::OP_AICHREQUEST,
+            vec![0u8; 37],
+        );
+        fs.write_packet(&short).await.unwrap();
+        assert!(
+            fs.read_packet_unpacked().await.is_err(),
+            "connection dropped on the malformed request"
+        );
+        drop(fs);
+        up.await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn multipacket_bundles_the_aich_root_only_when_asked() {
+        use mule_proto::{Packet, Writer, PROT_EMULE};
+        // Round 1: multipacket WITH the 0x9E sub-op -> the answer ends with
+        // <0x9D><root 20>. Round 2 (fresh connection): WITHOUT it -> no 0x9D.
+        for want_aich in [true, false] {
+            let tag = if want_aich { "mpaich1" } else { "mpaich0" };
+            let (_d, hash, root, mut fs, up, dir) = aich_serve_fixture(tag, 1, true).await;
+            let mut w = Writer::new();
+            w.write_bytes(&hash);
+            w.write_u8(OP_REQUESTFILENAME);
+            w.write_u16(0); // ext info: we hold no parts
+            w.write_u16(0); // complete sources (our advertised ExtReq v2)
+            w.write_u8(OP_SETREQFILEID);
+            if want_aich {
+                w.write_u8(crate::transfer::OP_AICHFILEHASHREQ);
+            }
+            fs.write_packet(&Packet::new(PROT_EMULE, OP_MULTIPACKET, w.into_inner()))
+                .await
+                .unwrap();
+            let ans = fs.read_packet_unpacked().await.unwrap();
+            assert_eq!(ans.opcode, crate::transfer::OP_MULTIPACKETANSWER);
+            let tail_is_root = ans.payload.len() >= 21
+                && ans.payload[ans.payload.len() - 21] == crate::transfer::OP_AICHFILEHASHANS
+                && ans.payload[ans.payload.len() - 20..] == root[..];
+            assert_eq!(
+                tail_is_root, want_aich,
+                "0x9D sub-answer present iff the request bundled 0x9E (want_aich={want_aich})"
+            );
+            drop(fs);
+            up.await.unwrap();
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
     #[tokio::test]
     async fn a_peer_downloads_a_complete_file_we_share() {
         let dir = tmpdir("one");
@@ -1006,6 +1353,7 @@ mod tests {
             path,
             rating: 0,
             comment: String::new(),
+            aich_root: None,
         }];
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1048,6 +1396,7 @@ mod tests {
             path,
             rating: 0,
             comment: String::new(),
+            aich_root: None,
         }];
         let peer_hash = [0xCC; 16];
         let store = Arc::new(CreditStore::empty(true));
@@ -1123,6 +1472,7 @@ mod tests {
             path,
             rating: 0,
             comment: String::new(),
+            aich_root: None,
         }]);
 
         let high_hash = [0x91; 16];
@@ -1356,6 +1706,7 @@ mod tests {
             path: path.clone(),
             rating: 0,
             comment: String::new(),
+            aich_root: None,
         }];
         // The user deletes it in the Files app; the library still lists it.
         std::fs::remove_file(&path).unwrap();
@@ -1403,6 +1754,7 @@ mod tests {
             path: fixture_file("shared", 100),
             rating: 0,
             comment: String::new(),
+            aich_root: None,
         }];
 
         let (client, server) = duplex(64 * 1024);
@@ -1545,6 +1897,7 @@ mod tests {
             path: fixture_file("shared", 100),
             rating: 0,
             comment: String::new(),
+            aich_root: None,
         }];
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1639,6 +1992,7 @@ mod tests {
             path: fixture_file("shared", 100),
             rating: 0,
             comment: String::new(),
+            aich_root: None,
         }];
         let gate = Arc::new(UploadGate::new(4, 8));
 
@@ -1727,6 +2081,7 @@ mod tests {
             path: fixture_file("shared", 100),
             rating: 0,
             comment: String::new(),
+            aich_root: None,
         }];
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1789,6 +2144,7 @@ mod tests {
             path: fixture_file("shared", 100),
             rating: 4,
             comment: "great little file".to_string(),
+            aich_root: None,
         }];
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1832,6 +2188,7 @@ mod tests {
             path: fixture_file("shared", 100),
             rating: 4,
             comment: "hidden".to_string(),
+            aich_root: None,
         }];
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1911,6 +2268,7 @@ mod tests {
             path,
             rating: 0,
             comment: String::new(),
+            aich_root: None,
         }];
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
