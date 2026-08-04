@@ -126,6 +126,15 @@ struct ContentView: View {
                 if model.reconnecting {
                     banner("Reconnecting...", systemImage: "arrow.clockwise", tint: .orange)
                 }
+                // Persistent (not just the one-shot alert above): the user may
+                // dismiss the alert and move to another screen, and sharing
+                // stays paused until they turn it back on - this keeps that
+                // state visible the whole time, same as the reconnect banner.
+                if model.sharingPausedForIpChange {
+                    banner(
+                        "Sharing paused: your public address changed. Turn sharing back on to clear this.",
+                        systemImage: "wifi.exclamationmark", tint: .orange)
+                }
                 if let err = model.bootError {
                     banner("Engine failed: \(err)", systemImage: "exclamationmark.triangle", tint: .red)
                 }
@@ -197,6 +206,21 @@ struct ContentView: View {
                         "The server \($0) closed the connection. "
                             + "Pick another live server from the Servers tab to reconnect."
                     } ?? ""
+                )
+            }
+            .alert(
+                "VPN or network changed",
+                isPresented: $model.publicAddressAlert
+            ) {
+                Button("OK", role: .cancel) { model.publicAddressAlert = false }
+            } message: {
+                // Deliberately no IP address anywhere in this text - see
+                // EngineModel's .publicAddressChanged case for why.
+                Text(
+                    "padMule's public address changed. This usually means a VPN tunnel dropped "
+                        + "or the device switched networks. Sharing has been paused automatically "
+                        + "so files are not served from the new address. Check your VPN, then turn "
+                        + "sharing back on when you're ready."
                 )
             }
             .sheet(item: $ratingFor) { f in
@@ -815,11 +839,22 @@ struct ContentView: View {
                     get: { model.sharing },
                     set: { model.setSharing($0) }
                 ))
-                Text(model.sharing
-                    ? "padMule serves these files to other peers while it's open. Sharing earns you better standing in their queues, so your own downloads go faster."
-                    : "Leech Mode: downloading only. padMule is not serving any files to peers.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                // Say the current EFFECTIVE state, and why, so a user whose
+                // sharing was auto-paused does not think the toggle is broken -
+                // same reasoning as SettingsView's sharingPausedForMeteredLink
+                // footer, checked first for the same reason: it overrides
+                // whatever the toggle itself reads.
+                if model.sharingPausedForIpChange {
+                    Text("Sharing is paused because your public address changed (likely a VPN drop or a network switch). Turn sharing back on when you're ready.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text(model.sharing
+                        ? "padMule serves these files to other peers while it's open. Sharing earns you better standing in their queues, so your own downloads go faster."
+                        : "Leech Mode: downloading only. padMule is not serving any files to peers.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
 
             Section(model.sharedFiles.isEmpty ? "Library" : "Library (\(model.sharedFiles.count))") {

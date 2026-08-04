@@ -52,6 +52,9 @@ fn drain(engine: &MuleEngine) {
             EngineEventFfi::ServerDropped { addr } => {
                 println!("   [event] SERVER DROPPED: {addr}")
             }
+            EngineEventFfi::PublicAddressChanged => {
+                println!("   [event] PUBLIC ADDRESS CHANGED - sharing paused (VPN dropped?)")
+            }
             EngineEventFfi::Kad { contacts } => println!("   [event] kad: {contacts} contacts"),
             EngineEventFfi::Progress { hash, have, total } => println!(
                 "   [event] progress {}: {} / {}",
