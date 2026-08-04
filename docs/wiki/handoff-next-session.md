@@ -184,15 +184,17 @@ channel.
    assertion + a refresh in-flight guard) but not eliminated; the ~10s crawl
    and ~20s search still freeze the UI. The periodic re-drive and share-verify
    both had to be kept deliberately small for this reason.
-3. **Remaining Tier 2**: a failed initial UPnP map permanently disables
-   refresh/release (both early-return on public_ip=None - a transient SSDP
-   failure at start means LowID all session); NAT-PMP is dead code in the
-   engine; the 4s offer_files timeout silently drops uploads on a slow link;
-   no bandwidth limiting anywhere.
-4. **Settings Tier 1/2 engine work** - nickname (hardcoded "padMule"),
-   obfuscation policy tri-state, ipfilter controls, UPnP toggle, upload slots;
-   then bandwidth caps (`upload_queue.rs` holds dead kbps logic to
-   revive-or-delete), port override, See-My-Shared-Files.
+3. **Remaining Tier 2**: NAT-PMP is dead code in the engine; the 4s
+   offer_files timeout silently drops uploads on a slow link; no bandwidth
+   limiting anywhere. [The failed-initial-map bug that was listed here is
+   FIXED - build-progress 8bc.]
+4. **Settings Tier 1/2 engine work**, with **PORT OVERRIDE promoted**: the
+   listening port is hardcoded to 4662, which BLOCKS the VPN story entirely -
+   a provider-assigned forwarded port cannot earn HighID until the port is
+   settable ([[net-highid-and-port-forwarding]], VPN section). Then nickname
+   (hardcoded "padMule"), obfuscation policy tri-state, ipfilter controls,
+   UPnP toggle, upload slots, bandwidth caps (`upload_queue.rs` holds dead
+   kbps logic to revive-or-delete), See-My-Shared-Files.
 5. **AICH block recovery** (wave 11, the last scorecard PARTIAL).
 6. **Continuous block-request top-up** - padMule is stop-and-wait per 3-block
    batch, shallower than both authorities; no wire change, big win at cellular

@@ -1,6 +1,6 @@
 # HighID and Port Forwarding (dev box + iPad)
 
-Updated: 2026-08-03 (the queued fixes below SHIPPED 2026-08-02 and are
+Updated: 2026-08-03 (VPN/port-forwarding section added; the queued fixes below SHIPPED 2026-08-02 and are
 device-verified; the finite-lease idea was investigated and KILLED - see the
 annotations in place)
 
@@ -233,6 +233,39 @@ Still true on foreign networks: UPnP-less routers, cellular, and CGNAT force
 wav + pdf arrived via LowID callbacks) - HighID is a bonus, never an
 assumption, and the UI surfaces which one we have plus the "Port mapping" row
 (see [[lifecycle-and-reactivation]]).
+
+## VPN + padMule: port forwarding is the whole question (2026-08-03)
+
+Anthony asked which VPN is best for padMule. Recorded because the answer is
+mostly a padMule fact, not a vendor opinion - and because NOTHING had been
+written on this before (the only prior "VPN" mentions in the KB are eMuleAI's
+VPN Guard, which we skipped since Network Extensions are blocked for free-team
+sideloads, and a random eD2k server's MOTD advertising "VPN with port
+forwarding (for High ID)" that scrolled past during a live login test - a
+server's ad, not a vetted recommendation).
+
+- **A VPN replaces the mechanism this whole entry documents.** On the tunnel,
+  the UPnP mapping padMule negotiates with the BE9700 is irrelevant: inbound
+  reachability now depends entirely on the PROVIDER forwarding a port. No
+  forwarding -> LowID for the whole session, which costs direct dials,
+  makes us dependent on server callbacks, and makes LowID-to-LowID peers
+  unreachable outright.
+- **Most consumer VPNs no longer forward ports.** As of the 2026-01 knowledge
+  cutoff: Mullvad REMOVED it (2023), PIA dropped it earlier, and Proton has it
+  on desktop but historically NOT on iOS. The ones that offered an
+  iPad-usable path were AirVPN (port assigned in their control panel, works
+  with a plain WireGuard config in the official WireGuard app) and TorGuard,
+  with Windscribe offering ephemeral forwarding on paid plans. VERIFY before
+  paying - this is exactly the feature providers quietly drop.
+- **BLOCKER ON OUR SIDE: padMule's listening port is hardcoded to 4662**
+  (`TCP_PORT`). A provider that assigns an ARBITRARY forwarded port cannot
+  give padMule HighID until the app can be told to listen on it. So "port
+  override" - already sitting in the Settings Tier 1/2 backlog - is a
+  PREREQUISITE for the VPN story, not a nicety, and should be promoted before
+  anyone subscribes for this purpose.
+- Worth weighing honestly: on the home network HighID already works via UPnP,
+  so a VPN is a privacy choice that COSTS connectivity unless the forwarding
+  is real and the port is settable.
 
 ## Related
 
