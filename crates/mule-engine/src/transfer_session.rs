@@ -170,8 +170,13 @@ where
                 // hash gets OP_FILEREQANSNOFIL, exactly as the individual path would.
                 match parse_multipacket_hash(&pkt.payload) {
                     Ok(h) if h == f.hash => {
-                        fs.write_packet(&build_multipacket_answer(&f.hash, f.name, f.available))
-                            .await?;
+                        fs.write_packet(&build_multipacket_answer(
+                            &f.hash,
+                            f.name,
+                            f.available,
+                            None,
+                        ))
+                        .await?;
                     }
                     Ok(h) => fs.write_packet(&build_file_req_ans_no_fil(&h)).await?,
                     Err(_) => {} // malformed multipacket - ignore

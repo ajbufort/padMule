@@ -11,7 +11,10 @@ pub mod packet;
 pub mod rc4;
 pub mod tag;
 
-pub use aich::{aich_master_hash, leaf_spans, AichLeafHasher, AichTree, EMBLOCKSIZE};
+pub use aich::{
+    aich_base32, aich_from_base32, aich_master_hash, leaf_spans, AichLeafHasher, AichTree,
+    EMBLOCKSIZE,
+};
 pub use hash::{ed2k_hash, ed2k_hash_parts, md4, part_count, OLD_MAX_FILE_SIZE, PARTSIZE};
 pub use io::{IoError, Reader, Writer};
 pub use kad_id::Kad128;
