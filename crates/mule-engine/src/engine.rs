@@ -3094,10 +3094,28 @@ impl Engine {
 
     /// Bind the Kad UDP socket and bootstrap off the persisted contacts.
     async fn start_kad(&mut self) {
-        let contacts: Vec<KadContact> = match std::fs::read(self.config_dir.join("nodes.dat")) {
-            Ok(b) => read_nodes_dat(&b).map(|n| n.contacts).unwrap_or_default(),
-            Err(_) => Vec::new(),
-        };
+        // BOTH sources, unioned - and the in-memory one FIRST, because it is the
+        // fresher of the two and the one this used to ignore.
+        //
+        // `pause()` drops the live node via `set_kad(None)`, which folds
+        // everything it learned into `self.routing`. Resume then came straight
+        // back here and re-seeded from nodes.dat ON DISK, so every contact
+        // learned since the last checkpoint was thrown away on each
+        // background/foreground round trip. Caught live on 2026-08-05: the
+        // Status screen read 138 contacts, Anthony opened a download in another
+        // app and came back, and the engine logged `kad contacts: 21`.
+        //
+        // That is also why the table never seemed to grow across a session -
+        // and it made the 2026-08-05 Kad maintenance (`maintain_kad`) rebuild
+        // into a bucket with a hole in it. `load_nodes` merges, so the union
+        // costs nothing when the two agree.
+        let mut contacts: Vec<KadContact> = routing_to_nodes(&self.routing);
+        let known: std::collections::HashSet<_> = contacts.iter().map(|c| c.id).collect();
+        if let Ok(b) = std::fs::read(self.config_dir.join("nodes.dat")) {
+            if let Ok(n) = read_nodes_dat(&b) {
+                contacts.extend(n.contacts.into_iter().filter(|c| !known.contains(&c.id)));
+            }
+        }
         // The dial list gets the same gate as the table load: the ipfilter means
         // NO CONTACT, not merely no routing entry, and a poisoned nodes.dat must
         // not aim the bootstrap sweep at loopback/LAN/DNS-port/Kad1 addresses.
@@ -4489,6 +4507,55 @@ mod tests {
     /// the same load gate `start()` applies to the routing-table load. A poisoned
     /// nodes.dat (ipfilter-blocked, unroutable, or Kad1 contacts) must not aim the
     /// bootstrap dial sweep at them - it must gate to empty and say so, not dial.
+    /// Resume must seed Kad from the IN-MEMORY table, not only from disk.
+    ///
+    /// `pause()` drops the live node and folds everything it learned into
+    /// `self.routing`; `start_kad` then used to re-read nodes.dat and ignore
+    /// that, so every contact learned since the last checkpoint was discarded on
+    /// each background/foreground round trip. Caught live 2026-08-05 - Status
+    /// showed 138 contacts, Anthony opened a download in another app and came
+    /// back, and the engine logged `kad contacts: 21`.
+    ///
+    /// Driven with NO nodes.dat at all, so the only way to reach a non-empty
+    /// dial list is through the in-memory table: if the union regresses, the
+    /// engine emits "no Kad contacts to bootstrap" and this fails.
+    #[tokio::test]
+    async fn resume_seeds_kad_from_the_in_memory_table_not_only_from_disk() {
+        let dir = tmp("kad-reseed");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(
+            !dir.join("nodes.dat").exists(),
+            "no disk contacts on purpose"
+        );
+
+        let (mut engine, mut rx) = Engine::new(&dir).unwrap();
+        // What a live session would have folded in on pause: routable, Kad2.
+        engine.routing.load_nodes(&[KadContact {
+            id: Kad128::from_hash(&[0x5A; 16]),
+            ip: 0x0808_0404, // 8.8.4.4 - routable and acceptable
+            udp_port: 4672,
+            tcp_port: 4662,
+            version: 8,
+            udp_key: 0,
+            udp_key_ip: 0,
+            verified: false,
+        }]);
+
+        engine.start_kad().await;
+
+        let evs = drain(&mut rx).await;
+        assert!(
+            !evs.iter().any(
+                |e| matches!(e, EngineEvent::Server(s) if s == "no Kad contacts to bootstrap")
+            ),
+            "the in-memory table was ignored, so a resume threw away everything \
+             learned since the last checkpoint; got {evs:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn start_kad_gates_the_dial_list_not_just_the_routing_table_load() {
         let dir = tmp("start-kad-gate");
