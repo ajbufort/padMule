@@ -18,7 +18,7 @@ rows 8bj-8bw and the [[log]] entries for 2026-08-03/04.
 - Oracles: amuled differential re-run GREEN after the transfer-path changes
   (3 files byte-for-byte, incl. the 15MB multipart). REVERSE / eserver / Kad
   verify not re-run this session.
-- **Latest IPA delivered: `d1f058f`** (branch head). Device on iPadOS
+- **Latest IPA delivered: `dffbc30`** (branch head). Device on iPadOS
   **26.6**. Cert re-signed 2026-08-04, lapses about **2026-08-11**.
 - IPAs are delivered to `/mnt/c/Users/ajbuf/Downloads/` as
   `padMule-INSTALL-THIS-unsigned-<sha>.ipa` ([[padmule-ipa-delivery]]).
@@ -92,7 +92,18 @@ re-dialed 8x per sweep and again on every retry.
 
 ## OPEN - and named as open, not explained
 
-0. **"Much download activity but NO completions" (Anthony, on the fixed build).**
+0. **"No completions" - PARTLY ANSWERED, and the answer was the swarm.** The
+   new per-row badge "N parts nobody has" showed the two non-moving files
+   were exactly the two missing parts no source held: one at Zero KB with 24
+   parts, another capped near 50% by 13 parts (~120MB). padMule was correct.
+   BUT the badge counts parts no source WE HAVE SEEN held, so on a 1-2 source
+   file it means "the one peer we found lacks these" - QUEUED: gate it on a
+   source-count threshold and reword to "no connected source has".
+0b. **The original stall shape is still open**, and the next occurrence should
+   name itself: `skipped: source BANNED` vs `skipped: fetch already running`
+   are now in the funnel. A restart unstuck a file at 85%, which means the
+   blocker is in-memory state a restart clears - those are the only two such
+   gates on the dial path.
    Leading candidate is the TAIL, and the funnel already points at it:
    `accepted, no block to take` was **84 of 194** granted slots (43%). Four
    workers x 3 blocks x 184320 = **2.11MB** can be under reservation at once,
