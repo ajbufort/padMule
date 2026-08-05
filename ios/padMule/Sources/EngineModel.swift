@@ -1025,7 +1025,28 @@ final class EngineModel: ObservableObject {
                 self?.endPauseBackgroundTask()
             }
         }
+        // INSTRUMENT (2026-08-05). A device capture showed padMule suspended
+        // 465ms after this ran, with the teardown not completing for another
+        // 30.5s - it finished on the way back IN, immediately before resume, so
+        // the "clean pause" never happened and the Kad fold landed too late to
+        // be re-read. TWO mechanisms could do that and the log could not tell
+        // them apart: the assertion was refused, or this work item sat behind
+        // something long on the SERIAL `work` queue (a 6s server probe would).
+        //
+        // So: say whether the assertion was granted, and stamp when the work
+        // actually STARTS as against when pause() was called. The gap between
+        // those two lines is the queue wait, and it names the mechanism instead
+        // of leaving it to be argued.
+        let granted = pauseBackgroundTask != .invalid
+        let requestedAt = Date()
+        engineLog.notice(
+            "lifecycle: pause background-task assertion \(granted ? "GRANTED" : "REFUSED", privacy: .public)"
+        )
         work.async { [weak self] in
+            let waited = Date().timeIntervalSince(requestedAt)
+            engineLog.notice(
+                "lifecycle: pause work STARTED after \(String(format: "%.2f", waited), privacy: .public)s on the work queue"
+            )
             e.pause()
             DispatchQueue.main.async {
                 guard let self else { return }
