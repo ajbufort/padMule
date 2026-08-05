@@ -841,10 +841,14 @@ struct ContentView: View {
                         .accessibilityLabel("Dismiss server message")
                     }
                     .foregroundStyle(.white)
+                    // Same #000066 as every other banner - this is the SERVER
+                    // NEWS banner, and it was the one Anthony picked the
+                    // treatment from originally, so it must not be the one left
+                    // behind on the old bright blue.
+                    //
                     // Rectangle().fill(...) because listRowBackground needs a
-                    // VIEW: Color.blue.gradient is an AnyGradient (a ShapeStyle),
-                    // which .background accepts but this modifier does not.
-                    .listRowBackground(Rectangle().fill(Color.blue.gradient))
+                    // VIEW, not a ShapeStyle.
+                    .listRowBackground(Rectangle().fill(Color.bannerBlue))
                 }
             }
             Section {
@@ -1670,21 +1674,28 @@ struct ContentView: View {
         .foregroundStyle(.white)
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
-        .background(tint.gradient)
+        // FLAT, not `.gradient`. A gradient lightens the top of the tint, so the
+        // colour named at the call site was never the colour rendered - which is
+        // exactly why the banner blue had to be specified three times. A solid
+        // fill is also what this function's doc above has always described.
+        .background(tint)
     }
 }
 
-/// padMule's informational banner blue.
+/// padMule's informational banner blue: **#000066**, specified exactly by
+/// Anthony (2026-08-04) after two rounds of "that is not the blue I asked for".
 ///
-/// DARK on purpose (Anthony, 2026-08-04). `Color.blue` is the bright system
-/// blue, and `.gradient` lightens its top further, so the informational banners
-/// read as a vivid mid-blue rather than the dark blue that was asked for. Note
-/// for the record: the tree has used `Color.blue.gradient` for these since
-/// 57a75f5 - there is no earlier dark-blue literal to restore, so this is a
-/// deliberate value rather than a revert. One line to re-tune if the shade is
-/// still not right.
+/// Written as the hex components over 255 rather than as pre-divided decimals,
+/// so the literal can be checked against the hex by eye and cannot drift from it
+/// through a rounding edit.
+///
+/// This is the third attempt at the shade, and the reason the first two missed
+/// is worth keeping: banners were drawn with `.gradient`, which lightens the top
+/// of whatever tint it is given - so the colour named in the code was never the
+/// colour on the glass. The gradient is gone (see `banner`), which is also what
+/// that function's own doc always claimed it did ("solid tint with white text").
 extension Color {
-    static let bannerBlue = Color(red: 0.05, green: 0.16, blue: 0.40)
+    static let bannerBlue = Color(red: 0x00 / 255.0, green: 0x00 / 255.0, blue: 0x66 / 255.0)
 }
 
 /// The hex hash uniquely identifies a hit - enough for SwiftUI's item-based sheet.
