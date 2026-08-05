@@ -41,7 +41,7 @@ use crate::transfer::{
     parse_aich_answer, parse_aich_file_hash_ans, parse_file_desc, parse_file_status,
     parse_hashset_answer, AichAnswer, BlockReceiver, FileStatus, EMBLOCKSIZE, OP_ACCEPTUPLOADREQ,
     OP_AICHANSWER, OP_AICHFILEHASHANS, OP_FILEDESC, OP_FILEREQANSNOFIL, OP_FILESTATUS,
-    OP_HASHSETANSWER, OP_QUEUERANKING, STANDARD_BLOCKS_REQUEST,
+    OP_HASHSETANSWER, OP_OUTOFPARTREQS, OP_QUEUERANKING, STANDARD_BLOCKS_REQUEST,
 };
 use crate::transfer_session::TransferError;
 use mule_proto::{AichTree, Packet, PARTSIZE};
@@ -570,6 +570,20 @@ impl Download {
                 g.availability[p] += 1;
             }
         }
+    }
+
+    /// Does this peer hold ANY part we still have bytes missing in?
+    ///
+    /// Deliberately ignores reservations: a part another worker is fetching
+    /// right now is still a part this peer could serve later, so it makes the
+    /// peer worth a slot. Only a peer that can never help us answers false.
+    pub async fn has_needed_part(&self, status: &FileStatus) -> bool {
+        let g = self.inner.lock().await;
+        g.store
+            .pf
+            .wanted_parts()
+            .into_iter()
+            .any(|p| status.has_part(p as usize))
     }
 
     pub async fn hash(&self) -> [u8; 16] {
@@ -1423,6 +1437,47 @@ async fn handle_aich_answer(payload: &[u8], dl: &Download, aich: &mut AichAsk, i
     }
 }
 
+/// Wait for the peer to grant us an upload slot (OP_ACCEPTUPLOADREQ).
+///
+/// Its own function because it is entered TWICE: once after the initial
+/// OP_STARTUPLOADREQ, and again whenever the peer later revokes the slot with
+/// OP_OUTOFPARTREQS and puts us back on its queue. `bail_on_queue` decides what
+/// a queue ranking means here - move on to another source, or wait our turn.
+///
+/// Nothing re-sends OP_STARTUPLOADREQ on the second entry: upstream re-queues us
+/// itself as part of revoking (`AddClientToQueue(this, true)`,
+/// UploadClient.cpp:781), so asking again would be a duplicate request for a
+/// place we already hold.
+async fn await_slot<S>(
+    fs: &mut FramedStream<S>,
+    dl: &Download,
+    sec: &mut Option<(SecureIdentSession, Arc<Identity>)>,
+    peer: Option<SocketAddr>,
+    aich: &mut AichAsk,
+    bail_on_queue: bool,
+) -> Result<(), TransferError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    loop {
+        let pkt = fs.read_packet_unpacked().await?;
+        match pkt.opcode {
+            OP_ACCEPTUPLOADREQ => {
+                crate::stats::note_accepted();
+                return Ok(());
+            }
+            OP_QUEUERANKING if bail_on_queue => {
+                crate::stats::note_queued();
+                return Err(TransferError::Queued);
+            }
+            _ => {
+                crate::stats::note_unexpected(pkt.opcode);
+                handle_aux_packet(&pkt, sec, fs, dl, peer, aich).await?
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_peer<S>(
     fs: &mut FramedStream<S>,
@@ -1489,26 +1544,57 @@ where
     let status = loop {
         let pkt = fs.read_packet_unpacked().await?;
         match pkt.opcode {
-            OP_FILEREQANSNOFIL => return Err(TransferError::NoFile),
+            OP_FILEREQANSNOFIL => {
+                crate::stats::note_nofile();
+                return Err(TransferError::NoFile);
+            }
             OP_FILESTATUS => break parse_file_status(&pkt.payload)?,
             // A source's OP_FILEDESC (rating/comment) or a secure-ident packet
             // can arrive here; neither is what we are waiting for.
-            _ => handle_aux_packet(&pkt, &mut sec, fs, dl, peer, &mut aich).await?,
+            _ => {
+                crate::stats::note_unexpected(pkt.opcode);
+                handle_aux_packet(&pkt, &mut sec, fs, dl, peer, &mut aich).await?
+            }
         }
     };
+    crate::stats::note_status();
     // Record what this peer holds so block selection knows which parts are rare.
     dl.note_status(&status).await;
 
+    // NOTHING HERE FOR US. eMule reads the same status and, when the peer holds
+    // no part it needs, sets DS_NONEEDEDPARTS and swaps away WITHOUT ever asking
+    // for an upload slot (DownloadClient.cpp:634-641; the slot request at :545-549
+    // is the else-branch). padMule asked unconditionally, and the stress funnel
+    // priced that: of 7 slots it actually WON, 6 went to peers holding nothing it
+    // needed - the scarcest thing on eD2k, spent on nothing, while the worker sat
+    // through the queue wait to get it.
+    //
+    // Fast-bail makes this worse than it sounds, because it SELECTS for such
+    // peers: a client that just started downloading this file has a free upload
+    // slot precisely because it has nothing to upload, so it is exactly the peer
+    // that answers instantly instead of queueing us.
+    //
+    // Ok(0) rather than an error: the peer is healthy and honest, it simply has
+    // nothing yet. Scoring it as a failure would sink it below untried sources
+    // forever, when it may well have parts by the next sweep.
+    if !dl.has_needed_part(&status).await {
+        crate::stats::note_no_needed_parts();
+        return Ok(0);
+    }
+
     // A multi-part file cannot be verified without the part hashes.
     if dl.needs_hashset().await {
+        crate::stats::note_hashset_need();
         fs.write_packet(&build_hashset_request(&hash)).await?;
         loop {
             let pkt = fs.read_packet_unpacked().await?;
             if pkt.opcode == OP_HASHSETANSWER {
                 let (_h, hashes) = parse_hashset_answer(&pkt.payload)?;
                 dl.set_hashset(hashes).await;
+                crate::stats::note_hashset_got();
                 break;
             }
+            crate::stats::note_unexpected(pkt.opcode);
             handle_aux_packet(&pkt, &mut sec, fs, dl, peer, &mut aich).await?;
         }
     }
@@ -1518,19 +1604,16 @@ where
     // hunt across many thin sources, sitting in a queue is dead time - bail the
     // instant we are queued so the sweep moves to the next source. A real
     // background client would instead keep the slot and wait its turn.
+    crate::stats::note_slot_ask();
     fs.write_packet(&build_start_upload_req(&hash)).await?;
-    loop {
-        let pkt = fs.read_packet_unpacked().await?;
-        match pkt.opcode {
-            OP_ACCEPTUPLOADREQ => break,
-            OP_QUEUERANKING if bail_on_queue => return Err(TransferError::Queued),
-            _ => handle_aux_packet(&pkt, &mut sec, fs, dl, peer, &mut aich).await?,
-        }
-    }
+    await_slot(fs, dl, &mut sec, peer, &mut aich, bail_on_queue).await?;
 
     // Fetch blocks until this peer has nothing we still need.
     let size = dl.size().await;
     let mut delivered = 0u64;
+    // Funnel bookkeeping: count this SESSION once, not once per block round.
+    let mut asked_once = false;
+    let mut counted_delivery = false;
     loop {
         // A corrupt part awaiting AICH recovery: ask THIS source for its block
         // hashes if it is eligible (capable, reported the trusted root, no ask
@@ -1557,7 +1640,16 @@ where
         }
         let blocks = dl.take_blocks(&status, STANDARD_BLOCKS_REQUEST).await;
         if blocks.is_empty() {
+            if !asked_once {
+                // Granted a slot, then found nothing this peer could serve us -
+                // it holds no part we still need, or every one is reserved.
+                crate::stats::note_no_blocks();
+            }
             return Ok(delivered);
+        }
+        if !asked_once {
+            asked_once = true;
+            crate::stats::note_requested();
         }
         held.extend_from_slice(&blocks);
 
@@ -1609,7 +1701,54 @@ where
                 handle_aux_packet(&pkt, &mut sec, fs, dl, peer, &mut aich).await?;
                 continue;
             }
-            for w in rx.accept(pkt.opcode, &pkt.payload)? {
+            // THE SLOT IS OVER. Not an error and not an edge case - it is how
+            // every upload turn ends. Both authorities revoke with this the
+            // moment CheckForTimeOver() trips, at 10 MB uploaded or one hour
+            // (eMule 0.50a UploadClient.cpp:722-725 + :767-782, aMule master
+            // UploadClient.cpp:463-466, UploadQueue.cpp:609-616), then put us
+            // straight back on the queue.
+            //
+            // padMule had no handler, and `BlockReceiver::accept` yields no
+            // writes for a non-data opcode, so this loop went on waiting for
+            // bytes that were never coming - until the CALLER's per-peer
+            // timeout, 45s of one of only four worker slots for that download.
+            // Every source that fed us 10 MB then parked a worker. That is the
+            // "partially download, then stop or slow to a crawl" report.
+            //
+            // aMule's own receive side does exactly what happens below: a
+            // DOWNLOADING client goes back to ON_QUEUE (ClientTCPSocket.cpp:
+            // 727-736). Whether that means "wait our turn" or "go find another
+            // source" is the same fast-bail question the slot wait already
+            // answers, so it is deferred to the same flag.
+            if pkt.opcode == OP_OUTOFPARTREQS {
+                crate::stats::note_revoked();
+                if bail_on_queue {
+                    // Report the bytes rather than an error: this source DID
+                    // deliver and behaved correctly, so the manager must score
+                    // it as a proven deliverer and come back to it.
+                    return Ok(delivered);
+                }
+                // Waiting our turn: give the in-flight blocks back first, so
+                // they are not stranded behind our place in the queue.
+                dl.release(held).await;
+                held.clear();
+                await_slot(fs, dl, &mut sec, peer, &mut aich, bail_on_queue).await?;
+                break;
+            }
+            let writes = rx.accept(pkt.opcode, &pkt.payload)?;
+            // A packet that produced no writes is one this loop had no use for
+            // while it was waiting for block data. Tallied by opcode, because
+            // "the session stalled after being granted a slot" does not say
+            // WHICH packet padMule failed to act on - and the answer decides
+            // whether the fix is a policy change or a missing handler.
+            if writes.is_empty() {
+                crate::stats::note_unexpected(pkt.opcode);
+            }
+            for w in writes {
+                if !counted_delivery {
+                    counted_delivery = true;
+                    crate::stats::note_delivered();
+                }
                 delivered += w.data.len() as u64;
                 crate::stats::add_downloaded(w.data.len() as u64);
                 // Accrue what this source GAVE us against its credit record - this
@@ -2335,6 +2474,392 @@ mod tests {
         assert!(got.is_ok(), "download failed: {got:?}");
         drop(fs);
         let _ = up.await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_small_file_is_fully_reserved_by_its_own_workers() {
+        // WHY THIS TEST EXISTS: the fetch funnel measured 12 of 17 hard-won
+        // upload slots ending in "accepted, no block to take", and the arithmetic
+        // says why. The manager runs `parallel_for_priority(PR_NORMAL) = 4`
+        // workers, each reserving STANDARD_BLOCKS_REQUEST = 3 blocks of
+        // EMBLOCKSIZE - so 4 x 3 x 180KiB = 2.11 MB of a download can be under
+        // reservation at once. Any file SMALLER than that is entirely spoken for
+        // the moment its own workers start, and every further peer session finds
+        // nothing to take - including one that just won a slot, the scarcest
+        // thing on eD2k.
+        //
+        // The band is NARROWER than that arithmetic alone suggests, and this
+        // test exists because assuming otherwise was wrong: below
+        // ENDGAME_LIMIT (4 blocks, 737 KB) `take_blocks` enters endgame and
+        // races the reserved blocks instead of returning empty, so the smallest
+        // files rescue themselves. The exposed band is
+        //
+        //     ENDGAME_LIMIT (737 KB)  <  still missing  <  2.11 MB
+        //
+        // plus, at any size, a peer holding only parts whose blocks are already
+        // spoken for. So this mechanism is REAL but does not on its own account
+        // for the 12-of-17 measured live - that remains open.
+        //
+        // Documents the mechanism; asserts no fix. Changing it is a policy call
+        // (fewer workers on small files, a wider endgame, finer reservations)
+        // and belongs to its own measured pass.
+        use crate::transfer::build_file_status_complete;
+        use mule_proto::ed2k_hash;
+
+        // Nine blocks: comfortably past ENDGAME_LIMIT, and exactly what three
+        // workers reserve - so the fourth arrives to nothing.
+        let size = (9 * EMBLOCKSIZE) as usize;
+        let data: Vec<u8> = (0..size as u32)
+            .map(|i| (i.wrapping_mul(5)) as u8)
+            .collect();
+        let hash = ed2k_hash(&data);
+        let dir = tmpdir("smallreserve");
+        let store = PartStore::create(&dir, 1, hash, size as u64, b"small.bin").unwrap();
+        let dl = Download::new(store);
+        assert!(
+            (size as u64) > ENDGAME_LIMIT,
+            "must be past endgame, or take_blocks races the reservations instead"
+        );
+
+        // Every peer here holds the WHOLE file, so nothing is refused for lack
+        // of availability - only for lack of an UNRESERVED block.
+        let complete = parse_file_status(&build_file_status_complete(&hash).payload).unwrap();
+        for w in 0..3 {
+            let got = dl.take_blocks(&complete, STANDARD_BLOCKS_REQUEST).await;
+            assert_eq!(got.len(), STANDARD_BLOCKS_REQUEST, "worker {w} reserves 3");
+        }
+
+        // The fourth peer is a COMPLETE source that would have served us, and it
+        // may well have just spent a queue wait winning that slot.
+        assert!(
+            dl.has_needed_part(&complete).await,
+            "the file is entirely missing, so the peer does hold parts we need"
+        );
+        assert!(
+            dl.take_blocks(&complete, STANDARD_BLOCKS_REQUEST)
+                .await
+                .is_empty(),
+            "this is the measured 'accepted, no block to take': a useful source \
+             turned away because its own siblings hold every block"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_source_holding_nothing_we_need_is_never_asked_for_a_slot() {
+        // eMule reads OP_FILESTATUS and, if the peer holds no part it needs,
+        // goes to DS_NONEEDEDPARTS and swaps away - the upload-slot request is
+        // the ELSE branch (DownloadClient.cpp:634-641 vs :545-549). An upload
+        // slot is the scarcest thing on the network; asking a peer that has
+        // nothing for one wastes both sides' time.
+        //
+        // The peer here is the common real case the stress funnel kept finding:
+        // another DOWNLOADER of the same file, zero parts so far - which is
+        // exactly the peer with a free upload slot to give.
+        use crate::transfer::{build_file_status, OP_STARTUPLOADREQ};
+        use mule_proto::{ed2k_hash, PARTSIZE};
+
+        // Two data parts, so the status carries a real (all-zero) bitfield
+        // rather than the "complete" shorthand.
+        let size = (PARTSIZE + 4096) as usize;
+        let data: Vec<u8> = (0..size as u32)
+            .map(|i| (i.wrapping_mul(3)) as u8)
+            .collect();
+        let hash = ed2k_hash(&data);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let up = tokio::spawn(async move {
+            let me = HelloInfo::baseline([0xC7; 16], 0, 4662, 4672, "up");
+            let (_p, mut fs) = accept_peer(&listener, &me).await.unwrap();
+            let mut asked_for_a_slot = false;
+            while let Ok(pkt) = fs.read_packet_unpacked().await {
+                match pkt.opcode {
+                    crate::transfer::OP_SETREQFILEID => {
+                        // "I am downloading this too, and I have none of it."
+                        let _ = fs
+                            .write_packet(&build_file_status(&hash, &[false, false]))
+                            .await;
+                    }
+                    OP_STARTUPLOADREQ => asked_for_a_slot = true,
+                    _ => {}
+                }
+            }
+            asked_for_a_slot
+        });
+
+        let dir = tmpdir("noneeded");
+        let store = PartStore::create(&dir, 1, hash, size as u64, b"noneeded.bin").unwrap();
+        let dl = Download::new(store);
+        let me = HelloInfo::baseline([0xC8; 16], 0x0A00_0001, 4663, 4673, "dl");
+        let (_p, mut fs) = connect_peer(addr, &me).await.unwrap();
+
+        let got = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            download_from_peer(&mut fs, &dl, true),
+        )
+        .await
+        .expect("a useless source must be dropped promptly, not waited on");
+        assert_eq!(
+            got.expect("holding nothing we need is not a transfer error"),
+            0
+        );
+        drop(fs);
+        assert!(
+            !up.await.unwrap(),
+            "asked a peer with zero parts for an upload slot"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_revoked_slot_ends_the_session_instead_of_hanging_until_the_timeout() {
+        // OP_OUTOFPARTREQS (0x57) is how an uploader says "your turn is over, go
+        // back on the queue". It is NOT an edge case: it is the ordinary end of
+        // every slot. eMule 0.50a UploadClient.cpp:722-725 and aMule master
+        // UploadClient.cpp:463-466 both call
+        // SendOutOfPartReqsAndAddToWaitingQueue() the moment CheckForTimeOver()
+        // trips, and that trips at 10 MB uploaded or one hour
+        // (UploadQueue.cpp:609-616 - the same 10 MB padMule itself encodes as
+        // upload_queue::SESSION_MAX_BYTES). So every source that hands padMule
+        // 10 MB then sends this.
+        //
+        // padMule had no handler. `BlockReceiver::accept` returns no writes for
+        // any non-data opcode, so the block loop kept waiting for bytes that
+        // were never coming - until the caller's 45s per-peer timeout, holding
+        // one of only FOUR concurrent worker slots for that download the whole
+        // time. That is the "partially download and then stop or slow to a
+        // crawl" report.
+        //
+        // The mock is the upstream sequence verbatim: grant a slot, serve ONE
+        // block, then revoke and re-queue (0x57 followed by a fresh
+        // OP_QUEUERANKING, exactly as AddClientToQueue does) and go quiet
+        // WITHOUT closing the socket - a close would have ended the loop by
+        // itself and hidden the bug.
+        use crate::transfer::{
+            build_out_of_part_reqs, build_queue_ranking, build_sending_part, parse_request_parts,
+            OP_REQUESTPARTS, OP_REQUESTPARTS_I64,
+        };
+        use mule_proto::{ed2k_hash, EMBLOCKSIZE};
+
+        let size = (4 * EMBLOCKSIZE) as usize;
+        let data: Vec<u8> = (0..size as u32)
+            .map(|i| (i.wrapping_mul(11)) as u8)
+            .collect();
+        let hash = ed2k_hash(&data);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let served = data.clone();
+        let up = tokio::spawn(async move {
+            let me = HelloInfo::baseline([0xC3; 16], 0, 4662, 4672, "up");
+            let (_p, mut fs) = accept_peer(&listener, &me).await.unwrap();
+            let mut revoked = false;
+            while let Ok(pkt) = fs.read_packet_unpacked().await {
+                match pkt.opcode {
+                    OP_REQUESTPARTS | OP_REQUESTPARTS_I64 => {
+                        let (_h, blocks) =
+                            parse_request_parts(&pkt.payload, pkt.opcode == OP_REQUESTPARTS_I64)
+                                .unwrap();
+                        if revoked {
+                            continue;
+                        }
+                        let (s, e) = blocks[0];
+                        let _ = fs
+                            .write_packet(&build_sending_part(
+                                &hash,
+                                s,
+                                e,
+                                &served[s as usize..e as usize],
+                            ))
+                            .await;
+                        // The slot is now spent. Revoke it and re-queue us,
+                        // then answer nothing further.
+                        revoked = true;
+                        let _ = fs.write_packet(&build_out_of_part_reqs()).await;
+                        let _ = fs.write_packet(&build_queue_ranking(7)).await;
+                    }
+                    crate::transfer::OP_REQUESTFILENAME => {
+                        let _ = fs
+                            .write_packet(&crate::transfer::build_req_filename_answer(
+                                &hash,
+                                b"kick.bin",
+                            ))
+                            .await;
+                    }
+                    crate::transfer::OP_SETREQFILEID => {
+                        let _ = fs
+                            .write_packet(&crate::transfer::build_file_status_complete(&hash))
+                            .await;
+                    }
+                    crate::transfer::OP_STARTUPLOADREQ => {
+                        let _ = fs
+                            .write_packet(&crate::transfer::build_accept_upload())
+                            .await;
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let dir = tmpdir("outofpartreqs");
+        let store = PartStore::create(&dir, 1, hash, size as u64, b"kick.bin").unwrap();
+        let dl = Download::new(store);
+        let me = HelloInfo::baseline([0xC4; 16], 0x0A00_0001, 4663, 4673, "dl");
+        let (_p, mut fs) = connect_peer(addr, &me).await.unwrap();
+
+        // 5s stands in for the caller's 45s per-peer budget: the session must
+        // end on the revocation, not wait out a timeout. MUTATION-CHECK by
+        // deleting the OP_OUTOFPARTREQS arm in `run_peer` - this goes red.
+        let got = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            download_from_peer(&mut fs, &dl, true),
+        )
+        .await
+        .expect("a revoked slot must end the session, not hang until the peer timeout");
+
+        // It reports the BYTES, not an error: the peer behaved correctly and
+        // gave us real data, so the manager must score it as a proven deliverer
+        // and come back to it rather than record a failure against it.
+        assert_eq!(
+            got.expect("a revoked slot is not a transfer error"),
+            EMBLOCKSIZE,
+            "the revocation must report what the source delivered"
+        );
+        // The block it DID serve was committed, not thrown away.
+        assert_eq!(
+            dl.missing().await,
+            (size - EMBLOCKSIZE as usize) as u64,
+            "the one delivered block must be kept"
+        );
+        drop(fs);
+        let _ = up.await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_dedicated_source_waits_out_a_revoked_slot_and_finishes_the_file() {
+        // The other half of OP_OUTOFPARTREQS. A called-back LowID source dialed
+        // US and cannot be redialed, so for it (`bail_on_queue = false`) the
+        // right answer to a revoked slot is aMule's own: go back to ON_QUEUE and
+        // wait for the next turn (ClientTCPSocket.cpp:727-736), not walk away.
+        //
+        // The mock revokes mid-file and then GRANTS A SECOND SLOT, so the test
+        // fails if padMule either hangs on the revocation or gives up on it.
+        use crate::transfer::{
+            build_accept_upload, build_out_of_part_reqs, build_sending_part, parse_request_parts,
+            OP_REQUESTPARTS, OP_REQUESTPARTS_I64,
+        };
+        use mule_proto::{ed2k_hash, EMBLOCKSIZE};
+
+        let size = (6 * EMBLOCKSIZE) as usize;
+        let data: Vec<u8> = (0..size as u32)
+            .map(|i| (i.wrapping_mul(13)) as u8)
+            .collect();
+        let hash = ed2k_hash(&data);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let served = data.clone();
+        let up = tokio::spawn(async move {
+            let me = HelloInfo::baseline([0xC5; 16], 0, 4662, 4672, "up");
+            let (_p, mut fs) = accept_peer(&listener, &me).await.unwrap();
+            let mut revoked = false;
+            let mut asked_with_no_slot = false;
+            while let Ok(pkt) = fs.read_packet_unpacked().await {
+                match pkt.opcode {
+                    OP_REQUESTPARTS | OP_REQUESTPARTS_I64 => {
+                        let (_h, blocks) =
+                            parse_request_parts(&pkt.payload, pkt.opcode == OP_REQUESTPARTS_I64)
+                                .unwrap();
+                        if !revoked {
+                            // The turn ends with NO data served for this
+                            // request. Serving a block first would not
+                            // discriminate: the continuous top-up (row 8bn)
+                            // legitimately fires a replacement request the
+                            // instant a block completes, so that request is
+                            // already in flight before the revocation is even
+                            // read. With nothing completing here, the only
+                            // reason to send another request is failing to go
+                            // back on the queue.
+                            revoked = true;
+                            let _ = fs.write_packet(&build_out_of_part_reqs()).await;
+                            // A real uploader serves nothing between revoking a
+                            // slot and granting the next one. A downloader that
+                            // merely stops waiting for data - instead of
+                            // returning to ON_QUEUE - asks again inside this
+                            // window while holding no slot. That request is
+                            // consumed here and never answered, so it then
+                            // hangs and the outer timeout fails the test too.
+                            let early = tokio::time::timeout(
+                                std::time::Duration::from_millis(300),
+                                fs.read_packet_unpacked(),
+                            )
+                            .await;
+                            asked_with_no_slot = early.is_ok();
+                            let _ = fs.write_packet(&build_accept_upload()).await;
+                        } else {
+                            for (s, e) in blocks {
+                                if e > s {
+                                    let _ = fs
+                                        .write_packet(&build_sending_part(
+                                            &hash,
+                                            s,
+                                            e,
+                                            &served[s as usize..e as usize],
+                                        ))
+                                        .await;
+                                }
+                            }
+                        }
+                    }
+                    crate::transfer::OP_REQUESTFILENAME => {
+                        let _ = fs
+                            .write_packet(&crate::transfer::build_req_filename_answer(
+                                &hash,
+                                b"requeue.bin",
+                            ))
+                            .await;
+                    }
+                    crate::transfer::OP_SETREQFILEID => {
+                        let _ = fs
+                            .write_packet(&crate::transfer::build_file_status_complete(&hash))
+                            .await;
+                    }
+                    crate::transfer::OP_STARTUPLOADREQ => {
+                        let _ = fs.write_packet(&build_accept_upload()).await;
+                    }
+                    _ => {}
+                }
+            }
+            asked_with_no_slot
+        });
+
+        let dir = tmpdir("requeue");
+        let store = PartStore::create(&dir, 1, hash, size as u64, b"requeue.bin").unwrap();
+        let dl = Download::new(store);
+        let me = HelloInfo::baseline([0xC6; 16], 0x0A00_0001, 4663, 4673, "dl");
+        let (_p, mut fs) = connect_peer(addr, &me).await.unwrap();
+
+        let got = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            download_from_peer(&mut fs, &dl, false),
+        )
+        .await
+        .expect("waiting out a revoked slot must not deadlock");
+        assert!(got.is_ok(), "download failed: {got:?}");
+        assert_eq!(
+            dl.missing().await,
+            0,
+            "the file completes across the requeue"
+        );
+        drop(fs);
+        assert!(
+            !up.await.unwrap(),
+            "asked for parts while holding no slot - a revoked slot must send us \
+             back to the queue, not straight back to requesting"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

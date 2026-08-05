@@ -969,6 +969,14 @@ impl MuleEngine {
     }
 }
 
+/// The fetch funnel: how far down the eD2k request sequence each peer session
+/// got this run, plus every opcode read out of turn. A DIAGNOSTIC surface, so it
+/// is deliberately NOT `#[uniffi::export]` - the harness reads it, the shipped
+/// Swift binding does not grow a method for it. See `mule_engine::stats`.
+pub fn fetch_report() -> String {
+    mule_engine::stats::fetch_report()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
