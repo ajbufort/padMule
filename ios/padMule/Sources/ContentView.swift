@@ -1509,19 +1509,32 @@ struct ContentView: View {
         return parts.isEmpty ? nil : parts.joined(separator: " / ")
     }
 
-    /// "3 parts nobody has" - the parts still needed that NO source we have
-    /// talked to was ever seen holding.
+    /// Statuses that must have been sampled before the gap is worth showing.
+    ///
+    /// Below this the claim is too weak to make: from one or two peers, "13
+    /// parts nobody has" really means "the one peer we found lacks 13 parts",
+    /// which is ordinary and says nothing about the swarm. Four is where a
+    /// unanimous gap starts to be interesting rather than anecdotal.
+    private static let minStatusesForGap: UInt32 = 4
+
+    /// "13 parts missing from all 22 sources" - parts still needed that NOT ONE
+    /// sampled peer offered.
     ///
     /// This is the difference between a slow tail and an impossible one, which
-    /// look identical on a row that reads "90%, 86 sources, not moving": either
+    /// look identical on a row reading "90%, 86 sources, not moving": either
     /// padMule is failing to ASK for the remainder, or the swarm does not HAVE
-    /// it. Shown only when non-zero, and only once at least one source has
-    /// reported - before that every part is trivially "unavailable" and saying
-    /// so would be alarming nonsense on a download that has merely just started.
+    /// it. The SAMPLE SIZE is named in the text on purpose - the first version
+    /// said "N parts nobody has" from a one-source sample, which overstated a
+    /// real measurement into a claim about the whole network.
     private func missingParts(_ dl: DownloadInfo) -> String? {
-        guard dl.partsUnavailable > 0, sourceOrigins(dl) != nil else { return nil }
+        guard dl.partsUnavailable > 0,
+              dl.partStatusReports >= Self.minStatusesForGap
+        else { return nil }
         let n = dl.partsUnavailable
-        return n == 1 ? "1 part nobody has" : "\(n) parts nobody has"
+        let seen = dl.partStatusReports
+        return n == 1
+            ? "1 part missing from all \(seen) sources"
+            : "\(n) parts missing from all \(seen) sources"
     }
 
     private func bytes(_ n: UInt64) -> String {
