@@ -195,6 +195,22 @@ const KAD_SEARCH_WAIT: Duration = Duration::from_secs(15);
 /// Per-node wait during a Kad keyword lookup.
 const KAD_PER_QUERY: Duration = Duration::from_millis(750);
 
+/// How often a RUNNING engine refreshes its Kad routing table.
+///
+/// padMule had NO Kad maintenance at all before 2026-08-05 - see
+/// `KadNode::refresh_routing`. Two minutes is a deliberate compromise: eMule
+/// refreshes bins on an hourly cycle driven by a per-second timer, but it is an
+/// always-on desktop client, whereas padMule only exists while it is on screen.
+/// A foreground session is measured in minutes to hours, so the table has to be
+/// built inside one rather than maintained across days.
+const KAD_REFRESH_EVERY: Duration = Duration::from_secs(120);
+
+/// Stop actively growing the table past this. Not a protocol rule - a battery
+/// and bandwidth one: past a few hundred well-spread contacts a lookup already
+/// converges, and a foreground-only client on a tablet should not keep paying
+/// UDP for contacts it will never use. Refresh resumes if the table shrinks.
+const KAD_TABLE_TARGET: usize = 600;
+
 /// DIALABLE sources a server answer must carry before `find_sources` skips the
 /// Kad arm entirely.
 ///
@@ -1166,6 +1182,18 @@ pub struct ServerEntry {
     pub connected: bool,
     /// A user favorite: kept by `prune_dead_servers` even when down.
     pub pinned: bool,
+    /// Silent so far, but not yet called DEAD: it has never answered us and has
+    /// missed fewer than `PROBE_MISSES_BEFORE_DEAD` rounds.
+    ///
+    /// The third state exists because two were a lie. `alive: false` was being
+    /// rendered as "no reply", which is a VERDICT, and on a cold start every
+    /// server is in that bucket after ONE silent round - the probe's history map
+    /// is in memory, so a fresh launch has nothing to vouch for anybody. That is
+    /// the same "one datum is never a verdict" rule the miss counter already
+    /// encodes for servers WITH history, missing from the branch for servers
+    /// without. Proven on 2026-08-05: padMule showed `eMule Sunrise` as "no
+    /// reply" and then logged into it with HighID moments later.
+    pub checking: bool,
 }
 
 /// What the server told us at login. Kept because HighID-vs-LowID decides
@@ -1277,6 +1305,9 @@ struct ProbeHealth {
     users: u32,
     files: u32,
     misses: u8,
+    /// Has this server EVER answered a probe? Distinguishes "silent and known
+    /// good" (keep showing its last counts) from "silent and unknown" (say so).
+    answered: bool,
 }
 
 /// How many consecutive silent probes before a server is called dead. Three
@@ -1288,6 +1319,59 @@ const PROBE_MISSES_BEFORE_DEAD: u8 = 3;
 /// and the fan-out is dozens of servers.
 const PROBE_COLLECT_BUDGET: Duration = Duration::from_secs(6);
 
+/// What one probe round concluded about one server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProbeVerdict {
+    alive: bool,
+    checking: bool,
+    users: u32,
+    files: u32,
+}
+
+/// Fold ONE probe round for one server against what we remember of it, updating
+/// that memory and returning what the row should say.
+///
+/// Extracted so the TEST drives the real rule instead of a copy of it. It used
+/// to re-implement this fold, which meant it could go green while production
+/// diverged - the exact shape [[interop-test-fidelity]] warns about, and it
+/// mattered the moment the rule gained a third outcome.
+///
+/// The rule: an answer is always believed and resets the miss count. Silence is
+/// only a VERDICT after `PROBE_MISSES_BEFORE_DEAD` rounds; before that a server
+/// that has answered before keeps its last good numbers, and one that never has
+/// is reported as still being CHECKED rather than as dead.
+fn fold_probe_round(h: &mut ProbeHealth, answered: bool, users: u32, files: u32) -> ProbeVerdict {
+    if answered {
+        *h = ProbeHealth {
+            users,
+            files,
+            misses: 0,
+            answered: true,
+        };
+        return ProbeVerdict {
+            alive: true,
+            checking: false,
+            users,
+            files,
+        };
+    }
+    h.misses = h.misses.saturating_add(1);
+    if h.misses >= PROBE_MISSES_BEFORE_DEAD {
+        return ProbeVerdict {
+            alive: false,
+            checking: false,
+            users: 0,
+            files: 0,
+        };
+    }
+    ProbeVerdict {
+        alive: h.answered,
+        checking: !h.answered,
+        users: h.users,
+        files: h.files,
+    }
+}
+
 pub struct Engine {
     identity: NodeIdentity,
     config_dir: PathBuf,
@@ -1296,6 +1380,8 @@ pub struct Engine {
     last_checkpoint: Instant,
     last_share_verify: Instant,
     last_resume_retry: Instant,
+    /// When `maintain_kad` last refreshed the routing table.
+    last_kad_refresh: Instant,
     events: mpsc::UnboundedSender<EngineEvent>,
     /// Persisted Kad contacts (loaded from / saved to `nodes.dat`).
     routing: RoutingTable,
@@ -1442,6 +1528,7 @@ impl Engine {
             last_checkpoint: Instant::now(),
             last_share_verify: Instant::now(),
             last_resume_retry: Instant::now(),
+            last_kad_refresh: Instant::now(),
             events: tx,
             routing,
             downloads: Arc::new(Mutex::new(Vec::new())),
@@ -2366,6 +2453,7 @@ impl Engine {
                     alive: false,
                     connected: Some(addr) == connected,
                     pinned: self.pinned.contains(&addr.to_string()),
+                    checking: false,
                 }
             })
             .collect();
@@ -2460,26 +2548,18 @@ impl Engine {
         // a server that is answering perfectly well, which is what Anthony saw.
         if let Ok(mut health) = self.server_health.lock() {
             for e in servers.iter_mut() {
-                if e.alive {
-                    health.insert(
-                        e.addr,
-                        ProbeHealth {
-                            users: e.users.unwrap_or(0),
-                            files: e.files.unwrap_or(0),
-                            misses: 0,
-                        },
-                    );
-                    continue;
-                }
-                let Some(h) = health.get_mut(&e.addr) else {
-                    continue; // never answered us; nothing to vouch for it
-                };
-                h.misses = h.misses.saturating_add(1);
-                if h.misses < PROBE_MISSES_BEFORE_DEAD {
-                    // Still believed live, showing the counts it last reported.
-                    e.alive = true;
-                    e.users = Some(h.users);
-                    e.files = Some(h.files);
+                let h = health.entry(e.addr).or_insert(ProbeHealth {
+                    users: 0,
+                    files: 0,
+                    misses: 0,
+                    answered: false,
+                });
+                let seen = fold_probe_round(h, e.alive, e.users.unwrap_or(0), e.files.unwrap_or(0));
+                e.alive = seen.alive;
+                e.checking = seen.checking;
+                if seen.alive {
+                    e.users = Some(seen.users);
+                    e.files = Some(seen.files);
                 }
             }
             // Do not accumulate forever: forget servers no longer in the list.
@@ -4219,6 +4299,50 @@ impl Engine {
     /// Periodically drop shared files the user deleted (see
     /// `verify_shared_library`). Runs off the same 1s heartbeat as the other
     /// maintainers, gated to `SHARE_VERIFY_EVERY`.
+    /// Refresh the Kad routing table: one bounded lookup toward a RANDOM target,
+    /// which pulls in every contact the answering nodes name.
+    ///
+    /// This is the maintenance padMule never had. Without it the table was fed
+    /// only by the bootstrap and by whatever a source lookup or keyword search
+    /// happened to walk past, so it neither grew on purpose nor shed the dead -
+    /// and Kad keyword search, whose quality is a direct function of how broad
+    /// and well-spread that table is, stayed correspondingly thin. Both
+    /// authorities run the equivalent on a timer (eMule
+    /// `CRoutingZone::OnBigTimer`, aMule RoutingZone.cpp).
+    ///
+    /// A RANDOM target rather than our own ID on purpose: a self-lookup only
+    /// ever deepens the region we already know best, while the keyspace a
+    /// keyword search lands in is uniform. Successive random targets walk the
+    /// whole space, which is the same effect eMule gets by refreshing each bin
+    /// in turn.
+    ///
+    /// Returns contacts gained, for the caller's log and for tests.
+    pub async fn maintain_kad(&mut self) -> usize {
+        if self.state != EngineState::Running || self.offline {
+            return 0;
+        }
+        if self.last_kad_refresh.elapsed() < KAD_REFRESH_EVERY {
+            return 0;
+        }
+        self.last_kad_refresh = Instant::now();
+        let Some(kad) = self.kad.as_mut() else {
+            return 0;
+        };
+        // Nothing to walk from - the bootstrap has to land first.
+        if kad.contacts_known() == 0 || kad.contacts_known() >= KAD_TABLE_TARGET {
+            return 0;
+        }
+        let mut bytes = [0u8; 16];
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut bytes);
+        let target = Kad128::from_hash(&bytes);
+        let gained = kad.refresh_routing(&target, KAD_PER_QUERY).await;
+        if gained > 0 {
+            let total = kad.contacts_known();
+            let _ = self.events.send(EngineEvent::Kad { contacts: total });
+        }
+        gained
+    }
+
     pub async fn maintain_share_verify(&mut self) -> u32 {
         if self.state != EngineState::Running
             || self.last_share_verify.elapsed() < SHARE_VERIFY_EVERY
@@ -5298,6 +5422,35 @@ mod tests {
             }
         });
         addr
+    }
+
+    /// Kad maintenance must be RATE-LIMITED and must never fire on a stopped or
+    /// offline engine. It runs from the heartbeat, i.e. once a second, and it
+    /// does real UDP work under the engine lock - so the guard is the whole
+    /// reason the call is safe to make that often.
+    #[tokio::test]
+    async fn kad_maintenance_is_rate_limited_and_never_runs_offline() {
+        let dir = tmp("kadmaint");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+        engine.set_offline(true);
+
+        // Stopped: nothing, whatever the clock says.
+        engine.last_kad_refresh = Instant::now() - KAD_REFRESH_EVERY - Duration::from_secs(1);
+        assert_eq!(engine.maintain_kad().await, 0, "a stopped engine is silent");
+
+        // Running but OFFLINE: still nothing. Offline means no packets, and
+        // maintenance is packets.
+        engine.state = EngineState::Running;
+        engine.last_kad_refresh = Instant::now() - KAD_REFRESH_EVERY - Duration::from_secs(1);
+        assert_eq!(engine.maintain_kad().await, 0, "offline means no UDP");
+
+        // Due-ness is checked BEFORE the offline short-circuit consumes it, so a
+        // freshly-stamped engine stays quiet on the next heartbeat too.
+        engine.last_kad_refresh = Instant::now();
+        assert_eq!(engine.maintain_kad().await, 0, "not due yet");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The Kad-skip threshold is TIED to the worker pool, not chosen by feel.
@@ -6703,66 +6856,67 @@ mod tests {
 
     #[test]
     fn a_single_silent_probe_does_not_kill_a_server() {
-        // "an event is not state", third occurrence. A status probe is UDP and
         // UDP loses datagrams - more so through a VPN at ~200ms RTT. One silent
         // round greyed out servers that were answering moments earlier and that
         // padMule had been connecting to. Observed live: the same two servers
         // read "no reply", then 3,651 / 47,008 users minutes later.
         //
-        // This drives the same fold the probe applies to its raw results.
-        fn fold(
-            health: &Arc<std::sync::Mutex<HashMap<SocketAddr, ProbeHealth>>>,
-            addr: SocketAddr,
-            answered: bool,
-            users: u32,
-        ) -> (bool, Option<u32>) {
-            let mut alive = answered;
-            let mut shown = answered.then_some(users);
-            let mut h = health.lock().unwrap();
-            if answered {
-                h.insert(
-                    addr,
-                    ProbeHealth {
-                        users,
-                        files: 9,
-                        misses: 0,
-                    },
-                );
-            } else if let Some(e) = h.get_mut(&addr) {
-                e.misses = e.misses.saturating_add(1);
-                if e.misses < PROBE_MISSES_BEFORE_DEAD {
-                    alive = true;
-                    shown = Some(e.users);
-                }
-            }
-            (alive, shown)
+        // Drives the REAL fold, not a copy of it (see fold_probe_round).
+        let mut h = ProbeHealth {
+            users: 0,
+            files: 0,
+            misses: 0,
+            answered: false,
+        };
+
+        // It answers once: alive, with its numbers.
+        let v = fold_probe_round(&mut h, true, 3_651, 9);
+        assert!(v.alive && !v.checking);
+        assert_eq!(v.users, 3_651);
+
+        // Two silent rounds: still believed live, still showing what it said.
+        for round in 1..PROBE_MISSES_BEFORE_DEAD {
+            let v = fold_probe_round(&mut h, false, 0, 0);
+            assert!(v.alive, "one lost datagram is not a death (round {round})");
+            assert_eq!(v.users, 3_651, "keeps its last good numbers");
         }
+        // The third consecutive miss is a real signal.
+        let v = fold_probe_round(&mut h, false, 0, 0);
+        assert!(!v.alive && !v.checking, "three misses in a row IS dead");
+    }
 
-        let health: Arc<std::sync::Mutex<HashMap<SocketAddr, ProbeHealth>>> =
-            Arc::new(std::sync::Mutex::new(HashMap::new()));
-        let addr: SocketAddr = "1.2.3.4:4661".parse().unwrap();
-
-        // It answers once, so we know it is real.
-        assert_eq!(fold(&health, addr, true, 5000), (true, Some(5000)));
-        // Two silent rounds: still shown live, with the counts it last gave.
-        assert_eq!(fold(&health, addr, false, 0), (true, Some(5000)), "1 miss");
-        assert_eq!(
-            fold(&health, addr, false, 0),
-            (true, Some(5000)),
-            "2 misses"
+    /// A COLD START must not call every server dead. The probe's history lives
+    /// in memory, so on a fresh launch nothing has ever answered - and the old
+    /// rule skipped those servers entirely, leaving `alive: false`, which the
+    /// screen printed as "no reply". That is a verdict from one datum, and it is
+    /// wrong: on 2026-08-05 padMule showed `eMule Sunrise` as "no reply" and
+    /// then logged into it with HighID moments later.
+    #[test]
+    fn a_never_answered_server_reads_as_checking_not_dead() {
+        let mut h = ProbeHealth {
+            users: 0,
+            files: 0,
+            misses: 0,
+            answered: false,
+        };
+        for round in 1..PROBE_MISSES_BEFORE_DEAD {
+            let v = fold_probe_round(&mut h, false, 0, 0);
+            assert!(
+                v.checking && !v.alive,
+                "round {round}: unknown is not dead, and must not be shown as dead"
+            );
+        }
+        // ...but silence is not indefinitely excusable either.
+        let v = fold_probe_round(&mut h, false, 0, 0);
+        assert!(
+            !v.checking && !v.alive,
+            "after {PROBE_MISSES_BEFORE_DEAD} silent rounds it really is dead"
         );
-        // Three in a row is a real signal, not just UDP being UDP.
-        assert_eq!(
-            fold(&health, addr, false, 0),
-            (false, None),
-            "3 misses -> dead"
-        );
-        // And one good answer rehabilitates it immediately.
-        assert_eq!(fold(&health, addr, true, 6000), (true, Some(6000)));
 
-        // A server that has NEVER answered is not vouched for by anything.
-        let unknown: SocketAddr = "9.9.9.9:4661".parse().unwrap();
-        assert_eq!(fold(&health, unknown, false, 0), (false, None));
+        // And a late first answer clears everything.
+        let v = fold_probe_round(&mut h, true, 42, 7);
+        assert!(v.alive && !v.checking);
+        assert_eq!((v.users, v.files), (42, 7));
     }
 
     #[tokio::test]

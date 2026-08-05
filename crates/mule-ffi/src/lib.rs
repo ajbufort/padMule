@@ -153,6 +153,12 @@ pub struct ServerEntryFfi {
     pub connected: bool,
     /// A user favorite: kept by `prune_dead_servers` even when down.
     pub pinned: bool,
+    /// Silent so far, but NOT yet judged dead - it has never answered a probe
+    /// and has missed fewer than three rounds. On a cold start this is every
+    /// server, and the UI must say "checking" rather than "no reply": the probe
+    /// is UDP and the login is TCP, so a silent server is very often perfectly
+    /// reachable (proven live 2026-08-05).
+    pub checking: bool,
 }
 
 /// The outcome of a search: hits (with whether the server has more pages to load)
@@ -587,6 +593,7 @@ impl MuleEngine {
                     alive: e.alive,
                     connected: e.connected,
                     pinned: e.pinned,
+                    checking: e.checking,
                 })
                 .collect()
         })
@@ -787,6 +794,9 @@ impl MuleEngine {
             g.maintain_share_verify().await;
             g.maintain_resume_fetches().await;
             g.maintain_server_harvest().await;
+            // Kad routing-table maintenance. Rate-limited to KAD_REFRESH_EVERY
+            // inside, so calling it every heartbeat costs a comparison.
+            g.maintain_kad().await;
         });
     }
 
