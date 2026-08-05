@@ -27,6 +27,9 @@ struct SettingsView: View {
     // a disagreement shows the toggle in one state while the engine is in the
     // other.
     @AppStorage(SettingsKey.upnpEnabled) private var upnpEnabled = false
+    // Same agreement rule as upnpEnabled above: false here must match the
+    // registered default, or the switch renders on while the app is light.
+    @AppStorage(SettingsKey.darkMode) private var darkMode = false
 
     @State private var newUrl = ""
 
@@ -41,6 +44,7 @@ struct SettingsView: View {
     var body: some View {
         NavigationStack {
             Form {
+                appearanceSection
                 sharingSection
                 serverListSection
                 networkSection
@@ -64,6 +68,30 @@ struct SettingsView: View {
                     Button("Done") { focusedPort = nil }
                 }
             }
+        }
+    }
+
+    // MARK: - Appearance
+
+    /// FIRST section on the screen (Anthony, 2026-08-05). It is the setting a
+    /// user is most likely to come here for and the only one whose effect is
+    /// visible the instant it is flipped, so it earns the top slot over
+    /// Sharing.
+    ///
+    /// padMule PINS its appearance rather than following the system. Light
+    /// unless this is on - see `PadMuleApp`, where the scheme is applied. The
+    /// alternative, `.preferredColorScheme(nil)`, would inherit iPadOS's
+    /// setting and mean the app could go dark by itself partway through a long
+    /// transfer because the iPad crossed a scheduled sunset. An explicit choice
+    /// that stays put is the better behaviour for an app that is meant to sit
+    /// open and on screen for hours.
+    private var appearanceSection: some View {
+        Section {
+            Toggle("Dark Mode", isOn: $darkMode)
+        } header: {
+            Text("Appearance")
+        } footer: {
+            Text("padMule starts in Light Mode unless you turn this on. It does not follow the iPad's system appearance, so it will not change on its own while a transfer is running.")
         }
     }
 

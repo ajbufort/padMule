@@ -88,6 +88,39 @@ final class SettingsTests: XCTestCase {
         XCTAssertEqual(list.count, 2)
     }
 
+    /// A row with zero connected sources must say WHICH kind of nothing it is.
+    /// "no sources exist" and "sources exist and none can be reached" need
+    /// opposite responses from the user and both used to render as a blank -
+    /// which is how a 312 MB file sat at Zero KB for ten minutes on 2026-08-05
+    /// while its search row advertised 15 sources.
+    func testIdlePoolDistinguishesEmptyFromUnreachable() {
+        XCTAssertEqual(ContentView.idlePoolLabel(found: 0, callback: 0), "no sources found")
+        XCTAssertEqual(ContentView.idlePoolLabel(found: 3, callback: 0), "0 of 3 connected")
+        // The LowID split: "awaiting callback" is a different prognosis from
+        // "we are dialing these", and it is the likely story for that file.
+        XCTAssertEqual(
+            ContentView.idlePoolLabel(found: 0, callback: 15), "15 awaiting callback")
+        XCTAssertEqual(
+            ContentView.idlePoolLabel(found: 3, callback: 12),
+            "0 of 3 connected, 12 awaiting callback")
+    }
+
+    /// The VPN drop warning fires on a TRANSITION, never on an absence. A user
+    /// who has never run a VPN must not be told theirs dropped - a warning that
+    /// cries wolf on first launch is one everybody learns to dismiss.
+    func testVpnDropWarnsOnlyAfterAVpnWasActuallySeen() {
+        XCTAssertFalse(
+            EngineModel.vpnDropWarrants(active: false, sawVpnBefore: false),
+            "no VPN has ever been up - nothing dropped")
+        XCTAssertTrue(
+            EngineModel.vpnDropWarrants(active: false, sawVpnBefore: true),
+            "a VPN that was up has gone away")
+        XCTAssertFalse(
+            EngineModel.vpnDropWarrants(active: true, sawVpnBefore: true),
+            "coming back up is not a drop")
+        XCTAssertFalse(EngineModel.vpnDropWarrants(active: true, sawVpnBefore: false))
+    }
+
     /// The build label must DISTINGUISH a CI build from an unstamped one. The
     /// whole point of the line is answering "which build is this?", and a label
     /// that read "1.0" for both would answer it wrongly rather than not at all -

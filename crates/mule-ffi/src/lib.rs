@@ -209,9 +209,21 @@ pub struct DownloadInfo {
     /// instantaneous rate: at a block boundary the rate legitimately reads zero,
     /// and an indicator that blinks off every few seconds is worse than none.
     pub receiving: bool,
+    /// Sources that HANDSHAKED with us in the last few minutes, by channel.
+    /// Zero across all three does NOT mean none were found - see the pool pair
+    /// below, which is what tells those two apart.
     pub sources_server: u32,
     pub sources_kad: u32,
     pub sources_exchange: u32,
+    /// What the LAST source lookup produced: `sources_found` went into the dial
+    /// pool, `sources_callback` are LowID peers that can only reach us by being
+    /// poked through the server.
+    ///
+    /// Without these an idle row is unreadable: "no sources exist" and "plenty
+    /// of sources exist and none can be reached" are opposite problems that both
+    /// render as a blank. See `Download::note_source_pool`.
+    pub sources_found: u32,
+    pub sources_callback: u32,
     /// Parts still needed, and how many of those NO source has ever been seen
     /// holding. The pair answers what a stalled near-complete download otherwise
     /// cannot: is padMule failing to ASK for the tail, or does the swarm not
@@ -724,6 +736,7 @@ impl MuleEngine {
                 let (rating, has_comment) = dl.rating_summary().await;
                 let origins = dl.source_origins().await;
                 let parts = dl.part_availability().await;
+                let pool = dl.source_pool();
                 out.push(DownloadInfo {
                     hash: hex::encode(dl.hash().await),
                     name: dl.name().await,
@@ -739,6 +752,8 @@ impl MuleEngine {
                     sources_server: origins.0,
                     sources_kad: origins.1,
                     sources_exchange: origins.2,
+                    sources_found: pool.0,
+                    sources_callback: pool.1,
                     parts_needed: parts.0,
                     parts_unavailable: parts.1,
                     part_status_reports: parts.2,
