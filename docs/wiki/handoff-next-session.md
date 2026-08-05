@@ -1,20 +1,29 @@
 # HANDOFF - start here next session
 
-Updated: 2026-08-04, close of the instrumentation session.
+Updated: 2026-08-05, after the reanalysis + serve-side rotation pass.
 
 Living doc - replace it wholesale next time. Full narrative: [[build-progress]]
-rows 8bt-8bx and the [[log]] entries for 2026-08-04.
+rows 8bt-8by and the [[log]] entries for 2026-08-04 and 2026-08-05.
 
 ## State of the tree
 
-- **Gate**: 618 Rust tests, clippy `-D warnings` clean, fmt clean, ASCII clean.
+- **Gate**: 622 Rust tests, clippy `-D warnings` clean, fmt clean, ASCII clean.
 - **YOU ARE ON BRANCH `fetch-funnel`, NOT main**, and nothing is merged. Decide
   that first. History is LINEAR across 390+ commits and must stay that way
   (`gh pr merge --rebase`). Do not trust prose for counts - run
   `git log --oneline main..HEAD` and `git log --oneline origin/main..main`.
-- Oracles: amuled differential re-run GREEN after every transfer-path change
-  today. REVERSE / eserver / Kad-verify not re-run this session.
-- **Latest IPA delivered: `9e446ea`.** iPadOS 26.6. Cert lapses ~2026-08-11.
+- Oracles: differential AND reverse both re-run GREEN 2026-08-05. Kad-verify not
+  re-run. NOTE what the reverse oracle does NOT cover: `mule-cli serve-file`
+  passes no upload gate and its fixture is 300KB with one downloader, so it
+  never drives the slot rotation (8by). A green oracle proves only the path it
+  drives - the third time that has mattered.
+- **Latest IPA delivered: `9e446ea`** - now THREE code commits behind
+  (`ed86d14`, `496d722`, plus the doc sweep). Rebuild before the next device
+  session. iPadOS 26.6. Cert lapses ~2026-08-11.
+- Nothing on device shows a build sha (`CFBundleVersion` is `1` in every
+  build); the quickest install check is the strip order, Transfers before
+  Downloads. Stamping the sha into `CFBundleVersion` in CI is a one-liner
+  nobody has done.
 - IPAs go to `/mnt/c/Users/ajbuf/Downloads/` as
   `padMule-INSTALL-THIS-unsigned-<sha>.ipa` ([[padmule-ipa-delivery]]).
 
@@ -36,10 +45,17 @@ needed that not one sampled peer offered. Separates a SLOW tail from an
 IMPOSSIBLE one - identical on a row reading "90%, 86 sources, not moving".
 Gated at 4 sampled statuses; the sample size is in the text on purpose.
 
-**3. `skipped: source BANNED` / `skipped: fetch already running`** - the two
-in-memory gates a RESTART clears (see open item 1).
+**3. `skipped: source BANNED`** - the in-memory gate a RESTART clears, and the
+standing lead (see open item 1). Its sibling `skipped: fetch already running`
+was CORRECTED 2026-08-05: it sat behind callers that already filter
+`!is_fetching()`, so it read 0 in exactly the stuck-flag case it was built for.
+It is now labelled `spawn raced a live fetch`, and the durable state is read
+instead from the **`fetches in flight` GAUGE** under `STATE (not reset)`.
 
-**4. The dial-time histogram**, split by whether the handshake succeeded.
+**4. The dial-time histogram**, split by whether the handshake succeeded - but
+it is now CENSORED by the 10s cap its own reading justified. Every bucket above
+10s is structurally dead; "20-45s: 0" is the cap talking, not the network.
+Re-measuring on another path means raising `fetch::CONNECT_TIMEOUT` first.
 
 ## Shipped
 
@@ -68,18 +84,33 @@ in-memory gates a RESTART clears (see open item 1).
    rounds of re-picking the shade could not. **When a value is repeatedly
    "wrong", check for a TRANSFORM between declaration and render before picking
    another value.**
+9. **(2026-08-05) The SERVE side rotates its slot** - was open item 6, and it
+   was the mirror of shipped fix 1. padMule held a granted slot for the whole
+   connection, so the first peer to win one kept it and everybody else timed out
+   at `QUEUE_WAIT` and was closed. Now kicked at 10MB/1h **only when somebody is
+   waiting** (eMule's anti-churn rule; aMule has none - divergence recorded both
+   sides), and the rotation clears the re-send dedup because upstream does and
+   because otherwise padMule's own downloader hangs for 45s. Row 8by.
+10. **(2026-08-05) Two instrument corrections** - `skipped: fetch already
+    running` could not observe a stuck flag (see instrument 3 above), and the
+    parts badge said "sources" for a count of SESSIONS. Row 8by.
 
 ## OPEN - named as open, not explained
 
-1. **The stall whose blocker a RESTART clears.** Anthony's clue and the best
-   lead of the day: a file sat at 85%, the app was restarted, it finished. That
-   rules out disk, network and the swarm, and leaves exactly two in-memory gates
-   - the per-download **ban set** (a HashSet, never persisted, consulted BEFORE
-   dialing, so a download that banned its handful of sources makes ZERO dials
-   while still listing them) and the **`fetching` flag** (the retry sweep skips
-   any download holding it). BOTH ARE NOW COUNTED. The next stall should name
-   itself; do not guess between them. NOTE a restart also CLEARS both, so the
-   counters need a fresh stall to develop before they mean anything.
+1. **The stall whose blocker a RESTART clears - now NARROWED to the ban set.**
+   Anthony's clue: a file sat at 85%, the app was restarted, it finished. That
+   rules out disk, network and the swarm and leaves in-memory state. Of the two
+   candidate gates, the per-download **ban set** is the live hypothesis: a plain
+   `HashSet<IpAddr>`, extended on corruption, **never lifted anywhere in the
+   code** and never persisted, consulted BEFORE dialing - so a download that
+   banned its handful of sources makes ZERO dials while still listing them.
+   `skipped: source BANNED` is correctly placed to catch it. The **`fetching`
+   flag** is the weaker candidate on two counts: `FetchGuard` releases it on any
+   task exit including unwind and `download_file` is bounded on every axis, so a
+   stuck flag should be unreachable - and that is an ARGUMENT, which is why the
+   `fetches in flight` gauge now exists to refute it. Do not read `spawn raced a
+   live fetch` as evidence either way. A restart clears the ban set too, so the
+   counter needs a FRESH stall to develop before it means anything.
 2. **"No completions" is PARTLY answered, and the answer was the swarm** - the
    two non-moving files were exactly the two carrying the parts-missing badge,
    one at Zero KB with 24 parts, another capped near 50% by 13 parts (~120MB).
@@ -92,12 +123,24 @@ in-memory gates a RESTART clears (see open item 1).
 5. **Nothing evicts a proven-dead source** from `download_file`'s pool -
    `PeerScoreboard` only re-ORDERS - so a dead peer is re-dialed 8x per sweep
    and again per retry.
-6. **padMule's serve side never rotates an upload slot**: `should_kick()` and
-   `build_out_of_part_reqs()` are BOTH dead code. Mirror image of shipped fix 1.
-7. Kad gave ZERO sources across 25 dev-box downloads but DID on device.
+6. ~~padMule's serve side never rotates an upload slot.~~ **CLOSED 2026-08-05,
+   row 8by** - see shipped item 9. Note the follow-on: the rotation has never
+   run live either, for the same reason item 4 has not.
+7. Kad gave ZERO sources across 25 dev-box downloads but DID on device. **Partly
+   self-inflicted, and unmeasured:** since the Get fix, `find_sources` returns on
+   the first NON-EMPTY server answer, so the Kad arm is skipped entirely whenever
+   the server names even one source (all three callers pass
+   `stop_when_server_answers = true`). The ~15s -> ~200ms win is measured; the
+   narrower source pool is NOT, and it sits directly against "downloads run short
+   of live sources". A count threshold, or letting the Kad arm land into the
+   mid-sweep `take_sx_sources` channel that already exists, would keep both.
 8. Status scalars lag behind `Engine::search`'s ~20s `&mut self`; Portability
-   Tier 2; Settings Tier 1/2; ten merged branches still on origin plus a stale
-   worktree at `.claude/worktrees/wave11-aich`.
+   Tier 2; Settings Tier 1/2.
+9. **Housekeeping, verified safe 2026-08-05:** ELEVEN remote branches (not ten)
+   are fully merged - `git cherry main origin/<b>` reports every commit
+   patch-equivalent for all of them, including `worktree-wave11-aich` - so they
+   and the locked worktree at `.claude/worktrees/wave11-aich` can be deleted.
+   `main` is also 4 commits ahead of `origin/main`, unpushed.
 
 ## Discipline this session actually paid for
 
@@ -113,15 +156,35 @@ in-memory gates a RESTART clears (see open item 1).
   badge shipped OVERSTATING its evidence - a real measurement inflated into a
   claim about the network, from a sample of one.
 - **A threshold tuned on one network is a hypothesis about the others.** "A 5s
-  connect cap is free" was true on the dev box and false over the VPN, where
-  real connections land at 20-45s. padMule ships on the VPN path.
+  connect cap is free" was true on the dev box (75 of 76 handshakes under 1s)
+  and false over the VPN, which had a real tail: of 315 successful handshakes,
+  one landed at 5-10s and TWO at 20-45s. 10s keeps 313 of 315. padMule ships on
+  the VPN path. [CORRECTED 2026-08-05: this line used to read "real connections
+  land at 20-45s", which says the BULK do - and read that way the shipped 10s
+  cap looks like a serious regression. It was chased as one before [[log]]
+  2026-08-04 refuted it. The measurement was right; the compression was not, in
+  the one document the next session reads first. **A summary that overstates its
+  own evidence costs the next session real time.**]
 - **Reasoning is not measurement, even when it is mine.** `Get`'s 15s and the
   queue-bail "root cause" were both argued rather than measured, and both wrong.
 - **Sampling too early is not a failed fix** - the Servers tab read 0 three
   times because `start()` still held the engine lock.
 - **A green oracle proves only the path it drives.** The differential test moves
   15MB, past the 10MB kick, and still never saw 0x57 - loopback is faster than
-  amuled's timer.
+  amuled's timer. Third instance 2026-08-05: the REVERSE oracle went green over
+  the new slot rotation without executing one line of it, because `mule-cli
+  serve-file` passes no upload gate and the fixture is 300KB with one downloader.
+  **Before citing an oracle as proof, name the path it drove.**
+- **(2026-08-05) An instrument can be placed where it cannot see.** `skipped:
+  fetch already running` was correct code counting a real event at a point every
+  caller had already filtered past - so it read 0 in exactly the case it was
+  built to name. Being lock-free, cheap and correct is not the same as being
+  OBSERVABLE. Check the call graph ABOVE a new counter, not just the line it
+  sits on.
+- **(2026-08-05) The same overstatement twice in one instrument.** The parts
+  badge was corrected on 2026-08-04 for inflating a one-peer sample into a claim
+  about the swarm, and the correction then called its sample "sources" when it
+  counts SESSIONS. A fix aimed at honesty is not automatically honest.
 - **DEVICE: only session-free reads are safe during a live run.**
   `GET /source` and `pymobiledevice3 developer dvt screenshot` disturb nothing;
   creating ANY WebDriverAgent session - even with empty capabilities -

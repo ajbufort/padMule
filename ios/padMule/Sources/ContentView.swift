@@ -1629,8 +1629,12 @@ struct ContentView: View {
                 model.clearBootError()
             }
         }
-        // Boot takes 12-30s and EVERY control silently no-ops until it finishes.
-        // Saying so is the difference between "starting" and "broken".
+        // EVERY control silently no-ops until boot finishes, and saying so is the
+        // difference between "starting" and "broken". (This used to claim boot
+        // takes 12-30s; the portability audit corrected that - it was the SUM of
+        // the timeouts, not a measurement. A warm boot with lists already on disk
+        // is ~1s. The banner still earns its place on a cold, slow or blocked
+        // network, where those timeouts really do elapse.)
         if !model.ready && model.bootError == nil && !hidStarting {
             banner(
                 "Starting padMule... searching and downloading will work in a moment.",

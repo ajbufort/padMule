@@ -1017,10 +1017,14 @@ impl MuleEngine {
     }
 }
 
-/// The fetch funnel: how far down the eD2k request sequence each peer session
-/// got this run, plus every opcode read out of turn. A DIAGNOSTIC surface, so it
-/// is deliberately NOT `#[uniffi::export]` - the harness reads it, the shipped
-/// Swift binding does not grow a method for it. See `mule_engine::stats`.
+/// The fetch funnel as a free function, for the stress harness - which prints it
+/// without holding a `MuleEngine`. See `mule_engine::stats`.
+///
+/// The app reads the same report through `MuleEngine::fetch_report` above, which
+/// IS exported (Stats -> Fetch diagnostics, shipped in build-progress row 8bv).
+/// This doc used to say the Swift binding deliberately had no method for it;
+/// that was true when the funnel was harness-only and stopped being true the day
+/// the on-device panel landed, thirty lines up from here.
 pub fn fetch_report() -> String {
     mule_engine::stats::fetch_report()
 }

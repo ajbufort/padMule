@@ -207,6 +207,13 @@ pub fn note_unexpected(opcode: u8) {
 /// first seconds, everything past that is dead air and can be cut. If they are
 /// spread out, cutting would throw away real sources - and the honest answer is
 /// to leave the timeout alone and widen the worker pool instead.
+///
+/// IT ANSWERED THAT, AND IS NOW CENSORED BY ITS OWN ANSWER. The device reading
+/// (313 of 315 successful handshakes under 10s, one at 5-10s, two at 20-45s) set
+/// `fetch::CONNECT_TIMEOUT` to 10s - so no dial can now last longer than that,
+/// and every bucket above 10s is structurally dead. A future "20-45s: 0" is NOT
+/// evidence that a network has no slow tail; it is the cap talking. Re-measuring
+/// on a different path (another VPN exit, cellular) means raising the cap first.
 const DIAL_BUCKET_MS: [u64; 6] = [1_000, 2_000, 5_000, 10_000, 20_000, 45_000];
 static DIAL_OK: [AtomicU64; 7] = {
     #[allow(clippy::declare_interior_mutable_const)]

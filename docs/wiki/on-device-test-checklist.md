@@ -1,7 +1,10 @@
 # On-device test checklist
 
-Updated: 2026-08-03 (Launch splash step corrected to readiness-gated; Lifecycle
-step corrected to drop the unrenderable Reconnecting-banner claim)
+Updated: 2026-08-05 (steps 15-20 added for the 8bv-8by on-glass work: the fetch
+diagnostics panel, the parts badge, closeable banners, the finish beep, the
+rate chart, and the strip reorder. Earlier: 2026-08-03, Launch splash corrected
+to readiness-gated; Lifecycle corrected to drop the unrenderable
+Reconnecting-banner claim)
 
 What to tap through on the iPad after a fresh Sideloadly install, to verify the
 whole app in hand. The engine side of every item is also exercisable without a
@@ -51,6 +54,38 @@ DELETE the old app off the iPad first, then Sideloadly. See [[padmule-ios-app-pa
 13. **Cancel** - swipe a transfer to Remove; it disappears.
 14. **Finished file** - a completed download opens in Files (On My iPad >
     padMule), hash-verified.
+
+## Pass - the 2026-08-04/05 diagnostics and on-glass round
+
+The strip order changed with this batch: Servers, Status, Search, **Transfers,
+Downloads**, Shared, Stats. Seeing Transfers before Downloads is the quickest
+confirmation that a NEW build actually installed (nothing shows a build sha -
+`CFBundleVersion` is `1` in every build).
+
+15. **Fetch diagnostics** (Stats, bottom) - the funnel renders in monospace with
+    **Copy report** and **Reset counters**. The workflow is **reset ->
+    reproduce -> read**: counters are cumulative since launch, so before
+    investigating a stall, Reset first or the healthy minutes dominate. Copy
+    report puts it on the clipboard so the numbers leave the device instead of
+    being retyped off a photograph. Read `skipped: source BANNED` first - it is
+    the one restart-clearable gate that can actually fire ([[build-progress]]
+    8by). `STATE / fetches in flight` is a gauge and is NOT cleared by Reset.
+16. **Parts badge** - a stalled transfer with >= 4 sampled statuses shows
+    "N parts missing from all M peer reports". It separates a slow tail from an
+    impossible one; both look identical on a row reading "90%, 86 sources, not
+    moving". Absence of the badge is information too.
+17. **Banners close** - every banner has an "x". Dismissing means "I have read
+    this", not "never warn me again": a state-driven banner (reconnecting,
+    sharing-paused, starting) RE-ARMS when its condition next changes. Banners
+    are flat **#000066** navy, not a gradient.
+18. **Finish beep** - Settings > Device, default ON, follows the silent switch.
+    Toggling it ON plays the sound immediately, so the choice is auditioned
+    rather than trusted. Then let a download finish and hear it.
+19. **Rate chart** - full width, scrolling newest-to-the-right over a fixed
+    60-point span, not squeezed into a sliver at the left.
+20. **Servers on open** - the server list loads at APP open (not tab open), and
+    the Status/Servers screens both name a connected server "Name (ip:port)".
+    Stop is the FIRST trailing toolbar icon.
 
 ## Related
 

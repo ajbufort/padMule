@@ -60,7 +60,8 @@ Details: `docs/wiki/decisions-and-lessons.md`, `docs/wiki/ref-source-trees.md`,
 ## Platform facts (still in force)
 
 - Target device: iPad Pro 11-inch, M4 generation - `iPad16,3` / board `J717AP`,
-  arm64e, iPadOS 26.5.2 (verified over USB 2026-08-02; 512GB, ~476GB free).
+  arm64e, iPadOS 26.6 (was 26.5.2 when verified over USB 2026-08-02; 512GB,
+  ~476GB free).
   SUPERSEDES the original target (iPad Pro 4th gen, 2020, A12Z) - constraints
   derived from A12Z (notably the ~3GB RAM budget) are calibrated to the wrong
   machine and are being re-derived; see `docs/wiki/ipados-constraints.md`.
