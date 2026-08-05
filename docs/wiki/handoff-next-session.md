@@ -7,7 +7,7 @@ rows 8bt-8bz and the [[log]] entries for 2026-08-04 and 2026-08-05.
 
 ## State of the tree
 
-- **Gate**: 625 Rust tests + 24 Swift simulator tests, clippy `-D warnings`
+- **Gate**: 628 Rust tests + 24 Swift simulator tests, clippy `-D warnings`
   clean, fmt clean, ASCII clean.
 - **YOU ARE ON BRANCH `fetch-funnel`, NOT main**, and nothing is merged. Decide
   that first. History is LINEAR across 390+ commits and must stay that way
@@ -18,9 +18,10 @@ rows 8bt-8bz and the [[log]] entries for 2026-08-04 and 2026-08-05.
   passes no upload gate and its fixture is 300KB with one downloader, so it
   never drives the slot rotation (8by). A green oracle proves only the path it
   drives - the third time that has mattered.
-- **Latest IPA delivered: `92a8f45`** (2026-08-05, CI run 30984990314), current
-  with the branch and carrying the RESERVATION-LEAK FIX (8cb). Verified by
-  reading the plist out of the delivered artifact, not from the CI log. iPadOS 26.6. Cert lapses ~2026-08-12.
+- **Latest IPA delivered: `2186e48`** (2026-08-05, CI run 30988060927), current
+  with the branch. Carries the reservation-leak fix (8cb) AND the Kad
+  maintenance + reseed fixes (8cd). Verified by reading the plist out of the
+  delivered artifact, not from the CI log. iPadOS 26.6. Cert lapses ~2026-08-12.
 - **The device can now name its own build.** CI stamps the git short sha into
   `CFBundleVersion`, and Settings > This device > **Build** reads
   "1.0 (d24e88d)", selectable. Verified in the delivered artifact. Confirm an
@@ -100,6 +101,14 @@ Re-measuring on another path means raising `fetch::CONNECT_TIMEOUT` first.
 10. **(2026-08-05) Two instrument corrections** - `skipped: fetch already
     running` could not observe a stuck flag (see instrument 3 above), and the
     parts badge said "sources" for a count of SESSIONS. Row 8by.
+13. **(2026-08-05) Kad got its first routing maintenance** (`maintain_kad`, a
+    random-target lookup every 120s) - it had NONE, which was both the low
+    contact count and the thin keyword results. And resume stopped throwing the
+    table away: it re-seeded from nodes.dat only, discarding what `pause()` had
+    just folded into memory (138 -> 21 in one round trip). Row 8cd.
+14. **(2026-08-05) The probe stopped calling every server dead on a cold start**
+    - "checking..." until three real misses, plus an auto re-probe 6s after
+    boot. Row 8cd.
 11. **(2026-08-05) An idle row now says WHICH kind of nothing it is** - "no
     sources found" vs "0 of 3 connected, 12 awaiting callback". Found by Anthony
     on glass, not by a code read. Row 8bz.
@@ -190,6 +199,26 @@ purpose. **Starting a session is the disruptive act, not holding one** - reuse
 the live one rather than cycling it. Session-free reads (`pymobiledevice3
 developer dvt screenshot`, `GET /source`) disturb nothing and are what the whole
 2026-08-05 observation session ran on.
+
+## OPEN LEADS FROM THE 2026-08-05 DEVICE SESSION
+
+1. **The pause teardown does not finish before iOS suspends.** Captured: 465ms
+   from `pause (backgrounded)` to `Suspending`, and `state -> paused` only 30.5s
+   later, on the way back IN. So the "clean, honest pause/resume" that
+   [[lifecycle-and-reactivation]] calls a HARD requirement is not what actually
+   happens - the process is frozen mid-teardown and its sockets reclaimed. Two
+   mechanisms fit and the log cannot separate them: the background-task
+   assertion was refused, or `e.pause()` queued behind something long on the
+   SERIAL work queue (the 6s server probe is a candidate). **`pause()` now logs
+   both** - assertion GRANTED/REFUSED, and how long the work waited before it
+   STARTED. Capture a background round trip on build 2186e48 and the answer is
+   in those two lines. Do not theorise first.
+2. **Kad recovery baseline, for comparing the fixes.** On a build with NEITHER
+   Kad fix, the table was watched going 21 -> 223 organically in a few minutes,
+   purely from incidental source lookups during active downloads. Anything the
+   2186e48 build does must beat that to have earned its keep.
+3. Whether `maintain_kad` actually lifts the table on device, and whether Kad
+   keyword-search results improve with it. Both are why it was built.
 
 ## THE TOP NEXT ACTION
 
