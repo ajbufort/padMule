@@ -14,7 +14,7 @@ rows 8bt-8bx and the [[log]] entries for 2026-08-04.
   `git log --oneline main..HEAD` and `git log --oneline origin/main..main`.
 - Oracles: amuled differential re-run GREEN after every transfer-path change
   today. REVERSE / eserver / Kad-verify not re-run this session.
-- **Installed on the iPad: `f82ee7e`.** iPadOS 26.6. Cert lapses ~2026-08-11.
+- **Latest IPA delivered: `9e446ea`.** iPadOS 26.6. Cert lapses ~2026-08-11.
 - IPAs go to `/mnt/c/Users/ajbuf/Downloads/` as
   `padMule-INSTALL-THIS-unsigned-<sha>.ipa` ([[padmule-ipa-delivery]]).
 
@@ -57,10 +57,17 @@ in-memory gates a RESTART clears (see open item 1).
 6. **The funnel counted two entry paths as one**, reporting more file statuses
    than handshakes - impossible. Inbound (called-back) sessions now counted
    separately.
-7. **UI round**: dark `Color.bannerBlue`, ALL banners closeable, server list on
-   APP open, finish BEEP (typed `Finished` event, not a match on prose),
-   full-width rate chart, Stop first in the toolbar, "Name (ip:port)" on the
-   Servers tab.
+7. **UI round**: banners at **#000066** and FLAT (see below), ALL banners
+   closeable, server list on APP open, finish BEEP (typed `Finished` event, not
+   a match on prose), full-width rate chart, Stop first in the toolbar,
+   "Name (ip:port)" on the Servers tab.
+8. **The banner colour took three attempts, and the value was never the
+   problem.** `.gradient` lightens the top of whatever tint it is given, so the
+   colour named at the call site was never the colour on the glass. Removing it
+   - which is what `banner`'s doc had always claimed it did - fixed what two
+   rounds of re-picking the shade could not. **When a value is repeatedly
+   "wrong", check for a TRANSFORM between declaration and render before picking
+   another value.**
 
 ## OPEN - named as open, not explained
 
