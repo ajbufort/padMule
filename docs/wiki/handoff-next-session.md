@@ -1,14 +1,14 @@
 # HANDOFF - start here next session
 
-Updated: 2026-08-04, close of the instrumentation session.
+Updated: 2026-08-04, close of the instrumentation + on-glass session.
 
 Living doc - replace it wholesale next time. Full narrative: [[build-progress]]
-rows 8bj-8bu and the [[log]] entries for 2026-08-03/04.
+rows 8bj-8bw and the [[log]] entries for 2026-08-03/04.
 
 ## State of the tree
 
-- **Gate**: 616 Rust tests, clippy `-D warnings` clean, fmt clean, ASCII clean.
-- **YOU ARE ON BRANCH `fetch-funnel`, NOT main.** Six commits ahead of main, all
+- **Gate**: 617 Rust tests, clippy `-D warnings` clean, fmt clean, ASCII clean.
+- **YOU ARE ON BRANCH `fetch-funnel`, NOT main.** Ten commits ahead of main, all
   pushed. `main` itself is still 4 commits ahead of `origin/main` from the
   previous session. Nothing has been merged - decide that first
   (`gh pr merge --rebase`, history is LINEAR across 390+ commits and must stay
@@ -18,7 +18,7 @@ rows 8bj-8bu and the [[log]] entries for 2026-08-03/04.
 - Oracles: amuled differential re-run GREEN after the transfer-path changes
   (3 files byte-for-byte, incl. the 15MB multipart). REVERSE / eserver / Kad
   verify not re-run this session.
-- **Installed on the iPad: `a980fba`** (current branch head). Device on iPadOS
+- **Latest IPA delivered: `d1f058f`** (branch head). Device on iPadOS
   **26.6**. Cert re-signed 2026-08-04, lapses about **2026-08-11**.
 - IPAs are delivered to `/mnt/c/Users/ajbuf/Downloads/` as
   `padMule-INSTALL-THIS-unsigned-<sha>.ipa` ([[padmule-ipa-delivery]]).
@@ -51,33 +51,58 @@ this gap survived three rounds of reasoning.
    `exists && len > 0` - length is not usability, so a `server.met` that parsed
    to ZERO servers was "already present" forever. Reachable normally: prune the
    last dead server and that is the file you get.
-4. **Strip order**: Servers, Status, Search, **Transfers, Downloads**, Shared,
-   Stats.
+4. **The funnel counted two entry paths as one**, so it reported more file
+   statuses than handshakes - impossible. A called-back source dials US and
+   never passes `fetch_one`. Inbound sessions are now counted separately.
+5. **The dial got its own 10s deadline** (see MEASURED below).
+6. **On-glass UI round** (row 8bw): dark `Color.bannerBlue`, ALL banners
+   closeable, server list on APP open, a finish BEEP (typed `Finished` event,
+   not a match on prose), a full-width rate chart, Stop first in the toolbar,
+   and "Name (ip:port)" on the Servers tab via a shared `serverLabel()`.
 
-All test-first with RED observed, and 1/2 mutation-checked.
+Items 1-3 test-first with RED observed, 2 of them mutation-checked.
 
-## MEASURED - act on these
+## MEASURED - and one number that CHANGED once the device spoke
 
-**The dial deadline is the biggest cheap win, and it is now evidence-backed.**
-Of 76 successful handshakes in a 5-minute run, 75 landed under 1s and ONE
-between 1-2s. **Not one dial connected after 2s.** Meanwhile 57 dials burned the
-FULL 45s and every one failed:
+**The dial now has its own 10s deadline (SHIPPED).** The dev box argued for far
+less: of 76 successful handshakes, 75 landed under 1s and one at 1-2s, with NOT
+ONE connecting after 2s, while 57 dials burned the full 45s and all failed. So
+"a 5s cap is free" looked safe.
+
+**The iPad refuted the word "free".** Over the VPN the slow tail is REAL - one
+connection at 5-10s and TWO at 20-45s, out of 315:
 
 ```
-0-1s    75 connected / 166 failed
-1-2s     1 / 5
-2-5s     0 / 22
->=45s    0 / 57
+              dev box            iPad (VPN)
+0-1s          75 ok / 166 fail   274 ok / 239 fail
+1-2s           1 / 5              31 / 25
+2-5s           0 / 22              7 / 5
+5-10s          -                   1 / 14
+20-45s         0                   2 / 0     <- real, and a 5s cap kills them
+>=45s          0 / 57              0 / 63
 ```
 
-A ~5s CONNECT deadline (separate from the session budget) would lose zero real
-sources and reclaim ~43 minutes of worker time from a 5-minute run. The "widen
-the worker pool instead" branch is refuted. **Nothing ever evicts a proven-dead
-source from `download_file`'s pool either** - `PeerScoreboard` only re-ORDERS -
-so a dead peer is re-dialed 8x per sweep and again on every retry.
+Settled at **10s**: keeps 313 of 315 (99.4%) and still kills the 63 dials that
+each burned 45s. LESSON: a threshold tuned on one network is a hypothesis about
+the others; padMule ships on the VPN path, so that is the one that decides.
+
+**Still true and still unfixed: nothing ever evicts a proven-dead source** from
+`download_file`'s pool - `PeerScoreboard` only re-ORDERS - so a dead peer is
+re-dialed 8x per sweep and again on every retry.
 
 ## OPEN - and named as open, not explained
 
+0. **"Much download activity but NO completions" (Anthony, on the fixed build).**
+   Leading candidate is the TAIL, and the funnel already points at it:
+   `accepted, no block to take` was **84 of 194** granted slots (43%). Four
+   workers x 3 blocks x 184320 = **2.11MB** can be under reservation at once,
+   while `ENDGAME_LIMIT` only races the last **737KB** - so a nearly-finished
+   file can have its whole remainder held by a few workers while every OTHER
+   source that wins a slot is turned away with nothing to do. If those holders
+   are slow or die, the tail never lands. NOT confirmed. The on-device funnel
+   settles it: let a download get near the end, then Copy report and look at
+   whether `accepted, no block to take` climbs while nothing completes. The
+   likely fix is widening the endgame window so the tail is RACED, not hoarded.
 1. **The device and this box DIVERGE on the same server at the same minute.**
    Dev box: 7 of 12 downloads receiving, one at 147MB, 42 delivering sessions.
    iPad at the same time: two files crossed 10MB then froze for 9 minutes with
