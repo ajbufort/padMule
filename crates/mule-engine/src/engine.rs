@@ -2098,6 +2098,16 @@ impl Engine {
                                     peer_aich,
                                     ..Default::default()
                                 };
+                                // Count it as an INBOUND session. This peer
+                                // dialed US, so it never passed through
+                                // `fetch_one` and never bumped the dial stages -
+                                // and one inbound connection is offered every
+                                // unfinished download in turn, so it can make
+                                // several sessions. Without this the funnel
+                                // showed more file statuses than handshakes,
+                                // which is impossible and made a correct set of
+                                // counts unreadable.
+                                crate::stats::note_inbound();
                                 match timeout(
                                     Duration::from_secs(120),
                                     download_from_peer_at(&mut fs, &dl, false, Some(peer), session),

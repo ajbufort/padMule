@@ -78,12 +78,30 @@ macro_rules! funnel {
     };
 }
 
+// TWO ENTRY PATHS, and conflating them made the first device report IMPOSSIBLE:
+// `got filestatus` read 396 against `connected` 315. A session cannot read a
+// file status without connecting first - unless it never dialed at all.
+//
+// It did not. A called-back source DIALS US (engine.rs `InboundKind::Source`),
+// so it enters `download_from_peer_at` directly, never through `fetch_one`, and
+// bumps every stage EXCEPT the two dial stages. Worse, one inbound connection is
+// offered EVERY unfinished download in turn, so a single callback can produce
+// several sessions. With a HighID user and LowID peers calling back, that was
+// ~160 phantom sessions in an outbound funnel.
+//
+// So the report is now three labelled groups instead of one column: what WE
+// dialed, what dialed US, and the per-session stages both paths share. The stage
+// counts were never wrong - only the story the layout told about them.
 funnel! {
-    F_DIAL      => note_dial / dials,             "dialed";
-    F_CONN      => note_connected / connected,    "connected";
+    F_DIAL      => note_dial / dials,             "outbound dials";
+    F_CONN      => note_connected / connected,    "  handshaked";
+    F_INBOUND   => note_inbound / inbound,        "inbound sessions (they dialed us)";
     F_STATUS    => note_status / got_status,      "got filestatus";
-    F_NOFILE    => note_nofile / nofile,          "  (peer said NOFILE)";
-    F_NONEEDED  => note_no_needed_parts / no_needed_parts, "  (holds nothing we need)";
+    // NOT a subset of the line above: the NOFILE arm returns BEFORE the
+    // filestatus counter, so these are disjoint. The old indentation implied
+    // otherwise and made the totals look broken.
+    F_NOFILE    => note_nofile / nofile,          "peer said NOFILE instead";
+    F_NONEEDED  => note_no_needed_parts / no_needed_parts, "holds nothing we need";
     F_HS_NEED   => note_hashset_need / hashset_need, "needed hashset";
     F_HS_GOT    => note_hashset_got / hashset_got,   "  got hashset";
     F_SLOT_ASK  => note_slot_ask / slot_asked,    "asked for a slot";
@@ -205,11 +223,17 @@ pub fn reset_fetch_stats() {
 
 /// The funnel and the out-of-turn opcodes as a printable block.
 pub fn fetch_report() -> String {
-    let mut s = String::from("  FETCH FUNNEL (peer sessions reaching each stage)\n");
+    // Three groups, because the two entry paths do not share the dial stages -
+    // see the `funnel!` block. Printing them as one column made a correct set of
+    // counts look impossible.
+    let mut s = String::from("  HOW SESSIONS START\n");
     for (label, n) in fetch_funnel() {
-        s.push_str(&format!("    {label:<28} {n:>6}\n"));
+        if label == "got filestatus" {
+            s.push_str("  THEN, PER SESSION (both paths)\n");
+        }
+        s.push_str(&format!("    {label:<34} {n:>6}\n"));
     }
-    s.push_str("  DIAL TIME (bucket: connected / failed)\n");
+    s.push_str("  DIAL TIME - OUTBOUND ONLY (bucket: connected / failed)\n");
     for (label, ok, fail) in dial_times() {
         if ok + fail > 0 {
             s.push_str(&format!("    {label:<18} {ok:>6} / {fail:<6}\n"));
