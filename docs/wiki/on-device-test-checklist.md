@@ -1,6 +1,8 @@
 # On-device test checklist
 
-Updated: 2026-08-05 (steps 15-20 added for the 8bv-8by on-glass work: the fetch
+Updated: 2026-08-05 (steps 21-26 added for the build stamp, Dark Mode, the VPN
+badge, the cold-start server list, Kad contact growth and the idle-row text.
+Earlier the same day: steps 15-20 added for the 8bv-8by on-glass work: the fetch
 diagnostics panel, the parts badge, closeable banners, the finish beep, the
 rate chart, and the strip reorder. Earlier: 2026-08-03, Launch splash corrected
 to readiness-gated; Lifecycle corrected to drop the unrenderable
@@ -59,8 +61,9 @@ DELETE the old app off the iPad first, then Sideloadly. See [[padmule-ios-app-pa
 
 The strip order changed with this batch: Servers, Status, Search, **Transfers,
 Downloads**, Shared, Stats. Seeing Transfers before Downloads is the quickest
-confirmation that a NEW build actually installed (nothing shows a build sha -
-`CFBundleVersion` is `1` in every build).
+confirmation that a NEW build actually installed - though since row 8by the
+authoritative check is Settings > This device > **Build**, which names the git
+sha.
 
 15. **Fetch diagnostics** (Stats, bottom) - the funnel renders in monospace with
     **Copy report** and **Reset counters**. The workflow is **reset ->
@@ -93,12 +96,20 @@ confirmation that a NEW build actually installed (nothing shows a build sha -
     regardless of the iPad's system appearance, and only goes dark if the switch
     is on. Flip it and the whole app repaints, sheets included; flip the iPad's
     own appearance and padMule must NOT follow.
-23. **VPN badge** - blue `VPN` in a square outline, upper-left toolbar, present
-    only while a tunnel is up. **Check it against the iPadOS status-bar VPN
-    badge** - that is the ground truth, and the detection is a heuristic
-    ([[padmule-vpn-airvpn]]). Drop the tunnel and a warning dialog should
-    appear; it says sharing was NOT paused, which is deliberate and true.
-24. **Idle transfer row** - a download with no connected sources now says which
+23. **VPN badge** - upper-left toolbar, ALWAYS present: **ON VPN** in blue, or
+    **OFF VPN** in red with VPN struck through. Its surroundings are transparent
+    in both appearances (no glass disc). **Check it against the iPadOS
+    status-bar VPN badge** - that is the ground truth, and the detection is a
+    heuristic ([[padmule-vpn-airvpn]]). Drop the tunnel and a warning dialog
+    should appear; it says sharing was NOT paused, which is deliberate and true.
+24. **Server list at start** - after a cold launch, servers that have not
+    answered yet read "checking...", NOT "no reply", and the list self-corrects
+    about 6s later without touching Refresh. A server reading "no reply" is
+    still worth TAPPING - the probe is UDP, the login is TCP.
+25. **Kad contacts should CLIMB** while the app runs (Status). Flat or falling
+    means the maintenance is not working; a collapse across a
+    background/foreground round trip means the reseed regressed (row 8cd).
+26. **Idle transfer row** - a download with no connected sources now says which
     kind of nothing it is: "no sources found", or "0 of N connected, M awaiting
     callback". A blank line there is the bug row 8bz fixed.
 
