@@ -72,6 +72,9 @@ macro_rules! funnel {
         pub fn fetch_funnel() -> Vec<(&'static str, u64)> {
             vec![$(($label, $get())),*]
         }
+        /// Every funnel counter, so `reset_fetch_stats` cannot miss one when a
+        /// new stage is added - the macro is the single place stages are listed.
+        static FUNNEL_REFS: &[&AtomicU64] = &[$(&$id),*];
     };
 }
 
@@ -180,6 +183,26 @@ pub fn unexpected_opcodes() -> Vec<(u8, u64)> {
     v
 }
 
+/// Zero every fetch counter.
+///
+/// Needed because the counters are cumulative since LAUNCH, so by the time a
+/// download stalls they are dominated by the healthy minutes before it. The
+/// diagnostic workflow is reset -> reproduce -> read, and without this the
+/// numbers cannot be attributed to the thing being investigated. Byte totals
+/// are deliberately NOT reset - those are the user's session stats, not a
+/// diagnostic.
+pub fn reset_fetch_stats() {
+    for c in FUNNEL_REFS {
+        c.store(0, Ordering::Relaxed);
+    }
+    for c in UNEXPECTED.iter() {
+        c.store(0, Ordering::Relaxed);
+    }
+    for c in DIAL_OK.iter().chain(DIAL_FAIL.iter()) {
+        c.store(0, Ordering::Relaxed);
+    }
+}
+
 /// The funnel and the out-of-turn opcodes as a printable block.
 pub fn fetch_report() -> String {
     let mut s = String::from("  FETCH FUNNEL (peer sessions reaching each stage)\n");
@@ -206,6 +229,27 @@ pub fn fetch_report() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `reset_fetch_stats` must clear EVERY funnel stage, and the only way to
+    /// guarantee that as stages are added is for the reset to iterate the same
+    /// list the macro generates. Asserting the two agree is race-free, unlike
+    /// asserting a counter reads zero - these are process-global and other
+    /// tests bump them concurrently.
+    #[test]
+    fn the_reset_covers_every_funnel_stage() {
+        assert_eq!(
+            FUNNEL_REFS.len(),
+            fetch_funnel().len(),
+            "a stage was added to the funnel that reset_fetch_stats would miss"
+        );
+        // The report must name every stage too, or a counter is invisible.
+        for (label, _) in fetch_funnel() {
+            assert!(
+                fetch_report().contains(label.trim()),
+                "stage {label:?} is counted but never printed"
+            );
+        }
+    }
 
     /// The counters only ever grow, so a delta assertion is race-safe even though
     /// other tests share the same process-global counter and may add concurrently.
