@@ -88,6 +88,25 @@ final class SettingsTests: XCTestCase {
         XCTAssertEqual(list.count, 2)
     }
 
+    /// A collapsed options group must NAME what is switched on inside it.
+    ///
+    /// The roll-up exists to reclaim screen space, and the way it could go wrong
+    /// is worse than the clutter it replaces: a user staring at thin results
+    /// with no way to see that "trusted only" is filtering them, behind a closed
+    /// triangle. Hiding a control is fine; hiding STATE is not.
+    func testCollapsedOptionLabelNamesWhatIsActive() {
+        XCTAssertEqual(
+            ContentView.optionSummary(prefix: "Search options", active: []),
+            "Search options", "nothing on - just the plain title")
+        XCTAssertEqual(
+            ContentView.optionSummary(prefix: "Search options", active: ["global"]),
+            "Search options: global")
+        XCTAssertEqual(
+            ContentView.optionSummary(
+                prefix: "Refine results", active: ["trusted only", "hiding have"]),
+            "Refine results: trusted only, hiding have")
+    }
+
     /// A row with zero connected sources must say WHICH kind of nothing it is.
     /// "no sources exist" and "sources exist and none can be reached" need
     /// opposite responses from the user and both used to render as a blank -
