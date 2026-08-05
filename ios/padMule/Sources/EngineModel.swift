@@ -1492,6 +1492,28 @@ final class EngineModel: ObservableObject {
         }
     }
 
+    // MARK: - Fetch diagnostics (the funnel)
+
+    /// The fetch funnel as a printable block - where peer sessions die, the
+    /// opcodes read out of turn, and how long dials take.
+    ///
+    /// Called STRAIGHT off the main thread, not via `work`: the engine side
+    /// reads process-global atomics and never takes the engine lock. That is
+    /// deliberate, because a stall is exactly when the engine is busy - routing
+    /// this through the serial queue would make the diagnostic unavailable
+    /// precisely when it is wanted. Returns a placeholder rather than an empty
+    /// panel before the engine exists.
+    var fetchReport: String {
+        engine?.fetchReport() ?? "Engine not started."
+    }
+
+    /// Zero the funnel counters, so the next reading describes one experiment
+    /// rather than everything since launch.
+    func resetFetchStats() {
+        engine?.resetFetchStats()
+        notice = "Fetch counters reset - reproduce the problem, then read them."
+    }
+
     /// Drop every dead, unpinned server from the list, then re-probe.
     func pruneDeadServers() {
         guard let e = engine, !loadingServers else { return }
