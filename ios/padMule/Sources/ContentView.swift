@@ -1521,8 +1521,8 @@ struct ContentView: View {
     /// unanimous gap starts to be interesting rather than anecdotal.
     private static let minStatusesForGap: UInt32 = 4
 
-    /// "13 parts missing from all 22 sources" - parts still needed that NOT ONE
-    /// sampled peer offered.
+    /// "13 parts missing from all 22 peer reports" - parts still needed that NOT
+    /// ONE sampled peer offered.
     ///
     /// This is the difference between a slow tail and an impossible one, which
     /// look identical on a row reading "90%, 86 sources, not moving": either
@@ -1530,15 +1530,23 @@ struct ContentView: View {
     /// it. The SAMPLE SIZE is named in the text on purpose - the first version
     /// said "N parts nobody has" from a one-source sample, which overstated a
     /// real measurement into a claim about the whole network.
+    ///
+    /// ...and it said "sources" until 2026-08-05, which overstated it a second
+    /// time in the same way. `partStatusReports` counts peer SESSIONS that read
+    /// a file status (`Download::note_status`), and `download_file` re-dials the
+    /// same pool every round - nothing evicts a source - so three peers dialled
+    /// eight times each rendered as "all 24 sources". "Peer reports" is what the
+    /// number actually is. The gap itself was never wrong; only its denominator.
     private func missingParts(_ dl: DownloadInfo) -> String? {
         guard dl.partsUnavailable > 0,
               dl.partStatusReports >= Self.minStatusesForGap
         else { return nil }
         let n = dl.partsUnavailable
         let seen = dl.partStatusReports
+        let reports = seen == 1 ? "1 peer report" : "\(seen) peer reports"
         return n == 1
-            ? "1 part missing from all \(seen) sources"
-            : "\(n) parts missing from all \(seen) sources"
+            ? "1 part missing from all \(reports)"
+            : "\(n) parts missing from all \(reports)"
     }
 
     private func bytes(_ n: UInt64) -> String {
