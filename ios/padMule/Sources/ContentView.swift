@@ -122,6 +122,11 @@ struct ContentView: View {
     @State private var hidReconnecting = false
     @State private var hidSharingPaused = false
     @State private var hidStarting = false
+    // Both search option groups start COLLAPSED - the point of the roll-up. Not
+    // persisted: a collapsed group whose label names its active options costs
+    // nothing to reopen, and one more UserDefaults key earns nothing.
+    @State private var showSearchOptions = false
+    @State private var showRefine = false
     @State private var query = ""
     @State private var serverListUrl = EngineModel.defaultServerListUrl
     @State private var detail: SearchHit?
@@ -533,20 +538,7 @@ struct ContentView: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
-                    // Pre-search filters: the server applies these to what it returns,
-                    // so the capped result set fills with matches instead of junk.
-                    Toggle("Complete sources only", isOn: $model.wireCompleteOnly)
-                        .font(.caption)
-                    Toggle("Search all servers (global)", isOn: $model.wireGlobal)
-                        .font(.caption)
-                    HStack {
-                        Text("Size").font(.caption).foregroundStyle(.secondary)
-                        Spacer()
-                        sizeMenu("Min", selection: $model.wireMinSizeMb)
-                        Text("-").foregroundStyle(.secondary)
-                        sizeMenu("Max", selection: $model.wireMaxSizeMb)
-                    }
-                    .font(.caption)
+                    searchOptionsGroup
                     if model.searched && !model.results.isEmpty {
                         HStack {
                             Menu {
@@ -569,15 +561,7 @@ struct ContentView: View {
                                     .font(.caption)
                             }
                         }
-                        HStack {
-                            Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-                            TextField("Filter these results", text: $model.nameFilter)
-                                .textInputAutocapitalization(.never)
-                                .disableAutocorrection(true)
-                        }
-                        .font(.caption)
-                        Toggle("Trusted only", isOn: $model.trustedOnly).font(.caption)
-                        Toggle("Hide ones I have", isOn: $model.hideHave).font(.caption)
+                        refineGroup
                         // An honest count (client-side filters can hide rows,
                         // so show both numbers when they differ), plus a way
                         // back to the top once the list is long enough to need one.
@@ -1667,6 +1651,81 @@ struct ContentView: View {
     }
 
     /// A size-preset menu (megabytes; 0 = "Any") for the pre-search size bounds.
+    /// PRE-search options, rolled up (Anthony, 2026-08-05: "too many option rows
+    /// in that Search tab"). These five controls sat permanently open above the
+    /// results and cost most of a screen before a single hit was visible.
+    ///
+    /// Collapsed by default, and its own `@ViewBuilder` for the reason row 8bw
+    /// paid for: a handful of conditional controls inline in an already-long
+    /// VStack is what pushed Swift's type-checker over its limit last time.
+    @ViewBuilder private var searchOptionsGroup: some View {
+        DisclosureGroup(isExpanded: $showSearchOptions) {
+            // The server applies these to what it RETURNS, so the capped result
+            // set fills with matches instead of junk.
+            Toggle("Complete sources only", isOn: $model.wireCompleteOnly)
+                .font(.caption)
+            Toggle("Search all servers (global)", isOn: $model.wireGlobal)
+                .font(.caption)
+            HStack {
+                Text("Size").font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                sizeMenu("Min", selection: $model.wireMinSizeMb)
+                Text("-").foregroundStyle(.secondary)
+                sizeMenu("Max", selection: $model.wireMaxSizeMb)
+            }
+            .font(.caption)
+        } label: {
+            Label(Self.optionSummary(prefix: "Search options", active: activeSearchOptions),
+                  systemImage: "slider.horizontal.3")
+                .font(.caption)
+        }
+    }
+
+    /// POST-search refinements, rolled up the same way. Sort and type stay OUT of
+    /// the disclosure: they are one compact row and the two most-reached-for
+    /// controls on the screen.
+    @ViewBuilder private var refineGroup: some View {
+        DisclosureGroup(isExpanded: $showRefine) {
+            HStack {
+                Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                TextField("Filter these results", text: $model.nameFilter)
+                    .textInputAutocapitalization(.never)
+                    .disableAutocorrection(true)
+            }
+            .font(.caption)
+            Toggle("Trusted only", isOn: $model.trustedOnly).font(.caption)
+            Toggle("Hide ones I have", isOn: $model.hideHave).font(.caption)
+        } label: {
+            Label(Self.optionSummary(prefix: "Refine results", active: activeRefinements),
+                  systemImage: "line.3.horizontal.decrease")
+                .font(.caption)
+        }
+    }
+
+    private var activeSearchOptions: [String] {
+        var on: [String] = []
+        if model.wireCompleteOnly { on.append("complete only") }
+        if model.wireGlobal { on.append("global") }
+        if model.wireMinSizeMb > 0 || model.wireMaxSizeMb > 0 { on.append("size") }
+        return on
+    }
+
+    private var activeRefinements: [String] {
+        var on: [String] = []
+        if !model.nameFilter.isEmpty { on.append("\"\(model.nameFilter)\"") }
+        if model.trustedOnly { on.append("trusted only") }
+        if model.hideHave { on.append("hiding have") }
+        return on
+    }
+
+    /// The collapsed label must NAME what is switched on, or the roll-up trades
+    /// clutter for a worse problem: a user staring at thin results with no way
+    /// to see that "trusted only" is filtering them, behind a closed triangle.
+    /// Hiding a control is fine; hiding STATE is not.
+    static func optionSummary(prefix: String, active: [String]) -> String {
+        active.isEmpty ? prefix : "\(prefix): \(active.joined(separator: ", "))"
+    }
+
     private func sizeMenu(_ label: String, selection: Binding<UInt64>) -> some View {
         let presets: [UInt64] = [0, 1, 10, 100, 700, 1024, 4096]
         return Menu {
