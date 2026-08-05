@@ -283,10 +283,46 @@ struct SettingsView: View {
             LabeledContent("Kad contacts", value: "\(model.kadContacts)")
             LabeledContent("IP filter", value: model.ipFilterRanges == 0
                 ? "off" : "\(model.ipFilterRanges) ranges")
+            LabeledContent("Build", value: Self.buildId)
+                .textSelection(.enabled)
         } header: {
             Text("This device")
         } footer: {
             Text("Your identity is generated on first launch and kept on device. It is never shown to peers as-is and never leaves the iPad.")
         }
     }
+
+    /// "1.0 (621092b)" - the marketing version and the GIT SHA this build was
+    /// made from, stamped into CFBundleVersion by CI.
+    ///
+    /// It exists because until 2026-08-05 nothing on the device could say WHICH
+    /// build was running: CFBundleVersion was the XcodeGen default of `1` in
+    /// every build ever shipped, so a fresh install was confirmed by spotting a
+    /// UI change and remembering which round it came from. That is guesswork
+    /// aimed at exactly the question a bug report has to answer first.
+    ///
+    /// Selectable on purpose - it belongs in a report, and the alternative is
+    /// transcribing it off a photograph.
+    ///
+    /// Falls back to "dev" for a local or simulator build, where nothing stamps
+    /// it and CFBundleVersion is still XcodeGen's default.
+    static var buildId: String {
+        let info = Bundle.main.infoDictionary
+        return buildLabel(
+            short: info?["CFBundleShortVersionString"] as? String ?? "?",
+            build: info?["CFBundleVersion"] as? String ?? "?"
+        )
+    }
+
+    /// The formatting rule alone, so it can be tested without a bundle - the
+    /// only interesting part is the unstamped fallback, and asserting that
+    /// through `Bundle.main` would be asserting how CI happened to build the
+    /// test host.
+    static func buildLabel(short: String, build: String) -> String {
+        build == UNSTAMPED_BUILD ? "\(short) (dev)" : "\(short) (\(build))"
+    }
 }
+
+/// XcodeGen's default CFBundleVersion, which is what an un-stamped build has.
+/// CI replaces it with the git short sha (.github/workflows/ios-build.yml).
+private let UNSTAMPED_BUILD = "1"

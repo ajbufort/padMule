@@ -87,4 +87,18 @@ final class SettingsTests: XCTestCase {
         XCTAssertTrue(accept("https://ed2k.example/list.met", into: &list))
         XCTAssertEqual(list.count, 2)
     }
+
+    /// The build label must DISTINGUISH a CI build from an unstamped one. The
+    /// whole point of the line is answering "which build is this?", and a label
+    /// that read "1.0" for both would answer it wrongly rather than not at all -
+    /// which is worse, because it looks like information.
+    func testBuildLabelNamesTheShaAndFallsBackForAnUnstampedBuild() {
+        XCTAssertEqual(
+            SettingsView.buildLabel(short: "1.0", build: "621092b"), "1.0 (621092b)")
+        // XcodeGen's default: no CI stamp, so say so rather than imply a version.
+        XCTAssertEqual(SettingsView.buildLabel(short: "1.0", build: "1"), "1.0 (dev)")
+        // A missing key degrades to a visible "?" instead of an empty pair of
+        // brackets that reads like a rendering bug.
+        XCTAssertEqual(SettingsView.buildLabel(short: "?", build: "?"), "? (?)")
+    }
 }

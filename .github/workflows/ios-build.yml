@@ -94,6 +94,27 @@ jobs:
             CODE_SIGN_IDENTITY="" \
             build
 
+      # Stamp the git sha into CFBundleVersion, so the device can say WHICH build
+      # it is running (Settings > This device > Build). Until now XcodeGen's
+      # default of `1` was in every build ever shipped, so a fresh install was
+      # confirmed by spotting a UI change and remembering which round it came
+      # from - guesswork aimed at the first question any bug report has to
+      # answer.
+      #
+      # A hex sha is not a legal App Store CFBundleVersion (that rule wants
+      # period-separated integers), and that is fine: padMule is sideload-only,
+      # so it never faces App Store validation. Sideloadly re-signs at install.
+      #
+      # Done on the BUILT app rather than in project.yml: PlistBuddy edits the
+      # binary plist in place, after xcodebuild can no longer overwrite it, and
+      # the app is unsigned at this point so there is no signature to invalidate.
+      - name: Stamp the build sha
+        run: |
+          APP=ios/build/Build/Products/Release-iphoneos/padMule.app
+          SHA=$(git rev-parse --short HEAD)
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $SHA" "$APP/Info.plist"
+          echo "CFBundleVersion is now: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP/Info.plist")"
+
       - name: Package the .ipa
         run: |
           cd ios/build/Build/Products/Release-iphoneos
