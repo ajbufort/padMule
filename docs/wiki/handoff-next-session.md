@@ -1,147 +1,174 @@
 # HANDOFF - start here next session
 
-Updated: 2026-08-04, written fresh at the close of a very long session.
-Everything below is verified; anything NOT verified says so, and the one claim
-that was asserted without evidence is marked REFUTED rather than deleted.
+Updated: 2026-08-04 (second session of the day: the fetch path was INSTRUMENTED,
+and the measurement replaced three rounds of theory).
 
 Living doc - replace it wholesale next time. Full narrative: [[build-progress]]
-rows 8bj-8bs and the [[log]] entries for 2026-08-03/04.
+rows 8bj-8bt and the [[log]] entries for 2026-08-03/04.
 
 ## State of the tree
 
-- **Gate**: 610 Rust tests, clippy `-D warnings` clean, fmt clean, ASCII clean.
+- **Gate**: 614 Rust tests, clippy `-D warnings` clean, fmt clean, ASCII clean.
 - History LINEAR across 390+ commits - zero merge commits, ever. Keep it that
   way (`gh pr merge --rebase`).
-- **THREE COMMITS ARE UNPUSHED** (`b02017f`, `678dbb3`, `a3c6da1`) and the iPad
-  build predates them. Push and rebuild before judging behaviour on device.
+- **UNPUSHED COMMITS** - check `git log origin/main..HEAD` before judging device
+  behaviour. (The previous handoff said "three" and named three; there were
+  FOUR. The commit that writes the handoff cannot list itself - use the command,
+  not the prose.)
 - [[security-model]]: **24 OPERATIONAL / 0 PARTIAL / 2 documented opt-outs**.
 - All four oracles pass: amuled differential, REVERSE, isolated eserver, Kad
   verify.
 - Installed on the iPad: **8068a71** (stale). Device on iPadOS **26.6**.
 - **Cert re-signed 2026-08-04**, lapses about **2026-08-11**.
 
-## THE OPEN PROBLEM: downloads stall, cause NOT identified
+## THE FETCH FUNNEL - build it, then read it
 
-Anthony ran padMule overnight: "many files partially download and then either
-stop or slow to a crawl". Three real bugs were found and fixed. The symptom is
-better but NOT solved, and the obvious explanation has been disproved.
+The previous handoff said the next step was "a MEASUREMENT, not another theory".
+That instrument now exists and is the most important thing in this file.
 
-**What is measured and true:**
+`mule_engine::stats` holds cumulative per-stage counters, bumped one line at a
+time through `run_peer`/`fetch_one`, plus a tally of every opcode read out of
+turn and a dial-duration histogram. `mule_ffi::fetch_report()` prints it; the
+stress harness prints it every 30s. The DROP between two adjacent stages is the
+loss at that stage - **including a loss to the per-peer TIMEOUT, which no error
+value can report.** That is precisely why the gap had stayed invisible.
 
-- Retries are cheap (~195ms, was 6.001s) and fair (was: one download got every
-  retry, forever).
-- 15 of 17 source lookups find **2-7 usable sources**, plus LowID peers.
-- Yet only ~**5 of 20** downloads ever receive a byte.
-- **Sources are found; data does not follow.** Nobody has looked inside that gap.
+Baseline, 480s, 25 downloads, HighID, a 41k-user server:
 
-**What is REFUTED**, and this is the useful part. `bail_on_queue` makes padMule
-abandon a peer the instant it queues us. eD2k rations upload slots, so "a client
-that never queues can never be served" looked like the answer - and it was
-written into the docs as the root cause before being tested. The A/B, with queue
-policy as the only variable:
+```
+dialed                         1583      <- includes re-dials across the sweep
+connected                        74      <- 4.7%
+got filestatus                   65
+asked for a slot                 65
+  slot ACCEPTED                   7      <- 11% of peers reached
+  queued (bailed)                50
+accepted, no block to take        6      <- 86% of the slots WON were useless
+requested blocks                  1
+DELIVERED bytes                   1      <- ONE session moved a byte
+```
 
-| policy | downloads receiving | bytes in 243s |
-|---|---|---|
-| BAIL (current) | 5 of 20 | 53.7 MB |
-| WAIT (the "fix") | 1 of 21 | **0.0 MB** |
+23 of 25 downloads reached `0/0/0` connected sources against a Search claim of
+8-22. **Kad contributed ZERO sources to any download** - unexplained, worth a
+look.
 
-Four times worse. The manager runs ~4 concurrent peers per download, so waiting
-parks all of them in hopeless queues instead of cycling to whoever has a FREE
-slot. Fast-bail is doing real work, exactly as the three-file milestone claimed.
-Reverted.
+## What that found, and what it did NOT
 
-**The next step is a MEASUREMENT, not another theory:** instrument what happens
-after a source is handed to the fetch task - connect success, handshake outcome,
-slot verdict per peer - because the gap between "found 5 sources" and "0 bytes"
-has never been observed directly.
+**FIXED - `OP_OUTOFPARTREQS` (0x57) had no handler.** Not an edge case: it is
+how every upload slot ends. Both authorities send it the instant
+`CheckForTimeOver()` trips, at 10 MB uploaded or one hour (eMule 0.50a
+UploadClient.cpp:722-725 + :767-782, aMule master UploadClient.cpp:463-466,
+UploadQueue.cpp:609-616 - the same 10 MB padMule already encodes as
+`SESSION_MAX_BYTES`). `BlockReceiver::accept` yields no writes for a non-data
+opcode, so the block loop waited for bytes that were never coming until the
+caller's **45s** timeout, holding one of only FOUR workers. The one download that
+moved in the baseline froze at exactly 18.6MB. *The differential test's 15MB file
+does cross 10MB, but on loopback it finishes before amuled's kick timer ticks.*
 
-**Untested candidate** (do not write it up as the cause until measured): bail
-while UNTRIED sources remain, wait only once every known source has queued us.
+**FIXED - padMule asked for a slot from peers holding nothing it needed.** eMule
+sets DS_NONEEDEDPARTS on the file status and swaps away WITHOUT asking
+(DownloadClient.cpp:634-641). Fast-bail SELECTS for these peers: a client that
+just started downloading has a free upload slot precisely because it has nothing
+to give. That was the 6-of-7 line.
 
-**Reproduce anything here with the stress harness:**
+**THE LIVE A/B IS INCONCLUSIVE - do not cite it as validation.** A second 480s
+run with both fixes: `1676 dialed -> 33 connected -> 24 slot asks -> 17 ACCEPTED
+-> 12 no-block-to-take -> 5 DELIVERED`, 2 of 25 receiving, 22.6MB. Every number
+moved the right way and none of it is attributable - `connected` fell 74 -> 33 on
+a similar dial count, so the runs sampled very different source populations, and
+an 11% -> 71% slot-accept swing is far too large for a gate that removed six
+asks. **Both fixes are established OFFLINE**, by deterministic loopback tests
+with mutation checks. Note `slot REVOKED (0x57) = 0` across the whole second run:
+no source fed padMule 10MB in one session, so the revocation fix was never
+exercised live. Proven by test, not by that run.
+
+**OPEN - `accepted, no block to take` did not fall; it rose to 12 of 17.** Part
+of the mechanism is proven and part was REFUTED. The arithmetic (4 workers x 3
+blocks x 184320 = 2.11MB reservable at once) says a small file is fully spoken
+for by its own workers - but a test written to prove that failed first, because
+below ENDGAME_LIMIT (737KB) `take_blocks` enters endgame and races the
+reservations. The real band is 737KB < still-missing < 2.11MB, plus any peer
+holding only already-reserved parts. Real, kept as a test, too narrow to explain
+12 of 17.
+
+**NOT EXPLAINED - the first stage, which is the biggest loss.** 95% of dials
+never complete a handshake, and neither fix touches it. Two known contributors,
+neither measured apart yet:
+
+1. Nothing ever removes a proven-dead source from `download_file`'s pool.
+   `PeerScoreboard` only re-ORDERS; one dead peer costs 8 dials per sweep and
+   again on every retry, so 1583 dials is far fewer distinct peers.
+2. The connect shares the 45s per-peer budget. Both authorities do use
+   CONNECTION_TIMEOUT = 40s (eMule opcodes.h:62, aMule Constants.h:33-35), but
+   eMule multiplexes hundreds of sockets so a stalled one costs it nothing;
+   padMule's four-worker pool turns the same number into a throughput cap.
+
+**The dial-duration histogram exists to settle #2 with data** - it splits dial
+times by whether the handshake SUCCEEDED. If successful handshakes all land in
+the first seconds, everything past that is dead air and a shorter CONNECT
+deadline is free. If they are spread out, cutting it would discard real sources
+and the honest answer is to widen the worker pool instead. **Run it and read it
+before changing either number.**
+
+**Reproduce anything here:**
 `cargo run --release -p mule-ffi --example stress -- /tmp/cfg /tmp/dl linux 25 480`
-
-## What landed this session
-
-Wave 11 AICH merged, then eleven PRs. The headline is that **eight real bugs
-were found by USING the app, none caught by the gate**:
-
-1. The serve side sent every block up to THREE times (both oracles blind to it -
-   duplicate bytes still verify, so a pass/fail harness cannot see a BANDWIDTH
-   defect).
-2. The AICH serve answer was unreachable on the path real clients use.
-3. Called-back sources were tracked nowhere.
-4. A second corruption round blamed the first round's source (a false ban).
-5. Live servers shown dead on one lost UDP datagram.
-6. The idle-retry sweep starved every download but one (stable sort + `.first()`
-   - invisible at N=1, which is every test).
-7. Retry budget was a floor not a ceiling: `find_sources` waited on both arms, so
-   every retry cost the maximum even when the server answered in 195ms.
-8. The Transfers badge counted every source EVER contacted (99 vs Search's 12).
-
-Also: continuous block-request top-up, the source-origin badge, the amber
-"receiving now" row, the Kad advertised-vs-bound port split, UPnP defaulting
-OFF, the Files button, real Open, sortable Downloaded/Servers, alphanumeric
-search sort, the floating Top button, and UI polls off the engine lock.
-
-## HighID over AirVPN - SOLVED, and the cause is a trap
-
-padMule is HighID on the VPN, device-proven. AirVPN's **"Local port" field
-cannot be left blank** - the form refuses to save an empty value and silently
-keeps the previous one, so the rule kept forwarding 5999 to an old 4662.
-
-**The diagnostic is worth more than the fix:** `Connection refused (111)` rather
-than a TIMEOUT proves the packet crossed the tunnel and reached the device,
-which answered "nothing listening". Tunnel, keepalive and routing were never
-suspects - only the port. Setup that works: one port, TCP+UDP, Local port set to
-the SAME number, all four padMule port fields that number, UPnP OFF.
-
-## Scope decisions
-
-- **Wave 9 seedbox mode: DROPPED** (2026-08-04). Foreground-only is PERMANENT,
-  so the honest pause/resume, readiness-gated splash, keep-screen-awake and
-  Stop-releases-the-port are the FINAL design. Do not promise an always-on mode.
 
 ## Open work (ranked)
 
-1. **The stall above** - measure the found-sources-to-no-bytes gap.
-2. **Status scalars lag during a long search.** UI polls are off the engine lock
-   now, but `state`/`server_info`/`kad_contacts` live in the engine and stall
-   behind `Engine::search`'s ~20s `&mut self`. Needs `server`/`kad` made
-   independently shareable - 34 use sites, new lock-ordering surface, NOT
-   required for a responsive UI.
-3. **Device-verify what shipped unseen**: Downloaded sort, the Open handoff,
+0. **Run the funnel several times before trusting any A/B on it.** One pair of
+   runs cannot separate a fix from source-population variance on this network;
+   the STAGE RATIOS are the signal, and even those need repetition.
+1. **The dial stage** - read the histogram, then decide: dead-source eviction,
+   a shorter connect deadline, a wider worker pool, or some of each.
+1b. **`accepted, no block to take`, 12 of 17** - the biggest loss among slots we
+   actually win, and unexplained past the narrow reservation band above.
+2. **Kad found zero sources across 25 downloads.** Server-only discovery is a
+   single point of failure, and this was not true earlier in the project.
+3. **padMule's serve side never rotates an upload slot.** `should_kick()` and
+   `build_out_of_part_reqs()` are both DEAD CODE, so a peer holding a padMule
+   slot holds it for the whole session and better-scored waiters never get in.
+   The `UploadGate` doc scopes out cross-connection queue persistence, but
+   rotation happens on the HELD connection, so this is not covered by that
+   decision. Mirror image of the bug above - padMule neither sent nor understood
+   slot rotation.
+4. **Status scalars lag during a long search** (`state`/`server_info`/
+   `kad_contacts` stall behind `Engine::search`'s ~20s `&mut self`). 34 use
+   sites, new lock-ordering surface, NOT required for a responsive UI.
+5. **Device-verify what shipped unseen**: Downloaded sort, the Open handoff,
    alphanumeric search sort, the amber row.
-4. **Portability Tier 2**: NAT-PMP dead code; the 4s `offer_files` timeout drops
+6. **Portability Tier 2**: NAT-PMP dead code; the 4s `offer_files` timeout drops
    uploads on a slow link; no bandwidth limiting.
-5. **Settings Tier 1/2**: nickname (hardcoded), obfuscation tri-state, ipfilter
+7. **Settings Tier 1/2**: nickname (hardcoded), obfuscation tri-state, ipfilter
    controls, upload slots, bandwidth caps, See-My-Shared-Files.
-6. **Smaller items**: harvest queue lost if the server.met write fails; no
+8. **Smaller items**: harvest queue lost if the server.met write fails; no
    thin-file guard on nodes.dat; related-search pollutes Recent Searches;
    Settings accepts `https://` URLs the engine rejects; kick alert may not
-   surface over a sheet; `hash-file` exits 0 on failure; MSRV unenforced.
+   surface over a sheet; `hash-file` exits 0 on failure; MSRV unenforced. Ten
+   merged feature branches still exist locally and on origin, plus a stale
+   worktree at `.claude/worktrees/wave11-aich`.
 
 ## Discipline that keeps earning its keep
 
-- **User testing finds what tests cannot.** Eight bugs this session, zero caught
-  by the gate.
-- **A tidy causal story is a HYPOTHESIS.** The queue-bail "root cause" was
-  written into the docs before it was tested, and measurement said four times
-  worse. A wrong diagnosis is costlier than a wrong fix, because it gets
-  believed. When reverting someone's deliberate decision, first find the
-  measurement that made them choose it. See [[verify-before-reporting]].
-- **A budget that is ALWAYS fully consumed is not a budget, it is a cost.** Ask
-  whether the fast path really finishes early or something in the join burns it.
-- **A zero-result test is not a failing test until you run the CONTROL.** The
-  video run moved 0 bytes; the control proved the build fine and the content
-  absent (Blender open movies live on blender.org, not eD2k).
-- **Bugs invisible at N=1.** A stable sort plus `.first()` looks fair until the
-  key ties. Ask what a selection does when keys tie, and whether the test
-  exercises N>1.
-- **MUTATION-CHECK anything load-bearing** - break the fix, watch the right test
-  go red.
-- **"An event is not state"** - FOUR occurrences ([[an-event-is-not-state]]).
+- **When two theories have already failed, stop and build the instrument.** The
+  funnel took under an hour and answered in one run what three rounds of
+  reasoning had not. It also refuted my OWN fresh hypothesis on the spot: the
+  0x57 handler was traced to real upstream source lines and was genuinely
+  missing, and the funnel still showed the block loop nearly unreachable, so it
+  was real but SECONDARY. **Citing the upstream line proves the code is wrong,
+  not that it is what is hurting you.**
+- **A tidy causal story is a HYPOTHESIS.** See [[verify-before-reporting]] - the
+  queue-bail "root cause" was documented before it was tested and measured four
+  times worse.
+- **User testing finds what tests cannot.** Eight bugs in the previous session,
+  zero caught by the gate.
 - **A green oracle proves only the path it drives**, and says nothing about COST.
+  The differential test transfers 15MB - past upstream's 10MB kick threshold -
+  and still never saw the revocation, because loopback is too fast for the
+  timer.
+- **MUTATION-CHECK anything load-bearing** - break the fix, watch the right test
+  go red. Both fixes here: red at 5.02s/5.19s `Elapsed`, green at 0.03s/0.23s.
+- **Bugs invisible at N=1.** A stable sort plus `.first()` looks fair until the
+  key ties.
+- **"An event is not state"** - FOUR occurrences ([[an-event-is-not-state]]).
 - **Swift type-checks ONLY in CI on this box.**
 - **`strings` on the .ipa can FALSE-NEGATIVE**: Swift stores <=15-byte strings
   inline. Pick longer markers.
@@ -151,7 +178,9 @@ the SAME number, all four padMule port fields that number, UPnP OFF.
 ## Related
 
 - [[build-progress]] / [[security-model]] / [[log]] / [[decisions-and-lessons]]
-- [[net-highid-and-port-forwarding]] - the AirVPN Local-port trap.
+- [[net-highid-and-port-forwarding]] - the AirVPN Local-port trap: the "Local
+  port" field cannot be left blank, and `Connection refused (111)` rather than a
+  TIMEOUT is what proves the packet crossed the tunnel.
 - [[ipad-usb-tooling]] - device runbook. `usbipd bind` is NOT needed;
   pymobiledevice3 reaches the iPad through Windows' own Apple service. NB the
   DDI unmounts on reboot and WebDriverAgent needs a remount before it will run.
