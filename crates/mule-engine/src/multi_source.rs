@@ -572,6 +572,30 @@ impl Download {
         }
     }
 
+    /// Parts we still need that NO source has ever been seen holding.
+    ///
+    /// Answers the one question a stalled near-complete download cannot answer
+    /// from the screen: is padMule failing to ASK for the tail, or does the
+    /// swarm simply not HAVE it? Those are opposite bugs with opposite fixes,
+    /// and "90% done, 86 sources, zero bytes" looks identical either way.
+    ///
+    /// `availability` is CUMULATIVE - `note_status` only ever increments, and
+    /// nothing decrements when a peer goes away. That is a feature here: a zero
+    /// means no source we have EVER talked to reported holding that part, which
+    /// is the conservative reading. A part held by a peer that has since gone is
+    /// NOT counted as missing, so this never overstates the problem.
+    ///
+    /// Returns `(still needed, of those unavailable)`.
+    pub async fn part_availability(&self) -> (u64, u64) {
+        let g = self.inner.lock().await;
+        let wanted = g.store.pf.wanted_parts();
+        let missing = wanted
+            .iter()
+            .filter(|&&p| g.availability.get(p as usize).copied().unwrap_or(0) == 0)
+            .count();
+        (wanted.len() as u64, missing as u64)
+    }
+
     /// Does this peer hold ANY part we still have bytes missing in?
     ///
     /// Deliberately ignores reservations: a part another worker is fetching

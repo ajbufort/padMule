@@ -3542,6 +3542,10 @@ impl Engine {
         // would stack a duplicate download_file every background/foreground cycle,
         // multiplying outbound peer connections.
         if !dl.try_begin_fetch() {
+            // Counted: a `fetching` flag that never clears makes the retry sweep
+            // skip this download for the rest of the process, which is one of
+            // the two in-memory gates that a restart silently repairs.
+            crate::stats::note_fetch_busy();
             return;
         }
         // Advertise SecureIdent v1 in the fetch HELLO so a source will initiate
