@@ -1,181 +1,137 @@
 # HANDOFF - start here next session
 
-Updated: 2026-08-04, close of the instrumentation + on-glass session.
+Updated: 2026-08-04, close of the instrumentation session.
 
 Living doc - replace it wholesale next time. Full narrative: [[build-progress]]
-rows 8bj-8bw and the [[log]] entries for 2026-08-03/04.
+rows 8bt-8bx and the [[log]] entries for 2026-08-04.
 
 ## State of the tree
 
-- **Gate**: 617 Rust tests, clippy `-D warnings` clean, fmt clean, ASCII clean.
-- **YOU ARE ON BRANCH `fetch-funnel`, NOT main.** Ten commits ahead of main, all
-  pushed. `main` itself is still 4 commits ahead of `origin/main` from the
-  previous session. Nothing has been merged - decide that first
-  (`gh pr merge --rebase`, history is LINEAR across 390+ commits and must stay
-  that way). Do not trust prose for commit counts; run
+- **Gate**: 618 Rust tests, clippy `-D warnings` clean, fmt clean, ASCII clean.
+- **YOU ARE ON BRANCH `fetch-funnel`, NOT main**, and nothing is merged. Decide
+  that first. History is LINEAR across 390+ commits and must stay that way
+  (`gh pr merge --rebase`). Do not trust prose for counts - run
   `git log --oneline main..HEAD` and `git log --oneline origin/main..main`.
-- [[security-model]]: **24 OPERATIONAL / 0 PARTIAL / 2 documented opt-outs**.
-- Oracles: amuled differential re-run GREEN after the transfer-path changes
-  (3 files byte-for-byte, incl. the 15MB multipart). REVERSE / eserver / Kad
-  verify not re-run this session.
-- **Latest IPA delivered: `dffbc30`** (branch head). Device on iPadOS
-  **26.6**. Cert re-signed 2026-08-04, lapses about **2026-08-11**.
-- IPAs are delivered to `/mnt/c/Users/ajbuf/Downloads/` as
+- Oracles: amuled differential re-run GREEN after every transfer-path change
+  today. REVERSE / eserver / Kad-verify not re-run this session.
+- **Installed on the iPad: `f82ee7e`.** iPadOS 26.6. Cert lapses ~2026-08-11.
+- IPAs go to `/mnt/c/Users/ajbuf/Downloads/` as
   `padMule-INSTALL-THIS-unsigned-<sha>.ipa` ([[padmule-ipa-delivery]]).
 
-## THE FETCH FUNNEL - now on the device. Use it before theorising.
+## THE POINT OF THIS SESSION: instruments, not guesses
 
-`mule_engine::stats` counts how far down the eD2k request sequence each PEER
-SESSION got, plus every opcode read out of turn and a dial-duration histogram.
-The DROP between two adjacent stages is the loss at that stage - **including a
-loss to the per-peer TIMEOUT, which no error value can report.** That is why
-this gap survived three rounds of reasoning.
+Three rounds of theory had failed on "downloads stall". Building the instrument
+took under an hour and answered it in one run. **Read these before theorising.**
 
-- **On the device**: Stats -> Fetch diagnostics, with **Copy report** and
-  **Reset counters**. Counters are cumulative since launch, so the workflow is
-  **reset -> reproduce -> read**, then Copy and paste the block.
-- **On this box**: `cargo run --release -p mule-ffi --example stress -- /tmp/cfg /tmp/dl linux 12 300`
-- Both FFI methods are LOCK-FREE by design (process-global atomics, never the
-  engine lock) - a stall is exactly when the engine is busy.
+**1. The fetch funnel** (`mule_engine::stats`; Stats -> Fetch diagnostics, with
+Copy report and Reset counters; also printed by the stress harness). Cumulative
+per-stage counts of how far each PEER SESSION got. The DROP between two adjacent
+stages is the loss at that stage - **including a loss to a TIMEOUT, which no
+error value can report.** Both FFI methods are LOCK-FREE by design: a stall is
+exactly when the engine is busy. Counters are cumulative since launch, so the
+workflow is **reset -> reproduce -> read**.
 
-## Fixed this session
+**2. "N parts missing from all M sources"** on each transfer row. Parts still
+needed that not one sampled peer offered. Separates a SLOW tail from an
+IMPOSSIBLE one - identical on a row reading "90%, 86 sources, not moving".
+Gated at 4 sampled statuses; the sample size is in the text on purpose.
 
-1. **`OP_OUTOFPARTREQS` (0x57) had no handler.** The ordinary end of every
-   upload slot - both authorities send it when `CheckForTimeOver()` trips at
-   10 MB or 1 hour (eMule 0.50a UploadClient.cpp:722-725/:767-782, aMule master
+**3. `skipped: source BANNED` / `skipped: fetch already running`** - the two
+in-memory gates a RESTART clears (see open item 1).
+
+**4. The dial-time histogram**, split by whether the handshake succeeded.
+
+## Shipped
+
+1. **`OP_OUTOFPARTREQS` (0x57) had no handler** - the ordinary end of every
+   upload slot (10MB or 1h; eMule UploadClient.cpp:722-725/:767-782, aMule
    UploadClient.cpp:463-466, UploadQueue.cpp:609-616). padMule waited out the
-   caller's 45s timeout holding 1 of only 4 workers.
-2. **Asking a slot of peers holding nothing we need.** eMule sets
+   45s per-peer timeout holding 1 of only 4 workers.
+2. **Slots asked of peers holding nothing we need** - eMule sets
    DS_NONEEDEDPARTS and swaps away without asking (DownloadClient.cpp:634-641).
-3. **The empty Servers tab was a bootstrap bug.** `ensure`'s guard was
-   `exists && len > 0` - length is not usability, so a `server.met` that parsed
-   to ZERO servers was "already present" forever. Reachable normally: prune the
-   last dead server and that is the file you get.
-4. **The funnel counted two entry paths as one**, so it reported more file
-   statuses than handshakes - impossible. A called-back source dials US and
-   never passes `fetch_one`. Inbound sessions are now counted separately.
-5. **The dial got its own 10s deadline** (see MEASURED below).
-6. **On-glass UI round** (row 8bw): dark `Color.bannerBlue`, ALL banners
-   closeable, server list on APP open, a finish BEEP (typed `Finished` event,
-   not a match on prose), a full-width rate chart, Stop first in the toolbar,
-   and "Name (ip:port)" on the Servers tab via a shared `serverLabel()`.
+3. **The empty Servers tab was a bootstrap bug**: `ensure`'s guard was
+   `exists && len > 0`, and LENGTH IS NOT USABILITY. Reachable normally - prune
+   the last dead server and that is the file you get.
+4. **The dial got its own 10s deadline** (was sharing the 45s session budget).
+5. **`Get` was a flat ~15s**, now ~200ms when the server answers.
+6. **The funnel counted two entry paths as one**, reporting more file statuses
+   than handshakes - impossible. Inbound (called-back) sessions now counted
+   separately.
+7. **UI round**: dark `Color.bannerBlue`, ALL banners closeable, server list on
+   APP open, finish BEEP (typed `Finished` event, not a match on prose),
+   full-width rate chart, Stop first in the toolbar, "Name (ip:port)" on the
+   Servers tab.
 
-Items 1-3 test-first with RED observed, 2 of them mutation-checked.
+## OPEN - named as open, not explained
 
-## MEASURED - and one number that CHANGED once the device spoke
-
-**The dial now has its own 10s deadline (SHIPPED).** The dev box argued for far
-less: of 76 successful handshakes, 75 landed under 1s and one at 1-2s, with NOT
-ONE connecting after 2s, while 57 dials burned the full 45s and all failed. So
-"a 5s cap is free" looked safe.
-
-**The iPad refuted the word "free".** Over the VPN the slow tail is REAL - one
-connection at 5-10s and TWO at 20-45s, out of 315:
-
-```
-              dev box            iPad (VPN)
-0-1s          75 ok / 166 fail   274 ok / 239 fail
-1-2s           1 / 5              31 / 25
-2-5s           0 / 22              7 / 5
-5-10s          -                   1 / 14
-20-45s         0                   2 / 0     <- real, and a 5s cap kills them
->=45s          0 / 57              0 / 63
-```
-
-Settled at **10s**: keeps 313 of 315 (99.4%) and still kills the 63 dials that
-each burned 45s. LESSON: a threshold tuned on one network is a hypothesis about
-the others; padMule ships on the VPN path, so that is the one that decides.
-
-**Still true and still unfixed: nothing ever evicts a proven-dead source** from
-`download_file`'s pool - `PeerScoreboard` only re-ORDERS - so a dead peer is
-re-dialed 8x per sweep and again on every retry.
-
-## OPEN - and named as open, not explained
-
-0. **"No completions" - PARTLY ANSWERED, and the answer was the swarm.** The
-   new per-row badge "N parts nobody has" showed the two non-moving files
-   were exactly the two missing parts no source held: one at Zero KB with 24
-   parts, another capped near 50% by 13 parts (~120MB). padMule was correct.
-   BUT the badge counts parts no source WE HAVE SEEN held, so on a 1-2 source
-   file it means "the one peer we found lacks these" - QUEUED: gate it on a
-   source-count threshold and reword to "no connected source has".
-0b. **The original stall shape is still open**, and the next occurrence should
-   name itself: `skipped: source BANNED` vs `skipped: fetch already running`
-   are now in the funnel. A restart unstuck a file at 85%, which means the
-   blocker is in-memory state a restart clears - those are the only two such
-   gates on the dial path.
-   Leading candidate is the TAIL, and the funnel already points at it:
-   `accepted, no block to take` was **84 of 194** granted slots (43%). Four
-   workers x 3 blocks x 184320 = **2.11MB** can be under reservation at once,
-   while `ENDGAME_LIMIT` only races the last **737KB** - so a nearly-finished
-   file can have its whole remainder held by a few workers while every OTHER
-   source that wins a slot is turned away with nothing to do. If those holders
-   are slow or die, the tail never lands. NOT confirmed. The on-device funnel
-   settles it: let a download get near the end, then Copy report and look at
-   whether `accepted, no block to take` climbs while nothing completes. The
-   likely fix is widening the endgame window so the tail is RACED, not hoarded.
-1. **The device and this box DIVERGE on the same server at the same minute.**
-   Dev box: 7 of 12 downloads receiving, one at 147MB, 42 delivering sessions.
-   iPad at the same time: two files crossed 10MB then froze for 9 minutes with
-   **ZERO sources**, and three 2-2.4GB ISOs (6-7 full srcs claimed) never
-   registered at all - while Connected/HighID/Kad-138 the whole time. The
-   difference between the two is the **VPN path**. MEASURE IT with the on-device
-   funnel now that it exists; do not assume.
-2. **`slot REVOKED (0x57) = 0` in all three runs.** No source has yet fed
-   padMule 10MB in one session, so that fix is TEST-proven only. Hunting it
-   needs large, genuinely well-seeded content (and note the documented trap:
-   Blender open movies are not on eD2k at all).
-3. **Kad contributed ZERO sources across 25 dev-box downloads** - but DID
-   contribute on the device. Possibly dev-box-specific.
-4. **`accepted, no block to take`** was 6-of-7 pre-fix and 0 in the control, but
-   12-of-17 in one run. The reservation arithmetic (4 workers x 3 blocks x
-   184320 = 2.11MB) is REAL but the band is only 737KB-2.11MB, because below
-   ENDGAME_LIMIT `take_blocks` races the reservations - a test proved that after
-   the obvious version of the theory failed.
-5. **padMule's serve side never rotates an upload slot.** `should_kick()` and
-   `build_out_of_part_reqs()` are both DEAD CODE, so a peer holding a padMule
-   slot holds it for the whole session. Mirror image of fix 1; NOT covered by
-   the UploadGate's foreground-only scoping, since rotation is on the held
-   connection.
-6. Status scalars lag behind `Engine::search`'s ~20s `&mut self`; Portability
+1. **The stall whose blocker a RESTART clears.** Anthony's clue and the best
+   lead of the day: a file sat at 85%, the app was restarted, it finished. That
+   rules out disk, network and the swarm, and leaves exactly two in-memory gates
+   - the per-download **ban set** (a HashSet, never persisted, consulted BEFORE
+   dialing, so a download that banned its handful of sources makes ZERO dials
+   while still listing them) and the **`fetching` flag** (the retry sweep skips
+   any download holding it). BOTH ARE NOW COUNTED. The next stall should name
+   itself; do not guess between them. NOTE a restart also CLEARS both, so the
+   counters need a fresh stall to develop before they mean anything.
+2. **"No completions" is PARTLY answered, and the answer was the swarm** - the
+   two non-moving files were exactly the two carrying the parts-missing badge,
+   one at Zero KB with 24 parts, another capped near 50% by 13 parts (~120MB).
+   padMule was correct. This does NOT close item 1.
+3. **Device and dev box DIVERGE** on the same server at the same minute; the
+   difference is the VPN path. Measure with the on-device funnel.
+4. **`slot REVOKED (0x57)` has never fired live** - a many-source file gives
+   each peer ~2MB, far under the 10MB kick. Test-proven only; needs a file with
+   few, fast sources.
+5. **Nothing evicts a proven-dead source** from `download_file`'s pool -
+   `PeerScoreboard` only re-ORDERS - so a dead peer is re-dialed 8x per sweep
+   and again per retry.
+6. **padMule's serve side never rotates an upload slot**: `should_kick()` and
+   `build_out_of_part_reqs()` are BOTH dead code. Mirror image of shipped fix 1.
+7. Kad gave ZERO sources across 25 dev-box downloads but DID on device.
+8. Status scalars lag behind `Engine::search`'s ~20s `&mut self`; Portability
    Tier 2; Settings Tier 1/2; ten merged branches still on origin plus a stale
    worktree at `.claude/worktrees/wave11-aich`.
 
-## Discipline that keeps earning its keep
+## Discipline this session actually paid for
 
-- **When two theories have failed, stop and build the instrument.** The funnel
-  took under an hour and answered in one run what three rounds of reasoning had
-  not - and then refuted my OWN fresh hypothesis, twice: the 0x57 handler was
-  genuinely missing yet SECONDARY, and the small-file reservation theory was
-  half wrong. **Citing the upstream source line proves the code is wrong, not
-  that it is what is hurting you.**
-- **A zero-result test is not a failing test until the CONTROL runs.** The
-  device showed 0 bytes and looked exactly like a regression from my own gate;
-  the control on this box showed `(holds nothing we need) = 0` across 70
-  file-status reads and 42 delivering sessions. The fixes were innocent.
-- **Sampling too early is not a failed fix.** The Servers tab read 0 three times
-  because `start()` still held the engine lock; a fourth read said 10.
+- **When two theories have failed, stop and build the instrument.** It refuted
+  my own fresh hypotheses THREE times: the 0x57 handler was genuinely missing
+  yet SECONDARY; the small-file reservation theory was half wrong; and the
+  needed-parts gate looked like a regression until the control cleared it.
+  **Citing the upstream source line proves the code is wrong, not that it is
+  what is hurting you.**
+- **A zero-result test is not a failing test until the CONTROL runs.**
+- **An instrument's first duty is to measure itself.** The funnel's own
+  arithmetic was impossible (396 statuses from 315 handshakes), and the parts
+  badge shipped OVERSTATING its evidence - a real measurement inflated into a
+  claim about the network, from a sample of one.
+- **A threshold tuned on one network is a hypothesis about the others.** "A 5s
+  connect cap is free" was true on the dev box and false over the VPN, where
+  real connections land at 20-45s. padMule ships on the VPN path.
+- **Reasoning is not measurement, even when it is mine.** `Get`'s 15s and the
+  queue-bail "root cause" were both argued rather than measured, and both wrong.
+- **Sampling too early is not a failed fix** - the Servers tab read 0 three
+  times because `start()` still held the engine lock.
 - **A green oracle proves only the path it drives.** The differential test moves
-  15MB - past the 10MB kick - and still never saw 0x57, because loopback is
-  faster than amuled's kick timer.
-- **A tidy causal story is a HYPOTHESIS** ([[verify-before-reporting]]).
-- **MUTATION-CHECK anything load-bearing**; **bugs invisible at N=1**;
-  **"an event is not state"** ([[an-event-is-not-state]]).
-- **Swift type-checks ONLY in CI here** - verify a new binding by running
-  `uniffi-bindgen` against the compiled cdylib BEFORE pushing.
-- **`strings` on the .ipa can FALSE-NEGATIVE**: Swift stores <=15-byte strings
+  15MB, past the 10MB kick, and still never saw 0x57 - loopback is faster than
+  amuled's timer.
+- **DEVICE: only session-free reads are safe during a live run.**
+  `GET /source` and `pymobiledevice3 developer dvt screenshot` disturb nothing;
+  creating ANY WebDriverAgent session - even with empty capabilities -
+  backgrounds padMule and pauses every transfer. Learned by doing it.
+- **Swift type-checks ONLY in CI here.** Verify a new binding with
+  `uniffi-bindgen` against the compiled cdylib BEFORE pushing, and expect the
+  type-checker to give up on a view with five conditional branches.
+- **`strings` on the .ipa can FALSE-NEGATIVE** - Swift stores <=15-byte strings
   inline. Pick longer markers.
-- **The WDA search field CONCATENATES**: tapping it places a cursor, it does not
-  select, and `/clear` does not take. The clear "x" is an 18pt button at the
-  RIGHT EDGE of the field (x~1160), and typing must go through
-  `element/{id}/value`. Read the field back before searching.
-- **Attaching a WDA session RELAUNCHES the app** - it will end whatever run is
-  in flight.
+- **The WDA search field CONCATENATES**: the clear "x" is an 18pt button at the
+  RIGHT EDGE of the field, and typing must go through `element/{id}/value`.
+  Read the field back before searching.
 
 ## Related
 
 - [[build-progress]] / [[security-model]] / [[log]] / [[decisions-and-lessons]]
 - [[padmule-ipa-delivery]] - the build-and-deliver loop.
+- [[ipad-usb-tooling]] - device runbook, incl. the read-only rule above.
 - [[net-highid-and-port-forwarding]] - the AirVPN Local-port trap.
-- [[ipad-usb-tooling]] - device runbook; the DDI unmounts on reboot.
 - [[lifecycle-and-reactivation]] - foreground-only, permanent.
