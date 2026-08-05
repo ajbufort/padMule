@@ -870,10 +870,13 @@ async fn finish_download(
             // re-announce it (OP_OFFERFILES) so the new file is findable without
             // waiting for a reconnect.
             shared_dirty.store(true, Ordering::Relaxed);
-            let _ = events.send(EngineEvent::Server(format!(
-                "Saved '{}'",
-                dest.file_name().unwrap_or_default().to_string_lossy()
-            )));
+            let saved = dest
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            let _ = events.send(EngineEvent::Server(format!("Saved '{saved}'")));
+            let _ = events.send(EngineEvent::Finished { name: saved });
         }
         Err(e) => {
             let _ = events.send(EngineEvent::Server(format!("could not save '{name}': {e}")));
@@ -1130,6 +1133,14 @@ pub enum EngineEvent {
         have: u64,
         total: u64,
     },
+    /// A download COMPLETED: hash-verified and moved into the downloads folder.
+    ///
+    /// A typed event rather than leaving the UI to string-match the "Saved '..'"
+    /// server line that accompanies it. That line is user-facing NEWS whose
+    /// wording is free to change; a completion is a fact the UI acts on (the
+    /// finish beep), and matching on prose would break silently the first time
+    /// someone reworded it.
+    Finished { name: String },
 }
 
 /// One row of the Servers screen: a server from `server.met`, enriched with a

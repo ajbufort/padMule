@@ -115,6 +115,13 @@ struct ContentView: View {
     @State private var screen: Screen = .servers
     /// The finished file being previewed, if any (the Downloaded tab's Open).
     @State private var quickLook: QuickLookItem?
+    // Dismissal for the three STATE-driven banners. They cannot be cleared by
+    // clearing a value the way `notice` and `bootError` can, so each hides until
+    // its condition next changes (see the .onChange resets below) - "I have read
+    // this", not "never show it again".
+    @State private var hidReconnecting = false
+    @State private var hidSharingPaused = false
+    @State private var hidStarting = false
     @State private var query = ""
     @State private var serverListUrl = EngineModel.defaultServerListUrl
     @State private var detail: SearchHit?
@@ -140,34 +147,48 @@ struct ContentView: View {
                 // never hunt for a feature).
                 functionStrip
 
-                // Global status banners - visible on every screen.
-                if model.reconnecting {
-                    banner("Reconnecting...", systemImage: "arrow.clockwise", tint: .orange)
+                // Global status banners - visible on every screen, and ALL of
+                // them closeable. The three driven by engine STATE (reconnect,
+                // sharing-paused, starting) cannot be cleared by clearing the
+                // state, so each carries its own "hidden" flag that resets when
+                // the condition next changes - dismissing means "I have read
+                // this", not "pretend it never happened".
+                if model.reconnecting && !hidReconnecting {
+                    banner("Reconnecting...", systemImage: "arrow.clockwise", tint: .orange) {
+                        hidReconnecting = true
+                    }
                 }
                 // Persistent (not just the one-shot alert above): the user may
                 // dismiss the alert and move to another screen, and sharing
                 // stays paused until they turn it back on - this keeps that
                 // state visible the whole time, same as the reconnect banner.
-                if model.sharingPausedForIpChange {
+                if model.sharingPausedForIpChange && !hidSharingPaused {
                     banner(
                         "Sharing paused: your public address changed. Turn sharing back on to clear this.",
-                        systemImage: "wifi.exclamationmark", tint: .orange)
+                        systemImage: "wifi.exclamationmark", tint: .orange
+                    ) { hidSharingPaused = true }
                 }
                 if let err = model.bootError {
-                    banner("Engine failed: \(err)", systemImage: "exclamationmark.triangle", tint: .red)
+                    banner(
+                        "Engine failed: \(err)", systemImage: "exclamationmark.triangle", tint: .red
+                    ) { model.bootError = nil }
                 }
                 // Boot takes 12-30s and EVERY control silently no-ops until it
                 // finishes. Saying so is the difference between "starting" and
                 // "broken" - previously the app looked live and did nothing.
-                if !model.ready && model.bootError == nil {
-                    banner("Starting padMule... searching and downloading will work in a moment.",
-                           systemImage: "hourglass", tint: .orange)
+                if !model.ready && model.bootError == nil && !hidStarting {
+                    banner(
+                        "Starting padMule... searching and downloading will work in a moment.",
+                        systemImage: "hourglass", tint: .orange
+                    ) { hidStarting = true }
                 }
                 // Action feedback stays global - it must appear where the user
                 // is. Server NEWS (MOTD, discovery results) is Servers-only; see
                 // EngineModel.serverNotice.
                 if let notice = model.notice {
-                    banner(notice, systemImage: "info.circle", tint: .blue)
+                    banner(notice, systemImage: "info.circle", tint: .bannerBlue) {
+                        model.notice = nil
+                    }
                 }
 
                 // The selected screen fills the rest.
@@ -182,32 +203,15 @@ struct ContentView: View {
                 }
             }
             .toolbar {
-                // Straight to the finished files. Declared FIRST so it sits to
-                // the left of Settings. `folder` is the Files app's own visual
-                // language (its icon is a folder), and it matches the outline
-                // weight of the other toolbar glyphs rather than the filled
-                // variant.
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    Button {
-                        model.openDownloadsInFiles()
-                    } label: {
-                        Image(systemName: "folder")
-                    }
-                    .accessibilityLabel("Open downloads in the Files app")
-                }
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    Button {
-                        showSettings = true
-                    } label: {
-                        Image(systemName: "gearshape")
-                    }
-                    .accessibilityLabel("Settings")
-                }
-                // Stop/Start reachable from ANY screen, not only Status: it is
-                // the thing to do before closing padMule, and hunting for the
-                // right tab first is exactly when people skip it. Same icons and
-                // the same confirmation as the Status control, so the two read
-                // as one feature in two places.
+                // Stop/Start FIRST in the trailing group (Anthony, 2026-08-04),
+                // so it is the leftmost icon of the cluster rather than third.
+                // Trailing items render in declaration order, left to right.
+                //
+                // Reachable from ANY screen, not only Status: it is the thing to
+                // do before closing padMule, and hunting for the right tab first
+                // is exactly when people skip it. Same icons and the same
+                // confirmation as the Status control, so the two read as one
+                // feature in two places.
                 ToolbarItem(placement: .navigationBarTrailing) {
                     if model.state == .stopped {
                         Button {
@@ -229,6 +233,26 @@ struct ContentView: View {
                         .accessibilityLabel("Stop padMule")
                     }
                 }
+                // Straight to the finished files. `folder` is the Files app's
+                // own visual language (its icon is a folder), and it matches the
+                // outline weight of the other toolbar glyphs rather than the
+                // filled variant.
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button {
+                        model.openDownloadsInFiles()
+                    } label: {
+                        Image(systemName: "folder")
+                    }
+                    .accessibilityLabel("Open downloads in the Files app")
+                }
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button {
+                        showSettings = true
+                    } label: {
+                        Image(systemName: "gearshape")
+                    }
+                    .accessibilityLabel("Settings")
+                }
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button {
                         showHelp = true
@@ -237,6 +261,19 @@ struct ContentView: View {
                     }
                     .accessibilityLabel("How to use padMule")
                 }
+            }
+            // Re-arm each dismissed banner when its condition next CHANGES, so
+            // dismissing means "I have read this" rather than silencing the
+            // warning permanently. A second reconnect, or sharing pausing again
+            // later, must be able to speak.
+            .onChange(of: model.reconnecting) { on in
+                if !on { hidReconnecting = false }
+            }
+            .onChange(of: model.sharingPausedForIpChange) { paused in
+                if !paused { hidSharingPaused = false }
+            }
+            .onChange(of: model.ready) { ready in
+                if !ready { hidStarting = false }
             }
             .sheet(isPresented: $showSettings) {
                 SettingsView().environmentObject(model)
@@ -857,7 +894,13 @@ struct ContentView: View {
                     HStack {
                         Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
                         VStack(alignment: .leading, spacing: 2) {
-                            Text("Connected to \(s.addr)").font(.callout)
+                            // NAME (addr), exactly as the Status screen's Server
+                            // row renders it (Anthony, 2026-08-04). The bare
+                            // address made the connected row the only place in
+                            // the app that identified a server by number when it
+                            // had a name - and the name is what the user picked
+                            // it by in the list directly below.
+                            Text("Connected to " + serverLabel(s)).font(.callout)
                             Text(s.lowId ? "LowID" : "HighID")
                                 .font(.caption).foregroundStyle(.secondary)
                         }
@@ -949,7 +992,10 @@ struct ContentView: View {
                 }
             }
         }
-        .onAppear { if model.servers.isEmpty { model.loadServers() } }
+        // The list is loaded on APP OPEN now (EngineModel.boot), so this is only
+        // a fallback for the case where boot's own load found nothing - it must
+        // not re-probe on every visit to the tab.
+        .onAppear { if model.servers.isEmpty && model.ready { model.loadServers() } }
     }
 
     /// One tappable column header. Tapping the ACTIVE column reverses it, which
@@ -1167,8 +1213,9 @@ struct ContentView: View {
                 // later event would overwrite it.
                 if let srv = model.server {
                     // Identity only - name (address) - now that Status above
-                    // no longer repeats "Connected to".
-                    row("Server", srv.name.map { "\($0) (\(srv.addr))" } ?? srv.addr)
+                    // no longer repeats "Connected to". Shares `serverLabel`
+                    // with the Servers tab so the two cannot drift apart.
+                    row("Server", serverLabel(srv))
                     HStack {
                         Text("ID").foregroundStyle(.secondary)
                         Spacer()
@@ -1545,20 +1592,57 @@ struct ContentView: View {
         mb >= 1024 ? "\(mb / 1024) GB" : "\(mb) MB"
     }
 
+    /// How a connected server is named ANYWHERE it is shown: "Name (ip:port)",
+    /// falling back to the bare address when server.met carried no name.
+    ///
+    /// One function so the Servers tab and the Status screen cannot drift apart
+    /// again - the Servers row printed a bare address while Status printed the
+    /// name, which is the same fact in two voices.
+    private func serverLabel(_ s: ServerInfoFfi) -> String {
+        guard let name = s.name, !name.isEmpty else { return s.addr }
+        return "\(name) (\(s.addr))"
+    }
+
     /// A full-width status banner. Solid tint with white text - the treatment
     /// Anthony picked out on the server-message banner - rather than the washed
     /// 15%-opacity fill these used to have, which was legible only in the blue
     /// case. The COLOUR still carries meaning (blue informational, orange needs
     /// attention, red broken); only the weight changed.
-    private func banner(_ text: String, systemImage: String, tint: Color) -> some View {
-        Label(text, systemImage: systemImage)
-            .font(.footnote)
-            .foregroundStyle(.white)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 8)
-            .background(tint.gradient)
+    ///
+    /// EVERY banner takes a dismiss action (Anthony, 2026-08-04): a banner the
+    /// user cannot close is a permanent strip of lost screen, and on the Status
+    /// and Transfers screens these sit directly over the content being read.
+    private func banner(
+        _ text: String, systemImage: String, tint: Color, dismiss: @escaping () -> Void
+    ) -> some View {
+        HStack(spacing: 8) {
+            Label(text, systemImage: systemImage)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Button(action: dismiss) {
+                Image(systemName: "xmark.circle.fill")
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Dismiss")
+        }
+        .font(.footnote)
+        .foregroundStyle(.white)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(tint.gradient)
     }
+}
+
+/// padMule's informational banner blue.
+///
+/// DARK on purpose (Anthony, 2026-08-04). `Color.blue` is the bright system
+/// blue, and `.gradient` lightens its top further, so the informational banners
+/// read as a vivid mid-blue rather than the dark blue that was asked for. Note
+/// for the record: the tree has used `Color.blue.gradient` for these since
+/// 57a75f5 - there is no earlier dark-blue literal to restore, so this is a
+/// deliberate value rather than a revert. One line to re-tune if the shade is
+/// still not right.
+extension Color {
+    static let bannerBlue = Color(red: 0.05, green: 0.16, blue: 0.40)
 }
 
 /// The hex hash uniquely identifies a hit - enough for SwiftUI's item-based sheet.

@@ -20,6 +20,11 @@ enum SettingsKey {
     static let shareUploads = "padMule.shareUploads"
     static let pauseSharingOnCellular = "padMule.pauseSharingOnCellular"
     static let keepAwakeWhileTransferring = "padMule.keepAwakeWhileTransferring"
+    /// Play a short sound when a download finishes, verifies and is saved.
+    /// padMule is foreground-only, so a long transfer means the iPad is sitting
+    /// there with the app open - a sound is the only way to be told it is done
+    /// without watching the screen.
+    static let beepOnDownloadComplete = "padMule.beepOnDownloadComplete"
     /// A LIST of server.met URLs, not one - eMule's `addresses.dat` model. Every
     /// list is merged (the engine's `merge_server_met` keeps existing entries and
     /// appends only new ip:port pairs), so several lists accumulate into one
@@ -75,6 +80,7 @@ enum SettingsDefaults {
             SettingsKey.shareUploads: true,
             SettingsKey.pauseSharingOnCellular: true,
             SettingsKey.keepAwakeWhileTransferring: true,
+            SettingsKey.beepOnDownloadComplete: true,
             SettingsKey.serverListUrls: [EngineModel.defaultServerListUrl],
             SettingsKey.updateServerListAtLaunch: false,
             SettingsKey.askServersForServers: true,
