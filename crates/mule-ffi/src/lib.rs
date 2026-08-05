@@ -955,6 +955,27 @@ impl MuleEngine {
             .block_on(async { self.inner.lock().await.cancel_download(h).await })
     }
 
+    /// THE FETCH FUNNEL, as a printable block: how far down the eD2k request
+    /// sequence each peer session got, every opcode read out of turn, and the
+    /// dial-duration histogram. See `mule_engine::stats`.
+    ///
+    /// LOCK-FREE ON PURPOSE - it reads process-global atomics and never touches
+    /// the engine lock. That is the whole point: a stalled download is exactly
+    /// when the engine is busy, and a diagnostic that queued behind `search` or
+    /// a source hunt would be unreadable precisely when it is needed (the same
+    /// reasoning as the lock-free status polls).
+    pub fn fetch_report(&self) -> String {
+        mule_engine::stats::fetch_report()
+    }
+
+    /// Zero the fetch counters. They are cumulative since LAUNCH, so by the time
+    /// something stalls they are dominated by the healthy minutes before it;
+    /// reset -> reproduce -> read is what makes the numbers mean the thing being
+    /// investigated. Session byte totals are NOT reset.
+    pub fn reset_fetch_stats(&self) {
+        mule_engine::stats::reset_fetch_stats();
+    }
+
     /// Drain and return every engine event queued since the last call. The UI
     /// polls this (e.g. on a timer) to observe state/progress changes.
     pub fn drain_events(&self) -> Vec<EngineEventFfi> {

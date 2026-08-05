@@ -1,5 +1,6 @@
 import Charts
 import SwiftUI
+import UIKit  // UIPasteboard - the report has to be able to LEAVE the device
 
 /// One per-second sample of transfer rate (bytes/sec), the unit StatsView charts.
 struct RatePoint: Identifiable {
@@ -59,6 +60,46 @@ struct StatsView: View {
                 statRow("Downloaded", byteText(model.totalDown))
                 statRow("Uploaded", byteText(model.totalUp))
                 statRow("Ratio (up:down)", ratioText)
+            }
+
+            // THE FETCH FUNNEL. A transfer that shows sources but moves nothing
+            // is the one problem this app cannot explain from its own screens -
+            // the row says "20 sources" and 0 bytes, and there is nowhere to see
+            // WHY. This panel is that missing view: how far down the eD2k
+            // request sequence each peer session got, so a stall can be
+            // attributed to a stage instead of guessed at.
+            //
+            // It stays live without a refresh button because the 1s stats poll
+            // republishes `rateHistory`, re-rendering this body; the engine side
+            // is lock-free, so reading it never queues behind a busy engine.
+            Section("Fetch diagnostics") {
+                Text(
+                    "Where peer sessions die on the way to bytes. Counts are cumulative since launch, or since you last reset them."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+                Text(model.fetchReport)
+                    .font(.system(.caption2, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                HStack {
+                    Button {
+                        UIPasteboard.general.string = model.fetchReport
+                        model.notice = "Fetch report copied to the clipboard."
+                    } label: {
+                        Label("Copy report", systemImage: "doc.on.doc")
+                    }
+                    Spacer()
+                    Button {
+                        model.resetFetchStats()
+                    } label: {
+                        Label("Reset counters", systemImage: "arrow.counterclockwise")
+                    }
+                }
+                .buttonStyle(.borderless)
+                .font(.callout)
             }
         }
     }
