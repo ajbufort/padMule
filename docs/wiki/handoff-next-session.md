@@ -7,7 +7,7 @@ rows 8bt-8bz and the [[log]] entries for 2026-08-04 and 2026-08-05.
 
 ## State of the tree
 
-- **Gate**: 624 Rust tests + 23 Swift simulator tests, clippy `-D warnings`
+- **Gate**: 625 Rust tests + 24 Swift simulator tests, clippy `-D warnings`
   clean, fmt clean, ASCII clean.
 - **YOU ARE ON BRANCH `fetch-funnel`, NOT main**, and nothing is merged. Decide
   that first. History is LINEAR across 390+ commits and must stay that way
@@ -107,8 +107,14 @@ Re-measuring on another path means raising `fetch::CONNECT_TIMEOUT` first.
 
 ## OPEN - named as open, not explained
 
-1. **The stall whose blocker a RESTART clears. THE BAN-SET NARROWING WAS
-   REFUTED BY MEASUREMENT (2026-08-05).** This entry said the per-download ban
+1. **[LIKELY CLOSED 2026-08-05, row 8cb] The stall whose blocker a RESTART
+   clears - it was the BLOCK-RESERVATION LEAK.** A cancelled peer session never
+   released its reserved blocks (`timeout` drops the future; the release was
+   trailing code), so `reserved` grew monotonically and a restart forgot it.
+   That is a third in-memory gate, and it fits the 85%-then-restart-finished
+   report better than either enumerated candidate. Fixed. Confirm on the next
+   build by watching whether a near-complete download still goes quiet.
+   **THE BAN-SET NARROWING WAS REFUTED BY MEASUREMENT, and it was mine.** This entry said the per-download ban
    set was the live hypothesis, on the strength of a code read: a HashSet never
    lifted anywhere, never persisted, consulted before dialing. The device funnel
    then read **`skipped: source BANNED` = 0** across 2719 dials and ~1235
@@ -185,14 +191,22 @@ developer dvt screenshot`, `GET /source`) disturb nothing and are what the whole
 
 ## THE TOP NEXT ACTION
 
-**`accepted, no block to take` = 722 of 959.** Measured, arithmetic-clean, and
-the only lossy stage left. Do not theorise first - `take_blocks` is where to
-look, and the two candidate mechanisms are already named: the 2.11 MB
-reservation ceiling per download (4 workers x 3 blocks x 184320), and the 898
-INBOUND sessions that are each offered every unfinished download in turn and
-compete for the same pool. Row 8bt proved the mechanism real but sized its band
-too narrow to explain the rate; the concurrency is the part that was never
-counted. A fix should be measured by this line moving, on this instrument.
+**RE-READ `accepted, no block to take` ON THE NEXT BUILD.** It was 722 of 959,
+and the cause was found and fixed the same day (row 8cb): a CANCELLED session
+never ran the release of its block reservations, because `timeout` drops the
+future and a dropped future skips trailing code - so every timed-out peer
+stranded 3 blocks permanently, and `reserved` only ever grew. Fixed with a
+destructor; RED-first and mutation-checked; both oracles green.
+
+**That fix is a hypothesis about the LIVE number until the funnel says so.**
+What remains possible underneath it is the narrower contention band row 8bt
+proved: `ENDGAME_LIMIT` is 4 blocks where four workers can hold 12, so a
+download with 737KB < missing < 2.11MB is fully reserved by its own workers.
+Real, unmeasured, and deliberately not bundled - widening endgame costs
+duplicate tail traffic. If the line is still high, that band is next.
+
+Note also this closes open item 1 differently than expected: **the leak is the
+restart-clearable gate**, not the ban set (which measured 0).
 
 ## Discipline this session actually paid for
 
