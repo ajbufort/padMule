@@ -8,6 +8,10 @@
 // already exposes. Nothing in this file needs new engine work - the settings that
 // do (bandwidth caps, ports, obfuscation policy) are tracked in the audit.
 
+// CFNetwork for CFNetworkCopySystemProxySettings (the VPN interface probe).
+// Imported explicitly rather than relied on through Foundation, which does not
+// reliably re-export it on iOS.
+import CFNetwork
 import Foundation
 import Network
 import SwiftUI
@@ -63,6 +67,11 @@ enum SettingsKey {
     /// the provider does the forwarding and a LAN-router mapping is a no-op the
     /// tunnel bypasses anyway.
     static let upnpEnabled = "padMule.upnpEnabled"
+    /// Dark Mode. padMule pins its own appearance rather than following the
+    /// system: it starts LIGHT unless this is on, so the look is a padMule
+    /// setting rather than an inherited one, and it never changes underneath the
+    /// user because the iPad crossed a sunset boundary mid-transfer.
+    static let darkMode = "padMule.darkMode"
 }
 
 /// Registers the DEFAULTS, so a first launch behaves correctly before the user
@@ -102,6 +111,12 @@ enum SettingsDefaults {
             // padMule" status line names the setting, so a user NOT behind a
             // VPN can find and enable it.
             SettingsKey.upnpEnabled: false,
+            // LIGHT unless the user says otherwise (Anthony, 2026-08-05).
+            // Registering it explicitly rather than leaning on bool(forKey:)
+            // returning false for an absent key: the two behave identically
+            // today, but the DEFAULT is a decision and it belongs where the
+            // other decisions are, not as an accident of the API.
+            SettingsKey.darkMode: false,
         ])
     }
 }
@@ -115,6 +130,9 @@ enum SettingsDefaults {
 @MainActor
 final class NetworkWatcher: ObservableObject {
     @Published private(set) var isMetered = false
+    /// True while a VPN tunnel appears to be up. See `vpnIsUp` for exactly what
+    /// that claim is worth.
+    @Published private(set) var vpnActive = false
 
     private let monitor = NWPathMonitor()
     private let queue = DispatchQueue(label: "padMule.path")
@@ -122,15 +140,68 @@ final class NetworkWatcher: ObservableObject {
     init() {
         monitor.pathUpdateHandler = { [weak self] path in
             let metered = path.isExpensive || path.isConstrained
+            let vpn = NetworkWatcher.vpnIsUp()
             Task { @MainActor in
-                guard let self, self.isMetered != metered else { return }
-                self.isMetered = metered
-                engineLog.notice(
-                    "network is now \(metered ? "METERED (cellular/hotspot/low-data)" : "unmetered", privacy: .public)"
-                )
+                guard let self else { return }
+                if self.isMetered != metered {
+                    self.isMetered = metered
+                    engineLog.notice(
+                        "network is now \(metered ? "METERED (cellular/hotspot/low-data)" : "unmetered", privacy: .public)"
+                    )
+                }
+                if self.vpnActive != vpn {
+                    self.vpnActive = vpn
+                    engineLog.notice("VPN tunnel is now \(vpn ? "UP" : "DOWN", privacy: .public)")
+                }
             }
         }
         monitor.start(queue: queue)
+    }
+
+    /// Re-read the VPN state on demand - used when padMule returns to the
+    /// foreground. A tunnel that collapsed while the app was suspended may not
+    /// produce a path callback we are awake to receive, and "the VPN dropped
+    /// while you were away" is precisely the case worth catching.
+    func refreshVpn() {
+        let vpn = NetworkWatcher.vpnIsUp()
+        guard vpnActive != vpn else { return }
+        vpnActive = vpn
+        engineLog.notice(
+            "VPN tunnel is now \(vpn ? "UP" : "DOWN", privacy: .public) (foreground re-check)")
+    }
+
+    /// Interface-name prefixes used by VPN tunnels on iOS. `utun` covers
+    /// NEPacketTunnelProvider (WireGuard, OpenVPN clients, most commercial apps
+    /// including AirVPN), `ipsec` the built-in IKEv2/IPsec profiles, and
+    /// `ppp`/`tap`/`tun` the older shapes.
+    private static let tunnelPrefixes = ["utun", "tap", "tun", "ppp", "ipsec"]
+
+    /// Is a VPN tunnel up? Provider-agnostic by construction - it looks for the
+    /// tunnel INTERFACE, so it works for any client rather than any particular
+    /// one, and needs no entitlement.
+    ///
+    /// BE CLEAR ABOUT WHAT THIS PROVES. It is a heuristic, and the honest
+    /// limits are: (1) it detects that a tunnel interface EXISTS and is
+    /// scoped for traffic, not that padMule's packets are going through it -
+    /// a split-tunnel config could route this app outside the VPN and still
+    /// read true; (2) iOS uses `utun` interfaces for non-VPN purposes too
+    /// (AirDrop, Personal Hotspot, Continuity), so a false positive is
+    /// possible; (3) a provider doing something unusual could read false while
+    /// genuinely connected. It agrees with the system status-bar VPN badge in
+    /// the ordinary case, which is the check to make if the reading ever looks
+    /// wrong. It is a convenience indicator, NOT a safety guarantee - padMule's
+    /// actual leak protection remains the public-address-change guard, which
+    /// watches the address the network reports back rather than a local
+    /// interface name.
+    nonisolated static func vpnIsUp() -> Bool {
+        guard
+            let settings = CFNetworkCopySystemProxySettings()?.takeRetainedValue()
+                as? [String: Any],
+            let scoped = settings["__SCOPED__"] as? [String: Any]
+        else { return false }
+        return scoped.keys.contains { key in
+            tunnelPrefixes.contains { key.hasPrefix($0) }
+        }
     }
 
     deinit { monitor.cancel() }

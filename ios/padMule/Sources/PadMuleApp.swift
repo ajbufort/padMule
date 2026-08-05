@@ -13,6 +13,11 @@ struct PadMuleApp: App {
     @StateObject private var network = NetworkWatcher()
     @Environment(\.scenePhase) private var scenePhase
     @State private var showSplash = true
+    /// Read HERE, at the root, so the pinned scheme covers the splash and every
+    /// sheet - Settings, the search detail, QuickLook - rather than only the
+    /// screen that happens to declare it. @AppStorage re-renders on change, so
+    /// flipping the switch in Settings repaints the app immediately.
+    @AppStorage(SettingsKey.darkMode) private var darkMode = false
 
     init() {
         // Register setting DEFAULTS before any view reads them, so a first launch
@@ -33,10 +38,23 @@ struct PadMuleApp: App {
                     .onChange(of: network.isMetered) { metered in
                         model.setMetered(metered)
                     }
+                    // Same pattern for the VPN verdict: the watcher owns the
+                    // path facts, the model owns what the UI does about them.
+                    // onChange also delivers the monitor's FIRST value, so the
+                    // badge is correct on a launch that starts with a VPN up.
+                    .onChange(of: network.vpnActive) { active in
+                        model.setVpnActive(active)
+                    }
                 if showSplash {
                     SplashView().transition(.opacity)
                 }
             }
+            // PINNED, never `nil`. `nil` would inherit the system appearance,
+            // which means padMule could flip to dark by itself in the middle of
+            // a long transfer when the iPad crosses a scheduled sunset. An app
+            // designed to sit open and on screen for hours should look the way
+            // the user last set it and stay that way. Light unless chosen.
+            .preferredColorScheme(darkMode ? .dark : .light)
             .task {
                 // Hold the splash until the engine is actually READY, not for a
                 // fixed 7s. The original intent was to cover the boot; the bug was
@@ -71,6 +89,10 @@ struct PadMuleApp: App {
                 // resume; without the boot() a transient launch failure was terminal.
                 model.boot()
                 model.resume()
+                // A tunnel that collapsed while padMule was suspended produces
+                // no path callback we were awake to hear, and "the VPN dropped
+                // while you were away" is exactly the case worth catching.
+                network.refreshVpn()
             case .background:
                 // Only on .background - .inactive fires for transient things
                 // (app switcher, a notification) and tearing down there would

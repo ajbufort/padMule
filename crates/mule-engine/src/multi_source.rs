@@ -17,7 +17,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -230,6 +230,28 @@ pub struct Download {
     /// sources and still be moving nothing, and the screen could not tell those
     /// apart.
     last_byte_at: AtomicU64,
+    /// What the LAST source lookup produced, as `(dialable, callback-only)`.
+    ///
+    /// The badge beside a transfer counts sources that completed a HANDSHAKE
+    /// (`note_source` runs only after `note_connected`), which means an empty
+    /// badge conflates two opposite situations: nothing was found, or plenty was
+    /// found and not one of it could be reached. Those need opposite responses,
+    /// and on 2026-08-05 a real download sat at Zero KB for ten minutes while
+    /// its search row read "15 srcs (14 full)" with no way to tell which it was.
+    ///
+    /// Both numbers already existed at `spawn_fetch`'s call sites and were
+    /// discarded there - `reg.sources().len()` and `lowids.len()`. Keeping them
+    /// is the whole fix. LAST lookup, not cumulative: the retry sweep re-runs
+    /// discovery, and a stale high-water mark would describe a swarm that is no
+    /// longer there.
+    ///
+    /// The split matters as much as the total. A LowID source is REMOVED from
+    /// the dial pool by `PeerSource::from_found` (it cannot accept our
+    /// connection) and can only reach us by calling back, so "12 awaiting
+    /// callback" and "12 sources we are dialing" look identical on screen while
+    /// meaning completely different things about what to expect.
+    sources_found: AtomicU32,
+    sources_callback: AtomicU32,
     /// Which source IP(s) contributed to each AICH BLOCK (keyed by the block's
     /// lattice start offset), recorded as data commits. On a part-hash failure
     /// the union over the part's blocks gives the old per-part view; after
@@ -300,6 +322,8 @@ impl Download {
             fetching: AtomicBool::new(false),
             last_retry_at: AtomicU64::new(0),
             last_byte_at: AtomicU64::new(0),
+            sources_found: AtomicU32::new(0),
+            sources_callback: AtomicU32::new(0),
             block_sources: StdMutex::new(HashMap::new()),
             aich: StdMutex::new(AichState {
                 status: AichStatus::Empty,
@@ -437,6 +461,26 @@ impl Download {
     /// A peer that dropped ten minutes ago is not "a source you have" in any
     /// sense a user means.
     pub const SOURCE_FRESH_SECS: u64 = 180;
+
+    /// Record what the latest source lookup produced: `dialable` sources that
+    /// went into the fetch pool, and `callback` LowID sources that can only
+    /// reach us by being poked through the server.
+    pub fn note_source_pool(&self, dialable: usize, callback: usize) {
+        self.sources_found
+            .store(dialable.min(u32::MAX as usize) as u32, Ordering::Relaxed);
+        self.sources_callback
+            .store(callback.min(u32::MAX as usize) as u32, Ordering::Relaxed);
+    }
+
+    /// The latest lookup's `(dialable, callback-only)` counts. Pairs with
+    /// [`Self::source_origins`], which counts only sources that HANDSHAKED - the
+    /// gap between the two is the whole diagnosis when a row shows no bytes.
+    pub fn source_pool(&self) -> (u32, u32) {
+        (
+            self.sources_found.load(Ordering::Relaxed),
+            self.sources_callback.load(Ordering::Relaxed),
+        )
+    }
 
     pub async fn source_origins(&self) -> (u32, u32, u32) {
         let now = crate::credit_store::now_secs() as u64;
@@ -3119,6 +3163,40 @@ mod tests {
         assert!(
             part_path.exists(),
             ".part is left for cancel_download to delete"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The pool counts must survive a lookup that finds NOTHING, and must
+    /// describe the LAST lookup rather than a high-water mark.
+    ///
+    /// Both matter for the thing they exist to explain. A retry that comes back
+    /// empty means the swarm has gone away, and a badge still boasting the 15
+    /// sources of ten minutes ago would be actively misleading about a file that
+    /// now has none - which is the failure mode this whole pair was added to
+    /// end, not a new instance of it.
+    #[tokio::test]
+    async fn the_source_pool_counts_describe_the_latest_lookup_only() {
+        let dir = tmpdir("pool");
+        let store = PartStore::create(&dir, 1, [0x77; 16], 500, b"p.bin").unwrap();
+        let dl = Download::new(store);
+        // Nothing looked up yet: zero/zero, which the UI renders as "no sources
+        // found" rather than as a blank.
+        assert_eq!(dl.source_pool(), (0, 0));
+
+        dl.note_source_pool(3, 12);
+        assert_eq!(
+            dl.source_pool(),
+            (3, 12),
+            "dialable and callback-only split"
+        );
+
+        // A later, WORSE lookup replaces it - it does not max() with the old one.
+        dl.note_source_pool(0, 0);
+        assert_eq!(
+            dl.source_pool(),
+            (0, 0),
+            "a stale high-water mark would describe a swarm that is gone"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -296,6 +296,16 @@ final class EngineModel: ObservableObject {
     @Published private(set) var portMapped: Bool = false
     /// Whether the current network is metered (cellular / hotspot / Low Data).
     @Published private(set) var meteredNow: Bool = false
+    /// Whether a VPN tunnel appears to be up. Drives the VPN badge in the top
+    /// left. A heuristic - see `NetworkWatcher.vpnIsUp` for what it does and
+    /// does not prove.
+    @Published private(set) var vpnActive: Bool = false
+    /// Set when a VPN that WAS up disappears; the UI raises an alert and clears
+    /// it. Not `private(set)` so the alert binding can reset it on dismiss.
+    @Published var vpnWentDown: Bool = false
+    /// Whether a VPN has been seen up at all this launch. Without it, every
+    /// user who has never used a VPN would be told theirs had dropped.
+    private var sawVpn = false
     /// Whether padMule serves files to peers. Off is "Leech Mode". Polled as a
     /// SNAPSHOT, like the server login: the engine owns the truth, the UI mirrors
     /// it. Defaults to true so the switch reads correctly before the first poll.
@@ -763,6 +773,32 @@ final class EngineModel: ObservableObject {
         guard meteredNow != metered else { return }
         meteredNow = metered
         applyEffectiveSharing()
+    }
+
+    /// Latest VPN verdict from the NetworkWatcher, fed in the same way as the
+    /// metered one so the watcher stays the single owner of path facts.
+    ///
+    /// The DROP is a transition, not a state: a user who has never used a VPN
+    /// must not be warned that theirs went down. `sawVpn` is what makes the
+    /// difference, and it is deliberately not reset when the tunnel comes back -
+    /// once padMule has seen a VPN on this launch, a later disappearance is
+    /// always worth saying out loud.
+    func setVpnActive(_ active: Bool) {
+        guard vpnActive != active else { return }
+        vpnActive = active
+        if active { sawVpn = true }
+        if EngineModel.vpnDropWarrants(active: active, sawVpnBefore: sawVpn) {
+            vpnWentDown = true
+            engineLog.error("VPN tunnel DROPPED while padMule was running")
+        }
+    }
+
+    /// Should a VPN state change raise the drop warning? The rule alone, so the
+    /// case that matters can be tested: a user who has NEVER had a VPN up must
+    /// never be told theirs went down, and that is the difference between a
+    /// useful warning and one everybody learns to dismiss.
+    static func vpnDropWarrants(active: Bool, sawVpnBefore: Bool) -> Bool {
+        !active && sawVpnBefore
     }
 
     /// Start downloading a hit. Blocks briefly (asking the server for sources),
