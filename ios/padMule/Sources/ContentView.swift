@@ -17,9 +17,14 @@ import SwiftUI
 /// The top-toolbar destinations. Each is one eD2k function, one icon.
 enum Screen: String, CaseIterable, Identifiable {
     // Order is Anthony's: the strip reads left-to-right as the order you
-    // actually use them - pick a server, check you are on it, search, see what
-    // arrived, watch what is moving, then the two reference screens.
-    case servers, status, search, downloaded, transfers, shared, stats
+    // actually use them - pick a server, check you are on it, search, watch
+    // what is moving, see what arrived, then the two reference screens.
+    // Transfers sits BEFORE Downloads (Anthony, 2026-08-04): a queued file is
+    // watched far more often than a finished one is opened, so the tab you
+    // return to should be nearer the tab you left.
+    // NOTE: this drives the strip order via `allCases`. The raw values are
+    // unchanged, and nothing persists them, so reordering is display-only.
+    case servers, status, search, transfers, downloaded, shared, stats
     var id: String { rawValue }
 
     var title: String {
