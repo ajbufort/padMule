@@ -122,11 +122,55 @@ funnel! {
     // dialing - so a download whose handful of sources all got banned makes ZERO
     // dials while still listing them, until a restart forgets the bans.
     //
-    // `fetch already running`: the retry sweep skips any download whose
-    // `fetching` flag is set, so a flag that never clears means that download is
-    // never re-driven again for the life of the process.
+    // `fetch already running`: see the correction below - this counter does NOT
+    // observe a stuck flag, and `fetches in flight` is what does.
     F_BANSKIP   => note_skipped_banned / skipped_banned, "skipped: source BANNED";
-    F_FETCHBUSY => note_fetch_busy / fetch_busy,  "skipped: fetch already running";
+    F_FETCHBUSY => note_fetch_busy / fetch_busy,  "spawn raced a live fetch";
+}
+
+/// How many downloads hold the in-flight fetch claim RIGHT NOW.
+///
+/// CORRECTION (2026-08-05) to the pair above. `skipped: fetch already running`
+/// was added to catch the second restart-clearable gate - a `fetching` flag that
+/// never clears - and it CANNOT: `note_fetch_busy` sits on `spawn_fetch`'s
+/// refusal branch, but every caller already filters `!is_fetching()` before it
+/// gets there (`resume_fetches` engine.rs:3641, `maintain_resume_fetches`
+/// :4133, and `add_download` only ever spawns a brand-new download). A download
+/// whose flag is stuck is EXCLUDED by those filters and never reaches the
+/// counter, so the line reads 0 in exactly the case it was built to name. What
+/// it does count is the rare genuine race between the filter and the spawn,
+/// which is why it is now labelled as that.
+///
+/// THIS IS THE FIX, and it is the shape of the mistake as much as the mistake:
+/// a stuck flag is durable STATE, and it was being chased with a momentary
+/// EVENT. So this is a GAUGE - claimed up, released down, never reset by
+/// `reset_fetch_stats`, because zeroing it would erase the fetches that are
+/// genuinely running. Read it as state: a number that stays put while nothing
+/// moves on the Transfers screen is the stuck flag, visible at last.
+///
+/// Note the standing expectation this is meant to TEST rather than assume:
+/// `FetchGuard` (engine.rs:716) releases the claim on any task exit including
+/// unwind, and `download_file` is bounded on every axis, so a stuck flag should
+/// be unreachable. That is an argument, not a measurement, and this is the
+/// measurement.
+static FETCH_INFLIGHT: AtomicU64 = AtomicU64::new(0);
+
+/// One download just claimed its fetch slot.
+pub fn note_fetch_claimed() {
+    FETCH_INFLIGHT.fetch_add(1, Ordering::Relaxed);
+}
+
+/// One download just released it. Saturating: a gauge that underflows to
+/// u64::MAX would be worse than useless in the report.
+pub fn note_fetch_released() {
+    let _ = FETCH_INFLIGHT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+        Some(n.saturating_sub(1))
+    });
+}
+
+/// Downloads holding a fetch claim right now.
+pub fn fetches_in_flight() -> u64 {
+    FETCH_INFLIGHT.load(Ordering::Relaxed)
 }
 
 /// Opcodes a wait loop read while it was waiting for something else, tallied by
@@ -249,6 +293,14 @@ pub fn fetch_report() -> String {
         }
         s.push_str(&format!("    {label:<34} {n:>6}\n"));
     }
+    // STATE, not a count - printed apart from the funnel and unaffected by
+    // Reset, because it describes what is happening NOW rather than what has
+    // happened since. See `FETCH_INFLIGHT`.
+    s.push_str(&format!(
+        "  STATE (not reset)\n    {:<34} {:>6}\n",
+        "fetches in flight",
+        fetches_in_flight()
+    ));
     s.push_str("  DIAL TIME - OUTBOUND ONLY (bucket: connected / failed)\n");
     for (label, ok, fail) in dial_times() {
         if ok + fail > 0 {
@@ -289,6 +341,27 @@ mod tests {
                 "stage {label:?} is counted but never printed"
             );
         }
+    }
+
+    /// The in-flight GAUGE must survive `reset_fetch_stats`. This is the whole
+    /// reason it lives outside the `funnel!` macro: Reset is for cumulative
+    /// history, and zeroing a gauge would report "no fetches running" while
+    /// downloads were running - stating the opposite of the truth at exactly the
+    /// moment somebody is trying to diagnose a stall.
+    ///
+    /// Asserted one-directionally (`>= 1` while WE hold a claim) rather than as
+    /// an exact value, because the gauge is process-global and other tests claim
+    /// and release concurrently.
+    #[test]
+    fn the_reset_does_not_erase_a_live_fetch_claim() {
+        note_fetch_claimed();
+        assert!(fetches_in_flight() >= 1);
+        reset_fetch_stats();
+        assert!(
+            fetches_in_flight() >= 1,
+            "reset erased a fetch that is still running"
+        );
+        note_fetch_released();
     }
 
     /// The counters only ever grow, so a delta assertion is race-safe even though

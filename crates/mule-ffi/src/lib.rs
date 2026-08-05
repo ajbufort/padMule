@@ -223,6 +223,10 @@ pub struct DownloadInfo {
     /// SIZE. That count only means "the swarm lacks these parts" in proportion
     /// to this; from one source it means "the one peer we found lacks them".
     /// Carried so the UI can say so rather than overstate.
+    ///
+    /// It is REPORTS, not distinct sources, and the UI must not call it sources:
+    /// `download_file` re-sweeps its pool every round and nothing evicts a
+    /// source, so one peer contributes one report per session it completes.
     pub part_status_reports: u32,
 }
 

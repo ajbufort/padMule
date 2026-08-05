@@ -339,17 +339,23 @@ impl Download {
     /// clear it with `end_fetch` when its task ends; a caller that gets `false`
     /// must NOT spawn a duplicate fetch task (one is already running).
     pub fn try_begin_fetch(&self) -> bool {
-        self.fetching
+        let won = self
+            .fetching
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+            .is_ok();
+        if won {
+            crate::stats::note_fetch_claimed();
+        }
+        won
     }
 
     /// Release the in-flight fetch slot (the fetch task has ended).
     pub fn end_fetch(&self) {
-        self.fetching.store(false, Ordering::Release);
+        if self.fetching.swap(false, Ordering::Release) {
+            crate::stats::note_fetch_released();
+        }
     }
 
-    /// True while a fetch task is live for this download.
     /// True if bytes landed within the last `window_secs`. Deliberately a TIME
     /// window rather than an instantaneous rate: at a block boundary, or between
     /// blocks on a slow link, a rate legitimately reads zero, and an indicator
@@ -370,6 +376,7 @@ impl Download {
         self.last_retry_at.store(at_secs, Ordering::Relaxed);
     }
 
+    /// True while a fetch task is live for this download.
     pub fn is_fetching(&self) -> bool {
         self.fetching.load(Ordering::Acquire)
     }
@@ -3125,6 +3132,13 @@ mod tests {
         assert!(dl.try_begin_fetch());
         assert!(!dl.try_begin_fetch(), "a second fetch task is refused");
         assert!(dl.is_fetching());
+        dl.end_fetch();
+        assert!(!dl.is_fetching());
+        // Releasing twice must be a no-op. It feeds the process-global in-flight
+        // GAUGE (stats::FETCH_INFLIGHT), and a release that counted down without
+        // having counted up would drift the gauge below the truth - so the
+        // decrement is gated on the flag having actually been set, not on the
+        // caller being well-behaved.
         dl.end_fetch();
         assert!(!dl.is_fetching());
         assert!(dl.try_begin_fetch(), "re-claimable after the task ends");
