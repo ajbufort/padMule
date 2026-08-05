@@ -265,6 +265,14 @@ struct Inner {
     /// Per data-part swarm availability: how many peer sessions have reported
     /// holding each part. Drives rarest-first block selection.
     availability: Vec<u32>,
+    /// How many peer statuses have been folded into `availability`.
+    ///
+    /// The SAMPLE SIZE behind every claim that number makes. "13 parts nobody
+    /// has" drawn from ONE source really means "the single peer we found lacks
+    /// 13 parts", which is a different and much weaker statement - so the count
+    /// is carried alongside rather than left implicit, and the UI says it out
+    /// loud instead of overstating.
+    status_reports: u32,
 }
 
 /// Once the file is within this many bytes of complete, a peer that finds all
@@ -282,6 +290,7 @@ impl Download {
                 store,
                 reserved: Vec::new(),
                 availability: vec![0u32; parts],
+                status_reports: 0,
             }),
             sources: Mutex::new(Vec::new()),
             cancelled: AtomicBool::new(false),
@@ -565,6 +574,7 @@ impl Download {
     /// later block selection knows which parts are rare.
     pub async fn note_status(&self, status: &FileStatus) {
         let mut g = self.inner.lock().await;
+        g.status_reports = g.status_reports.saturating_add(1);
         for p in 0..g.availability.len() {
             if status.has_part(p) {
                 g.availability[p] += 1;
@@ -585,15 +595,21 @@ impl Download {
     /// is the conservative reading. A part held by a peer that has since gone is
     /// NOT counted as missing, so this never overstates the problem.
     ///
-    /// Returns `(still needed, of those unavailable)`.
-    pub async fn part_availability(&self) -> (u64, u64) {
+    /// Returns `(still needed, of those unavailable, statuses sampled)`.
+    ///
+    /// The third value is the SAMPLE SIZE and it is not optional decoration: the
+    /// second value only means "the swarm lacks these" in proportion to it. From
+    /// one source it means "the one peer we found lacks these", which is a much
+    /// weaker claim, and reporting the two numbers without the third invites
+    /// exactly that overstatement.
+    pub async fn part_availability(&self) -> (u64, u64, u32) {
         let g = self.inner.lock().await;
         let wanted = g.store.pf.wanted_parts();
         let missing = wanted
             .iter()
             .filter(|&&p| g.availability.get(p as usize).copied().unwrap_or(0) == 0)
             .count();
-        (wanted.len() as u64, missing as u64)
+        (wanted.len() as u64, missing as u64, g.status_reports)
     }
 
     /// Does this peer hold ANY part we still have bytes missing in?
@@ -2498,6 +2514,57 @@ mod tests {
         assert!(got.is_ok(), "download failed: {got:?}");
         drop(fs);
         let _ = up.await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn the_unavailable_part_count_carries_its_sample_size() {
+        // The number makes a claim about the NETWORK, so it has to be pinned:
+        // a part is "unavailable" only when NOT ONE sampled peer offered it, and
+        // the sample size travels with it. Reporting the gap without the sample
+        // is what turned a real measurement into "13 parts nobody has" drawn
+        // from a single source.
+        use crate::transfer::{build_file_status, build_file_status_complete};
+        use mule_proto::{ed2k_hash, PARTSIZE};
+
+        // Three data parts.
+        let size = (2 * PARTSIZE + 4096) as usize;
+        let data: Vec<u8> = (0..size as u32)
+            .map(|i| (i.wrapping_mul(17)) as u8)
+            .collect();
+        let hash = ed2k_hash(&data);
+        let dir = tmpdir("availsample");
+        let store = PartStore::create(&dir, 1, hash, size as u64, b"avail.bin").unwrap();
+        let dl = Download::new(store);
+
+        // Nothing sampled yet: every part is trivially unoffered, and the sample
+        // size of ZERO is what stops the UI shouting about it.
+        let (needed, gap, seen) = dl.part_availability().await;
+        assert_eq!((needed, gap, seen), (3, 3, 0), "no sample yet");
+
+        // One peer holding only part 0.
+        let only_first =
+            parse_file_status(&build_file_status(&hash, &[true, false, false]).payload).unwrap();
+        dl.note_status(&only_first).await;
+        let (_, gap, seen) = dl.part_availability().await;
+        assert_eq!(
+            (gap, seen),
+            (2, 1),
+            "2 parts unoffered, from a sample of ONE"
+        );
+
+        // A second peer holding part 1 shrinks the gap and grows the sample.
+        let only_second =
+            parse_file_status(&build_file_status(&hash, &[false, true, false]).payload).unwrap();
+        dl.note_status(&only_second).await;
+        let (_, gap, seen) = dl.part_availability().await;
+        assert_eq!((gap, seen), (1, 2), "only part 2 remains unoffered");
+
+        // A complete source closes it entirely.
+        dl.note_status(&parse_file_status(&build_file_status_complete(&hash).payload).unwrap())
+            .await;
+        let (_, gap, seen) = dl.part_availability().await;
+        assert_eq!((gap, seen), (0, 3), "a complete source offers every part");
         std::fs::remove_dir_all(&dir).ok();
     }
 
