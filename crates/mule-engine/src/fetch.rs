@@ -258,10 +258,18 @@ async fn fetch_one(
             _ => connect_peer(src.addr, me).await,
         }
     };
-    let (peer, mut fs) = match timeout(per_peer, connect).await {
+    crate::stats::note_dial();
+    let dial_started = std::time::Instant::now();
+    let dialed = timeout(per_peer, connect).await;
+    crate::stats::note_dial_time(
+        dial_started.elapsed().as_millis() as u64,
+        matches!(dialed, Ok(Ok(_))),
+    );
+    let (peer, mut fs) = match dialed {
         Ok(Ok(v)) => v,
         _ => return Err(()),
     };
+    crate::stats::note_connected();
     // Record what we learned about this source (software, obfuscation, LowID)
     // for the per-source UI. Report the connection we ACTUALLY made, so the
     // SourcesView lock reflects the wire rather than merely knowing a hash.
