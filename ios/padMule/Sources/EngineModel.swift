@@ -532,6 +532,23 @@ final class EngineModel: ObservableObject {
                     // there first, seeing "No server list on disk" because the
                     // tab's onAppear fired while start() still held the lock).
                     self.loadServers()
+                    // ...and AGAIN a few seconds later (Anthony, 2026-08-05).
+                    // The first probe runs while boot is still busy - two HTTP
+                    // fetches, UPnP SOAP, Kad bootstrap - and it is UDP, so on a
+                    // cold, contended start most answers are simply lost. Worse,
+                    // the probe's memory is per-launch, so nothing vouches for
+                    // any server on that first round and they all read as
+                    // unknown at once. A single cheap re-probe once the boot
+                    // rush has passed is what turns that into the correct list
+                    // WITHOUT the user having to find the Refresh button, which
+                    // is what Anthony had to do.
+                    //
+                    // Not a fixed "breather" before the FIRST probe: showing the
+                    // list promptly matters too, and a second look costs one UDP
+                    // fan-out. Do both - early AND correct.
+                    self.work.asyncAfter(deadline: .now() + 6) { [weak self] in
+                        self?.loadServers()
+                    }
                 }
             } catch {
                 // A cold-boot failure is otherwise visible only as a message on
