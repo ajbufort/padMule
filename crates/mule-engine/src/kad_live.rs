@@ -34,6 +34,12 @@ use tokio::time::{timeout, Instant};
 /// dropped (eMule caps the response at the requested count, Search.cpp:377).
 const KAD_REQUESTED_CONTACTS: usize = 11;
 
+/// Iteration rounds for a maintenance refresh. Deliberately shallower than the
+/// 12 a real lookup runs: this fires on the heartbeat under the engine lock, so
+/// its worst case is a user's search waiting behind it. Breadth comes from
+/// repeating it against fresh random targets, not from one deep dive.
+const REFRESH_ROUNDS: usize = 4;
+
 /// Bind the Kad UDP socket with SO_REUSEADDR set.
 ///
 /// padMule binds a FIXED Kad port, and `pause()` -> `resume()` closes and rebinds
@@ -541,6 +547,69 @@ impl KadNode {
         self.note_responder(node, verified, sender_vk);
         let res = parse_search_res(&res_payload)?;
         Ok(res.results.iter().filter_map(|r| r.as_source()).collect())
+    }
+
+    /// Grow and refresh the routing table with an iterative lookup toward
+    /// `target`, asking nobody for sources. Returns the net contacts gained.
+    ///
+    /// THE GAP THIS FILLS: padMule had NO periodic Kad maintenance of any kind.
+    /// The table was fed only by the bootstrap at start and by contacts learned
+    /// incidentally when a source lookup or keyword search happened to pass
+    /// through them, so it never grew on purpose and stale entries were never
+    /// aged out by use. Both authorities run exactly this on a timer - eMule
+    /// `CRoutingZone::OnBigTimer` fires a random-target lookup into each stale
+    /// bin, aMule mirrors it in RoutingZone.cpp - and it is what keeps a table
+    /// broad enough for keyword search to converge.
+    ///
+    /// Observed live 2026-08-05: after a reinstall wiped `nodes.dat`, the table
+    /// sat at 138 contacts and keyword searches returned very few Kad hits.
+    /// Anthony flagged both as suspicious; they were the same defect.
+    ///
+    /// Bounded harder than a real lookup (`REFRESH_ROUNDS`, not 12) because this
+    /// runs on the heartbeat under the engine lock: maintenance must never cost
+    /// the user a slow search. It converges over repeated rounds instead of one
+    /// deep dive, which also spreads the traffic out - the point is a table that
+    /// keeps improving, not one perfect lookup.
+    pub async fn refresh_routing(&mut self, target: &Kad128, per_query: Duration) -> usize {
+        let before = self.routing.len();
+        let seeds: Vec<WireContact> = self
+            .routing
+            .closest_to(target, 50)
+            .into_iter()
+            .map(|c| WireContact {
+                id: c.id,
+                ip: c.ip,
+                udp_port: c.udp_port,
+                tcp_port: c.tcp_port,
+                version: c.version,
+            })
+            .collect();
+        if seeds.is_empty() {
+            return 0; // nothing to ask - bootstrap first
+        }
+        let mut lookup = Lookup::new(*target, seeds);
+        for _round in 0..REFRESH_ROUNDS {
+            let batch = lookup.next_queries(ALPHA_QUERY, K);
+            if batch.is_empty() {
+                break;
+            }
+            for node in &batch {
+                if let Ok((contacts, verified, sender_vk)) =
+                    self.find_node(node, target, per_query).await
+                {
+                    // Same bookkeeping a real lookup does: the responder proved
+                    // its IP iff the receiver key was valid, and every contact it
+                    // named joins the table unverified until it answers for
+                    // itself. That second part is where the growth comes from.
+                    self.note_responder(node, verified, sender_vk);
+                    for c in &contacts {
+                        self.add_contact(c.id, c.ip, c.udp_port, c.tcp_port, c.version, false);
+                    }
+                    lookup.on_response(contacts);
+                }
+            }
+        }
+        self.routing.len().saturating_sub(before)
     }
 
     /// The Wave-6 goal: resolve an ed2k `file_hash` to sources. Runs an iterative

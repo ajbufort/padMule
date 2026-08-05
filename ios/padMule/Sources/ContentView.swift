@@ -171,9 +171,7 @@ struct ContentView: View {
                 // is none - an always-present badge would be one more thing to
                 // read past, and the question it answers ("am I covered right
                 // now?") is a yes/no that a missing badge answers just as well.
-                ToolbarItem(placement: .navigationBarLeading) {
-                    if model.vpnActive { vpnBadge }
-                }
+                vpnToolbarItem
                 // Stop/Start FIRST in the trailing group (Anthony, 2026-08-04),
                 // so it is the leftmost icon of the cluster rather than third.
                 // Trailing items render in declaration order, left to right.
@@ -1049,11 +1047,18 @@ struct ContentView: View {
                             .font(.caption).monospacedDigit()
                             .frame(width: 84, alignment: .trailing)
                     } else {
-                        // "no reply" not "offline": the probe is a UDP status ping,
-                        // and plenty of networks block outbound UDP while passing
-                        // the TCP the actual login uses. Saying "offline" asserted
-                        // more than we know.
-                        Text("no reply")
+                        // THREE states, not two. "no reply" not "offline": the
+                        // probe is a UDP status ping, and plenty of networks
+                        // block outbound UDP while passing the TCP the actual
+                        // login uses - saying "offline" asserted more than we
+                        // know. And "checking..." not "no reply" for a server
+                        // that has simply never answered YET: the probe's memory
+                        // is per-launch, so on a cold start every server is in
+                        // that state after one silent round, and calling them
+                        // all dead is a verdict from one datum. Proven live on
+                        // 2026-08-05 - padMule showed a server as "no reply" and
+                        // logged into it with HighID moments later.
+                        Text(srv.checking ? "checking..." : "no reply")
                             .font(.caption).foregroundStyle(.secondary)
                             .frame(width: 154, alignment: .trailing)
                     }
@@ -1531,26 +1536,58 @@ struct ContentView: View {
         return parts.isEmpty ? idlePool(dl) : parts.joined(separator: " / ")
     }
 
-    /// "VPN" in blue capitals inside a square outline - the same shape iPadOS
-    /// puts in its own status bar, so it reads as the familiar thing rather than
-    /// as padMule inventing an icon.
+    /// The VPN indicator as a toolbar item, with the bar's own SHARED BACKGROUND
+    /// suppressed (Anthony, 2026-08-05: "you need its surroundings to be
+    /// transparent so it blends seamlessly into the light or dark background").
     ///
-    /// Deliberately NOT a claim of safety. It says a tunnel interface is up (see
-    /// `NetworkWatcher.vpnIsUp` for the limits); padMule's real leak protection
-    /// is the public-address-change guard, which watches what the NETWORK
-    /// reports back rather than a local interface name.
+    /// iPadOS 26 puts every toolbar item inside a shared glass capsule, which is
+    /// right for the tappable cluster on the trailing side and wrong here: this
+    /// is an INDICATOR, not a control, and the capsule drew a visible disc
+    /// around it in both appearances. `sharedBackgroundVisibility(.hidden)` opts
+    /// this one item out. Availability-gated because the deployment target is
+    /// still iOS 16, where the capsule does not exist and nothing is needed.
+    @ToolbarContentBuilder private var vpnToolbarItem: some ToolbarContent {
+        if #available(iOS 26.0, *) {
+            ToolbarItem(placement: .navigationBarLeading) { vpnBadge }
+                .sharedBackgroundVisibility(.hidden)
+        } else {
+            ToolbarItem(placement: .navigationBarLeading) { vpnBadge }
+        }
+    }
+
+    /// The VPN indicator: **ON VPN** in blue, or **OFF VPN** in red with VPN
+    /// struck through (Anthony, 2026-08-05).
+    ///
+    /// Always present, in both states. An indicator that only appears when
+    /// things are GOOD cannot be trusted to mean anything - its absence reads
+    /// identically to "padMule has not looked", which is the failure mode this
+    /// whole class of row keeps producing. Saying OFF out loud is the point:
+    /// padMule is a P2P client whose user has deliberately put it behind a
+    /// tunnel, and "no badge" is a terrible way to learn the tunnel is gone.
+    ///
+    /// Word order is ON/OFF FIRST, as specified - it is the part that changed,
+    /// so it reads first.
+    ///
+    /// NOT a safety guarantee: it reports a tunnel INTERFACE, not that padMule's
+    /// packets traverse it (see `NetworkWatcher.vpnIsUp`). The real leak defence
+    /// is the public-address-change guard.
     private var vpnBadge: some View {
-        Text("VPN")
-            .font(.system(size: 11, weight: .bold, design: .rounded))
-            .kerning(0.5)
-            .foregroundStyle(Color.vpnBlue)
-            .padding(.horizontal, 4)
-            .padding(.vertical, 1)
-            .overlay(
-                RoundedRectangle(cornerRadius: 3)
-                    .stroke(Color.vpnBlue, lineWidth: 1.5)
-            )
-            .accessibilityLabel("VPN active")
+        let on = model.vpnActive
+        let tint = on ? Color.vpnBlue : Color.vpnRed
+        return HStack(spacing: 3) {
+            Text(on ? "ON" : "OFF")
+            Text("VPN").strikethrough(!on, color: tint)
+        }
+        .font(.system(size: 11, weight: .bold, design: .rounded))
+        .kerning(0.5)
+        .foregroundStyle(tint)
+        .padding(.horizontal, 4)
+        .padding(.vertical, 1)
+        .overlay(
+            RoundedRectangle(cornerRadius: 3)
+                .stroke(tint, lineWidth: 1.5)
+        )
+        .accessibilityLabel(on ? "VPN on" : "VPN off")
     }
 
     /// What a row with ZERO connected sources should say.
@@ -1860,6 +1897,12 @@ extension Color {
     /// ground. It is also the one padMule colour that must stay recognisable in
     /// BOTH appearances now that Dark Mode exists.
     static let vpnBlue = Color(red: 0x00 / 255.0, green: 0x66 / 255.0, blue: 0xCC / 255.0)
+
+    /// The VPN badge red, for the OFF state. Picked to the same brief as
+    /// `vpnBlue`: legible as a thin stroke and 11pt letters on BOTH the light
+    /// and dark toolbar, rather than the system red, which goes muddy against
+    /// dark chrome at this weight.
+    static let vpnRed = Color(red: 0xCC / 255.0, green: 0x22 / 255.0, blue: 0x22 / 255.0)
 }
 
 /// The hex hash uniquely identifies a hit - enough for SwiftUI's item-based sheet.
