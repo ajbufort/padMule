@@ -62,6 +62,9 @@ fn drain(engine: &MuleEngine) {
                 mib(have),
                 mib(total)
             ),
+            EngineEventFfi::Finished { name } => {
+                println!("   [event] FINISHED + verified + saved: {name}")
+            }
         }
     }
 }
