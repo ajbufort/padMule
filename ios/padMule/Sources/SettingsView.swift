@@ -17,6 +17,7 @@ struct SettingsView: View {
     @AppStorage(SettingsKey.shareUploads) private var shareUploads = true
     @AppStorage(SettingsKey.pauseSharingOnCellular) private var pauseOnCellular = true
     @AppStorage(SettingsKey.keepAwakeWhileTransferring) private var keepAwake = true
+    @AppStorage(SettingsKey.beepOnDownloadComplete) private var beepOnComplete = true
     @AppStorage(SettingsKey.updateServerListAtLaunch) private var updateAtLaunch = false
     @AppStorage(SettingsKey.askServersForServers) private var askServers = true
     @AppStorage(SettingsKey.defaultPriority) private var defaultPriority = 1
@@ -255,10 +256,17 @@ struct SettingsView: View {
                 get: { keepAwake },
                 set: { keepAwake = $0; model.applyKeepAwake() }
             ))
+            // Play it on the way IN as well, so the choice is auditioned rather
+            // than taken on trust - the toggle is otherwise silent until the
+            // next download happens to finish.
+            Toggle("Beep when a download finishes", isOn: Binding(
+                get: { beepOnComplete },
+                set: { beepOnComplete = $0; if $0 { EngineModel.playFinishedSound() } }
+            ))
         } header: {
             Text("Device")
         } footer: {
-            Text("padMule only transfers while it is open and on screen (iPadOS suspends background apps). Keeping the screen awake during an active transfer stops it pausing when the display would otherwise sleep. It only holds the screen on while bytes are actually moving - a stalled transfer with no sources will not keep the screen on.")
+            Text("padMule only transfers while it is open and on screen (iPadOS suspends background apps). Keeping the screen awake during an active transfer stops it pausing when the display would otherwise sleep. It only holds the screen on while bytes are actually moving - a stalled transfer with no sources will not keep the screen on.\n\nThe finish sound plays once per file, after it has been hash-verified and saved. It follows the silent switch.")
         }
     }
 

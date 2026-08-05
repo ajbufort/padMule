@@ -77,6 +77,12 @@ pub enum EngineEventFfi {
         have: u64,
         total: u64,
     },
+    /// A download finished, was hash-verified, and landed in the downloads
+    /// folder. Typed rather than a prose match on the accompanying server line -
+    /// the UI acts on this (the finish beep).
+    Finished {
+        name: String,
+    },
 }
 
 impl From<EngineEvent> for EngineEventFfi {
@@ -90,6 +96,7 @@ impl From<EngineEvent> for EngineEventFfi {
             EngineEvent::Kad { contacts } => EngineEventFfi::Kad {
                 contacts: contacts as u32,
             },
+            EngineEvent::Finished { name } => EngineEventFfi::Finished { name },
             EngineEvent::Progress { hash, have, total } => EngineEventFfi::Progress {
                 hash: hex::encode(hash),
                 have,

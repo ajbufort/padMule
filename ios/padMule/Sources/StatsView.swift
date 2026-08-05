@@ -28,14 +28,22 @@ struct StatsView: View {
                         .frame(maxWidth: .infinity, alignment: .center)
                         .padding(.vertical, 24)
                 } else {
-                    Chart(model.rateHistory) { p in
+                    // `ratePlot`, not `rateHistory`: a fixed 60-point span with
+                    // the newest sample pinned to the right edge, so the trace
+                    // uses the whole width instead of being scaled to whatever
+                    // few samples happen to be buffered.
+                    Chart(model.ratePlot) { p in
                         LineMark(x: .value("Time", p.id), y: .value("Rate", p.down))
                             .foregroundStyle(by: .value("Direction", "Down"))
                         LineMark(x: .value("Time", p.id), y: .value("Rate", p.up))
                             .foregroundStyle(by: .value("Direction", "Up"))
                     }
                     .chartForegroundStyleScale(["Down": Color.blue, "Up": Color.green])
+                    .chartXScale(domain: 0...(EngineModel.rateWindow - 1))
                     .chartXAxis(.hidden)
+                    .chartPlotStyle { plot in
+                        plot.frame(maxWidth: .infinity)
+                    }
                     .chartYAxis {
                         AxisMarks { value in
                             AxisGridLine()

@@ -7,6 +7,7 @@
 // callback interface is the later upgrade. See docs/wiki/padmule-enhancement-channel.md
 // ... and docs/wiki/lifecycle-and-reactivation.md for why pause/resume is honest.
 
+import AudioToolbox  // AudioServicesPlaySystemSound - the download-finished beep
 import Foundation
 import OSLog
 import SwiftUI
@@ -166,7 +167,33 @@ final class EngineModel: ObservableObject {
     private var lastSampleTime = Date()
     private var sampleIndex = 0
     private var statsPrimed = false
-    private let rateHistoryCap = 60
+    /// Samples kept, and therefore the chart's fixed X span: 60 seconds.
+    static let rateWindow = 60
+    private let rateHistoryCap = EngineModel.rateWindow
+
+    /// `rateHistory` padded to exactly `rateWindow` points and re-indexed 0...59,
+    /// newest at the RIGHT.
+    ///
+    /// The chart used to plot the raw samples against their absolute sample
+    /// index, so its X domain was whatever range happened to be in the buffer.
+    /// Early on that is a handful of points, and Swift Charts scaled the domain
+    /// to fit them - so the live trace was squeezed into a sliver instead of
+    /// using the width it had. Padding on the LEFT with zeros fixes the span at
+    /// a full minute and makes the newest sample always land on the right edge,
+    /// so the trace scrolls leftwards the way a live rate graph should.
+    var ratePlot: [RatePoint] {
+        let recent = rateHistory.suffix(EngineModel.rateWindow)
+        let pad = EngineModel.rateWindow - recent.count
+        var out: [RatePoint] = []
+        out.reserveCapacity(EngineModel.rateWindow)
+        for i in 0..<pad {
+            out.append(RatePoint(id: i, down: 0, up: 0))
+        }
+        for (i, p) in recent.enumerated() {
+            out.append(RatePoint(id: pad + i, down: p.down, up: p.up))
+        }
+        return out
+    }
     // Pre-search WIRE filters (sent to the server so it pre-filters the capped
     // result set), distinct from the client-side sort/filter chips below which
     // refine what came back. `mb` values are megabytes; 0 = no bound.
@@ -486,6 +513,15 @@ final class EngineModel: ObservableObject {
                     self.startPolling()
                     self.refreshFast()
                     self.refresh()
+                    // Load + probe the server list ON APP OPEN (Anthony,
+                    // 2026-08-04), not when the Servers tab first appears.
+                    // start() has just fetched server.met if it was missing or
+                    // unusable, and the probe takes a few seconds - doing it
+                    // here means the list is READY when the user arrives at the
+                    // tab, instead of them watching it fill (or, if they got
+                    // there first, seeing "No server list on disk" because the
+                    // tab's onAppear fired while start() still held the lock).
+                    self.loadServers()
                 }
             } catch {
                 // A cold-boot failure is otherwise visible only as a message on
@@ -1229,7 +1265,26 @@ final class EngineModel: ObservableObject {
             kadContacts = contacts
         case .progress:
             break // downloads() already carries the numbers
+        case .finished(let name):
+            // A TYPED completion, not a match on the "Saved '..'" server line
+            // that accompanies it: that line is prose whose wording is free to
+            // change, and a beep that stopped working the day someone reworded
+            // it would be a silent regression.
+            engineLog.notice("download finished: \(name, privacy: .public)")
+            loadDownloadedFiles()
+            if UserDefaults.standard.bool(forKey: SettingsKey.beepOnDownloadComplete) {
+                EngineModel.playFinishedSound()
+            }
         }
+    }
+
+    /// The finish sound. `AudioServicesPlaySystemSound` needs no session setup
+    /// and no audio permission, and it follows the silent switch - which is the
+    /// right behaviour for an alert the user did not ask to hear right now.
+    /// 1057 is the short "Tink": audible without being an alarm, since a busy
+    /// queue can finish several files in a row.
+    static func playFinishedSound() {
+        AudioServicesPlaySystemSound(1057)
     }
 
     // MARK: - Servers
