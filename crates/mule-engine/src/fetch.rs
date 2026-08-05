@@ -234,6 +234,36 @@ pub struct FetchOutcome {
     pub bytes_present: u64,
 }
 
+/// How long a DIAL may take, separate from the whole-session budget.
+///
+/// MEASURED, on both networks, and the number changed once the device data
+/// arrived - which is why it is written down rather than assumed:
+///
+/// On this box, of 76 successful handshakes 75 landed under 1s and one at 1-2s;
+/// NOT ONE connected after 2s, while 57 dials burned the full 45s and every one
+/// failed. That alone argued for a very short deadline.
+///
+/// On the iPad over a VPN the tail is REAL: 1 connection landed in 5-10s and
+/// TWO in 20-45s, out of 315. So "a 5s cap is free" was true only of the
+/// unencapsulated path. 10s keeps 313 of those 315 (99.4%) and still kills the
+/// 63 dials that each burned 45s - about 37 minutes of worker time in one run.
+///
+/// It matters far more here than upstream: both authorities use
+/// CONNECTION_TIMEOUT = 40s (eMule opcodes.h:62, aMule Constants.h:33-35), but
+/// eMule multiplexes hundreds of sockets so a stalled one costs it nothing,
+/// whereas padMule gives a download only FOUR workers - so one black-holed
+/// address is a quarter of that file's dialing capacity, held for the duration.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The dial deadline for a session allowed `per_peer` in total.
+///
+/// Never longer than the session budget itself: a caller that deliberately
+/// passes a short `per_peer` (the CLI, the tests) must not have its dial silently
+/// extended past the budget it chose.
+fn connect_deadline(per_peer: Duration) -> Duration {
+    CONNECT_TIMEOUT.min(per_peer)
+}
+
 /// Connect to `src` (obfuscated if we know its userhash, else plaintext) and
 /// download into `dl` until the peer stops or the deadline hits. `Ok(bytes)`
 /// with the count this source delivered (0 if it connected but only queued us);
@@ -260,7 +290,7 @@ async fn fetch_one(
     };
     crate::stats::note_dial();
     let dial_started = std::time::Instant::now();
-    let dialed = timeout(per_peer, connect).await;
+    let dialed = timeout(connect_deadline(per_peer), connect).await;
     crate::stats::note_dial_time(
         dial_started.elapsed().as_millis() as u64,
         matches!(dialed, Ok(Ok(_))),
@@ -803,6 +833,27 @@ mod tests {
         assert_eq!(dropped, 1);
         assert_eq!(reg.len(), 1);
         assert_eq!(reg.sources()[0].addr, "8.8.8.8:4662".parse().unwrap());
+    }
+
+    #[test]
+    fn the_dial_deadline_is_short_but_never_outlives_the_session_budget() {
+        // A black-holed address used to hold one of a download's FOUR workers
+        // for the whole 45s session budget. The dial now gets its own, far
+        // shorter deadline - measured, not guessed: on the VPN 313 of 315 real
+        // connections land inside 10s, while 63 dials in one run burned 45s
+        // each and connected zero times.
+        let session = Duration::from_secs(45);
+        assert_eq!(connect_deadline(session), CONNECT_TIMEOUT);
+        assert!(
+            CONNECT_TIMEOUT < session,
+            "the dial deadline must be shorter than the session budget, or it \
+             does nothing"
+        );
+        // ...but a caller that deliberately chose a SHORTER budget keeps it.
+        // Extending a 2s budget to 10s would break the CLI and the tests that
+        // bound their own runtime.
+        let brief = Duration::from_secs(2);
+        assert_eq!(connect_deadline(brief), brief);
     }
 
     #[test]
