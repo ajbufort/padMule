@@ -3373,8 +3373,20 @@ impl Engine {
         // A hands-on simulation caught the old gate: with every server down but
         // Kad up, search returned real hits yet every download was refused
         // "NoServer" - even though Kad had the sources.
+        // `true` - return the moment the server yields sources. Get used to cost
+        // a FLAT ~15s (see find_sources): the joined path waits for the slower
+        // arm, and a Kad lookup essentially always burns its whole budget, so
+        // the user paid ~14.8s of Kad timeout after the server had already
+        // answered in ~200ms - while holding the engine lock, so queueing four
+        // files cost a minute.
+        //
+        // Nothing is lost in the case that matters: with no server, or a server
+        // that knows nothing, this falls through to the SAME joined Kad path as
+        // before (see `add_download_without_a_server_still_tries_kad`). Kad
+        // sources simply arrive via the retry sweep and source exchange instead
+        // of at the instant of the tap.
         let (reg, lowids) = self
-            .find_sources(hash, size, ADD_SOURCES_BUDGET, false)
+            .find_sources(hash, size, ADD_SOURCES_BUDGET, true)
             .await;
         // A LowID source can only reach us via a SERVER callback, so without a
         // server only directly-connectable (HighID) sources are usable - otherwise
@@ -3421,10 +3433,16 @@ impl Engine {
     /// `found=1 ... took=6.001s`. That is what made the retry sweep expensive
     /// enough to need a duty-cycle cap, since it runs under the engine lock.
     ///
-    /// Retries pass `true`: getting SOME sources now beats getting more in six
-    /// seconds. `add_download` passes `false` - the user is watching a spinner
-    /// for that one file and wants the widest net, and it is not on the
-    /// heartbeat's lock budget.
+    /// BOTH callers now pass `true`. Retries always did - getting SOME sources
+    /// now beats getting more in six seconds.
+    ///
+    /// `add_download` passed `false` until 2026-08-04, justified as "the user is
+    /// watching a spinner for that one file and wants the widest net". That was
+    /// REASONING, not measurement, and Anthony reported the consequence: every
+    /// Get cost a flat ~15s. The measurement had already been taken on the retry
+    /// path and pointed the other way - 195ms instead of 6.001s, 16 of 16
+    /// retries sub-second. The widest net is worth little if it is cast 15
+    /// seconds late, under the engine lock, once per queued file.
     async fn find_sources(
         &mut self,
         hash: [u8; 16],
