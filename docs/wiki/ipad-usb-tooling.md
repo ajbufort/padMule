@@ -73,6 +73,21 @@ proceeds. No `sudo`, no `tunneld`. Verified on iPadOS 26.5.2.
 
 ## Caveats that will bite
 
+**READ-ONLY vs DISTURBING (learned by breaking it, 2026-08-04).** While a live
+run is in progress, only two things are safe:
+
+- `GET localhost:8100/source?format=json` - works with NO session at all
+- `pymobiledevice3 developer dvt screenshot` - never touches the app
+
+Creating a WebDriverAgent **session** disturbs the app, and this is not limited
+to passing a `bundleId`: a session created with EMPTY capabilities backgrounded
+padMule, which on a foreground-only app pauses every transfer; the screen then
+slept and recovery needed a relaunch. Download progress survived (byte counts
+matched exactly) but the process-global fetch counters did not. If the run
+matters, screenshot and read `/source` - do not open a session.
+
+
+
 - **ATTACHING TO WSL TAKES THE DEVICE AWAY FROM WINDOWS.** While attached,
   Sideloadly cannot see the iPad. Run `usbipd detach` before a Sideloadly
   install, and re-attach afterwards. This is the single most likely source of
