@@ -3433,8 +3433,17 @@ impl Engine {
     /// `found=1 ... took=6.001s`. That is what made the retry sweep expensive
     /// enough to need a duty-cycle cap, since it runs under the engine lock.
     ///
-    /// BOTH callers now pass `true`. Retries always did - getting SOME sources
-    /// now beats getting more in six seconds.
+    /// ALL THREE production callers now pass `true` (`add_download`,
+    /// `resume_fetches`, `maintain_resume_fetches`). The two resume paths always
+    /// did - getting SOME sources now beats getting more in six seconds.
+    ///
+    /// KNOWN COST, not yet measured: the fast path returns on the first NON-EMPTY
+    /// server answer, so Kad is skipped entirely whenever the server names even
+    /// one source. The latency win is measured (~200ms vs ~15s); the narrower
+    /// source pool is not, and it sits directly against the open question of why
+    /// downloads run short of live sources. A count threshold, or letting the Kad
+    /// arm land into the mid-sweep source channel `take_sx_sources` already
+    /// provides, would keep both - see the handoff.
     ///
     /// `add_download` passed `false` until 2026-08-04, justified as "the user is
     /// watching a spinner for that one file and wants the widest net". That was
