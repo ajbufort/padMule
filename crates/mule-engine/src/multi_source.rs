@@ -264,6 +264,19 @@ pub struct Download {
     block_sources: StdMutex<HashMap<u64, HashSet<IpAddr>>>,
     /// AICH master-root trust + recovery bookkeeping (see [`AichState`]).
     aich: StdMutex<AichState>,
+    /// Blocks some peer has asked for and not yet delivered.
+    ///
+    /// A STD lock, deliberately, and the reason is a bug rather than a
+    /// preference: this must be releasable from a `Drop`, and `Drop` cannot
+    /// await. Both session paths wrap `download_from_peer_at` in a `timeout`,
+    /// and a timeout DROPS the future - so the explicit release at the end of
+    /// that function never ran for a session that timed out, and its blocks
+    /// stayed reserved for the LIFE of the download. That leak is what made
+    /// `accepted, no block to take` 722 of 959 won slots on the 2026-08-05
+    /// device reading (build-progress 8ca), and being in-memory per-download is
+    /// why a RESTART cleared it. Held only for the length of a `retain`/`extend`,
+    /// never across an await.
+    reserved: StdMutex<Vec<(u64, u64)>>,
     /// Source IPs banned for THIS download after being caught delivering a corrupt
     /// part (eMule's CorruptionBlackBox, per-file). BOTH the outbound fetch sweep
     /// AND the inbound called-back-source path skip them.
@@ -282,8 +295,6 @@ pub struct Download {
 
 struct Inner {
     store: PartStore,
-    /// Blocks some peer has asked for and not yet delivered.
-    reserved: Vec<(u64, u64)>,
     /// Per data-part swarm availability: how many peer sessions have reported
     /// holding each part. Drives rarest-first block selection.
     availability: Vec<u32>,
@@ -310,7 +321,6 @@ impl Download {
         Arc::new(Download {
             inner: Mutex::new(Inner {
                 store,
-                reserved: Vec::new(),
                 availability: vec![0u32; parts],
                 status_reports: 0,
             }),
@@ -332,6 +342,7 @@ impl Download {
                 reported: HashMap::new(),
                 pending: HashMap::new(),
             }),
+            reserved: StdMutex::new(Vec::new()),
             banned: StdMutex::new(HashSet::new()),
             sx_sources: StdMutex::new(Vec::new()),
             asked_sources: StdMutex::new(HashSet::new()),
@@ -734,8 +745,8 @@ impl Download {
             return Vec::new();
         }
         let preview = self.preview.load(Ordering::Relaxed);
-        let mut g = self.inner.lock().await;
-        let reserved = g.reserved.clone();
+        let g = self.inner.lock().await;
+        let reserved = self.reserved.lock().unwrap().clone();
         let avail = g.availability.clone();
         let missing = g.store.pf.missing();
         let rarity = |p: u64| avail.get(p as usize).copied().unwrap_or(0);
@@ -751,17 +762,28 @@ impl Download {
                 .pf
                 .next_blocks(&has, &reserved, max, &rarity, true, preview);
         }
-        g.reserved.extend_from_slice(&blocks);
+        self.reserved.lock().unwrap().extend_from_slice(&blocks);
         blocks
     }
 
     /// Give blocks back to the pool so another peer can fetch them.
-    async fn release(&self, blocks: &[(u64, u64)]) {
+    ///
+    /// SYNCHRONOUS on purpose - see the `reserved` field. A release that must be
+    /// awaited cannot be performed by a destructor, and a destructor is the only
+    /// cleanup a CANCELLED future ever runs.
+    fn release(&self, blocks: &[(u64, u64)]) {
         if blocks.is_empty() {
             return;
         }
-        let mut g = self.inner.lock().await;
-        g.reserved.retain(|b| !blocks.contains(b));
+        self.reserved
+            .lock()
+            .unwrap()
+            .retain(|b| !blocks.contains(b));
+    }
+
+    /// Blocks reserved right now. For tests and diagnostics.
+    pub fn reserved_now(&self) -> Vec<(u64, u64)> {
+        self.reserved.lock().unwrap().clone()
     }
 
     /// Write received bytes through to disk and close their gap.
@@ -1362,6 +1384,49 @@ where
 /// against it) and `sec` carries the secure-ident context (our RSA identity +
 /// whether the peer advertised support), enabling mutual secure-identification
 /// inline with the transfer. `sec = None` disables it (plain download).
+/// The blocks this session has reserved, released when it is dropped.
+///
+/// A DESTRUCTOR rather than a line at the end of the function, and the
+/// difference is the whole fix. `download_from_peer_at` is wrapped in a
+/// `timeout` on both session paths (`fetch::fetch_one` and the inbound handler),
+/// and a timeout DROPS the future - so trailing code never runs, while a local's
+/// destructor always does. The old explicit release therefore covered every exit
+/// EXCEPT the most common failure, and the blocks of every timed-out session
+/// stayed reserved for the life of the download. Measured cost before the fix:
+/// `accepted, no block to take` on 722 of 959 won upload slots (build-progress
+/// 8ca).
+struct HeldBlocks<'a> {
+    dl: &'a Download,
+    blocks: Vec<(u64, u64)>,
+}
+
+impl HeldBlocks<'_> {
+    fn extend(&mut self, blocks: &[(u64, u64)]) {
+        self.blocks.extend_from_slice(blocks);
+    }
+
+    /// Drop `done` from the held set AND from the download's reservations - the
+    /// two must move together or a completed block is either re-fetched or
+    /// stranded.
+    fn release(&mut self, done: &[(u64, u64)]) {
+        self.dl.release(done);
+        self.blocks.retain(|b| !done.contains(b));
+    }
+
+    /// Hand everything back now (the peer revoked our slot and we intend to wait
+    /// for another turn on this same connection).
+    fn release_all(&mut self) {
+        self.dl.release(&self.blocks);
+        self.blocks.clear();
+    }
+}
+
+impl Drop for HeldBlocks<'_> {
+    fn drop(&mut self) {
+        self.dl.release(&self.blocks);
+    }
+}
+
 pub async fn download_from_peer_at<S>(
     fs: &mut FramedStream<S>,
     dl: &Download,
@@ -1372,11 +1437,14 @@ pub async fn download_from_peer_at<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut held: Vec<(u64, u64)> = Vec::new();
-    let r = run_peer(fs, dl, &mut held, bail_on_queue, peer, session).await;
-    // Whatever happened, do not strand blocks nobody else will be offered.
-    dl.release(&held).await;
-    r
+    // Dropped however this function ends - returned, `?`-propagated, or
+    // CANCELLED by the caller's timeout - which is the one case the previous
+    // explicit release could not reach.
+    let mut held = HeldBlocks {
+        dl,
+        blocks: Vec::new(),
+    };
+    run_peer(fs, dl, &mut held, bail_on_queue, peer, session).await
 }
 
 /// If `pkt` is a source's OP_FILEDESC, record its rating + comment against
@@ -1573,7 +1641,7 @@ where
 async fn run_peer<S>(
     fs: &mut FramedStream<S>,
     dl: &Download,
-    held: &mut Vec<(u64, u64)>,
+    held: &mut HeldBlocks<'_>,
     bail_on_queue: bool,
     peer: Option<SocketAddr>,
     session: PeerSession,
@@ -1742,7 +1810,7 @@ where
             asked_once = true;
             crate::stats::note_requested();
         }
-        held.extend_from_slice(&blocks);
+        held.extend(&blocks);
 
         fs.write_packet(&build_request_parts(&hash, &blocks))
             .await?;
@@ -1821,8 +1889,7 @@ where
                 }
                 // Waiting our turn: give the in-flight blocks back first, so
                 // they are not stranded behind our place in the queue.
-                dl.release(held).await;
-                held.clear();
+                held.release_all();
                 await_slot(fs, dl, &mut sec, peer, &mut aich, bail_on_queue).await?;
                 break;
             }
@@ -1858,8 +1925,7 @@ where
             if done.is_empty() {
                 continue;
             }
-            dl.release(&done).await;
-            held.retain(|b| !done.contains(b));
+            held.release(&done);
             if no_more_blocks {
                 continue;
             }
@@ -1870,7 +1936,7 @@ where
                 no_more_blocks = true;
                 continue;
             }
-            held.extend_from_slice(&more);
+            held.extend(&more);
             rx.add_blocks(&more);
             fs.write_packet(&build_request_parts(&hash, &more)).await?;
         }
@@ -3831,6 +3897,92 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A session KILLED BY ITS OWN TIMEOUT must not strand its reservations.
+    ///
+    /// This is the leak that made `accepted, no block to take` 722 of 959 won
+    /// slots on the 2026-08-05 device reading (build-progress 8ca). Both the
+    /// outbound path (`fetch::fetch_one`) and the inbound one (engine.rs) wrap
+    /// the session in `timeout(...)`, and a timeout DROPS the future - so
+    /// `download_from_peer_at`'s trailing `release` never runs, and the three
+    /// blocks that session reserved stay reserved for the LIFE of the Download.
+    ///
+    /// The peer that dies is already covered (see the test below): there
+    /// `run_peer` RETURNS and the release executes. The difference is
+    /// cancellation, which no `?`-path cleanup can reach - only a destructor.
+    ///
+    /// It also explains the restart-clearable stall directly: `reserved` is
+    /// in-memory per-Download, so relaunching forgets every stranded block.
+    #[tokio::test]
+    async fn a_session_cancelled_by_its_timeout_does_not_strand_its_reservations() {
+        use mule_proto::{ed2k_hash, EMBLOCKSIZE};
+        let dir = tmpdir("cancel-strand");
+        let size = (4 * EMBLOCKSIZE) as usize;
+        let data: Vec<u8> = (0..size as u32)
+            .map(|i| (i.wrapping_mul(7)) as u8)
+            .collect();
+        let hash = ed2k_hash(&data);
+
+        // A peer that grants a slot and then goes SILENT - no data, no close.
+        // Silence is what makes the caller's timeout the thing that ends the
+        // session, which is the whole point; closing would return an error and
+        // take the ordinary release path instead.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mute = tokio::spawn(async move {
+            let me = HelloInfo::baseline([0xC7; 16], 0, 4662, 4672, "mute");
+            let Ok((_p, mut fs)) = accept_peer(&listener, &me).await else {
+                return;
+            };
+            while let Ok(pkt) = fs.read_packet_unpacked().await {
+                match pkt.opcode {
+                    crate::transfer::OP_REQUESTFILENAME => {
+                        let _ = fs
+                            .write_packet(&crate::transfer::build_req_filename_answer(
+                                &hash,
+                                b"mute.bin",
+                            ))
+                            .await;
+                    }
+                    crate::transfer::OP_SETREQFILEID => {
+                        let _ = fs
+                            .write_packet(&crate::transfer::build_file_status_complete(&hash))
+                            .await;
+                    }
+                    crate::transfer::OP_STARTUPLOADREQ => {
+                        let _ = fs
+                            .write_packet(&crate::transfer::build_accept_upload())
+                            .await;
+                    }
+                    // OP_REQUESTPARTS: answer NOTHING and hold the socket open.
+                    _ => {}
+                }
+            }
+        });
+
+        let store = PartStore::create(&dir, 1, hash, size as u64, b"mute.bin").unwrap();
+        let dl = Download::new(store);
+        let me = HelloInfo::baseline([0xAA; 16], 0x0A00_0001, 4802, 4673, "dl");
+        let (_p, mut fs) = connect_peer(addr, &me).await.unwrap();
+
+        // Exactly what fetch_one does, with a short budget so the test is quick.
+        let r = tokio::time::timeout(
+            std::time::Duration::from_millis(700),
+            download_from_peer_at(&mut fs, &dl, true, None, PeerSession::default()),
+        )
+        .await;
+        assert!(r.is_err(), "the session must be ended by the TIMEOUT");
+
+        assert!(
+            dl.reserved_now().is_empty(),
+            "a cancelled session stranded {} block(s) - every later session that \
+             wins a slot on this download will find nothing to take",
+            dl.reserved_now().len()
+        );
+
+        mute.abort();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[tokio::test]
     async fn a_peer_that_dies_mid_transfer_does_not_strand_its_blocks() {
         let dir = tmpdir("strand");
@@ -3861,7 +4013,7 @@ mod tests {
         // Nothing must remain reserved, or a healthy peer would never be offered
         // those blocks and the download would stall forever.
         assert!(
-            dl.inner.lock().await.reserved.is_empty(),
+            dl.reserved_now().is_empty(),
             "dead peer stranded its reservations"
         );
 
