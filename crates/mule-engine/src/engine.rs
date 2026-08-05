@@ -195,6 +195,16 @@ const KAD_SEARCH_WAIT: Duration = Duration::from_secs(15);
 /// Per-node wait during a Kad keyword lookup.
 const KAD_PER_QUERY: Duration = Duration::from_millis(750);
 
+/// DIALABLE sources a server answer must carry before `find_sources` skips the
+/// Kad arm entirely.
+///
+/// Tied to `fetch::parallel_for_priority`'s Normal width: below that the worker
+/// pool is starved BY DEFINITION, so waiting for Kad costs nothing that was
+/// going to be used, and skipping it forfeits the only other place sources come
+/// from. Pinned to that constant by test rather than chosen by taste - a
+/// threshold picked on feel is the mistake this file has already made twice.
+const MIN_DIALABLE_TO_SKIP_KAD: usize = 4;
+
 /// Minimum interval between SERVER searches - a client-side flood guard mirroring
 /// aMule's silent 2 s (SearchDlg.cpp:277). padMule improves on aMule by surfacing
 /// the remaining seconds instead of silently ignoring the click. Wire-neutral.
@@ -3406,6 +3416,10 @@ impl Engine {
         let dl = Download::new(store);
         self.downloads.lock().await.push(Arc::clone(&dl));
 
+        // Keep what the lookup produced. Both numbers are right here and were
+        // discarded; without them a row with no bytes cannot say whether nothing
+        // was found or plenty was found and none of it was reachable.
+        dl.note_source_pool(reg.sources().len(), lowids.len());
         self.request_callbacks(&lowids).await;
         self.spawn_fetch(dl, hash, size, name, reg.sources().to_vec());
         AddResult::Started
@@ -3473,9 +3487,39 @@ impl Engine {
                     .unwrap_or_default(),
                 None => Vec::new(),
             };
-            if !found.is_empty() {
+            // NOT `!found.is_empty()`. The gate has to be on sources we can
+            // actually DIAL, because a server answer is not the same thing as a
+            // usable one: `PeerSource::from_found` drops every LowID source (it
+            // cannot accept our connection), so a hash whose swarm is mostly
+            // LowID answers with a healthy-looking count and yields almost
+            // nothing to dial. Observed live 2026-08-05 - a file whose search row
+            // read "15 srcs (14 full)" sat at Zero KB while five siblings ran at
+            // hundreds of KB/s, and Kad was skipped for it on the strength of
+            // that non-empty answer.
+            let dialable = found
+                .iter()
+                .filter(|s| crate::fetch::PeerSource::from_found(s).is_some())
+                .count();
+            if dialable >= MIN_DIALABLE_TO_SKIP_KAD {
                 return self.registry_from(found, low_id, &[]);
             }
+            // Too thin to fill even one download's worker pool, so the Kad wait
+            // costs nothing we would have been using. Keep the server's answer
+            // and ADD Kad to it rather than falling through, which would re-ask
+            // the server for something we are already holding.
+            let kad_sources = match self.kad.as_mut() {
+                Some(node) => timeout(
+                    budget.min(KAD_SEARCH_WAIT),
+                    node.resolve_sources(&Kad128::from_hash(&hash), size, 20, KAD_PER_QUERY),
+                )
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .map(|o| o.sources)
+                .unwrap_or_default(),
+                None => Vec::new(),
+            };
+            return self.registry_from(found, low_id, &kad_sources);
         }
         let server = self.server.as_mut();
         let kad = self.kad.as_mut();
@@ -3675,6 +3719,7 @@ impl Engine {
             if reg.is_empty() && lowids.is_empty() {
                 continue;
             }
+            dl.note_source_pool(reg.sources().len(), lowids.len());
             self.request_callbacks(&lowids).await;
             self.spawn_fetch(dl, hash, size, &name, reg.sources().to_vec());
         }
@@ -4165,6 +4210,7 @@ impl Engine {
         if reg.is_empty() && lowids.is_empty() {
             return false;
         }
+        dl.note_source_pool(reg.sources().len(), lowids.len());
         self.request_callbacks(&lowids).await;
         self.spawn_fetch(dl, hash, size, &name, reg.sources().to_vec());
         true
@@ -5252,6 +5298,24 @@ mod tests {
             }
         });
         addr
+    }
+
+    /// The Kad-skip threshold is TIED to the worker pool, not chosen by feel.
+    ///
+    /// The rule it encodes: skipping Kad is only safe when the server alone
+    /// produced enough DIALABLE sources to keep the pool busy. Below that the
+    /// pool is starved by definition, so the Kad wait costs nothing that was
+    /// going to be used. If the Normal pool width ever changes, this assert
+    /// fails and the threshold gets revisited deliberately - which is the whole
+    /// point, since a threshold tuned on one network and then forgotten is
+    /// exactly how the 5s connect cap nearly shipped.
+    #[test]
+    fn the_kad_skip_threshold_matches_the_default_worker_pool() {
+        assert_eq!(
+            MIN_DIALABLE_TO_SKIP_KAD,
+            crate::fetch::parallel_for_priority(crate::part_store::PR_NORMAL),
+            "the Kad-skip threshold and the Normal worker pool have drifted apart"
+        );
     }
 
     /// Source discovery must honour the budget it is GIVEN, so the caller never

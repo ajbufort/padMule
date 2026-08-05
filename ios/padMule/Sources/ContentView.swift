@@ -161,6 +161,14 @@ struct ContentView: View {
                 }
             }
             .toolbar {
+                // UPPER LEFT (Anthony, 2026-08-05): a VPN indicator, shown only
+                // while a tunnel is up. Absent rather than greyed-out when there
+                // is none - an always-present badge would be one more thing to
+                // read past, and the question it answers ("am I covered right
+                // now?") is a yes/no that a missing badge answers just as well.
+                ToolbarItem(placement: .navigationBarLeading) {
+                    if model.vpnActive { vpnBadge }
+                }
                 // Stop/Start FIRST in the trailing group (Anthony, 2026-08-04),
                 // so it is the leftmost icon of the cluster rather than third.
                 // Trailing items render in declaration order, left to right.
@@ -308,6 +316,31 @@ struct ContentView: View {
                         + "or the device switched networks. Sharing has been paused automatically "
                         + "so files are not served from the new address. Check your VPN, then turn "
                         + "sharing back on when you're ready."
+                )
+            }
+            // The VPN INTERFACE went away. Distinct from the alert above, and
+            // the pair is deliberate: this one is LOCAL and fast (the tunnel
+            // vanished from the interface list, noticed within a second), while
+            // the address-change alert is authoritative but late (it needs the
+            // network to report a different public address back, which may not
+            // happen until the next server login).
+            //
+            // It does NOT pause sharing, and the text says so rather than
+            // implying protection that did not happen. Auto-pausing on this
+            // signal would be wrong: the detection is a heuristic that can fire
+            // on a non-VPN `utun` interface, and stopping a user's uploads on a
+            // false positive is a real cost. The engine's address-change guard
+            // is what actually pauses, on evidence rather than inference.
+            .alert("VPN appears to have dropped", isPresented: $model.vpnWentDown) {
+                Button("OK", role: .cancel) { model.vpnWentDown = false }
+            } message: {
+                Text(
+                    "padMule can no longer see a VPN tunnel on this device. If you rely on a VPN, "
+                        + "your traffic may no longer be going through it.\n\n"
+                        + "Sharing has NOT been paused by this warning - padMule pauses it "
+                        + "automatically only once it confirms its public address actually changed. "
+                        + "To stop serving files right now, turn off Share uploads on the Status "
+                        + "screen, or use Stop."
                 )
             }
             .sheet(item: $ratingFor) { f in
@@ -1499,9 +1532,10 @@ struct ContentView: View {
     /// Connected sources by DISCOVERY CHANNEL, e.g. "4 ed2k / 2 kad" - which
     /// channel is actually feeding this transfer. Invisible otherwise, and it is
     /// the first question when one file flies and another crawls. Channels with
-    /// no sources are omitted rather than shown as zeros, and the whole badge
-    /// disappears when nothing is connected, so a stalled row stays quiet
-    /// instead of asserting "0 ed2k".
+    /// no sources are omitted rather than shown as zeros.
+    ///
+    /// When NOTHING is connected it falls back to describing the POOL instead of
+    /// going quiet, because silence there was unreadable - see `idlePool`.
     private func sourceOrigins(_ dl: DownloadInfo) -> String? {
         var parts: [String] = []
         if dl.sourcesServer > 0 { parts.append("\(dl.sourcesServer) ed2k") }
@@ -1510,7 +1544,58 @@ struct ContentView: View {
         // naming it "sx" keeps the badge honest rather than folding peer-learned
         // sources into the server count.
         if dl.sourcesExchange > 0 { parts.append("\(dl.sourcesExchange) sx") }
-        return parts.isEmpty ? nil : parts.joined(separator: " / ")
+        return parts.isEmpty ? idlePool(dl) : parts.joined(separator: " / ")
+    }
+
+    /// "VPN" in blue capitals inside a square outline - the same shape iPadOS
+    /// puts in its own status bar, so it reads as the familiar thing rather than
+    /// as padMule inventing an icon.
+    ///
+    /// Deliberately NOT a claim of safety. It says a tunnel interface is up (see
+    /// `NetworkWatcher.vpnIsUp` for the limits); padMule's real leak protection
+    /// is the public-address-change guard, which watches what the NETWORK
+    /// reports back rather than a local interface name.
+    private var vpnBadge: some View {
+        Text("VPN")
+            .font(.system(size: 11, weight: .bold, design: .rounded))
+            .kerning(0.5)
+            .foregroundStyle(Color.vpnBlue)
+            .padding(.horizontal, 4)
+            .padding(.vertical, 1)
+            .overlay(
+                RoundedRectangle(cornerRadius: 3)
+                    .stroke(Color.vpnBlue, lineWidth: 1.5)
+            )
+            .accessibilityLabel("VPN active")
+    }
+
+    /// What a row with ZERO connected sources should say.
+    ///
+    /// This used to say nothing at all, and the blank was the problem: "no
+    /// sources exist" and "sources exist and not one can be reached" are
+    /// opposite situations with opposite responses, and both rendered as an
+    /// empty line under a 0% progress bar. On 2026-08-05 a 312 MB file sat at
+    /// Zero KB for ten minutes while its own search row read "15 srcs (14 full)"
+    /// and five siblings ran at hundreds of KB/s - nothing on the transfer row
+    /// could account for the difference.
+    ///
+    /// The LowID split is the part that actually explains it. A LowID source is
+    /// dropped from the dial pool outright (`PeerSource::from_found` - it cannot
+    /// accept an incoming connection) and can only reach us by being poked
+    /// through the server, so "12 awaiting callback" is a completely different
+    /// prognosis from "12 sources we are dialing" while looking identical.
+    private func idlePool(_ dl: DownloadInfo) -> String? {
+        ContentView.idlePoolLabel(found: dl.sourcesFound, callback: dl.sourcesCallback)
+    }
+
+    /// The rule alone, so the three branches can be tested. They are the whole
+    /// point of the line and each one means something different to the user.
+    static func idlePoolLabel(found: UInt32, callback: UInt32) -> String? {
+        if found == 0 && callback == 0 { return "no sources found" }
+        var parts: [String] = []
+        if found > 0 { parts.append("0 of \(found) connected") }
+        if callback > 0 { parts.append("\(callback) awaiting callback") }
+        return parts.joined(separator: ", ")
     }
 
     /// Statuses that must have been sampled before the gap is worth showing.
@@ -1708,6 +1793,14 @@ struct ContentView: View {
 /// that function's own doc always claimed it did ("solid tint with white text").
 extension Color {
     static let bannerBlue = Color(red: 0x00 / 255.0, green: 0x00 / 255.0, blue: 0x66 / 255.0)
+
+    /// The VPN badge blue. NOT `bannerBlue` (#000066): that navy is chosen to
+    /// carry white text on a filled bar, and as a thin stroke plus 11pt letters
+    /// on the toolbar's light background it reads as near-black. This is a
+    /// legible mid-blue for the badge's opposite job - dark ink on a light
+    /// ground. It is also the one padMule colour that must stay recognisable in
+    /// BOTH appearances now that Dark Mode exists.
+    static let vpnBlue = Color(red: 0x00 / 255.0, green: 0x66 / 255.0, blue: 0xCC / 255.0)
 }
 
 /// The hex hash uniquely identifies a hit - enough for SwiftUI's item-based sheet.
