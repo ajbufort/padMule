@@ -219,6 +219,11 @@ pub struct DownloadInfo {
     /// this. Conservative by construction - see `Download::part_availability`.
     pub parts_needed: u64,
     pub parts_unavailable: u64,
+    /// How many peer statuses `parts_unavailable` is drawn from - the SAMPLE
+    /// SIZE. That count only means "the swarm lacks these parts" in proportion
+    /// to this; from one source it means "the one peer we found lacks them".
+    /// Carried so the UI can say so rather than overstate.
+    pub part_status_reports: u32,
 }
 
 /// One complete file we are serving to peers (the shared library).
@@ -732,6 +737,7 @@ impl MuleEngine {
                     sources_exchange: origins.2,
                     parts_needed: parts.0,
                     parts_unavailable: parts.1,
+                    part_status_reports: parts.2,
                 });
             }
             out
