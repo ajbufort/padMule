@@ -1579,7 +1579,7 @@ struct ContentView: View {
         }
         if let err = model.bootError {
             banner("Engine failed: " + err, systemImage: "exclamationmark.triangle", tint: .red) {
-                model.bootError = nil
+                model.clearBootError()
             }
         }
         // Boot takes 12-30s and EVERY control silently no-ops until it finishes.
