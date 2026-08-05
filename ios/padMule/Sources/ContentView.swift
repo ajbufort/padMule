@@ -1475,6 +1475,13 @@ struct ContentView: View {
                     Text(origins)
                         .accessibilityLabel("Sources: \(origins)")
                 }
+                // Orange, because unlike the other numbers on this row it is not
+                // progress - it is the reason there may not BE any.
+                if let gap = missingParts(dl) {
+                    Text(gap)
+                        .foregroundStyle(.orange)
+                        .accessibilityLabel(gap)
+                }
             }
             .font(.caption)
             .foregroundStyle(.secondary)
@@ -1500,6 +1507,21 @@ struct ContentView: View {
         // sources into the server count.
         if dl.sourcesExchange > 0 { parts.append("\(dl.sourcesExchange) sx") }
         return parts.isEmpty ? nil : parts.joined(separator: " / ")
+    }
+
+    /// "3 parts nobody has" - the parts still needed that NO source we have
+    /// talked to was ever seen holding.
+    ///
+    /// This is the difference between a slow tail and an impossible one, which
+    /// look identical on a row that reads "90%, 86 sources, not moving": either
+    /// padMule is failing to ASK for the remainder, or the swarm does not HAVE
+    /// it. Shown only when non-zero, and only once at least one source has
+    /// reported - before that every part is trivially "unavailable" and saying
+    /// so would be alarming nonsense on a download that has merely just started.
+    private func missingParts(_ dl: DownloadInfo) -> String? {
+        guard dl.partsUnavailable > 0, sourceOrigins(dl) != nil else { return nil }
+        let n = dl.partsUnavailable
+        return n == 1 ? "1 part nobody has" : "\(n) parts nobody has"
     }
 
     private func bytes(_ n: UInt64) -> String {
