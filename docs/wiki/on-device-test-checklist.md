@@ -86,6 +86,21 @@ confirmation that a NEW build actually installed (nothing shows a build sha -
 20. **Servers on open** - the server list loads at APP open (not tab open), and
     the Status/Servers screens both name a connected server "Name (ip:port)".
     Stop is the FIRST trailing toolbar icon.
+21. **Build row** - Settings > This device > **Build** reads `1.0 (<sha>)` and
+    is selectable. This is how an install is confirmed; do NOT go back to
+    spotting a UI change (row 8by).
+22. **Appearance / Dark Mode** - first section in Settings. padMule starts LIGHT
+    regardless of the iPad's system appearance, and only goes dark if the switch
+    is on. Flip it and the whole app repaints, sheets included; flip the iPad's
+    own appearance and padMule must NOT follow.
+23. **VPN badge** - blue `VPN` in a square outline, upper-left toolbar, present
+    only while a tunnel is up. **Check it against the iPadOS status-bar VPN
+    badge** - that is the ground truth, and the detection is a heuristic
+    ([[padmule-vpn-airvpn]]). Drop the tunnel and a warning dialog should
+    appear; it says sharing was NOT paused, which is deliberate and true.
+24. **Idle transfer row** - a download with no connected sources now says which
+    kind of nothing it is: "no sources found", or "0 of N connected, M awaiting
+    callback". A blank line there is the bug row 8bz fixed.
 
 ## Related
 

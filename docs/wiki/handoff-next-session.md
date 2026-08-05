@@ -3,11 +3,12 @@
 Updated: 2026-08-05, after the reanalysis + serve-side rotation pass.
 
 Living doc - replace it wholesale next time. Full narrative: [[build-progress]]
-rows 8bt-8by and the [[log]] entries for 2026-08-04 and 2026-08-05.
+rows 8bt-8bz and the [[log]] entries for 2026-08-04 and 2026-08-05.
 
 ## State of the tree
 
-- **Gate**: 622 Rust tests, clippy `-D warnings` clean, fmt clean, ASCII clean.
+- **Gate**: 624 Rust tests + 23 Swift simulator tests, clippy `-D warnings`
+  clean, fmt clean, ASCII clean.
 - **YOU ARE ON BRANCH `fetch-funnel`, NOT main**, and nothing is merged. Decide
   that first. History is LINEAR across 390+ commits and must stay that way
   (`gh pr merge --rebase`). Do not trust prose for counts - run
@@ -17,14 +18,15 @@ rows 8bt-8by and the [[log]] entries for 2026-08-04 and 2026-08-05.
   passes no upload gate and its fixture is 300KB with one downloader, so it
   never drives the slot rotation (8by). A green oracle proves only the path it
   drives - the third time that has mattered.
-- **Latest IPA delivered: `d24e88d`** (2026-08-05, CI run 30979781242), current
-  with the branch. iPadOS 26.6. Cert lapses ~2026-08-12.
+- **Latest IPA delivered: `d24e88d`** (2026-08-05, CI run 30979781242). Now
+  ONE code commit behind (`0ca36fb`, row 8bz) - Anthony asked for no rebuild
+  yet. iPadOS 26.6. Cert lapses ~2026-08-12.
 - **The device can now name its own build.** CI stamps the git short sha into
   `CFBundleVersion`, and Settings > This device > **Build** reads
   "1.0 (d24e88d)", selectable. Verified in the delivered artifact. Confirm an
   install by READING that row, not by spotting a UI change.
 - Both iOS workflows re-run green on this branch: the .ipa build and the Swift
-  simulator tests (21 tests). The Swift tests are the ONLY type-check available
+  simulator tests (23 tests). The Swift tests are the ONLY type-check available
   from this box - dispatch `ios-test.yml` after any Swift edit.
 - IPAs go to `/mnt/c/Users/ajbuf/Downloads/` as
   `padMule-INSTALL-THIS-unsigned-<sha>.ipa` ([[padmule-ipa-delivery]]).
@@ -42,7 +44,7 @@ error value can report.** Both FFI methods are LOCK-FREE by design: a stall is
 exactly when the engine is busy. Counters are cumulative since launch, so the
 workflow is **reset -> reproduce -> read**.
 
-**2. "N parts missing from all M sources"** on each transfer row. Parts still
+**2. "N parts missing from all M peer reports"** on each transfer row. Parts still
 needed that not one sampled peer offered. Separates a SLOW tail from an
 IMPOSSIBLE one - identical on a row reading "90%, 86 sources, not moving".
 Gated at 4 sampled statuses; the sample size is in the text on purpose.
@@ -96,23 +98,27 @@ Re-measuring on another path means raising `fetch::CONNECT_TIMEOUT` first.
 10. **(2026-08-05) Two instrument corrections** - `skipped: fetch already
     running` could not observe a stuck flag (see instrument 3 above), and the
     parts badge said "sources" for a count of SESSIONS. Row 8by.
+11. **(2026-08-05) An idle row now says WHICH kind of nothing it is** - "no
+    sources found" vs "0 of 3 connected, 12 awaiting callback". Found by Anthony
+    on glass, not by a code read. Row 8bz.
+12. **(2026-08-05) Kad is no longer skipped on a useless server answer**, plus
+    **Dark Mode** (Appearance, first in Settings, light unless chosen) and a
+    provider-agnostic **VPN badge + drop warning**. Row 8bz.
 
 ## OPEN - named as open, not explained
 
-1. **The stall whose blocker a RESTART clears - now NARROWED to the ban set.**
-   Anthony's clue: a file sat at 85%, the app was restarted, it finished. That
-   rules out disk, network and the swarm and leaves in-memory state. Of the two
-   candidate gates, the per-download **ban set** is the live hypothesis: a plain
-   `HashSet<IpAddr>`, extended on corruption, **never lifted anywhere in the
-   code** and never persisted, consulted BEFORE dialing - so a download that
-   banned its handful of sources makes ZERO dials while still listing them.
-   `skipped: source BANNED` is correctly placed to catch it. The **`fetching`
-   flag** is the weaker candidate on two counts: `FetchGuard` releases it on any
-   task exit including unwind and `download_file` is bounded on every axis, so a
-   stuck flag should be unreachable - and that is an ARGUMENT, which is why the
-   `fetches in flight` gauge now exists to refute it. Do not read `spawn raced a
-   live fetch` as evidence either way. A restart clears the ban set too, so the
-   counter needs a FRESH stall to develop before it means anything.
+1. **The stall whose blocker a RESTART clears. THE BAN-SET NARROWING WAS
+   REFUTED BY MEASUREMENT (2026-08-05).** This entry said the per-download ban
+   set was the live hypothesis, on the strength of a code read: a HashSet never
+   lifted anywhere, never persisted, consulted before dialing. The device funnel
+   then read **`skipped: source BANNED` = 0** across 2719 dials and ~1235
+   sessions. It never fired. The reasoning was clean and the answer was still
+   no - which is exactly why the counter was placed there. Do not re-adopt the
+   ban set without new evidence. `spawn raced a live fetch` = 0 too, as expected
+   (see instrument 3). **What the same reading DID surface: `fetches in flight`
+   = 3 against SIX queued downloads**, so three downloads had no live fetch task
+   at all. That is the live lead now - a download whose fetch task has ended and
+   which the retry sweep is not re-driving. Row 8ca.
 2. **"No completions" is PARTLY answered, and the answer was the swarm** - the
    two non-moving files were exactly the two carrying the parts-missing badge,
    one at Zero KB with 24 parts, another capped near 50% by 13 parts (~120MB).
@@ -128,14 +134,14 @@ Re-measuring on another path means raising `fetch::CONNECT_TIMEOUT` first.
 6. ~~padMule's serve side never rotates an upload slot.~~ **CLOSED 2026-08-05,
    row 8by** - see shipped item 9. Note the follow-on: the rotation has never
    run live either, for the same reason item 4 has not.
-7. Kad gave ZERO sources across 25 dev-box downloads but DID on device. **Partly
-   self-inflicted, and unmeasured:** since the Get fix, `find_sources` returns on
-   the first NON-EMPTY server answer, so the Kad arm is skipped entirely whenever
-   the server names even one source (all three callers pass
-   `stop_when_server_answers = true`). The ~15s -> ~200ms win is measured; the
-   narrower source pool is NOT, and it sits directly against "downloads run short
-   of live sources". A count threshold, or letting the Kad arm land into the
-   mid-sweep `take_sx_sources` channel that already exists, would keep both.
+7. ~~Kad gave ZERO sources...~~ **CONFIRMED then FIXED 2026-08-05 (row 8bz).**
+   It was partly self-inflicted: `find_sources` skipped the Kad arm on ANY
+   non-empty server answer, and a mostly-LowID swarm answers with a healthy
+   count that yields almost nothing dialable. Confirmed live first - six
+   downloads across two samples, every badge `ed2k` or `sx`, not one `kad`. The
+   gate is now on DIALABLE sources with the threshold tied by test to the Normal
+   worker-pool width. STILL OPEN: whether Kad now actually contributes on
+   device. Watch for a `kad` badge on the next build.
 8. Status scalars lag behind `Engine::search`'s ~20s `&mut self`; Portability
    Tier 2; Settings Tier 1/2.
 9. **Housekeeping, verified safe 2026-08-05:** ELEVEN remote branches (not ten)
@@ -143,6 +149,50 @@ Re-measuring on another path means raising `fetch::CONNECT_TIMEOUT` first.
    patch-equivalent for all of them, including `worktree-wave11-aich` - so they
    and the locked worktree at `.claude/worktrees/wave11-aich` can be deleted.
    `main` is also 4 commits ahead of `origin/main`, unpushed.
+
+## LIVE STATE at close (2026-08-05, build d24e88d on the iPad)
+
+- **Best throughput padMule has ever shown: ~990 MB in 23 minutes across six
+  downloads, ~718 KB/s sustained** (measured from timestamped screenshots, not
+  the Stats screen). Against 106 KB/s on the 2026-08-04 device run.
+- **THE FUNNEL WAS CAPTURED, and it names the bottleneck (row 8ca):**
+
+      slot ACCEPTED              959
+      accepted, no block to take 722     <- 75% of every slot we win
+      requested blocks           237
+      DELIVERED bytes            222
+
+  padMule wins an upload slot - the scarcest thing on eD2k - and has nothing to
+  ask for three times in four. The arithmetic closes exactly (722+237=959), and
+  every OTHER stage is healthy: 42% of dials handshake (vs 5% in the 8bt
+  baseline), 78% of slot asks are accepted, 94% of block requests deliver. There
+  is now exactly ONE lossy stage and it is on padMule's side of the wire.
+  **THE NEXT PIECE OF WORK IS HERE**, not in the swarm.
+- Also live at close: an ebook stuck at 23.2/25.9 MB (89%) for 23 minutes with 4
+  handshaked sources and no parts-missing badge - 2.7 MB remaining against the
+  2.11 MB that four workers x three blocks can hold reserved.
+- `100.avi` sat at Zero KB throughout with 15 server-advertised sources. Row
+  8bz's badge should now say whether they are unreachable or LowID-only; that
+  needs the next build to answer.
+
+## DEVICE TOOLING NOTE
+
+A WebDriverAgent runner and a `usbmux forward 8100 8100` were left RUNNING on
+purpose. **Starting a session is the disruptive act, not holding one** - reuse
+the live one rather than cycling it. Session-free reads (`pymobiledevice3
+developer dvt screenshot`, `GET /source`) disturb nothing and are what the whole
+2026-08-05 observation session ran on.
+
+## THE TOP NEXT ACTION
+
+**`accepted, no block to take` = 722 of 959.** Measured, arithmetic-clean, and
+the only lossy stage left. Do not theorise first - `take_blocks` is where to
+look, and the two candidate mechanisms are already named: the 2.11 MB
+reservation ceiling per download (4 workers x 3 blocks x 184320), and the 898
+INBOUND sessions that are each offered every unfinished download in turn and
+compete for the same pool. Row 8bt proved the mechanism real but sized its band
+too narrow to explain the rate; the concurrency is the part that was never
+counted. A fix should be measured by this line moving, on this instrument.
 
 ## Discipline this session actually paid for
 
