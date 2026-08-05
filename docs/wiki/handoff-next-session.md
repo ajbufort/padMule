@@ -18,16 +18,18 @@ rows 8bt-8bz and the [[log]] entries for 2026-08-04 and 2026-08-05.
   passes no upload gate and its fixture is 300KB with one downloader, so it
   never drives the slot rotation (8by). A green oracle proves only the path it
   drives - the third time that has mattered.
-- **Latest IPA delivered: `d24e88d`** (2026-08-05, CI run 30979781242). Now
-  ONE code commit behind (`0ca36fb`, row 8bz) - Anthony asked for no rebuild
-  yet. iPadOS 26.6. Cert lapses ~2026-08-12.
+- **Latest IPA delivered: `92a8f45`** (2026-08-05, CI run 30984990314), current
+  with the branch and carrying the RESERVATION-LEAK FIX (8cb). Verified by
+  reading the plist out of the delivered artifact, not from the CI log. iPadOS 26.6. Cert lapses ~2026-08-12.
 - **The device can now name its own build.** CI stamps the git short sha into
   `CFBundleVersion`, and Settings > This device > **Build** reads
   "1.0 (d24e88d)", selectable. Verified in the delivered artifact. Confirm an
   install by READING that row, not by spotting a UI change.
 - Both iOS workflows re-run green on this branch: the .ipa build and the Swift
-  simulator tests (23 tests). The Swift tests are the ONLY type-check available
-  from this box - dispatch `ios-test.yml` after any Swift edit.
+  simulator tests (24 tests). The Swift tests are the ONLY type-check available
+  from this box - dispatch `ios-test.yml` after any Swift edit, and **verify
+  `gh run view --json headSha` matches local HEAD**: a dispatch once raced the
+  push and reported success for the PREVIOUS commit (row 8cc).
 - IPAs go to `/mnt/c/Users/ajbuf/Downloads/` as
   `padMule-INSTALL-THIS-unsigned-<sha>.ipa` ([[padmule-ipa-delivery]]).
 
