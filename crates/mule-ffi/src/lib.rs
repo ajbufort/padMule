@@ -212,6 +212,13 @@ pub struct DownloadInfo {
     pub sources_server: u32,
     pub sources_kad: u32,
     pub sources_exchange: u32,
+    /// Parts still needed, and how many of those NO source has ever been seen
+    /// holding. The pair answers what a stalled near-complete download otherwise
+    /// cannot: is padMule failing to ASK for the tail, or does the swarm not
+    /// HAVE it? Opposite bugs, opposite fixes, and identical on screen without
+    /// this. Conservative by construction - see `Download::part_availability`.
+    pub parts_needed: u64,
+    pub parts_unavailable: u64,
 }
 
 /// One complete file we are serving to peers (the shared library).
@@ -707,6 +714,7 @@ impl MuleEngine {
                 let have = size - dl.missing().await;
                 let (rating, has_comment) = dl.rating_summary().await;
                 let origins = dl.source_origins().await;
+                let parts = dl.part_availability().await;
                 out.push(DownloadInfo {
                     hash: hex::encode(dl.hash().await),
                     name: dl.name().await,
@@ -722,6 +730,8 @@ impl MuleEngine {
                     sources_server: origins.0,
                     sources_kad: origins.1,
                     sources_exchange: origins.2,
+                    parts_needed: parts.0,
+                    parts_unavailable: parts.1,
                 });
             }
             out

@@ -582,6 +582,10 @@ pub async fn download_file(
                     // Skip a source banned for delivering a corrupt part to this
                     // file (per-source poisoning defense, multi_source::localize_corruption).
                     if dl.is_banned(&src.addr) {
+                        // Counted: the ban set is in-memory and never expires,
+                        // so a download can quietly ban its way to zero usable
+                        // sources and look identical to one with none.
+                        crate::stats::note_skipped_banned();
                         continue;
                     }
                     tried += 1;

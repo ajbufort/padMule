@@ -111,6 +111,22 @@ funnel! {
     F_REQ       => note_requested / requested,    "requested blocks";
     F_DELIVERED => note_delivered / delivered,    "DELIVERED bytes";
     F_REVOKED   => note_revoked / revoked,        "  slot REVOKED (0x57)";
+    // WHY A RESTART UNSTICKS A STALLED DOWNLOAD. Anthony's observation: a file
+    // sat at 85% for a long time, the app was restarted, and it finished. That
+    // narrows the blocker to in-memory state a restart clears, and there are
+    // exactly two such gates on the dial path - both counted here so the next
+    // stall says which, instead of being argued about.
+    //
+    // `skipped BANNED`: the per-download corruption ban set is a plain
+    // in-memory HashSet, never persisted, and `is_banned` is consulted BEFORE
+    // dialing - so a download whose handful of sources all got banned makes ZERO
+    // dials while still listing them, until a restart forgets the bans.
+    //
+    // `fetch already running`: the retry sweep skips any download whose
+    // `fetching` flag is set, so a flag that never clears means that download is
+    // never re-driven again for the life of the process.
+    F_BANSKIP   => note_skipped_banned / skipped_banned, "skipped: source BANNED";
+    F_FETCHBUSY => note_fetch_busy / fetch_busy,  "skipped: fetch already running";
 }
 
 /// Opcodes a wait loop read while it was waiting for something else, tallied by
