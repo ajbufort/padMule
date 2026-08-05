@@ -43,11 +43,13 @@ use crate::sources::{
 use crate::transfer::{
     build_accept_upload, build_aich_answer, build_aich_answer_failure, build_aich_file_hash_ans,
     build_file_desc, build_file_req_ans_no_fil, build_file_status_complete, build_hashset_answer,
-    build_multipacket_answer, build_queue_ranking, build_req_filename_answer, build_sending_part,
-    parse_aich_request, parse_request_parts, EMBLOCKSIZE, OP_AICHFILEHASHREQ, OP_AICHREQUEST,
-    OP_HASHSETREQUEST, OP_MULTIPACKET, OP_MULTIPACKET_EXT, OP_REQUESTFILENAME, OP_REQUESTPARTS,
-    OP_REQUESTPARTS_I64, OP_SETREQFILEID, OP_STARTUPLOADREQ,
+    build_multipacket_answer, build_out_of_part_reqs, build_queue_ranking,
+    build_req_filename_answer, build_sending_part, parse_aich_request, parse_request_parts,
+    EMBLOCKSIZE, OP_AICHFILEHASHREQ, OP_AICHREQUEST, OP_HASHSETREQUEST, OP_MULTIPACKET,
+    OP_MULTIPACKET_EXT, OP_REQUESTFILENAME, OP_REQUESTPARTS, OP_REQUESTPARTS_I64, OP_SETREQFILEID,
+    OP_STARTUPLOADREQ,
 };
+use crate::upload_queue::should_kick;
 
 /// Re-asking for the SAME file sooner than this is an "aggressive" request
 /// (eMule `MIN_REQUESTTIME`, opcodes.h:116 = MIN2MS(10) = 10 minutes).
@@ -774,10 +776,18 @@ where
     };
     // The file this peer is after, once it names one.
     let mut file: Option<SharedFile> = None;
-    // The upload slot, held for the whole session once granted (immediately if a
-    // slot is free, or after queueing). Kept alive here so dropping it on return
-    // frees the slot for the next waiter.
+    // The upload slot. Kept alive here so dropping it on return frees the slot
+    // for the next waiter. It is NOT held for the whole connection: once the
+    // session cap is passed and somebody is waiting, it is revoked and this peer
+    // goes back on the queue (see the rotation in OP_REQUESTPARTS).
     let mut permit: Option<SlotGuard> = None;
+    // The current slot SESSION: when it was granted and how many file bytes have
+    // gone out on it. Both reset on every grant, because upstream's counters are
+    // per-slot rather than per-connection (`GetUpStartTimeDelay` /
+    // `GetSessionUp`, aMule UploadQueue.cpp:601-603) - a peer that waits its turn
+    // again earns a fresh session, it does not resume the spent one.
+    let mut slot_since = std::time::Instant::now();
+    let mut slot_bytes = 0u64;
     let mut pending = first;
     // Per-file request scoring for THIS connection (eMule AddRequestCount).
     let mut requests = RequestCounter::default();
@@ -1054,6 +1064,8 @@ where
                             // A slot was free (and nobody queued) - grant it now.
                             Some(guard) => {
                                 permit = Some(guard);
+                                slot_since = std::time::Instant::now();
+                                slot_bytes = 0;
                                 fs.write_packet(&build_accept_upload()).await?;
                             }
                             // At capacity: queue this peer by its CREDIT SCORE and
@@ -1079,6 +1091,8 @@ where
                                 match timeout(QUEUE_WAIT, waiter.granted()).await {
                                     Ok(guard) => {
                                         permit = Some(guard);
+                                        slot_since = std::time::Instant::now();
+                                        slot_bytes = 0;
                                         fs.write_packet(&build_accept_upload()).await?;
                                     }
                                     // Timed out: the waiter is dropped here, which
@@ -1124,10 +1138,75 @@ where
                         fs.write_packet(&build_sending_part(&f.hash, s, e, &data))
                             .await?;
                         crate::stats::add_uploaded(data.len() as u64);
+                        slot_bytes += data.len() as u64;
                         // Accrue what we gave this peer against its credit record
                         // (raises what it owes us, lowering its future queue score).
                         if let Some((cs, uh)) = &credit {
                             cs.add_uploaded(*uh, data.len() as u64, now_secs());
+                        }
+                    }
+                }
+                // THE SLOT IS UP - ROTATE IT. This is how an upload turn ENDS
+                // upstream, not an edge case: `CheckForTimeOver` trips at 10 MB
+                // or one hour and the client is removed from the upload list and
+                // sent OP_OUTOFPARTREQS, which re-queues it (eMule 0.50a
+                // UploadClient.cpp:722-725 -> SendOutOfPartReqsAndAddToWaitingQueue
+                // :767-782; aMule 3.0.1 UploadQueue.cpp:598-606).
+                //
+                // padMule never called `should_kick`, so a granted slot was held
+                // for the whole connection: the first peer to win one kept it,
+                // and everybody else timed out at QUEUE_WAIT and was closed. That
+                // is the mirror image of the download-side defect in row 8bt, and
+                // it also suppresses the credit padMule earns on the network -
+                // which is what buys its own place in other clients' queues.
+                //
+                // ONLY WHEN SOMEBODY IS WAITING. eMule checks this first and
+                // returns false: "If we have nobody in the queue, do NOT remove
+                // the current uploads.. This will save some bandwidth and some
+                // unneeded swapping from upload/queue/upload" (UploadQueue.cpp:
+                // 804-807). aMule has no such guard and simply re-promotes the
+                // client it just kicked; we follow eMule, because revoking into
+                // an empty queue is a round trip to hand the slot straight back.
+                if let (Some(g), true) = (gate, permit.is_some()) {
+                    let held_secs = slot_since.elapsed().as_secs().min(u32::MAX as u64) as u32;
+                    // padMule has no friend slots, so a peer is never exempt.
+                    if should_kick(held_secs, slot_bytes, false) && g.waiting() > 0 {
+                        fs.write_packet(&build_out_of_part_reqs()).await?;
+                        // Free the slot BEFORE queueing, both so the best waiter
+                        // can take it and because queueing behind a slot we are
+                        // ourselves holding would deadlock until QUEUE_WAIT.
+                        // `take` rather than `= None`: dropping the guard IS the
+                        // release, and spelling it as a drop says so.
+                        drop(permit.take());
+                        // Clear the re-send dedup, exactly as upstream does:
+                        // `RemoveFromUploadQueue` calls `ClearUploadBlockRequests`
+                        // (UploadQueue.cpp:750), which empties m_DoneBlocks_list
+                        // (UploadClient.cpp:845-856), and only then is 0x57 sent.
+                        // Required, not cosmetic: padMule's own downloader
+                        // RELEASES its in-flight blocks on 0x57 and re-requests
+                        // them once re-granted, so a stale dedup would answer
+                        // those with silence and hang the peer for its full 45s.
+                        recently_sent.clear();
+                        let score_key = leecher_score_key(&credit, &sec);
+                        let Some(waiter) = g.enqueue(score_key) else {
+                            // Queue filled while we were uploading - same
+                            // identity-independent refusal as the ask path.
+                            return Ok(());
+                        };
+                        let rank = (waiter.rank).min(u16::MAX as usize) as u16;
+                        // The rank is not unsolicited: upstream's re-queue ends in
+                        // `SendRankingInfo` on this very path (AddClientToQueue,
+                        // UploadQueue.cpp:682-694), and a revoked peer that is
+                        // told nothing cannot know whether to wait or leave.
+                        fs.write_packet(&build_queue_ranking(rank)).await?;
+                        match timeout(QUEUE_WAIT, waiter.granted()).await {
+                            Ok(guard) => {
+                                permit = Some(guard);
+                                slot_since = std::time::Instant::now();
+                                slot_bytes = 0;
+                                fs.write_packet(&build_accept_upload()).await?;
+                            }
+                            Err(_) => return Ok(()),
                         }
                     }
                 }
@@ -2649,5 +2728,309 @@ mod tests {
         drop(fs);
         up.await.unwrap();
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A leecher harness for the slot-rotation tests: connect, name the file,
+    /// ask for a slot, and return the stream plus the opcode we were answered
+    /// with (OP_ACCEPTUPLOADREQ = granted, OP_QUEUERANKING = queued).
+    async fn ask_for_slot(
+        addr: std::net::SocketAddr,
+        user_hash: [u8; 16],
+        hash: [u8; 16],
+    ) -> (crate::framed::FramedStream<tokio::net::TcpStream>, u8) {
+        use crate::transfer::{build_request_filename_ext, build_start_upload_req};
+        let me = HelloInfo::baseline(user_hash, 0x0A00_0001, 4663, 4673, "leech");
+        let (_p, mut fs) = connect_peer(addr, &me).await.unwrap();
+        fs.write_packet(&build_request_filename_ext(&hash))
+            .await
+            .unwrap();
+        let _ = fs.read_packet_unpacked().await.unwrap(); // filename answer
+        fs.write_packet(&build_start_upload_req(&hash))
+            .await
+            .unwrap();
+        let r = fs.read_packet_unpacked().await.unwrap();
+        (fs, r.opcode)
+    }
+
+    /// Pull blocks like a real downloader - three at a time, topping up as they
+    /// land - until the server revokes the slot or the file runs out. Returns
+    /// `(bytes delivered, revoked?)`.
+    async fn pull_until_revoked(
+        fs: &mut crate::framed::FramedStream<tokio::net::TcpStream>,
+        hash: [u8; 16],
+        size: u64,
+    ) -> (u64, bool) {
+        use crate::transfer::{
+            build_request_parts, parse_sending_part, OP_OUTOFPARTREQS, OP_SENDINGPART,
+            STANDARD_BLOCKS_REQUEST,
+        };
+        use mule_proto::EMBLOCKSIZE;
+        let mut next = 0u64;
+        let mut delivered = 0u64;
+        let mut outstanding = 0usize;
+        for _ in 0..1000 {
+            if outstanding == 0 {
+                if next >= size {
+                    break;
+                }
+                let mut blocks = Vec::new();
+                for _ in 0..STANDARD_BLOCKS_REQUEST {
+                    if next >= size {
+                        break;
+                    }
+                    let e = (next + EMBLOCKSIZE).min(size);
+                    blocks.push((next, e));
+                    next = e;
+                }
+                outstanding = blocks.len();
+                fs.write_packet(&build_request_parts(&hash, &blocks))
+                    .await
+                    .unwrap();
+            }
+            let pkt = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                fs.read_packet_unpacked(),
+            )
+            .await
+            .expect("the server went quiet instead of answering")
+            .unwrap();
+            match pkt.opcode {
+                OP_SENDINGPART => {
+                    let p = parse_sending_part(&pkt.payload, false).unwrap();
+                    delivered += p.data.len() as u64;
+                    outstanding -= 1;
+                }
+                OP_OUTOFPARTREQS => return (delivered, true),
+                other => panic!("unexpected opcode 0x{other:02X} while pulling blocks"),
+            }
+        }
+        (delivered, false)
+    }
+
+    /// Build a shared-file fixture just past the session byte cap, so one
+    /// leecher can cross it.
+    fn oversize_fixture(tag: &str) -> (Arc<Vec<SharedFile>>, [u8; 16], u64, PathBuf) {
+        use mule_proto::EMBLOCKSIZE;
+        // 60 blocks (~10.5 MB): past SESSION_MAX_BYTES, and still under
+        // DEDUP_DEPTH so `recently_sent` never evicts an entry on its own -
+        // any skipped re-send in these tests is the rotation's doing, not the
+        // FIFO's.
+        let size = 60 * EMBLOCKSIZE;
+        assert!(size > crate::upload_queue::SESSION_MAX_BYTES);
+        let data = vec![7u8; size as usize];
+        let hash = ed2k_hash(&data);
+        let path = fixture_file(tag, 0);
+        std::fs::write(&path, &data).unwrap();
+        let lib = Arc::new(vec![SharedFile {
+            hash,
+            size,
+            name: b"big.bin".to_vec(),
+            part_hashes: vec![],
+            path: path.clone(),
+            rating: 0,
+            comment: String::new(),
+            aich_root: None,
+        }]);
+        (lib, hash, size, path)
+    }
+
+    /// Spawn a server that serves `n` gated connections.
+    fn spawn_gated_server(
+        listener: Arc<TcpListener>,
+        library: Arc<Vec<SharedFile>>,
+        gate: Arc<UploadGate>,
+        n: usize,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            for _ in 0..n {
+                let me = HelloInfo::baseline([0xBB; 16], 0, 4662, 4672, "seed");
+                let Ok((_peer, mut fs)) = accept_peer(&listener, &me).await else {
+                    return;
+                };
+                let (library, gate) = (Arc::clone(&library), Arc::clone(&gate));
+                tokio::spawn(async move {
+                    let _ = serve_shared(
+                        &mut fs,
+                        &library,
+                        None,
+                        Some(&gate),
+                        0,
+                        ServeSession::default(),
+                    )
+                    .await;
+                });
+            }
+        })
+    }
+
+    /// THE SLOT MUST ROTATE. Both authorities revoke an upload slot the moment
+    /// `CheckForTimeOver()` trips - 10 MB in the session or one hour - by
+    /// sending OP_OUTOFPARTREQS and putting the peer straight back on the
+    /// queue (eMule 0.50a UploadClient.cpp:722-725 -> :767-782 ->
+    /// UploadQueue.cpp AddClientToQueue :682-694; aMule 3.0.1
+    /// UploadQueue.cpp:598-606).
+    ///
+    /// padMule granted a slot and held it for the whole connection: nothing
+    /// ever called `should_kick`, so the first peer to win a slot kept it and
+    /// every waiter timed out at QUEUE_WAIT and was closed. This is the mirror
+    /// image of the download-side bug fixed in build-progress row 8bt.
+    #[tokio::test]
+    async fn the_slot_rotates_past_the_session_cap_when_a_peer_is_waiting() {
+        use crate::transfer::{OP_ACCEPTUPLOADREQ, OP_QUEUERANKING};
+        let (library, hash, size, path) = oversize_fixture("rotate");
+        let gate = Arc::new(UploadGate::new(1, 32));
+        let listener = Arc::new(TcpListener::bind("127.0.0.1:0").await.unwrap());
+        let addr = listener.local_addr().unwrap();
+        let server = spawn_gated_server(Arc::clone(&listener), library, Arc::clone(&gate), 2);
+
+        // A takes the only slot; B is then queued behind it.
+        let (mut a, a_op) = ask_for_slot(addr, [0xA1; 16], hash).await;
+        assert_eq!(a_op, OP_ACCEPTUPLOADREQ, "the only slot was free");
+        let (mut b, b_op) = ask_for_slot(addr, [0xB1; 16], hash).await;
+        assert_eq!(b_op, OP_QUEUERANKING, "the slot is held, so B queues");
+        while gate.waiting() < 1 {
+            tokio::task::yield_now().await;
+        }
+
+        let (delivered, revoked) = pull_until_revoked(&mut a, hash, size).await;
+        assert!(
+            revoked,
+            "A held the slot for the whole file - no OP_OUTOFPARTREQS after {delivered} bytes"
+        );
+        assert!(
+            delivered > crate::upload_queue::SESSION_MAX_BYTES,
+            "revoked early, at {delivered} bytes"
+        );
+
+        // Re-queued, exactly as AddClientToQueue does: the revoke is followed by
+        // a fresh rank so the peer knows where it now stands.
+        let rank =
+            tokio::time::timeout(std::time::Duration::from_secs(10), a.read_packet_unpacked())
+                .await
+                .expect("no packet after the revoke")
+                .unwrap();
+        assert_eq!(
+            rank.opcode, OP_QUEUERANKING,
+            "the revoked peer must be told its new place"
+        );
+
+        // ...and the freed slot goes to the peer that was waiting for it.
+        let granted =
+            tokio::time::timeout(std::time::Duration::from_secs(10), b.read_packet_unpacked())
+                .await
+                .expect("B never got the rotated slot")
+                .unwrap();
+        assert_eq!(granted.opcode, OP_ACCEPTUPLOADREQ);
+
+        server.abort();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// ...and it must NOT rotate when nobody is waiting. eMule checks this
+    /// FIRST and returns false - "If we have nobody in the queue, do NOT remove
+    /// the current uploads.. This will save some bandwidth and some unneeded
+    /// swapping from upload/queue/upload" (UploadQueue.cpp:804-807). Revoking
+    /// into an empty queue costs a round trip to hand the slot straight back.
+    #[tokio::test]
+    async fn a_slot_is_never_revoked_while_nobody_is_waiting() {
+        use crate::transfer::OP_ACCEPTUPLOADREQ;
+        let (library, hash, size, path) = oversize_fixture("norotate");
+        let gate = Arc::new(UploadGate::new(1, 32));
+        let listener = Arc::new(TcpListener::bind("127.0.0.1:0").await.unwrap());
+        let addr = listener.local_addr().unwrap();
+        let server = spawn_gated_server(Arc::clone(&listener), library, Arc::clone(&gate), 1);
+
+        let (mut a, a_op) = ask_for_slot(addr, [0xA2; 16], hash).await;
+        assert_eq!(a_op, OP_ACCEPTUPLOADREQ);
+        assert_eq!(gate.waiting(), 0, "nobody is queued");
+
+        let (delivered, revoked) = pull_until_revoked(&mut a, hash, size).await;
+        assert!(
+            !revoked,
+            "revoked with an empty queue after {delivered} bytes - pure churn"
+        );
+        assert_eq!(delivered, size, "the whole file should have been served");
+
+        server.abort();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The rotation must also CLEAR the per-connection re-send dedup, and this
+    /// is not a padMule nicety - upstream does exactly the same thing.
+    /// `RemoveFromUploadQueue` calls `ClearUploadBlockRequests()`
+    /// (UploadQueue.cpp:750), which empties `m_DoneBlocks_list`
+    /// (UploadClient.cpp:845-856), and only THEN is OP_OUTOFPARTREQS sent.
+    ///
+    /// It matters because padMule's own downloader releases its in-flight
+    /// blocks on 0x57 and re-requests them once re-granted (`run_peer`, the
+    /// `bail_on_queue == false` arm). Without the clear, `recently_sent` would
+    /// answer those re-requests with silence and the peer would hang until its
+    /// 45s timeout - the very bug row 8bt fixed, re-introduced from the other
+    /// side.
+    #[tokio::test]
+    async fn a_rotated_peer_can_re_request_the_blocks_it_already_took() {
+        use crate::transfer::{
+            build_request_parts, parse_sending_part, OP_ACCEPTUPLOADREQ, OP_QUEUERANKING,
+            OP_SENDINGPART,
+        };
+        use mule_proto::EMBLOCKSIZE;
+        let (library, hash, size, path) = oversize_fixture("redup");
+        let gate = Arc::new(UploadGate::new(1, 32));
+        let listener = Arc::new(TcpListener::bind("127.0.0.1:0").await.unwrap());
+        let addr = listener.local_addr().unwrap();
+        let server = spawn_gated_server(Arc::clone(&listener), library, Arc::clone(&gate), 2);
+
+        let (mut a, _) = ask_for_slot(addr, [0xA3; 16], hash).await;
+        let (b, _) = ask_for_slot(addr, [0xB3; 16], hash).await;
+        while gate.waiting() < 1 {
+            tokio::task::yield_now().await;
+        }
+        let (_, revoked) = pull_until_revoked(&mut a, hash, size).await;
+        assert!(revoked);
+        let rank = a.read_packet_unpacked().await.unwrap();
+        assert_eq!(rank.opcode, OP_QUEUERANKING);
+
+        // B finishes and goes away, so A is granted the slot back.
+        drop(b);
+        let granted =
+            tokio::time::timeout(std::time::Duration::from_secs(10), a.read_packet_unpacked())
+                .await
+                .expect("A never got the slot back")
+                .unwrap();
+        assert_eq!(granted.opcode, OP_ACCEPTUPLOADREQ);
+
+        // Block 0 was served before the rotation. Ask for it AGAIN - which is
+        // exactly what a re-granted padMule downloader does - and it must come
+        // back rather than being deduped into silence.
+        //
+        // Read PAST any other block still arriving: `pull_until_revoked`
+        // pipelines the next batch before it reads the revoke, so that request
+        // is in flight across the rotation and is legitimately served under the
+        // new slot. Only block 0 answers the question this test asks.
+        let again = (0u64, EMBLOCKSIZE);
+        a.write_packet(&build_request_parts(&hash, &[again]))
+            .await
+            .unwrap();
+        let mut re_served = false;
+        for _ in 0..8 {
+            let pkt =
+                tokio::time::timeout(std::time::Duration::from_secs(10), a.read_packet_unpacked())
+                    .await
+                    .expect("the re-request was deduped into silence")
+                    .unwrap();
+            assert_eq!(pkt.opcode, OP_SENDINGPART);
+            let p = parse_sending_part(&pkt.payload, false).unwrap();
+            if (p.start, p.end) == again {
+                re_served = true;
+                break;
+            }
+        }
+        assert!(
+            re_served,
+            "a block served before the rotation was never re-served after it"
+        );
+
+        server.abort();
+        std::fs::remove_file(&path).ok();
     }
 }
