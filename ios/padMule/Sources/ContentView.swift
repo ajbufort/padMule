@@ -147,49 +147,7 @@ struct ContentView: View {
                 // never hunt for a feature).
                 functionStrip
 
-                // Global status banners - visible on every screen, and ALL of
-                // them closeable. The three driven by engine STATE (reconnect,
-                // sharing-paused, starting) cannot be cleared by clearing the
-                // state, so each carries its own "hidden" flag that resets when
-                // the condition next changes - dismissing means "I have read
-                // this", not "pretend it never happened".
-                if model.reconnecting && !hidReconnecting {
-                    banner("Reconnecting...", systemImage: "arrow.clockwise", tint: .orange) {
-                        hidReconnecting = true
-                    }
-                }
-                // Persistent (not just the one-shot alert above): the user may
-                // dismiss the alert and move to another screen, and sharing
-                // stays paused until they turn it back on - this keeps that
-                // state visible the whole time, same as the reconnect banner.
-                if model.sharingPausedForIpChange && !hidSharingPaused {
-                    banner(
-                        "Sharing paused: your public address changed. Turn sharing back on to clear this.",
-                        systemImage: "wifi.exclamationmark", tint: .orange
-                    ) { hidSharingPaused = true }
-                }
-                if let err = model.bootError {
-                    banner(
-                        "Engine failed: \(err)", systemImage: "exclamationmark.triangle", tint: .red
-                    ) { model.bootError = nil }
-                }
-                // Boot takes 12-30s and EVERY control silently no-ops until it
-                // finishes. Saying so is the difference between "starting" and
-                // "broken" - previously the app looked live and did nothing.
-                if !model.ready && model.bootError == nil && !hidStarting {
-                    banner(
-                        "Starting padMule... searching and downloading will work in a moment.",
-                        systemImage: "hourglass", tint: .orange
-                    ) { hidStarting = true }
-                }
-                // Action feedback stays global - it must appear where the user
-                // is. Server NEWS (MOTD, discovery results) is Servers-only; see
-                // EngineModel.serverNotice.
-                if let notice = model.notice {
-                    banner(notice, systemImage: "info.circle", tint: .bannerBlue) {
-                        model.notice = nil
-                    }
-                }
+                statusBanners
 
                 // The selected screen fills the rest.
                 switch screen {
@@ -1590,6 +1548,55 @@ struct ContentView: View {
 
     private func sizeLabel(_ mb: UInt64) -> String {
         mb >= 1024 ? "\(mb / 1024) GB" : "\(mb) MB"
+    }
+
+    /// Global status banners - visible on every screen, and ALL of them
+    /// closeable. The three driven by engine STATE (reconnect, sharing-paused,
+    /// starting) cannot be cleared by clearing a value, so each carries its own
+    /// "hidden" flag that RE-ARMS when its condition next changes (see the
+    /// .onChange resets) - dismissing means "I have read this", not "pretend it
+    /// never happened".
+    ///
+    /// Its own @ViewBuilder rather than inline in the body: five conditional
+    /// banners, each with a trailing closure, pushed the enclosing VStack past
+    /// what Swift's type-checker will solve, and CI failed with "unable to
+    /// type-check this expression in reasonable time". Splitting a view is the
+    /// standard cure, and it costs nothing at runtime.
+    @ViewBuilder private var statusBanners: some View {
+        if model.reconnecting && !hidReconnecting {
+            banner("Reconnecting...", systemImage: "arrow.clockwise", tint: .orange) {
+                hidReconnecting = true
+            }
+        }
+        // Persistent (not just the one-shot alert): the user may dismiss the
+        // alert and move to another screen, and sharing stays paused until they
+        // turn it back on - this keeps that state visible the whole time.
+        if model.sharingPausedForIpChange && !hidSharingPaused {
+            banner(
+                "Sharing paused: your public address changed. Turn sharing back on to clear this.",
+                systemImage: "wifi.exclamationmark", tint: .orange
+            ) { hidSharingPaused = true }
+        }
+        if let err = model.bootError {
+            banner("Engine failed: " + err, systemImage: "exclamationmark.triangle", tint: .red) {
+                model.bootError = nil
+            }
+        }
+        // Boot takes 12-30s and EVERY control silently no-ops until it finishes.
+        // Saying so is the difference between "starting" and "broken".
+        if !model.ready && model.bootError == nil && !hidStarting {
+            banner(
+                "Starting padMule... searching and downloading will work in a moment.",
+                systemImage: "hourglass", tint: .orange
+            ) { hidStarting = true }
+        }
+        // Action feedback stays global - it must appear where the user is.
+        // Server NEWS (MOTD, discovery) is Servers-only; see serverNotice.
+        if let notice = model.notice {
+            banner(notice, systemImage: "info.circle", tint: .bannerBlue) {
+                model.notice = nil
+            }
+        }
     }
 
     /// How a connected server is named ANYWHERE it is shown: "Name (ip:port)",
