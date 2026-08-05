@@ -70,6 +70,37 @@ sets DS_NONEEDEDPARTS on the file status and swaps away WITHOUT asking
 just started downloading has a free upload slot precisely because it has nothing
 to give. That was the 6-of-7 line.
 
+## REPRODUCED ON THE DEVICE - and here is the re-test to run
+
+2026-08-04, agent-driven over WebDriverAgent, on the STALE 8068a71 build with
+Anthony's real config on the VPN. Connected to eMule Sunrise HighID, searched
+(375 hits), queued four. One download went 20MB -> 35.3 -> 64.8 -> **65 MB /
+67.5 MB (96%), then froze for over ten minutes while its source count climbed
+20 -> 30 -> 33 -> 42 ed2k**. More sources, zero bytes. A sibling download
+progressed normally the whole time (2MB -> 41.2MB), so the engine was not
+wedged - the stall is PER-DOWNLOAD and it struck at the TAIL, which is exactly
+where the two fixes compound (about 2.5MB left, near the 2.11MB four workers can
+hold reserved, and a worker hung on the missing 0x57 handler keeps its
+reservations for the full 45s).
+
+**THE RE-TEST, once a fixed build is installed:** connect to a big server, queue
+3-4 files of 50MB+, and watch for a row that pins at high percent while its
+source count keeps growing. That signature - frozen bytes, climbing sources - is
+the bug. If it is gone, the fixes did it.
+
+**Installing needs Anthony.** CI builds an UNSIGNED .ipa (verified: no
+`_CodeSignature`, no `embedded.mobileprovision`), so Sideloadly on the Windows
+host must re-sign it. Everything else in this loop is agent-drivable: WDA is
+installed, `pymobiledevice3 developer dvt xcuitest ...` plus the 8100 forward
+gives full touch control, and `GET /source?format=json` reads the transfer rows
+as text.
+
+**Also seen on-device, unexplained:** the Servers screen read "No server list on
+disk" / Servers (0) on a device that had been downloading overnight; one
+"Refresh server list" tap restored 10. And Kad DID supply sources on the device
+(2 kad, 1 kad) where the dev-box stress runs got zero from it - so the
+zero-Kad finding below may be dev-box-specific.
+
 **THE LIVE A/B IS INCONCLUSIVE - do not cite it as validation.** A second 480s
 run with both fixes: `1676 dialed -> 33 connected -> 24 slot asks -> 17 ACCEPTED
 -> 12 no-block-to-take -> 5 DELIVERED`, 2 of 25 receiving, 22.6MB. Every number
