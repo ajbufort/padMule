@@ -1742,13 +1742,26 @@ impl Engine {
         // must not stop the engine; we simply come up offline and can retry).
         if !self.offline {
             self.emit(EngineEvent::Status("Fetching network lists...".into()));
-            bootstrap::ensure(
+            // SAY what happened to the server list. `ensure` now re-fetches a
+            // file that is present but unusable (see its docs - that is what
+            // left the Servers tab empty), and the user has no other way to
+            // tell an auto-load from a list that was simply already there.
+            match bootstrap::ensure(
                 &self.config_dir,
                 "server.met",
                 bootstrap::SERVER_MET_URL,
                 bootstrap::looks_like_server_met,
             )
-            .await;
+            .await
+            {
+                bootstrap::Fetched::Downloaded => {
+                    self.emit(EngineEvent::Server("Server list downloaded".into()))
+                }
+                bootstrap::Fetched::Failed => self.emit(EngineEvent::Server(
+                    "Server list unavailable - use Refresh on the Servers screen".into(),
+                )),
+                bootstrap::Fetched::AlreadyPresent => {}
+            }
             bootstrap::ensure(
                 &self.config_dir,
                 "nodes.dat",

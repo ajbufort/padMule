@@ -211,12 +211,22 @@ pub enum Fetched {
     Failed,
 }
 
-/// Ensure `name` exists in `dir`, downloading from `url` if missing. Never
-/// overwrites an existing file, and never fails hard - a bootstrap fetch is best
-/// effort; the engine must still start (and can retry later) without one.
+/// Ensure a USABLE `name` exists in `dir`, downloading from `url` if it is
+/// missing or unusable. Never overwrites a good file, and never fails hard - a
+/// bootstrap fetch is best effort; the engine must still start (and can retry
+/// later) without one.
 ///
-/// `validate` gates what we write: a captive-portal or error page must not be
-/// saved as if it were a real `.met`.
+/// `validate` gates BOTH ends: what we write (a captive-portal or error page
+/// must not be saved as if it were a real `.met`) and what we accept as already
+/// present.
+///
+/// That second use is the fix for an empty Servers tab. The guard used to be
+/// "exists and len > 0", so a `server.met` that was non-empty but held ZERO
+/// servers - or did not parse at all - counted as present on every launch,
+/// forever, and the screen read "No server list on disk" until the user
+/// happened to find the Refresh button. Seen on the device 2026-08-04. A
+/// prune that removes the last server produces exactly that file, so this is
+/// reachable in normal use, not just from a corrupt write.
 pub async fn ensure(
     dir: &Path,
     name: &str,
@@ -224,10 +234,9 @@ pub async fn ensure(
     validate: impl Fn(&[u8]) -> bool,
 ) -> Fetched {
     let path = dir.join(name);
-    if path.exists()
-        && std::fs::metadata(&path)
-            .map(|m| m.len() > 0)
-            .unwrap_or(false)
+    if std::fs::read(&path)
+        .map(|b| !b.is_empty() && validate(&b))
+        .unwrap_or(false)
     {
         return Fetched::AlreadyPresent;
     }
@@ -385,6 +394,38 @@ mod tests {
         let r = ensure(&dir, "server.met", "http://127.0.0.1:1/x", |_| true).await;
         assert_eq!(r, Fetched::AlreadyPresent);
         assert_eq!(std::fs::read(dir.join("server.met")).unwrap(), b"existing");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn ensure_refetches_a_file_that_is_present_but_unusable() {
+        // THE EMPTY SERVERS TAB. The guard used to be "exists and len > 0", so a
+        // server.met that was non-empty but held ZERO servers - or did not parse
+        // at all - counted as AlreadyPresent on every launch, forever. The
+        // Servers screen then read "No server list on disk" with no way back
+        // except the user finding the Refresh button, which is exactly what was
+        // seen on the device 2026-08-04.
+        //
+        // `validate` was already sitting right there, used only to gate what we
+        // WRITE. Using it on what we already HAVE is the whole fix.
+        let dir = std::env::temp_dir().join(format!("padmule-boot3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("server.met"), b"not a real met").unwrap();
+        // Bogus URL, so a re-fetch ATTEMPT surfaces as Failed. The point is that
+        // it is not AlreadyPresent: the old code never even tried.
+        let r = ensure(&dir, "server.met", "http://127.0.0.1:1/x", |b| {
+            looks_like_server_met(b)
+        })
+        .await;
+        assert_eq!(
+            r,
+            Fetched::Failed,
+            "an unusable file must be re-fetched, not accepted forever"
+        );
+        // The bad file is left alone rather than deleted - having something is
+        // never worse than having nothing, and the next launch tries again.
+        assert!(dir.join("server.met").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
