@@ -90,7 +90,7 @@ Details and what is portable from them: `docs/wiki/ref-ecosystem.md`.
 source "$HOME/.cargo/env"              # cargo is NOT on the default PATH
 
 cargo build --workspace
-cargo test --workspace                 # the unit gate (~610 tests, offline)
+cargo test --workspace                 # the unit gate (~614 tests, offline)
 cargo clippy --workspace --all-targets # must be warning-free
 cargo fmt --all -- --check
 
@@ -99,6 +99,14 @@ cargo fmt --all -- --check
 # Reports how many downloads EVER received a byte, how many are receiving now,
 # and search-vs-connected source counts. Reach for it BEFORE theorising about
 # transfer behaviour - it is what refuted the queue-bail hypothesis.
+#
+# It also prints THE FETCH FUNNEL (mule_engine::stats): how far down the eD2k
+# request sequence each PEER SESSION got - dial, handshake, filestatus, hashset,
+# slot, blocks, bytes - plus every opcode read out of turn and a dial-duration
+# histogram. The DROP between two adjacent stages is the loss at that stage,
+# including a loss to the per-peer TIMEOUT, which no error value can report.
+# This is the instrument that found the missing OP_OUTOFPARTREQS handler; when a
+# transfer question starts with "why", read the funnel before writing a theory.
 
 # Differential oracle (real amuled 3.0.1):
 scripts/build-amuled-oracle.sh         # one-time build into build-oracle/

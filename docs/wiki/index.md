@@ -38,6 +38,7 @@ the Ingest / Query / Lint workflows.
 
 ## Tools
 - `crates/mule-ffi/examples/stress.rs` - the LIVE stress harness: N real downloads through the SAME FFI the app uses, reporting ever-received / receiving-now / search-vs-connected sources. Built 2026-08-04 and immediately earned its keep: it measured the retry starvation, proved the 30x retry-cost win, and REFUTED the queue-bail hypothesis. Reach for it before theorising about transfer behaviour. See [[build-progress]] rows 8br/8bs.
+- **THE FETCH FUNNEL** (`mule_engine::stats`, printed by the harness via `mule_ffi::fetch_report()`) - cumulative counters for how far down the eD2k request sequence each PEER SESSION got, plus every opcode read out of turn and a dial-duration histogram. The DROP between two adjacent stages is the loss at that stage, including a loss to the per-peer TIMEOUT that no error value can report. Built 2026-08-04 to answer the one question the handoff said nobody had looked at, and it answered it in a single run: 1583 dials, 74 handshakes, 7 slots, ONE session that moved a byte. Deliberately not a UniFFI export - a diagnostic, not a shipped Swift method. See [[build-progress]] row 8bt.
 
 ## Process
 - [[decisions-and-lessons]] - locked decisions, rejected approaches, gotchas.
