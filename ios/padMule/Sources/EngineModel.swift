@@ -1549,6 +1549,14 @@ final class EngineModel: ObservableObject {
 
     // MARK: - Fetch diagnostics (the funnel)
 
+    /// Dismiss the boot-failure banner. A method because `bootError` is
+    /// `private(set)` - only boot() may SET it, so only the model may clear it.
+    /// Clearing hides the banner without pretending the engine started: `ready`
+    /// stays false and every control still reports honestly.
+    func clearBootError() {
+        bootError = nil
+    }
+
     /// The fetch funnel as a printable block - where peer sessions die, the
     /// opcodes read out of turn, and how long dials take.
     ///
