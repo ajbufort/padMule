@@ -23,7 +23,7 @@
 //! Usage:
 //!   cargo run --release -p mule-ffi --example stress -- [config] [dl] [keyword] [n] [secs]
 
-use mule_ffi::{MuleEngine, SearchFilters, SearchOutcome};
+use mule_ffi::{fetch_report, MuleEngine, SearchFilters, SearchOutcome};
 use std::collections::{BTreeMap, HashSet};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -188,6 +188,10 @@ fn main() {
                 receiving,
                 mb(total)
             );
+            // The funnel EVERY report, not just at the end: the interesting
+            // question is where sessions are lost while the run is still going,
+            // and a single end-of-run total cannot show a stage getting worse.
+            print!("{}", fetch_report());
         }
     }
 
@@ -223,6 +227,10 @@ fn main() {
             d.sources_exchange
         );
     }
+    println!();
+    println!();
+    println!("== WHERE PEER SESSIONS DIED ==");
+    print!("{}", fetch_report());
     println!();
     println!("  NOTE on the cross-tab columns: 'search' is what the SERVER INDEX");
     println!("  claimed at search time (aggregate, often stale); the connected");
