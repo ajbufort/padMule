@@ -1,6 +1,6 @@
 # padMule Wiki - Index
 
-Updated: 2026-08-06
+Updated: 2026-08-07
 
 AI-maintained knowledge base. Start here. See `/CLAUDE.md` for the schema and
 the Ingest / Query / Lint workflows.
@@ -16,7 +16,7 @@ the Ingest / Query / Lint workflows.
 - [[security-model]] - the "bulletproof" release gate: eMule/Kad spec security measures (checklist + status) + non-burdensome additions; RELEASE BLOCKER.
 - [[obfuscation-posture]] - what padMule obfuscates (c2c TCP, Kad UDP) vs the deliberate v1 opt-out (server TCP/UDP obf); the documented decision behind the 2 server-obf scorecard rows.
 - [[protocol-understanding]] - the mental model: eD2k + Kad flows/state machines, interop landmines, capability gating, padMule recommendations. The background for any wire work (it informed Waves 3-6).
-- [[kad-routing-lifecycle]] - **the TWO routing tables** (`Engine::routing`, monotonic and shown to the user; `KadNode::routing`, rebuilt near-empty on every `start_kad` and the only one lookups read), what a resume actually preserves, which half of eMule's maintenance padMule performs, and how to read the Kad instruments honestly. Written 2026-08-06 because its absence produced a misdiagnosis.
+- [[kad-routing-lifecycle]] - **the TWO routing tables** (`Engine::routing`, monotonic and shown to the user; `KadNode::routing`, the only one lookups read) and **the three pieces of a Kad KEYWORD SEARCH** (tokenise per word, hash ONE word, attach the expression tree so the storing node filters). Kad indexes per WORD, never per phrase: padMule hashed the whole query until 2026-08-07, so every multi-word Kad search returned zero WITHOUT failing. Also: what a resume actually preserves, which half of eMule's maintenance padMule performs, how to read the Kad instruments honestly, and that padMule PUBLISHES NOTHING to Kad (payloads decoded, not built).
 - **Kad maintenance (2026-08-05, [[build-progress]] 8cd; CORRECTED 2026-08-06 by 8ce):** padMule had NO periodic maintenance - no bucket refresh, no random lookup, no contact ping - so the routing table was fed only by the bootstrap and by accident. That is a real defect and `maintain_kad` (a random-target lookup every 120s) is a real fix, though it implements only eMule's `OnBigTimer` half - contact expiry and the liveness ping (`OnSmallTimer`) still do not exist, and nothing evicts a contact anywhere. The companion resume fix is ALSO real but its stated cause was wrong: `Engine::routing` was never discarded (`start_kad` only merges), and the "138 -> 21" that motivated it was a LIVE-node count landing in the same UI field as a PERSISTED one. The live table is still rebuilt from one bootstrap response on every resume. See [[kad-routing-lifecycle]].
 - [[padmule-enhancement-channel]] - padMule-to-padMule capability channel on a provably-ignored HELLO tag (source-grounded carrier proof); Layer 1 detection DONE + amuled-validated; Layer 2 wire spec'd (opcode 0xD8 on 0xC5).
 - [[nat-traversal-design]] - design for connecting two firewalled (LowID) padMule peers (hole punching + QUIC over Kad/buddy rendezvous); confirmed no stock hole punching; reusable Kad primitives; phased plan. Not built.
