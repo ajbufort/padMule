@@ -120,6 +120,23 @@ final class EngineModel: ObservableObject {
     /// itself and so cannot observe this.
     @Published private(set) var uiPollTicks: UInt64 = 0
     @Published private(set) var heartbeatTicks: UInt64 = 0
+    /// THE LONGEST GAP between two consecutive status-poll publishes, in seconds.
+    ///
+    /// THE COUNTS ALONE CANNOT ANSWER THE QUESTION THEY WERE BUILT FOR, which the
+    /// 2026-08-07 reanalysis found the hard way. `eventQueue` is SERIAL, so a poll
+    /// that blocks does not skip its ticks - the timer keeps queueing work items
+    /// and they all run the moment the block clears. Over any window that outlasts
+    /// the stall, "stalled 10s then burst" and "never stalled" produce the SAME
+    /// total, and the device reading taken from those totals ("0.94/s - keeps
+    /// running") cannot tell them apart.
+    ///
+    /// A maximum gap can. It is the one statistic a burst cannot hide: whatever
+    /// else happens, the interval that spans the stall is recorded. Idle it sits
+    /// near the 1s poll period; if anything on this queue ever takes the engine
+    /// lock again it jumps to the length of the longest operation, and the number
+    /// on screen names the fault instead of hinting at it.
+    @Published private(set) var uiPollMaxGapSecs: Double = 0
+    private var lastUiPollAt: Date?
     /// How many IP-blocklist ranges are loaded (0 = no ipfilter placed).
     @Published private(set) var ipFilterRanges: UInt32 = 0
     @Published private(set) var identity: IdentityInfo?
@@ -1219,10 +1236,17 @@ final class EngineModel: ObservableObject {
             // heartbeat() in the same closure on the SERIAL `work` queue - so a
             // 10-20s search froze every status row on screen until it finished.
             // Measured: a user action issued 1.9s into a search took 20.62s
-            // against 7.5-9.3s idle. All five are now lock-free on the Rust side
-            // (mule-ffi pins that with a test that HOLDS the engine lock), so
-            // they belong on this queue with the other lock-free reads rather
-            // than behind the one call that genuinely needs the lock.
+            // against 7.5-9.3s idle. They belong on this queue with the other
+            // lock-free reads rather than behind the one call that genuinely
+            // needs the lock.
+            //
+            // FOUR OF THE FIVE WERE LOCK-FREE WHEN THEY MOVED HERE. `serverInfo()`
+            // was not - it kept taking the engine lock until the 2026-08-07
+            // reanalysis found it - so this whole closure, and with it the event
+            // drain that shares this queue, still stalled for the length of every
+            // search. Anything added here must be lock-free on the Rust side AND
+            // named in mule-ffi's `the_status_readers_answer_while_the_engine_lock
+            // _is_held`, which is the only thing that can catch the next one.
             let st = e.state()
             let kad = e.kadContacts()
             let ipf = e.ipFilterRanges()
@@ -1245,6 +1269,12 @@ final class EngineModel: ObservableObject {
                 self.sampleStats(stats)
                 self.applyKeepAwake()
                 self.uiPollTicks &+= 1
+                let now = Date()
+                if let last = self.lastUiPollAt {
+                    self.uiPollMaxGapSecs = max(
+                        self.uiPollMaxGapSecs, now.timeIntervalSince(last))
+                }
+                self.lastUiPollAt = now
             }
         }
     }

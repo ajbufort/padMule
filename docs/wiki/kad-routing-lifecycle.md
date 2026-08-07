@@ -1,8 +1,10 @@
 # Kad routing lifecycle - the two tables, and who maintains them
 
-Updated: 2026-08-07 (row 8cf: keyword SEARCH added - three pieces, two of them
-missing since Wave 6, including the expression tree. Created 2026-08-06 by the
-reanalysis pass, [[build-progress]] 8ce)
+Updated: 2026-08-07 (row 8ch: ALPHA is a CONCURRENCY parameter and padMule used
+it as a batch size - see "How much a lookup costs" below, which changes what
+every Kad timeout in the tree means. Row 8cf: keyword SEARCH added - three
+pieces, two of them missing since Wave 6, including the expression tree. Created
+2026-08-06 by the reanalysis pass, [[build-progress]] 8ce)
 
 Where Kad contacts live, how they get there, what survives a pause, and which of
 eMule's maintenance duties padMule performs. This entry exists because its
@@ -63,6 +65,59 @@ gated `add_contact`, and carries the VERIFIED bit and the stored verify key
 across: without the bit the seeds would inflate `contacts_known()` while staying
 invisible to `closest_to`, which is worse than not seeding at all, because the
 number would then claim the problem was solved.
+
+## How much a lookup COSTS - alpha is concurrency, not a batch size
+
+Until 2026-08-07 every lookup in `kad_live.rs` did this:
+
+```rust
+let batch = lookup.next_queries(ALPHA_QUERY, K);
+for node in &batch { self.find_node(node, target, per_query).await }
+```
+
+`ALPHA_QUERY`'s own doc comment says "concurrent queries in flight (eMule
+`ALPHA_QUERY`)", and eMule's `CSearch` does keep three requests outstanding and
+reacts to whichever answers first. padMule took three and then **blocked on each
+in turn**, so a round cost `ALPHA_QUERY * KAD_PER_QUERY` instead of
+`KAD_PER_QUERY`:
+
+| Call | Structural worst case BEFORE | AFTER | Its budget |
+|---|---|---|---|
+| `resolve_keyword` | 12x3x750ms lookup + 10x750ms keyword = **34.5s** | 12x750ms + 4x750ms = **12s** | `KAD_SEARCH_WAIT` 15s |
+| `resolve_sources` | same shape = **34.5s** | **12s** | 6-15s per caller |
+| `refresh_routing` | 4x3x750ms = **9s** | 4x750ms = **3s** | `KAD_MAINTENANCE_BUDGET` 3s |
+
+Consequences that were being read as other problems:
+
+- **The search cap WAS the search cost.** `KAD_SEARCH_WAIT` looked like a safety
+  bound and was the actual duration of every search, because the work beneath it
+  could not finish inside it. The device-measured 10.3s submit-to-results was
+  the Kad arm running until it was cut off, with the server arm having answered
+  in under a second and `tokio::join!` waiting for the slower one.
+- **Kad maintenance never completed a round.** 9s of work under a 3s deadline
+  got through about four of its twelve queries, every 120 seconds, which is a
+  large part of why the table grows as slowly as it does.
+
+**ONE SOCKET IS WHY IT WAS SERIAL, and it is the real difficulty.**
+`UdpSocket::recv_from` hands each datagram to exactly one waiter, and the old
+`request` loop DISCARDED anything not from its own destination - so two
+concurrent requests would silently eat each other's replies. The fix is a batch
+demultiplexer (`KadNode::request_batch`): send the whole batch, then run ONE
+receive loop that matches each datagram to the slot waiting on it. A datagram
+that used to be dropped as "not mine" now reaches the peer in this batch that
+wants it. Matching is by EXACT address, falling back to the old IP-only rule,
+because `MAX_CONTACTS_PER_IP` permits two contacts on one address in a batch.
+
+Wire-identical: same datagrams, same keys, same peers, same obfuscation. Only
+the order of our own waiting changed - and concurrent alpha is what eMule does,
+so this is closer to the authority, not further from it.
+
+`request` is now a batch of one, so there is exactly ONE receive loop in the
+file. The sender-key capture (`note_responder`) moved OUT of the request helpers
+and into the callers, because the batch collects with `&self`; the two tests that
+pin that capture were rewritten to drive `resolve_sources` / `resolve_keyword`
+rather than the helpers, or they would have passed with the production call site
+deleted.
 
 ## Which eMule maintenance duties padMule performs
 
