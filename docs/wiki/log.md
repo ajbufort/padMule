@@ -441,3 +441,19 @@ Append-only, timestamped record of Ingest / Query / Lint passes.
   as PNGs, and one inside a real toolbar, uploaded by `ios-test.yml`. CI green on
   1605c9a (27 tests, 0 failures) and the OFF state was seen for the FIRST time in
   that artifact. Device-verified separately by screenshot on 48b5128.
+
+- 2026-08-07 **Always-on background running REOPENED (Anthony).** The
+  foreground-only posture, made "permanent" on 2026-08-04, is back on the table.
+  No new research was needed and none was done: [[lifecycle-and-reactivation]]
+  already ranks the four mechanisms, and the headline is that there is no
+  backdoor to look for - the `audio` `UIBackgroundModes` key is a plain Info.plist
+  key a FREE team may set, forbidden only by App Store review 2.5.4, which never
+  applies to a build that is never reviewed. Sideloading is what makes the
+  ORDINARY mechanism available. Annotated in place rather than rewritten. What
+  the entry did NOT have, added now: jetsam TERMINATION rather than suspension is
+  the overnight failure mode, so background memory under ~100MB is the real
+  target and has never been measured on any build; and the 1s heartbeat is a
+  `Timer` on the MAIN RUNLOOP owned by the UI, driving seven duties that fail
+  silently if it stops - it would still fire under keepalive, but that clock
+  belongs in Rust before any background posture rests on it. Clean pause/resume
+  stays required either way, because every keepalive can be revoked or killed.

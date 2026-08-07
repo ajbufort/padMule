@@ -136,6 +136,31 @@ lock or into the actor. That is where the tests belong.
 
 After that: Track 2 (below), concurrency under load, still never started.
 
+**REOPENED 2026-08-07 - always-on background running.** Anthony wants padMule,
+and Kad in particular, running in the background rather than foreground-only.
+The 2026-08-04 "permanent posture" decision is back on the table. **The research
+is already complete** in [[lifecycle-and-reactivation]] and does not need
+redoing: the mechanism is the `audio` `UIBackgroundModes` key, which a FREE team
+may set, blocked only by App Store review 2.5.4 - which never applies to a
+sideloaded build. There is no backdoor to find; the ordinary mechanism is
+already available.
+
+What is missing is MEASUREMENT, not research:
+1. **Background memory under ~100MB** - jetsam TERMINATION, not suspension, is
+   the overnight failure mode, and padMule's background memory has never been
+   measured on any build.
+2. **Keepalive longevity overnight** on the M4 iPad Pro, and whether
+   `BGContinuedProcessingTask` is eligible under iPadOS 26 there. Both were open
+   questions against the OLD A12Z target and were never re-asked.
+3. **Move the 1s heartbeat clock out of the UI first.** It is a `Timer` on the
+   main runloop (`EngineModel.startPolling`) driving seven duties that fail
+   SILENTLY if it stops. It would still fire under audio keepalive, but a
+   background posture resting on the UI's runloop is fragile - the clock belongs
+   in Rust as a tokio interval. Found 2026-08-07.
+
+Clean pause/resume stays REQUIRED regardless: every keepalive can be revoked or
+jetsam-killed, so the app must always degrade back to it.
+
 ## HOW TO MEASURE ANYTHING ON THIS DEVICE - read before you measure
 
 **`GET /source` is NOT a passive read.** It walks the whole view hierarchy on the
