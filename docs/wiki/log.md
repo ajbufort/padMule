@@ -387,3 +387,37 @@ Append-only, timestamped record of Ingest / Query / Lint passes.
   being trusted (`/source` 1.70s, element query 0.53s, screenshot 2.13s) so the
   cheapest was used. All three are now written into [[handoff-next-session]]'s
   measurement rules, and `scripts/device-timing.sh` encodes them.
+
+- 2026-08-07 **Kad lookup diagnostic, the device pass on 19d06d0, and a claim of
+  mine deleted.** Added `stats::kad_report` (rounds run, rounds held open by a
+  peer that never answered, requests sent/answered, avg round and value window),
+  instrumented at the three batch functions, exported as `MuleEngine::kad_report`
+  and shown as Stats -> "Kad lookup"; `mule-cli kad-keyword` prints the same
+  block. **It corrected my model on its first reading, twice:** a lookup runs 5-6
+  rounds, not 12 - the `0..12` bound is a safety cap the frontier never reaches -
+  so the earlier "12 rounds x RTT matches the residual" was agreement between two
+  wrong numbers, and it is DELETED from the handoff rather than softened. And a
+  15% silence rate poisons ~45% of rounds, because a round is only as fast as its
+  slowest member: `1 - 0.85^3 = 38.6%` predicted, 40-50% observed. **On device it
+  is worse and that is the reading that decides the CSearch question:** 62% of
+  rounds and 87% of value windows held open by a silent peer, a 67% answer rate
+  against the dev box's 85%, and an average round burning 633ms of its 750ms cap.
+  Nearly every round runs to the deadline, so the barrier IS the remaining cost.
+  **The instrument also paid for itself immediately:** searches on 19d06d0 read
+  7.27/8.13/7.42s against 4.58-6.38s for 7d1b349 the same day, which looks like a
+  regression - `git diff` over the Kad path between those commits is counter
+  increments and a timer and nothing else, so it was the swarm answering 67%
+  instead of 85%. A day of hunting avoided. Also: the search A/B was settled
+  OFF-DEVICE with `mule-cli kad-keyword` (alternating old/new binaries, no probe,
+  no UI) at median **-25%**, not the 3x the worst-case table implies - recorded,
+  and the worst case relabelled as a worst case. Refresh 1.66/2.77/1.67s, poll
+  gap 1.1s again. **VPN badge fixed** - it rendered as ". . .   . . ." because a
+  ToolbarItem compresses its content below ideal size; `fixedSize` + `lineLimit`.
+  The accessibility label was correct throughout, which is why only Anthony's eye
+  caught it. **And a gap nothing had recorded:** padMule ANSWERS nothing on Kad -
+  three production socket call sites, the only `recv_from` inside the reply
+  collection, no listener and no request opcode handled - so it stores nothing
+  (Anthony's eMule on the Acer carries 7,700+ indexed entries), answers no
+  ping, and ages out of other clients' routing tables. Its fix needs the same
+  restructure as the CSearch design, so the two are now flagged to be designed
+  together.
