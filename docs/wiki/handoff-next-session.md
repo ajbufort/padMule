@@ -1,18 +1,39 @@
 # HANDOFF - start here next session
 
-Updated: 2026-08-05, after the reanalysis + serve-side rotation pass.
+Updated: 2026-08-06, after the full-tree reanalysis pass (row 8ce).
 
 Living doc - replace it wholesale next time. Full narrative: [[build-progress]]
-rows 8bt-8bz and the [[log]] entries for 2026-08-04 and 2026-08-05.
+rows 8bt-8ce and the [[log]] entries for 2026-08-04 through 2026-08-06.
+
+**READ THIS FIRST if you were about to go read Kad numbers off the device.** The
+2026-08-06 reanalysis found that the "Kad contacts" reading this handoff
+nominated as the verdict on row 8cd **could not fall on any build**, and that
+8cd's resume fix named the wrong table. Open leads 2 and 3 are rewritten
+accordingly; the mechanism is [[kad-routing-lifecycle]].
+
+**THREE OF THE SIX FINDINGS ARE ALREADY FIXED (row 8ce, same day):** the live Kad
+table is now SEEDED from what we already know instead of from one bootstrap
+response; "Kad contacts" reports one quantity (the live table) instead of two;
+and `maintain_kad` has a real 3s deadline instead of a 9s structural bound held
+under the engine lock. **So the number is now worth reading again** - but only on
+a build carrying this, which as of writing is NOT the delivered `2186e48`.
+Findings 4-6 (contact expiry + liveness ping, the near-biased nodes.dat sample,
+the missing bootstrap retry) are open by choice - see items 11-12.
 
 ## State of the tree
 
 - **Gate**: 628 Rust tests + 24 Swift simulator tests, clippy `-D warnings`
-  clean, fmt clean, ASCII clean.
+  clean, fmt clean, ASCII clean. Re-verified locally 2026-08-06.
 - **YOU ARE ON BRANCH `fetch-funnel`, NOT main**, and nothing is merged. Decide
-  that first. History is LINEAR across 390+ commits and must stay that way
+  that first. History is LINEAR across 447 commits and must stay that way
   (`gh pr merge --rebase`). Do not trust prose for counts - run
   `git log --oneline main..HEAD` and `git log --oneline origin/main..main`.
+  Measured 2026-08-06: **33 ahead of local `main`**, and local `main` is 4 ahead
+  of `origin/main`. (This line said "17 ahead" for a while, which is exactly why
+  it tells you to run the command.)
+- **`rust.yml` only fires on push to `main` and on PRs**, so none of the 33
+  branch commits have been through the CI Rust gate. The LOCAL gate is the only
+  one that has run on this work.
 - Oracles: differential AND reverse both re-run GREEN 2026-08-05. Kad-verify not
   re-run. NOTE what the reverse oracle does NOT cover: `mule-cli serve-file`
   passes no upload gate and its fixture is 300KB with one downloader, so it
@@ -24,8 +45,10 @@ rows 8bt-8bz and the [[log]] entries for 2026-08-04 and 2026-08-05.
   delivered artifact, not from the CI log. iPadOS 26.6. Cert lapses ~2026-08-12.
 - **The device can now name its own build.** CI stamps the git short sha into
   `CFBundleVersion`, and Settings > This device > **Build** reads
-  "1.0 (d24e88d)", selectable. Verified in the delivered artifact. Confirm an
-  install by READING that row, not by spotting a UI change.
+  "1.0 (short-sha)", selectable - so on the delivered build it should read
+  **"1.0 (2186e48)"**. Confirm an install by READING that row, not by spotting a
+  UI change. (This line used to quote `d24e88d`, the build BEFORE the delivered
+  one, which is the wrong thing to check an install against.)
 - Both iOS workflows re-run green on this branch: the .ipa build and the Swift
   simulator tests (24 tests). The Swift tests are the ONLY type-check available
   from this box - dispatch `ios-test.yml` after any Swift edit, and **verify
@@ -161,7 +184,34 @@ Re-measuring on another path means raising `fetch::CONNECT_TIMEOUT` first.
    device. Watch for a `kad` badge on the next build.
 8. Status scalars lag behind `Engine::search`'s ~20s `&mut self`; Portability
    Tier 2; Settings Tier 1/2.
-9. **Housekeeping, verified safe 2026-08-05:** ELEVEN remote branches (not ten)
+9. **THE KAD FINDINGS FROM THE 2026-08-06 REANALYSIS (row 8ce)** are items
+   10-12, plus the two corrections already folded into open leads 2-3 below and
+   into [[kad-routing-lifecycle]]. None is a regression; all are pre-existing,
+   and most are 8cd's own new code read against what it actually does.
+10. ~~`maintain_kad` is the only Kad call with no deadline.~~ **CLOSED
+    2026-08-06, row 8ce** - `KAD_MAINTENANCE_BUDGET` (3s), pinned by test to be
+    strictly under `refresh_routing`'s 9s structural worst case so the cap
+    actually binds. Partial work is kept and the gain is measured from the table,
+    so a cancelled round still reports what it learned.
+11. **(2026-08-06, row 8ce) STILL OPEN: only eMule's `OnBigTimer` half of Kad
+    maintenance exists.** No contact expiry, no liveness ping, no eviction -
+    `Contact` has no timestamp and `RoutingTable` has no removal path. So dead
+    contacts accumulate in a monotonic table and get written into nodes.dat,
+    where the truncation to 200 is ALSO near-biased (padMule takes the first 200
+    in tree order; eMule takes a deliberately SPREAD sample via `TopDepth(4)`).
+    And `KAD_TABLE_TARGET`'s comment "Refresh resumes if the table shrinks"
+    describes something that cannot happen.
+12. **(2026-08-06, row 8ce) STILL OPEN, but much narrower: a failed Kad bootstrap
+    is unrecoverable in-session.** `start_kad` runs only from
+    `start()`/`resume()`. The seeding fix means a failed bootstrap now leaves a
+    POPULATED table, so `maintain_kad`'s `contacts_known() == 0` guard no longer
+    locks Kad off for the session - maintenance can carry it. What is still
+    missing is a bootstrap RETRY. Also unfixed and separate: `KadNode::add_contact`
+    has no Kad-version gate, so a peer that NAMES a v1 contact over the wire gets
+    it into the table and a lookup can spend `KAD_PER_QUERY` on a node the
+    protocol cannot speak to. The seeding path is safe (`gate_loaded_nodes`
+    filters version > 1); the wire paths are not.
+13. **Housekeeping, verified safe 2026-08-05 and re-verified 2026-08-06:** ELEVEN remote branches (not ten)
    are fully merged - `git cherry main origin/<b>` reports every commit
    patch-equivalent for all of them, including `worktree-wave11-aich` - so they
    and the locked worktree at `.claude/worktrees/wave11-aich` can be deleted.
@@ -213,12 +263,29 @@ developer dvt screenshot`, `GET /source`) disturb nothing and are what the whole
    both** - assertion GRANTED/REFUSED, and how long the work waited before it
    STARTED. Capture a background round trip on build 2186e48 and the answer is
    in those two lines. Do not theorise first.
-2. **Kad recovery baseline, for comparing the fixes.** On a build with NEITHER
-   Kad fix, the table was watched going 21 -> 223 organically in a few minutes,
-   purely from incidental source lookups during active downloads. Anything the
-   2186e48 build does must beat that to have earned its keep.
-3. Whether `maintain_kad` actually lifts the table on device, and whether Kad
-   keyword-search results improve with it. Both are why it was built.
+2. ~~**Kad recovery baseline, for comparing the fixes.** The table was watched
+   going 21 -> 223 organically...~~ **THIS TEST CANNOT WORK, AND THE REANALYSIS
+   SAYS WHY (2026-08-06, row 8ce).** The "Kad contacts" number on screen is
+   `Engine::routing.len()` - the PERSISTED table - and `RoutingTable` has no
+   removal path anywhere, so **it is monotonic and cannot fall on any build**.
+   It climbed before `maintain_kad` existed and it will climb after; the reading
+   is not evidence about it either way. Worse, the same UI field is ALSO written
+   by the `Kad` event, which carries the PERSISTED count from `start()` but the
+   **LIVE node's** count from `start_kad` and `maintain_kad` - so the field
+   alternates between two different quantities at 1s resolution. **The 21 in the
+   "21 -> 223" baseline is not a damaged table; it is a freshly-bootstrapped
+   LIVE node**, which is what `start_kad` produces every single time.
+   Do NOT spend a device session on this reading until the two quantities are
+   separated. See [[kad-routing-lifecycle]].
+3. **Whether `maintain_kad` lifts the LIVE table, which is the only one lookups
+   read.** Still the right question; it just needs an instrument that can answer
+   it. Note what 8ce found underneath it: the live table is rebuilt from ONE
+   bootstrap response (~21 contacts, of which exactly ONE is verified and
+   therefore visible to `closest_to`) on every start AND every resume, because
+   `bind_with_identity` constructs an empty table and nothing seeds it from
+   `Engine::routing`. The 8cd union improved the bootstrap DIAL LIST, not the
+   table. Kad keyword-search quality tracks the LIVE table, so that is the thing
+   to fix and then measure.
 
 ## THE TOP NEXT ACTION
 
@@ -248,6 +315,20 @@ restart-clearable gate**, not the ban set (which measured 0).
   **Citing the upstream source line proves the code is wrong, not that it is
   what is hurting you.**
 - **A zero-result test is not a failing test until the CONTROL runs.**
+- **(2026-08-06) A NUMBER THAT CANNOT FALL CANNOT BE A VERDICT.** This handoff
+  nominated "watch Kad contacts climb" as the test of a fix, against a counter
+  that is monotonic by construction - and the same UI field is fed by two
+  different quantities depending on which code path last wrote it. Before
+  nominating a reading as the judge of a change, ask what it does when the change
+  DOESN'T work. If the answer is "the same thing", it is not an instrument.
+  This is [[an-event-is-not-state]] instance 7, inverted: durable state
+  OVERWRITTEN by an event carrying a different measurement.
+- **(2026-08-06) A fix can be right and its stated cause still wrong.** 8cd's
+  resume union is a genuine improvement to the bootstrap dial list. Its commit
+  message explains it as recovering a table that was never lost. The mechanism
+  gets written into the wiki alongside the fix and is what the NEXT session
+  reasons from - so an unverified cause attached to a working fix is more
+  durable than an ordinary mistake, not less.
 - **An instrument's first duty is to measure itself.** The funnel's own
   arithmetic was impossible (396 statuses from 315 handshakes), and the parts
   badge shipped OVERSTATING its evidence - a real measurement inflated into a
@@ -298,6 +379,8 @@ restart-clearable gate**, not the ban set (which measured 0).
 ## Related
 
 - [[build-progress]] / [[security-model]] / [[log]] / [[decisions-and-lessons]]
+- [[kad-routing-lifecycle]] - the two routing tables, and why the Kad readings
+  in this doc had to be rewritten.
 - [[padmule-ipa-delivery]] - the build-and-deliver loop.
 - [[ipad-usb-tooling]] - device runbook, incl. the read-only rule above.
 - [[net-highid-and-port-forwarding]] - the AirVPN Local-port trap.

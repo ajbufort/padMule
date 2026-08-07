@@ -1,7 +1,24 @@
 # Lifecycle Status + Clean Reactivation (hard requirement)
 
-Updated: 2026-08-04 (seedbox mode DROPPED - foreground-only is now the PERMANENT
-posture, so the research below is retained as background, not as a roadmap)
+Updated: 2026-08-06 (annotated: the clean-pause requirement below is currently
+NOT MET on device - see the banner. Seedbox mode DROPPED 2026-08-04 -
+foreground-only is now the PERMANENT posture, so the research below is retained
+as background, not as a roadmap)
+
+> **[ANNOTATION 2026-08-05/06 - THE REQUIREMENT BELOW IS NOT WHAT HAPPENS.]**
+> A device syslog capture measured **465ms** from `pause (backgrounded)` to
+> `Suspending`, with `state -> paused` arriving only **30.5s later, on the way
+> back IN**. So iPadOS freezes the process MID-TEARDOWN and reclaims its sockets;
+> the orderly pause this entry calls a hard requirement is aspirational on the
+> real device, not descriptive. Two mechanisms fit and the log could not separate
+> them - the `beginBackgroundTask` assertion was refused, or `e.pause()` queued
+> behind something long on the SERIAL work queue (the 6s server probe is a
+> candidate). Build `2186e48` INSTRUMENTS both rather than guessing: `pause()`
+> now logs the assertion as GRANTED/REFUSED and stamps how long the work item
+> waited before it STARTED (EngineModel.swift:1040-1049). **One background round
+> trip on that build answers it; do not theorise first.** Everything below stays
+> as the design intent and as the spec any fix must satisfy.
+> ([[handoff-next-session]] open lead 1, [[build-progress]] 8cd/8ce.)
 
 padMule is foreground-only ([[ipados-constraints]]): iPadOS suspends the app
 ~30s after backgrounding and reclaims every TCP/UDP socket (EBADF). When focus
