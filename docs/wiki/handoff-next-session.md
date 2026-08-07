@@ -15,7 +15,7 @@ first direct evidence the lock-free poll really does keep running.
 
 ## State of the tree
 
-- **Gate**: 644 Rust tests, 24 Swift simulator tests, clippy `-D warnings`,
+- **Gate**: 647 Rust tests, 24 Swift simulator tests, clippy `-D warnings`,
   fmt + ASCII clean.
 - **BRANCH `fetch-funnel`, nothing merged.** Do not trust prose for counts - run
   `git log --oneline main..HEAD` and `git log --oneline origin/main..main`.
@@ -24,10 +24,11 @@ first direct evidence the lock-free poll really does keep running.
   not get the CI Rust gate automatically. It DOES take `workflow_dispatch`
   though - `gh workflow run "Rust unit gate" --ref <branch>` - which is worth
   doing per commit on this branch rather than trusting the local gate alone.
-  Done for `7d1b349`: PASSED, as did the iOS build on the same sha.
-- **Installed on device: `7d1b349`**, confirmed by reading Settings > This
-  device > **Build** (`1.0 (7d1b349)`) - which is how to confirm any install,
-  never by spotting a UI change.
+  Done for `7d1b349` and `19d06d0`: both PASSED, as did the iOS builds.
+- **Installed on device: `19d06d0`**, confirmed by reading Settings > This
+  device > **Build** (`1.0 (19d06d0)`) - which is how to confirm any install,
+  never by spotting a UI change. NOT yet on device: `0e34fcf` (the VPN-badge
+  fix) and `e143b28` (docs).
 
 ## THE INSTALL PATH - read this before touching Sideloadly
 
@@ -80,20 +81,29 @@ when it lapses, agent-driven device testing stops until a Sideloadly renewal.
 Kad still contributes - rows read `server + kad`, and "hedda hopper" split 2 kad
 / 2 server - so the search did not get faster by dropping an arm.
 
-**ATTRIBUTION IS UNEVEN, and the difference matters.** Refresh is
-mechanism-matched (a 2s quiet period plus the send fan-out predicts ~2.8s, and it
-reads 2.83s three times running) and the poll gap is measured INSIDE the app, so
-neither depends on the probe. **The SEARCH comparison is the weak one:** the
-probe cadence behind the 10.3s baseline is unknown, and a cheaper probe biases
-the new number down. An A/B against f946e02 with the same probe would settle it
-and has NOT been run; the old unsigned IPA is kept for exactly that.
+**THE SEARCH A/B WAS SETTLED OFF-DEVICE, which is the better experiment.**
+`mule-cli kad-keyword` calls `resolve_keyword` directly, so old binary vs new,
+alternating against the live network, measures the function with no probe, no UI
+and no server arm: 6.12->3.42, 6.73->5.02, 8.17->6.11. New won all three pairs;
+median **-25%**, NOT the 3x the worst-case arithmetic implies - most queried
+nodes ANSWER, so batching saves round trips rather than timeouts. Quote it as a
+quarter to a half. The device A/B against f946e02 was therefore dropped.
 
-**THE RESIDUAL ~6.3s IS THE KAD ARM AND IT NOW MATCHES THE MODEL:** 12 lookup
-rounds at about one RTT each plus 4 keyword windows. That is round count x RTT -
-what a Kademlia lookup actually costs - where each of those rounds used to cost
-three sequential 750ms timeouts. **The next lever is fewer rounds, or overlapping
-the keyword phase with the lookup the way eMule's CSearch does**, not another
-constant.
+Refresh is mechanism-matched (2s quiet period plus the send fan-out predicts
+~2.8s) and the poll gap is measured INSIDE the app, so neither depends on the
+probe.
+
+**THAT "12 rounds x RTT matches the residual" CLAIM WAS WRONG - deleted rather
+than softened.** The `stats::kad_report` panel added in 19d06d0 measured 5-6
+rounds per lookup, not 12: the `0..12` bound is a safety cap the frontier never
+reaches. The agreement was a coincidence between two wrong numbers.
+
+**WHAT THE PANEL ACTUALLY SAYS (on device, over AirVPN, per_query 750ms):** 62%
+of rounds and 87% of value windows are held open by a peer that never answers,
+and the average round burns 633ms of its 750ms cap (84%). The answer rate is 67%
+on device against 85% on the dev box. **So the barrier IS the remaining cost**,
+and eMule's event-driven `CSearch` - no rounds, value requests interleaved -
+is worth roughly 2-3x on the Kad arm. See [[kad-routing-lifecycle]].
 
 ## THE TOP NEXT ACTION
 
@@ -117,8 +127,14 @@ starved the app and refuted a correct fix.
 **THREE PROBES WERE WRONG BEFORE THEY WERE RIGHT on 2026-08-07, each producing a
 plausible number first.** (1) The results list is NOT cleared between searches,
 so a probe polling for result rows finds the PREVIOUS run's at t=0 and reports
-1.3-1.5s - probe latency wearing a search time's clothes. Tap **Clear search**
-and assert zero rows before starting the clock. (2) A probe matching `srcs`
+1.3-1.5s - probe latency wearing a search time's clothes. **Do NOT solve this
+with the Clear button:** `Clear search` is the field's own affordance and exists
+only while the field holds text AND has focus, and clearing the FIELD does not
+empty the results list - only the X button's `clearSearch()` does. Both cost a
+run on 2026-08-07. Detect by CONTENT instead - poll for a distinctive token of
+the query - which works with stale rows on screen and needs no control at all.
+Re-find the search field every run, too: a cached element id goes stale when the
+hierarchy is rebuilt. (2) A probe matching `srcs`
 reported NO RESULTS by 46s while four results sat on screen, because a
 single-source row reads **`1 src`**. Match **`Get`** instead - exactly one per
 row, regardless of source count. (3) See the probe costs above.
