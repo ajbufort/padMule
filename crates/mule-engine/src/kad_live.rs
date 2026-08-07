@@ -764,7 +764,18 @@ impl KadNode {
         want: usize,
         per_query: Duration,
     ) -> Result<Vec<FileResult>, KadError> {
-        let target = kad_keyword_target(keyword);
+        // ONE WORD GOES ON THE WIRE, NOT THE PHRASE. Kad indexes one entry per
+        // word, so hashing the raw query targeted a region nobody publishes to
+        // and every multi-word search returned zero - silently, because the
+        // lookup converges perfectly on an empty part of the keyspace. Proven
+        // 2026-08-07: "Yes Prime Minister" -> 0, "minister" -> a full page.
+        // eMule sends `m_listWords.front()` (SearchManager.cpp:140-141) and
+        // filters the results by the rest, which is what the tail of this
+        // function now does.
+        let Some(primary) = mule_kad::kad_primary_keyword(keyword) else {
+            return Ok(Vec::new()); // nothing indexable (all tokens under 3 bytes)
+        };
+        let target = kad_keyword_target(&primary);
         let seeds: Vec<WireContact> = self
             .routing
             .closest_to(&target, 50)
@@ -806,6 +817,13 @@ impl KadNode {
             }
             if let Ok(found) = self.search_keyword_node(&node, &target, per_query).await {
                 for f in found {
+                    // The wire matched ONE word. Apply the rest locally, exactly
+                    // as eMule does per result (Search.cpp:1379-1395) - without
+                    // this, a search for "yes prime minister" hands back
+                    // everything on the network indexed under "yes".
+                    if !mule_kad::kad_filename_matches(&f.name, keyword) {
+                        continue;
+                    }
                     if !files.iter().any(|e| e.hash == f.hash) {
                         files.push(f);
                     }
