@@ -61,7 +61,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -1142,6 +1142,7 @@ fn map_server_event(e: ServerEvent) -> EngineEvent {
 
 /// The coarse lifecycle state the UI shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum EngineState {
     /// Not started (or shut down): no sockets, nothing running.
     Stopped,
@@ -1271,12 +1272,47 @@ pub struct SearchFilters {
 /// engine's life. That last property is what makes this safe; if any of these
 /// fields were ever replaced rather than mutated in place, a handle would
 /// silently go stale and the UI would read a dead copy forever.
+/// Status scalars PUBLISHED as atomics so a reader never takes the engine lock.
+///
+/// WHY: measured on device 2026-08-07, a "Refresh server list" tapped 1.9s into
+/// a search took 20.62s against 7.5-9.3s idle - a user action waiting ~12s
+/// behind another. Three of the four values the 1s UI poll reads are trivial
+/// field reads (`state` is a Copy enum, `sharing_paused_for_ip_change` a bool,
+/// `ip_filter_ranges` an `Arc::len`) and they were each taking a lock that a
+/// search can hold for twenty seconds. Reading a bool must not queue behind
+/// network I/O.
+///
+/// Same lock-free idea as `EngineHandles`' existing fields, extended to the
+/// scalars. NOT a cache to be invalidated: every value has exactly one writer
+/// inside the engine, which publishes on change.
+#[derive(Clone, Default)]
+pub struct StatusPub {
+    state: Arc<AtomicU8>,
+    ip_paused: Arc<AtomicBool>,
+    ipfilter_ranges: Arc<AtomicUsize>,
+    kad_contacts: Arc<AtomicUsize>,
+}
+
+impl StatusPub {
+    fn set_state(&self, s: EngineState) {
+        self.state.store(s as u8, Ordering::Relaxed);
+    }
+    fn state(&self) -> EngineState {
+        match self.state.load(Ordering::Relaxed) {
+            1 => EngineState::Running,
+            2 => EngineState::Paused,
+            _ => EngineState::Stopped,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct EngineHandles {
     downloads: Arc<Mutex<Vec<Arc<Download>>>>,
     shared: Arc<Mutex<Vec<SharedFile>>>,
     sharing: Arc<AtomicBool>,
     public_ip: Arc<std::sync::Mutex<Option<Ipv4Addr>>>,
+    status: StatusPub,
 }
 
 impl EngineHandles {
@@ -1314,6 +1350,21 @@ impl EngineHandles {
     /// Session byte totals - process-global atomics, never engine state.
     pub fn transfer_totals(&self) -> (u64, u64) {
         (crate::stats::downloaded(), crate::stats::uploaded())
+    }
+
+    /// The four status scalars the 1s UI poll reads, WITHOUT the engine lock.
+    /// See [`StatusPub`] for why this exists.
+    pub fn state(&self) -> EngineState {
+        self.status.state()
+    }
+    pub fn kad_contacts(&self) -> usize {
+        self.status.kad_contacts.load(Ordering::Relaxed)
+    }
+    pub fn ip_filter_ranges(&self) -> usize {
+        self.status.ipfilter_ranges.load(Ordering::Relaxed)
+    }
+    pub fn sharing_paused_for_ip_change(&self) -> bool {
+        self.status.ip_paused.load(Ordering::Relaxed)
     }
 }
 
@@ -1420,6 +1471,8 @@ pub struct Engine {
     /// Set when the shared library grows mid-session (a download finishing), so
     /// the next downloads() poll re-announces it to the server (OP_OFFERFILES).
     /// Cloned into each download's completion task, which has no path to `server`.
+    /// Status scalars mirrored for lock-free reads - see [`StatusPub`].
+    status: StatusPub,
     shared_dirty: Arc<AtomicBool>,
     /// Servers a connected server advertised via OP_SERVERLIST, awaiting merge
     /// into server.met on the 1s heartbeat. The heartbeat is the race-free spot:
@@ -1541,6 +1594,7 @@ impl Engine {
         // The AICH hashset store: index built in one scan, torn tail truncated.
         let known2 = Arc::new(Known2Store::load(&config_dir));
         let engine = Engine {
+            status: StatusPub::default(),
             identity,
             downloads_dir: config_dir.join("downloads"),
             config_dir,
@@ -1702,6 +1756,7 @@ impl Engine {
     /// at construction; the underlying `Arc`s are never reassigned.
     pub fn handles(&self) -> EngineHandles {
         EngineHandles {
+            status: self.status.clone(),
             downloads: Arc::clone(&self.downloads),
             shared: Arc::clone(&self.shared),
             sharing: Arc::clone(&self.sharing),
@@ -1797,6 +1852,7 @@ impl Engine {
         if on {
             // The user has decided; stop saying we paused for them.
             self.sharing_paused_for_ip_change = false;
+            self.status.ip_paused.store(false, Ordering::Relaxed);
         }
     }
 
@@ -1822,6 +1878,7 @@ impl Engine {
             Some(prev) if prev != id => {
                 self.sharing.store(false, Ordering::Relaxed);
                 self.sharing_paused_for_ip_change = true;
+                self.status.ip_paused.store(true, Ordering::Relaxed);
                 self.emit(EngineEvent::PublicAddressChanged);
             }
             _ => {}
@@ -1854,6 +1911,10 @@ impl Engine {
     }
 
     fn set_state(&mut self, s: EngineState) {
+        // Published FIRST and unconditionally: a paused engine that still reads
+        // "Running" to the UI is the dishonest-status failure this project
+        // treats as a hard requirement ([[lifecycle-and-reactivation]]).
+        self.status.set_state(s);
         if self.state != s {
             self.state = s;
             self.emit(EngineEvent::State(s));
@@ -1875,6 +1936,10 @@ impl Engine {
         // Load the IP blocklist if the user placed one. Best-effort: absent or
         // unparseable means no filtering (never a startup failure).
         self.ip_filter = load_ip_filter(&self.config_dir);
+        self.status.ipfilter_ranges.store(
+            self.ip_filter.as_ref().map_or(0, |f| f.len()),
+            Ordering::Relaxed,
+        );
         if let Some(f) = &self.ip_filter {
             self.emit(EngineEvent::Server(format!(
                 "IP filter: {} ranges blocked",
@@ -4457,6 +4522,19 @@ impl Engine {
         self.last_checkpoint = Instant::now();
     }
 
+    /// Refresh the status scalars that are DERIVED rather than set once.
+    ///
+    /// `kad_contacts` walks a routing table, so unlike the other three it cannot
+    /// just be published at a write site - contacts arrive continuously from
+    /// every lookup. Driven from the heartbeat, which already holds the lock, so
+    /// the published value is at most one beat stale and costs no extra locking.
+    /// The other three publish at their single write sites and are exact.
+    pub fn publish_status(&self) {
+        self.status
+            .kad_contacts
+            .store(self.kad_contacts(), Ordering::Relaxed);
+    }
+
     /// Install or clear the live Kad node, absorbing whatever the OUTGOING node
     /// learned first.
     ///
@@ -4469,6 +4547,10 @@ impl Engine {
     fn set_kad(&mut self, node: Option<KadNode>) {
         self.absorb_kad_routing();
         self.kad = node;
+        // Immediate, not left to the next heartbeat: pause/resume swaps the live
+        // table wholesale and a stale count across that boundary is exactly the
+        // "138 -> 21" confusion of row 8cd.
+        self.publish_status();
     }
 
     /// Copy the LIVE Kad node's table into the persisted one.

@@ -1202,6 +1202,20 @@ final class EngineModel: ObservableObject {
             let shr = e.isSharing()
             let stats = e.transferStats()
             let mapped = e.hasPortMapping()
+            // THE STATUS SCALARS MOVED HERE (2026-08-07) and that is the whole
+            // GUI-responsiveness fix. They used to sit in refresh(), AFTER
+            // heartbeat() in the same closure on the SERIAL `work` queue - so a
+            // 10-20s search froze every status row on screen until it finished.
+            // Measured: a user action issued 1.9s into a search took 20.62s
+            // against 7.5-9.3s idle. All five are now lock-free on the Rust side
+            // (mule-ffi pins that with a test that HOLDS the engine lock), so
+            // they belong on this queue with the other lock-free reads rather
+            // than behind the one call that genuinely needs the lock.
+            let st = e.state()
+            let kad = e.kadContacts()
+            let ipf = e.ipFilterRanges()
+            let srv = e.serverInfo()
+            let ipPause = e.sharingPausedForIpChange()
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.downloads = dls
@@ -1211,6 +1225,11 @@ final class EngineModel: ObservableObject {
                     Set(dls.filter { $0.complete }.map { $0.hash }).union(shf.map { $0.hash })
                 self.sharing = shr
                 self.portMapped = mapped
+                self.state = st
+                self.kadContacts = kad
+                self.ipFilterRanges = ipf
+                self.server = srv
+                self.sharingPausedForIpChange = ipPause
                 self.sampleStats(stats)
                 self.applyKeepAwake()
             }
@@ -1221,25 +1240,18 @@ final class EngineModel: ObservableObject {
         guard let e = engine, !refreshInFlight else { return }
         refreshInFlight = true
         work.async { [weak self] in
-            // THE HEARTBEAT FIRST. It used to be a side effect of downloads();
-            // splitting the read out made it a caller obligation, and seven
-            // background duties fail SILENTLY if it stops - so it leads, before
-            // anything that could early-return.
+            // HEARTBEAT ONLY. It genuinely needs the engine lock - it drives
+            // seven background duties that fail SILENTLY if it stops - so it
+            // stays on the serial `work` queue and is allowed to be slow.
+            //
+            // What it must NOT do any more is carry the status reads with it.
+            // They used to follow it in this same closure, which meant every
+            // status row on screen froze for the length of whatever held the
+            // lock (a search: up to 20s). They now ride refreshFast() on the
+            // lock-free queue. Nothing here publishes to the UI, so a slow
+            // heartbeat costs background timeliness and nothing visible.
             e.heartbeat()
-            let st = e.state()
-            let kad = e.kadContacts()
-            let ipf = e.ipFilterRanges()
-            let srv = e.serverInfo()
-            let ipPause = e.sharingPausedForIpChange()
-            DispatchQueue.main.async {
-                guard let self else { return }
-                self.refreshInFlight = false
-                self.state = st
-                self.kadContacts = kad
-                self.ipFilterRanges = ipf
-                self.server = srv
-                self.sharingPausedForIpChange = ipPause
-            }
+            DispatchQueue.main.async { self?.refreshInFlight = false }
         }
     }
 
