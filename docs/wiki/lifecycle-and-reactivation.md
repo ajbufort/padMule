@@ -151,7 +151,13 @@ WHAT ACTUALLY DECIDES IT, and it is measurable rather than arguable:
 
 1. **Jetsam, not suspension, is the enemy.** Audio keepalive stops the SUSPEND;
    it does nothing about TERMINATION for memory. Background residency wants
-   memory under ~100MB and padMule's has never been measured, on any build.
+   memory under ~100MB. **MEASURED 2026-08-07 on the device (build 48b5128,
+   foreground, server connected, Kad up): `physFootprint` 30.8 MB, stable across
+   samples, CPU falling to 0.1% idle.** So padMule sits at under a THIRD of the
+   budget, and the risk that killed this idea in the abstract is much smaller
+   than assumed. A seed-only background mode - no source hunting, no Kad
+   lookups, no block scheduling - would sit below even that. **The memory
+   objection is answered; what remains untested is LONGEVITY.**
 2. **The 1s heartbeat is a UI-owned clock** (`EngineModel.startPolling`, a
    `Timer` on the MAIN RUNLOOP) and seven background duties fail silently if it
    stops - see `MuleEngine::heartbeat`. Under audio keepalive the app is not
