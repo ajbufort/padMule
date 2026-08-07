@@ -87,6 +87,59 @@ in turn**, so a round cost `ALPHA_QUERY * KAD_PER_QUERY` instead of
 | `resolve_sources` | same shape = **34.5s** | **12s** | 6-15s per caller |
 | `refresh_routing` | 4x3x750ms = **9s** | 4x750ms = **3s** | `KAD_MAINTENANCE_BUDGET` 3s |
 
+**THE WORST CASE IS NOT THE TYPICAL GAIN, and the table above is worst cases.**
+A/B measured 2026-08-07 on this box, old binary vs new, ALTERNATING runs against
+the live network so drift hits both (`mule-cli kad-keyword`, per_query 1400ms,
+"yes prime minister"):
+
+| pair | before | after | delta |
+|---|---|---|---|
+| 1 | 6.12s | 3.42s | -44% |
+| 2 | 6.73s | 5.02s | -25% |
+| 3 | 8.17s | 6.11s | -25% |
+
+New won all three pairs; median 6.73s -> 5.02s, about **-25%**, NOT the 3x the
+arithmetic suggests. The reason is that the arithmetic assumes every query costs
+the full `KAD_PER_QUERY`, and most queried nodes ANSWER within an RTT - so a
+serial round of three cost roughly 3 RTTs, and batching saves 2 RTTs rather than
+2 timeouts. The 3x only materialises when the queried nodes are DEAD. Quote the
+worst case as a worst case; the expected gain is a quarter to a half.
+
+## What the round barrier actually costs - measured 2026-08-07
+
+`stats::kad_report` counts, per FIND_NODE round, whether the batch window ended
+because the last member ANSWERED or because a member never did. Read live off
+this box (`mule-cli kad-keyword`, per_query 1400ms):
+
+| | "yes prime minister" | "hedda hopper" |
+|---|---|---|
+| rounds run | 5 | 6 |
+| rounds with a SILENT peer | 2 (**40%**) | 3 (**50%**) |
+| requests sent / answered | 13 / 11 | 14 / 11 |
+| avg round | 814 ms | 815 ms |
+| value windows | 1 | 4 |
+| windows with a SILENT peer | 0 (0%) | 3 (**75%**) |
+| avg window | 515 ms | 1150 ms |
+
+**Two corrections to the model this entry carried.**
+
+1. **A lookup runs 5-6 rounds, not 12.** `next_queries` empties once the frontier
+   is exhausted, so the `0..12` bound is a safety cap that is never reached. Any
+   estimate multiplying by 12 is wrong by a factor of two.
+2. **A 15% silence rate poisons ~45% of ROUNDS**, because a round is only as fast
+   as its slowest member. That is the arithmetic signature of a barrier and it
+   matches exactly: `1 - 0.85^3 = 38.6%` predicted, 40% and 50% observed. The
+   answer rate is HIGH; the round-level cost is high anyway.
+
+So the average round costs 814ms against a ~250ms round trip, and the value phase
+- which is not overlapped at all - added four more windows at 1150ms for the
+second query. **This is the evidence for eMule's event-driven `CSearch`** (no
+rounds; a response immediately fires the next request, and value requests
+interleave with the lookup, Search.cpp:278-350): it would cut each hop from
+"slowest of three, or the deadline" to "as soon as this one answered", and remove
+the separate value phase entirely. Estimated on these numbers at roughly 2-3x on
+the Kad arm - which is the search's remaining cost.
+
 Consequences that were being read as other problems:
 
 - **The search cap WAS the search cost.** `KAD_SEARCH_WAIT` looked like a safety
