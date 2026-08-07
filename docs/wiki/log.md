@@ -480,3 +480,23 @@ Append-only, timestamped record of Ingest / Query / Lint passes.
   path was WRONG in the first draft (`kademlia/kademlia/` rather than
   `kademlia/routing/`) and is corrected. Not started; awaiting Anthony's read of
   the spec.
+
+- 2026-08-07 **The autonomy loop closed, and the background-memory gate MEASURED.**
+  Anthony granted the signing key to the agent explicitly, reversing the
+  "Anthony runs zsign himself" rule recorded in [[ipad-usb-tooling]] and
+  [[padmule-ipa-delivery]]. `scripts/ship.sh` is the closed loop that follows:
+  commit -> CI -> verify sha AND CFBundleVersion from a fresh extraction -> sign
+  -> install -> confirm WDA survived, with each guard traceable to a session it
+  already cost. The KB + handoff steps and the "run reanalyze after a compact"
+  rule are written into the script's tail, because Anthony asked for them to be
+  part of the loop rather than a chore after it.
+  **THE MEASUREMENT THAT MATTERS:** padMule's `physFootprint` on device is
+  **30.8 MB**, stable, CPU 0.1% idle - against the ~100MB jetsam budget that
+  decides whether background running survives a night. The memory objection to
+  background seeding is therefore ANSWERED; only longevity is still untested.
+  Also found: **padMule had been UNINSTALLED from the device** at some point
+  after the 48b5128 verification - `dvt launch` and WDA both failed with
+  FBSOpenApplicationServiceErrorDomain Code=4, and the apps list confirmed the
+  bundle was gone while WebDriverAgent remained. Reinstalled from the signed IPA
+  on disk. Worth knowing that a launch failure can mean "not installed" rather
+  than "broken build", and that the apps list settles it in one call.
