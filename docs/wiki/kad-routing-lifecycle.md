@@ -286,6 +286,50 @@ field of its own; the receiver masks it with `& 0x7FFF`. **Depth limit 24** -
 exceed it and the far end discards the whole expression and answers unfiltered,
 which looks like the feature silently not working.
 
+## padMule ANSWERS NOTHING either - it is a pure client (2026-08-07)
+
+Bigger than the publish gap below, and previously unrecorded. The Kad socket is
+touched in exactly THREE production places: `request_batch`'s `send_to` and its
+single `recv_from`, plus `send_hello_res_ack`. **There is no listener task, no
+inbound dispatch, and no request opcode is handled anywhere.**
+
+So the socket is read ONLY while padMule is waiting for a reply to its own
+request. The rest of the time nothing reads it and inbound datagrams sit in the
+kernel buffer until they are dropped; and even mid-batch, a datagram from a peer
+not in the current batch is discarded by the demux.
+
+| | a real eMule node | padMule |
+|---|---|---|
+| entries indexed FOR others | thousands (7,700+ observed on Anthony's Acer, 2026-08-07) | 0 - nothing is ever stored |
+| answers FIND_NODE / HELLO / PING / SEARCH | yes | **never** |
+| publishes its own shares | yes | never (below) |
+
+Consequences, in order of how much they cost:
+
+1. **Other clients evict padMule.** eMule's `OnSmallTimer` HELLO-pings the oldest
+   contact in each bin and drops what does not answer (RoutingZone.cpp:858-920).
+   padMule never answers, so it ages out of every routing table that learns it.
+   It cannot be found as a Kad source, and any future buddy/rendezvous scheme
+   ([[nat-traversal-design]]) depends on exactly the reachability this removes.
+2. **It contributes nothing to a volunteer network** while taking from it. That
+   is a POLICY position padMule has never actually chosen - it fell out of never
+   building the serve side - and it is worth choosing deliberately before a
+   community release ([[security-model]] is about not being harmful; this is
+   about not being a freeloader).
+3. It cannot be one of the nodes a keyword search converges on, so padMule users
+   help each other not at all through Kad.
+
+NOT a defect in padMule's own downloads: a pure client works, because the network
+tolerates silent nodes by evicting them. This is about what padMule gives back,
+and about being findable.
+
+Building it needs an inbound dispatch loop on the same socket - which the
+`request_batch` demux now makes structurally awkward, since one reader owns the
+socket for the duration of a batch. The honest shape is a single owning read
+loop that routes datagrams either to a waiting request or to a request handler,
+which is the SAME restructure the event-driven `CSearch` design needs. **The two
+should be designed together, not one after the other.**
+
 ## padMule PUBLISHES NOTHING to Kad (2026-08-07)
 
 Opcodes `0x43`-`0x45` are not defined in `message.rs` and there is no call site.
