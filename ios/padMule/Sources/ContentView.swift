@@ -1562,41 +1562,11 @@ struct ContentView: View {
     /// things are GOOD cannot be trusted to mean anything - its absence reads
     /// identically to "padMule has not looked", which is the failure mode this
     /// whole class of row keeps producing. Saying OFF out loud is the point:
-    /// padMule is a P2P client whose user has deliberately put it behind a
-    /// tunnel, and "no badge" is a terrible way to learn the tunnel is gone.
-    ///
-    /// Word order is ON/OFF FIRST, as specified - it is the part that changed,
-    /// so it reads first.
-    ///
-    /// NOT a safety guarantee: it reports a tunnel INTERFACE, not that padMule's
-    /// packets traverse it (see `NetworkWatcher.vpnIsUp`). The real leak defence
-    /// is the public-address-change guard.
+    /// The VPN indicator. The VIEW lives in `VpnBadge.swift` so it can be
+    /// rendered in a test without a device and without a tunnel in the wanted
+    /// state - see `VpnBadgeTests`, which is what now guards its layout.
     private var vpnBadge: some View {
-        let on = model.vpnActive
-        let tint = on ? Color.vpnBlue : Color.vpnRed
-        return HStack(spacing: 3) {
-            Text(on ? "ON" : "OFF")
-            Text("VPN").strikethrough(!on, color: tint)
-        }
-        .font(.system(size: 11, weight: .bold, design: .rounded))
-        .kerning(0.5)
-        // BOTH WORDS TRUNCATED TO "..." ON DEVICE (2026-08-07, seen on glass:
-        // the badge read ". . .   . . ." inside its border). A ToolbarItem is
-        // free to compress its content below the ideal size, and these two short
-        // Texts are exactly the kind of thing it will squeeze to nothing rather
-        // than push anything else around. `fixedSize` says this width is not
-        // negotiable; `lineLimit(1)` states the intent that it is one line, so a
-        // future longer label wraps nowhere silently.
-        .lineLimit(1)
-        .fixedSize()
-        .foregroundStyle(tint)
-        .padding(.horizontal, 4)
-        .padding(.vertical, 1)
-        .overlay(
-            RoundedRectangle(cornerRadius: 3)
-                .stroke(tint, lineWidth: 1.5)
-        )
-        .accessibilityLabel(on ? "VPN on" : "VPN off")
+        VpnBadge(on: model.vpnActive)
     }
 
     /// What a row with ZERO connected sources should say.
