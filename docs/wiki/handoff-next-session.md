@@ -182,8 +182,24 @@ Re-measuring on another path means raising `fetch::CONNECT_TIMEOUT` first.
    gate is now on DIALABLE sources with the threshold tied by test to the Normal
    worker-pool width. STILL OPEN: whether Kad now actually contributes on
    device. Watch for a `kad` badge on the next build.
-8. Status scalars lag behind `Engine::search`'s ~20s `&mut self`; Portability
-   Tier 2; Settings Tier 1/2.
+8. **[MEASURED 2026-08-07 - Track 1] The GUI slowness is real, and it has TWO
+   stacked causes.** On device: search **10.3s**; server refresh alone
+   **7.5-9.3s**; the same refresh tapped 1.9s into a search **20.62s**. So an
+   action issued during a search waits ~12s extra.
+   - **Cause 1**, the Rust engine mutex: 25 of 42 FFI methods take it, and the
+     1s poll takes it five times.
+   - **Cause 2, and it changes the fix**: `EngineModel.swift:376` declares a
+     **SERIAL** `DispatchQueue`, and every engine call goes through
+     `work.async` - so it serialises even the LOCK-FREE Rust methods. The
+     lock-free work already done (8bq, the funnel's `fetch_report`) is partly
+     defeated on the Swift side. **Making more Rust methods lock-free would NOT
+     fix this on its own** - which is the fix a code read alone would pick.
+   - The two cannot be separated from outside the app; either alone produces the
+     measurement. The Swift queue being serial is provable from the declaration.
+   - **Separately: the operations are individually slow.** `SEARCH_WAIT` 20s
+     (both arms awaited), `PROBE_COLLECT_BUDGET` 6s held under the lock. Two
+     separable problems; fixing either alone leaves the other.
+   Portability Tier 2; Settings Tier 1/2.
 9. **THE KAD FINDINGS FROM THE 2026-08-06 REANALYSIS (row 8ce)** are items
    10-12, plus the two corrections already folded into open leads 2-3 below and
    into [[kad-routing-lifecycle]]. None is a regression; all are pre-existing,
