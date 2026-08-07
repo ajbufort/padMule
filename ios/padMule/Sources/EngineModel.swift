@@ -108,6 +108,18 @@ final class EngineModel: ObservableObject {
     /// The files we are serving to peers (the persisted + session shared library).
     @Published private(set) var sharedFiles: [SharedFileInfo] = []
     @Published private(set) var kadContacts: UInt32 = 0
+    /// How many times the LOCK-FREE status poll has published, and how many
+    /// times the LOCK-TAKING heartbeat has completed.
+    ///
+    /// A PAIR, deliberately, so the instrument carries its own control: during a
+    /// long engine operation (a search holds the lock up to 20s) the first must
+    /// keep climbing at ~1/s while the second stalls. One counter alone would
+    /// only say "something ticked"; the two together say WHICH path is free and
+    /// which is blocked, in the same reading. Built 2026-08-07 to close Track 1,
+    /// because every probe available from outside the app needs the engine lock
+    /// itself and so cannot observe this.
+    @Published private(set) var uiPollTicks: UInt64 = 0
+    @Published private(set) var heartbeatTicks: UInt64 = 0
     /// How many IP-blocklist ranges are loaded (0 = no ipfilter placed).
     @Published private(set) var ipFilterRanges: UInt32 = 0
     @Published private(set) var identity: IdentityInfo?
@@ -1232,6 +1244,7 @@ final class EngineModel: ObservableObject {
                 self.sharingPausedForIpChange = ipPause
                 self.sampleStats(stats)
                 self.applyKeepAwake()
+                self.uiPollTicks &+= 1
             }
         }
     }
@@ -1251,7 +1264,10 @@ final class EngineModel: ObservableObject {
             // lock-free queue. Nothing here publishes to the UI, so a slow
             // heartbeat costs background timeliness and nothing visible.
             e.heartbeat()
-            DispatchQueue.main.async { self?.refreshInFlight = false }
+            DispatchQueue.main.async {
+                self?.refreshInFlight = false
+                self?.heartbeatTicks &+= 1
+            }
         }
     }
 

@@ -80,6 +80,16 @@ struct StatsView: View {
             // It stays live without a refresh button because the 1s stats poll
             // republishes `rateHistory`, re-rendering this body; the engine side
             // is lock-free, so reading it never queues behind a busy engine.
+            Section("UI responsiveness") {
+                Text(
+                    "The status poll is lock-free; the heartbeat needs the engine lock. During a long operation (a search) the first should keep climbing and the second should stall - that gap IS the contention, visible without guessing."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                LabeledContent("Status polls (lock-free)", value: "\(model.uiPollTicks)")
+                LabeledContent("Heartbeats (takes the lock)", value: "\(model.heartbeatTicks)")
+            }
+
             Section("Fetch diagnostics") {
                 Text(
                     "Where peer sessions die on the way to bytes. Counts are cumulative since launch, or since you last reset them."
