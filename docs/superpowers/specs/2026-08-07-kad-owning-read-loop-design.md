@@ -100,9 +100,9 @@ unchanged.
 
 | Inbound | Response | Notes |
 |---|---|---|
-| `KADEMLIA2_HELLO_REQ` | `HELLO_RES` with misc-option `0x04` | matches eMule `SendMyDetails`; asks for the ACK so the peer verifies us. Adds/refreshes the sender. |
+| `KADEMLIA2_HELLO_REQ` | `HELLO_RES`, ACK bit **CONDITIONAL** | eMule sets it as `bAddedOrUpdated && !bValidReceiverKey` (KademliaUDPListener.cpp:601) - i.e. ONLY when the sender's IP is not already proven. The first draft of this spec said "always", which would beg an ACK from peers already verified. Corrected 2026-08-07 by reading `SendMyDetails` (:106-140) rather than trusting the summary. |
 | `KADEMLIA2_HELLO_RES_ACK` | none | marks the sender IP-verified. eMule hard-drops this opcode on an invalid receiver key - match that. |
-| `KADEMLIA2_PING` | `KADEMLIA2_PONG` | this is the one that stops the eviction. |
+| `KADEMLIA2_PING` | `KADEMLIA2_PONG` carrying **the requester's UDP port as a u16** | this is the one that stops the eviction. The payload is not empty: eMule's comment is "currently it is however only used to determine ones external port" (`Process_KADEMLIA2_PING`, :1970-1977), so the port we echo is how the peer learns its own external port. No builder exists for this - `build_pong` is new. |
 | `KADEMLIA2_REQ` | `KADEMLIA2_RES` with the closest contacts | capped at the REQUESTED count; never the requester itself; verified-only, since `closest_to` already is. |
 | `KADEMLIA2_BOOTSTRAP_REQ` | `BOOTSTRAP_RES` | rate-limited harder - see amplification. |
 | `KADEMLIA2_SEARCH_KEY_REQ` / `SEARCH_SOURCE_REQ` | **empty `SEARCH_RES`** | DELIBERATE DEVIATION - see below. |
