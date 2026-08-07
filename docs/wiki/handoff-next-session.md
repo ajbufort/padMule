@@ -8,10 +8,10 @@ Full narrative: [[build-progress]] rows 8cf-8ch and the [[log]] entries for
 
 ## THE ONE-LINE SUMMARY
 
-The GUI freeze (8cg) and the operation slowness (8ch) are both fixed in code and
-**neither the slowness fix nor the freeze fix has been measured on device** -
-8cg's own re-measurement was inconclusive and 8ch is structural-plus-tests only.
-**A device timing pass is the top action.**
+The GUI freeze (8cg) and the operation slowness (8ch) are both fixed and **both
+are now measured on device**: search 10.3s -> 4.6-6.4s, Refresh 7.5-9.3s ->
+2.83s, and a **Longest poll gap of 1.1s** across nine searches, which is the
+first direct evidence the lock-free poll really does keep running.
 
 ## State of the tree
 
@@ -20,11 +20,14 @@ The GUI freeze (8cg) and the operation slowness (8ch) are both fixed in code and
 - **BRANCH `fetch-funnel`, nothing merged.** Do not trust prose for counts - run
   `git log --oneline main..HEAD` and `git log --oneline origin/main..main`.
   History is LINEAR and must stay that way (`gh pr merge --rebase`).
-- **`rust.yml` only fires on push to `main` and on PRs**, so the branch commits
-  have NOT been through the CI Rust gate. The local gate is the only one.
-- **Installed on device: `f946e02`** - which is BEFORE this session's work.
-  Confirm any install by reading Settings > This device > **Build**, not by
-  spotting a UI change.
+- **`rust.yml` only fires on push to `main` and on PRs**, so branch commits do
+  not get the CI Rust gate automatically. It DOES take `workflow_dispatch`
+  though - `gh workflow run "Rust unit gate" --ref <branch>` - which is worth
+  doing per commit on this branch rather than trusting the local gate alone.
+  Done for `7d1b349`: PASSED, as did the iOS build on the same sha.
+- **Installed on device: `7d1b349`**, confirmed by reading Settings > This
+  device > **Build** (`1.0 (7d1b349)`) - which is how to confirm any install,
+  never by spotting a UI change.
 
 ## THE INSTALL PATH - read this before touching Sideloadly
 
@@ -65,21 +68,37 @@ when it lapses, agent-driven device testing stops until a Sideloadly renewal.
 5. **Stats -> "Longest poll gap"**, because the 8cg counters cannot answer their
    own question (below).
 
-## THE TOP NEXT ACTION - MEASURE 8cg AND 8ch ON DEVICE
+## MEASURED (2026-08-07, build 7d1b349, eMule Sunrise, HighID)
 
-Nothing in either row has a device number behind it. Build, install, and take
-three readings:
+| Reading | Before | Now | n |
+|---|---|---|---|
+| search submit-to-results | 10.3s | **4.58-6.38s** | 9 |
+| "Refresh server list" idle | 7.5-9.31s | **2.82-2.86s** | 3 |
+| Stats -> Longest poll gap | (unmeasurable) | **1.1s** | - |
+| connect to a server | - | 2.6s, HighID | 1 |
 
-| Reading | Before | Expect |
-|---|---|---|
-| search submit-to-results | 10.3s | materially lower; the Kad arm no longer sets the pace |
-| "Refresh server list" idle | 7.5-9.3s | lower - the probe stops when answers are in |
-| Stats -> **Longest poll gap** after a search | (new) | near 1s. Anything near the search length means something on that queue takes the engine lock again |
+Kad still contributes - rows read `server + kad`, and "hedda hopper" split 2 kad
+/ 2 server - so the search did not get faster by dropping an arm.
 
-The gap row is the honest instrument. **The tick COUNTS cannot answer this** -
-see below. If the search is still ~10s, the Kad arm is not the pace-setter and
-the next suspect is the server arm or `ranked_to_hits` (which calls
-`hit_status` per result, ~143 times, under the lock).
+**ATTRIBUTION IS UNEVEN, and the difference matters.** Refresh is
+mechanism-matched (a 2s quiet period plus the send fan-out predicts ~2.8s, and it
+reads 2.83s three times running) and the poll gap is measured INSIDE the app, so
+neither depends on the probe. **The SEARCH comparison is the weak one:** the
+probe cadence behind the 10.3s baseline is unknown, and a cheaper probe biases
+the new number down. An A/B against f946e02 with the same probe would settle it
+and has NOT been run; the old unsigned IPA is kept for exactly that.
+
+**THE RESIDUAL ~6.3s IS THE KAD ARM AND IT NOW MATCHES THE MODEL:** 12 lookup
+rounds at about one RTT each plus 4 keyword windows. That is round count x RTT -
+what a Kademlia lookup actually costs - where each of those rounds used to cost
+three sequential 750ms timeouts. **The next lever is fewer rounds, or overlapping
+the keyword phase with the lookup the way eMule's CSearch does**, not another
+constant.
+
+## THE TOP NEXT ACTION
+
+Track 2 (below): concurrency under load, which is Anthony's remaining complaint
+and has never been started.
 
 ## HOW TO MEASURE ANYTHING ON THIS DEVICE - read before you measure
 
@@ -89,6 +108,20 @@ work and will manufacture the freeze you are trying to measure. On 2026-08-07 it
 produced a reading that refuted a correct fix.
 
 **Take the measurement OUT of the window: record, leave, record once.**
+
+**MEASURE THE PROBES BEFORE TRUSTING THEM.** Timed on device 2026-08-07:
+`/source` **1.70s**, a single element query **0.53s**, `dvt screenshot`
+**2.13s**. Use the element query; `/source` is three times the cost and is what
+starved the app and refuted a correct fix.
+
+**THREE PROBES WERE WRONG BEFORE THEY WERE RIGHT on 2026-08-07, each producing a
+plausible number first.** (1) The results list is NOT cleared between searches,
+so a probe polling for result rows finds the PREVIOUS run's at t=0 and reports
+1.3-1.5s - probe latency wearing a search time's clothes. Tap **Clear search**
+and assert zero rows before starting the clock. (2) A probe matching `srcs`
+reported NO RESULTS by 46s while four results sat on screen, because a
+single-source row reads **`1 src`**. Match **`Get`** instead - exactly one per
+row, regardless of source count. (3) See the probe costs above.
 
 **THE 8cg TICK COUNTERS CANNOT SUPPORT THE READING TAKEN FROM THEM.**
 `uiPollTicks` / `heartbeatTicks` are cumulative, and their `eventQueue` is
@@ -103,7 +136,8 @@ running, and finding (2) above makes the burst the likelier explanation:
 | status polls | ~1.2/s | 0.94/s | a total, which a burst reproduces |
 | heartbeats | ~1.2/s | 0.69/s | a real stall (it does take the lock) |
 
-Read **Longest poll gap** instead. It is the one statistic a burst cannot hide.
+Read **Longest poll gap** instead. It is the one statistic a burst cannot hide,
+and on 2026-08-07 it read **1.1s** across nine searches and three probe rounds.
 
 **The WDA search field CONCATENATES.** The helper now clears, sets and READS THE
 FIELD BACK, aborting on mismatch. A re-run once silently searched
