@@ -1,6 +1,8 @@
 # Driving the iPad from this box over USB (WSL2 + usbipd + pymobiledevice3)
 
-Updated: 2026-08-03 (TOUCH CONTROL NOW WORKS - go-ios was never needed; and
+Updated: 2026-08-07 (THE INSTALL PATH is zsign + pymobiledevice3; Sideloadly is
+for RENEWALS ONLY, and every Sideloadly round breaks WebDriverAgent. 2026-08-03:
+TOUCH CONTROL WORKS - go-ios was never needed; and
 engine os_log logging LANDED - subsystem us.ajbconsulting.padMule, category
 padMule.engine - device-verified 2026-08-03 via idevicesyslog)
 
@@ -203,19 +205,49 @@ pymobiledevice3's own `developer dvt xcuitest` launches the runner directly, so
 go-ios is not part of the path at all. The three go-ios recovery ideas queued
 here are retained only as history.]
 
-## Signing padMule locally (a genuine win, independent of WDA)
+## THE INSTALL PATH: zsign + pymobiledevice3. Sideloadly is for RENEWALS ONLY.
 
-zsign + the cached Sideloadly cert/key + a device-pulled profile means padMule
-builds can be signed and installed FROM HERE, with no Sideloadly round trip and
-no detach/attach dance: sign, `pymobiledevice3 apps install`, watch syslog.
-The padMule profile pulled 2026-08-02 is
-`iOS Team Provisioning Profile: us.ajbconsulting.padMule.Q444CHAF2Z`.
-LIMIT: profiles + free-account cert expire **2026-08-10**. Renewal still needs
-Sideloadly (Apple ID auth, App ID + device registration, cert issuance); after
-each renewal, re-pull the profile with `ideviceprovision copy`.
+**This is the default. Do not reach for Sideloadly to install a build.**
+Promoted from a footnote 2026-08-07 after the footnote version cost a session:
+this capability was documented here on 2026-08-02, was READ during the
+2026-08-07 session, and a Sideloadly install was run anyway - which re-signed
+WebDriverAgent, stripped its nested `.xctest` signature, and produced the
+XCTest-103 dead end below. **A capability recorded as "a genuine win" at the
+bottom of an entry reads as trivia. State the default at the top.**
+
+    # 1. Anthony signs (his key, and it stays his - see the security note)
+    zsign -k <sideloadly>/key.pem -c cert.pem -m padmule.mobileprovision \
+          -b us.ajbconsulting.padMule.Q444CHAF2Z \
+          -o padmule-signed.ipa padmule-unsigned.ipa
+    # 2. the agent installs, ~30 seconds, no GUI, no detach/attach
+    pymobiledevice3 apps install padmule-signed.ipa
+
+Kits are staged and stay staged: `/home/ajbufort/padmule-resign/` and
+`/home/ajbufort/wda-resign/` (zsign binary, cert, profile, unsigned ipa).
+
+**WHY IT MATTERS BEYOND CONVENIENCE: every Sideloadly install re-signs whatever
+it touches, and it does NOT sign a nested `.xctest`.** So a Sideloadly round
+breaks WebDriverAgent every single time, and the automation has to be rebuilt
+before any device testing can resume. The zsign path leaves the runner alone -
+verified 2026-08-07: padMule went 92e5ab2 -> 32f1d0e with WDA still answering
+`ready: True` on the same session.
+
+**What Sideloadly is STILL required for: renewal.** zsign only USES an existing
+cert + profile; it cannot ask Apple for new ones (Apple ID auth, App ID + device
+registration, cert issuance). After each renewal, re-pull profiles with
+`pymobiledevice3 provision dump <dir>` - NOT `ideviceprovision copy`, which
+cannot see the device unless it is attached to WSL.
+
+**THE 7-DAY CLOCK IS THE PROFILE, NOT THE CERT.** Read from the profile itself:
+`TimeToLive: 7`, and the developer certificate inside it runs to **2027-07-16**.
+So renewals are profile refreshes, not cert re-issues - the entry used to
+conflate them. Live expiries as of 2026-08-07: WebDriverAgent **2026-08-10**,
+padMule **2026-08-14**; WDA is the binding one. A paid Apple Developer Program
+membership issues 1-year profiles and would end the treadmill for both.
+
 SECURITY NOTE: the signing key is Anthony's; the agent's tool call touching it
 was correctly blocked by a safety classifier, so ANTHONY runs the zsign command
-himself. Keep it that way.
+himself. Keep it that way - the agent stages everything else and installs.
 
 With touch control working, the [[on-device-test-checklist]] pass is now
 AGENT-DRIVABLE end to end (launch, tap, type, read the accessibility tree,
