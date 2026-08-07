@@ -652,9 +652,15 @@ impl KadNode {
                 (n.id, contact_addr(n.ip, n.udp_port), pack_kad(op, payload))
             })
             .collect();
-        self.request_batch(&reqs, OP_KAD2_RES, wait)
-            .await
-            .into_iter()
+        // PROFILE THE ROUND HERE, where the batch size and the window are both
+        // known, so nothing has to be threaded through three call sites. What
+        // matters is whether the window was ended by the last ANSWER or by the
+        // deadline - see `stats::note_kad_round`.
+        let t0 = Instant::now();
+        let raw = self.request_batch(&reqs, OP_KAD2_RES, wait).await;
+        let answered = raw.iter().filter(|r| r.is_ok()).count();
+        crate::stats::note_kad_round(reqs.len(), answered, t0.elapsed().as_millis() as u64);
+        raw.into_iter()
             .zip(nodes)
             .map(|(answer, node)| {
                 let (res_payload, verified, sender_vk) = answer.ok()?;
@@ -703,9 +709,11 @@ impl KadNode {
                 (n.id, contact_addr(n.ip, n.udp_port), pack_kad(op, payload))
             })
             .collect();
-        self.request_batch(&reqs, OP_SEARCH_RES, wait)
-            .await
-            .into_iter()
+        let t0 = Instant::now();
+        let raw = self.request_batch(&reqs, OP_SEARCH_RES, wait).await;
+        let answered = raw.iter().filter(|r| r.is_ok()).count();
+        crate::stats::note_kad_value_window(reqs.len(), answered, t0.elapsed().as_millis() as u64);
+        raw.into_iter()
             .map(|answer| {
                 let (res_payload, verified, sender_vk) = answer.ok()?;
                 let res = parse_search_res(&res_payload).ok()?;
@@ -737,6 +745,7 @@ impl KadNode {
     /// deep dive, which also spreads the traffic out - the point is a table that
     /// keeps improving, not one perfect lookup.
     pub async fn refresh_routing(&mut self, target: &Kad128, per_query: Duration) -> usize {
+        crate::stats::note_kad_lookup();
         let before = self.routing.len();
         let seeds: Vec<WireContact> = self
             .routing
@@ -789,6 +798,7 @@ impl KadNode {
         want: usize,
         per_query: Duration,
     ) -> Result<ResolveOutcome, KadError> {
+        crate::stats::note_kad_lookup();
         // Seed the lookup from the routing table's closest-to-hash contacts.
         let seeds: Vec<WireContact> = self
             .routing
@@ -895,9 +905,11 @@ impl KadNode {
                 (n.id, contact_addr(n.ip, n.udp_port), pack_kad(op, payload))
             })
             .collect();
-        self.request_batch(&reqs, OP_SEARCH_RES, wait)
-            .await
-            .into_iter()
+        let t0 = Instant::now();
+        let raw = self.request_batch(&reqs, OP_SEARCH_RES, wait).await;
+        let answered = raw.iter().filter(|r| r.is_ok()).count();
+        crate::stats::note_kad_value_window(reqs.len(), answered, t0.elapsed().as_millis() as u64);
+        raw.into_iter()
             .map(|answer| {
                 let (res_payload, verified, sender_vk) = answer.ok()?;
                 let res = parse_search_res(&res_payload).ok()?;
@@ -925,6 +937,7 @@ impl KadNode {
         // eMule sends `m_listWords.front()` (SearchManager.cpp:140-141) and
         // filters the results by the rest, which is what the tail of this
         // function now does.
+        crate::stats::note_kad_lookup();
         let words = mule_kad::kad_keywords(keyword);
         let Some(primary) = words.first().cloned() else {
             return Ok(Vec::new()); // nothing indexable (all tokens under 3 bytes)

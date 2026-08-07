@@ -1702,11 +1702,23 @@ final class EngineModel: ObservableObject {
         engine?.fetchReport() ?? "Engine not started."
     }
 
-    /// Zero the funnel counters, so the next reading describes one experiment
-    /// rather than everything since launch.
+    /// The Kad lookup profile - rounds run, how many were held open by a peer
+    /// that never answered, and the average round duration. Lock-free on the
+    /// engine side for the same reason as `fetchReport`.
+    ///
+    /// It answers one question: a batch round ends when its last member answers
+    /// OR at the full per-query deadline, and which dominates decides whether
+    /// removing the round barrier is worth building. "with a SILENT peer"
+    /// against "rounds run" is the reading.
+    var kadReport: String {
+        engine?.kadReport() ?? "Engine not started."
+    }
+
+    /// Zero the funnel counters AND the Kad profile, so the next reading
+    /// describes one experiment rather than everything since launch.
     func resetFetchStats() {
         engine?.resetFetchStats()
-        notice = "Fetch counters reset - reproduce the problem, then read them."
+        notice = "Diagnostic counters reset - reproduce the problem, then read them."
     }
 
     /// Drop every dead, unpinned server from the list, then re-probe.

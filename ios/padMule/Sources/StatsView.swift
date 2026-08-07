@@ -98,6 +98,25 @@ struct StatsView: View {
                     value: String(format: "%.1fs", model.uiPollMaxGapSecs))
             }
 
+            // THE KAD LOOKUP PROFILE. A search's remaining cost is the Kad arm,
+            // and the arm's cost is one of two things: the round trips a lookup
+            // genuinely needs, or batch windows held open by peers that never
+            // answer. Those call for opposite responses - the first is
+            // irreducible, the second is fixed by removing the round barrier -
+            // and from outside they look identical. This panel tells them apart.
+            Section("Kad lookup") {
+                Text(
+                    "A lookup round ends when its last peer answers, or at the per-query deadline if one never does. If \"with a SILENT peer\" is most of \"rounds run\", the rounds are paying full timeouts and the barrier is the cost; if it is small, the cost is the round trips the lookup genuinely needs."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+                Text(model.kadReport)
+                    .font(.system(.caption2, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
             Section("Fetch diagnostics") {
                 Text(
                     "Where peer sessions die on the way to bytes. Counts are cumulative since launch, or since you last reset them."
@@ -112,8 +131,12 @@ struct StatsView: View {
 
                 HStack {
                     Button {
-                        UIPasteboard.general.string = model.fetchReport
-                        model.notice = "Fetch report copied to the clipboard."
+                        // BOTH panels. They share one Reset, so a report carrying
+                        // only half of what that Reset cleared would be read as
+                        // covering the whole experiment.
+                        UIPasteboard.general.string =
+                            "KAD LOOKUP\n\(model.kadReport)\nFETCH FUNNEL\n\(model.fetchReport)"
+                        model.notice = "Diagnostic report copied to the clipboard."
                     } label: {
                         Label("Copy report", systemImage: "doc.on.doc")
                     }

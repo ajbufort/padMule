@@ -1033,12 +1033,30 @@ impl MuleEngine {
         mule_engine::stats::fetch_report()
     }
 
-    /// Zero the fetch counters. They are cumulative since LAUNCH, so by the time
-    /// something stalls they are dominated by the healthy minutes before it;
-    /// reset -> reproduce -> read is what makes the numbers mean the thing being
-    /// investigated. Session byte totals are NOT reset.
+    /// THE KAD LOOKUP PROFILE, as a printable block: rounds run, how many of
+    /// them were held open by a peer that never answered, requests sent vs
+    /// answered, and the average round / value-window duration.
+    ///
+    /// It exists to settle ONE question with data rather than argument: a batch
+    /// round ends either when its last member answers or at the full
+    /// `KAD_PER_QUERY` deadline, and which of those dominates decides whether
+    /// eMule's event-driven `CSearch` (no rounds, keyword requests interleaved
+    /// with the lookup) is worth building. `with a SILENT peer` against
+    /// `rounds run` IS the reading. See `mule_engine::stats`.
+    ///
+    /// LOCK-FREE, like `fetch_report` and for the same reason.
+    pub fn kad_report(&self) -> String {
+        mule_engine::stats::kad_report()
+    }
+
+    /// Zero the fetch counters AND the Kad lookup profile - both panels are
+    /// diagnostics and share one Reset, so a reset -> reproduce -> read cycle
+    /// covers everything on the Stats screen. They are cumulative since LAUNCH,
+    /// so by the time something is worth investigating they are dominated by the
+    /// healthy minutes before it. Session byte totals are NOT reset.
     pub fn reset_fetch_stats(&self) {
         mule_engine::stats::reset_fetch_stats();
+        mule_engine::stats::reset_kad_stats();
     }
 
     /// Drain and return every engine event queued since the last call. The UI

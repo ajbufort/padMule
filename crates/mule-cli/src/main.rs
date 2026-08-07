@@ -2005,6 +2005,9 @@ async fn cmd_kad_keyword(nodes_path: &str, keyword: &str) {
         }
         Err(e) => eprintln!("keyword search failed: {e}"),
     }
+    // The lookup profile for the search just run. Same block the app shows under
+    // Stats -> Kad lookup; printed here so it can be read without a device.
+    print!("\nKAD LOOKUP\n{}", mule_engine::stats::kad_report());
 }
 
 /// Attempt a NAT-PMP port mapping against the gateway - opens our port for
