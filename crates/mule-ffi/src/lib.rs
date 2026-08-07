@@ -533,9 +533,11 @@ impl MuleEngine {
 
     /// The current coarse lifecycle state.
     pub fn state(&self) -> EngineStateFfi {
-        self.rt
-            .block_on(async { self.inner.lock().await.state() })
-            .into()
+        // LOCK-FREE. Measured 2026-08-07: an action issued during a search waits
+        // ~12s behind it, and four of the five engine calls the 1s UI poll makes
+        // were taking that lock to read a bool or a Copy enum. The status poll
+        // must never queue behind network I/O.
+        self.handles.state().into()
     }
 
     /// The persistent node identity.
@@ -569,8 +571,9 @@ impl MuleEngine {
 
     /// How many Kad contacts the routing table holds.
     pub fn kad_contacts(&self) -> u32 {
-        self.rt
-            .block_on(async { self.inner.lock().await.kad_contacts() as u32 })
+        // LOCK-FREE, refreshed by `publish_status` on the heartbeat, so at most
+        // one beat stale rather than blocking for the length of a search.
+        self.handles.kad_contacts() as u32
     }
 
     /// The Servers screen: read server.met and PROBE each server's UDP status
@@ -683,8 +686,7 @@ impl MuleEngine {
     /// (a dropped VPN tunnel, a network switch). The UI keeps saying why until
     /// the user turns sharing back on, which clears it.
     pub fn sharing_paused_for_ip_change(&self) -> bool {
-        self.rt
-            .block_on(async { self.inner.lock().await.sharing_paused_for_ip_change() })
+        self.handles.sharing_paused_for_ip_change() // LOCK-FREE
     }
 
     /// Override the eD2k ports. Takes effect on the NEXT start().
@@ -797,6 +799,9 @@ impl MuleEngine {
             // Kad routing-table maintenance. Rate-limited to KAD_REFRESH_EVERY
             // inside, so calling it every heartbeat costs a comparison.
             g.maintain_kad().await;
+            // Refresh the derived status scalars while we already hold the lock,
+            // so the lock-free readers above see a value at most one beat old.
+            g.publish_status();
         });
     }
 
@@ -838,8 +843,7 @@ impl MuleEngine {
 
     /// How many IP-blocklist ranges are loaded (0 = no filter placed).
     pub fn ip_filter_ranges(&self) -> u32 {
-        self.rt
-            .block_on(async { self.inner.lock().await.ip_filter_ranges() as u32 })
+        self.handles.ip_filter_ranges() as u32 // LOCK-FREE
     }
 
     /// Whether a router port mapping is currently held. The UI needs this to stay
@@ -1250,5 +1254,57 @@ mod tests {
         assert_eq!(eng.state(), EngineStateFfi::Stopped);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dl_dir);
+    }
+
+    /// THE STATUS POLL MUST NOT QUEUE BEHIND A LONG ENGINE OPERATION.
+    ///
+    /// Measured on device 2026-08-07: a "Refresh server list" tapped 1.9s into a
+    /// search took 20.62s against 7.5-9.3s idle. Four of the five engine calls
+    /// the 1s UI poll makes were taking the engine lock - to read a `bool`, a
+    /// `Copy` enum, and an `Arc::len`. A search can hold that lock for twenty
+    /// seconds.
+    ///
+    /// This test HOLDS THE LOCK and asserts the four readers still answer. It
+    /// fails - by timing out rather than by assertion - the moment any of them
+    /// goes back to `inner.lock()`, which is precisely how the regression would
+    /// otherwise return unnoticed.
+    #[test]
+    fn the_status_readers_answer_while_the_engine_lock_is_held() {
+        let dir = std::env::temp_dir().join(format!("padmule-ffi-lockfree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let e = MuleEngine::new(
+            dir.to_string_lossy().into_owned(),
+            dir.to_string_lossy().into_owned(),
+        )
+        .unwrap();
+
+        // Take the engine lock and hold it well past any plausible read.
+        let held = std::sync::Arc::clone(&e);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let hog = std::thread::spawn(move || {
+            held.rt.block_on(async {
+                let _g = held.inner.lock().await;
+                tx.send(()).unwrap();
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            });
+        });
+        rx.recv().unwrap(); // the lock is now definitely held
+
+        let t0 = std::time::Instant::now();
+        let _ = e.state();
+        let _ = e.kad_contacts();
+        let _ = e.ip_filter_ranges();
+        let _ = e.sharing_paused_for_ip_change();
+        let elapsed = t0.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "the status readers took {elapsed:?} while the engine lock was held - \
+             one of them is taking the lock again, so the UI will freeze for the \
+             length of every search"
+        );
+        hog.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
