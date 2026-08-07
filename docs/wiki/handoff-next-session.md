@@ -107,10 +107,34 @@ on device against 85% on the dev box. **So the barrier IS the remaining cost**,
 and eMule's event-driven `CSearch` - no rounds, value requests interleaved -
 is worth roughly 2-3x on the Kad arm. See [[kad-routing-lifecycle]].
 
-## THE TOP NEXT ACTION
+## THE TOP NEXT ACTION - a DECISION is pending, not work
 
-Track 2 (below): concurrency under load, which is Anthony's remaining complaint
-and has never been started.
+Anthony asked for the **event-driven `CSearch` rewrite, designed together with
+the Kad serve loop** (not after it - they need the same restructure, and doing
+them separately means doing it twice). Serve scope is DECIDED: **routing answers
+only** - HELLO, PING, KADEMLIA2_REQ and the v8 verification handshake; no index,
+no storage. The reason is padMule's foreground-only posture: answering routing
+queries is stateless and a node that vanishes is what eviction already handles,
+whereas STORING published data would take other clients' keywords and sources and
+then disappear on a background, which is worse for the network than not storing.
+
+What is NOT decided is the sequencing, and three options were put:
+
+- **A** - one change, both halves together. Fewest moving parts, but it rewrites
+  the layer verified today and the serve loop confounds any search regression.
+- **B (recommended)** - serve loop FIRST (the owning read loop plus the inbound
+  handler, keeping today's batched lookup on top of it), then the event-driven
+  lookup as a pure policy change. Front-loads the structural risk into the step
+  with an unambiguous success test - does a real eMule keep padMule in its
+  routing table? - and leaves the perf change measurable by the Kad panel that
+  already exists.
+- **C** - lookup first, serve second: the "restructure twice" outcome.
+
+**The main correctness surface either way:** an owning read loop means the
+routing table is READ by the handler and WRITTEN by lookups, so it moves behind a
+lock or into the actor. That is where the tests belong.
+
+After that: Track 2 (below), concurrency under load, still never started.
 
 ## HOW TO MEASURE ANYTHING ON THIS DEVICE - read before you measure
 
