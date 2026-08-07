@@ -1,7 +1,10 @@
 # Driving the iPad from this box over USB (WSL2 + usbipd + pymobiledevice3)
 
 Updated: 2026-08-07 (THE INSTALL PATH is zsign + pymobiledevice3; Sideloadly is
-for RENEWALS ONLY, and every Sideloadly round breaks WebDriverAgent. 2026-08-03:
+for RENEWALS ONLY, and every Sideloadly round breaks WebDriverAgent - re-verified
+this day, padMule f946e02 -> 7d1b349 with WDA still answering ready:True on the
+same session. Plus MEASURING ANYTHING THROUGH WDA: the probe costs and the three
+probes that were wrong before they were right. 2026-08-03:
 TOUCH CONTROL WORKS - go-ios was never needed; and
 engine os_log logging LANDED - subsystem us.ajbconsulting.padMule, category
 padMule.engine - device-verified 2026-08-03 via idevicesyslog)
@@ -157,6 +160,42 @@ Endpoints that matter: `GET /screenshot` (base64 PNG), `GET /source?format=json`
 state in text), `POST /session/{id}/actions` (W3C tap), `POST
 /session/{id}/elements` then `.../element/{eid}/click` and `.../value`,
 `POST /session/{id}/alert/accept`.
+
+## MEASURING ANYTHING THROUGH WDA - the rules, with their costs
+
+Kept HERE rather than only in [[handoff-next-session]], which is replaced
+wholesale every session. `scripts/device-timing.sh` encodes all of it.
+
+**Probe costs, timed on device 2026-08-07** (this is the whole reason the rules
+below exist - every probe spends MAIN-THREAD time in the app you are measuring):
+
+| Probe | Cost | Use it? |
+|---|---|---|
+| `GET /source?format=json` | **1.70s** | Only for a one-shot read at the END |
+| `POST /session/{id}/elements` (one locator) | **0.53s** | YES - the polling probe |
+| `pymobiledevice3 developer dvt screenshot` | **2.13s** | Out-of-process, but slow |
+
+Polling `/source` once a second is a >100% duty cycle on the main thread. It
+manufactures the freeze it is measuring, and on 2026-08-07 it produced a reading
+that refuted a correct fix.
+
+**THREE PROBES WERE WRONG BEFORE THEY WERE RIGHT (2026-08-07), each with a
+plausible number first:**
+
+1. **The results list is NOT cleared between searches.** A probe polling for
+   result rows finds the PREVIOUS run's at t=0 and reports 1.3-1.5s - probe
+   latency wearing a search time's clothes, and it looks like a spectacular win.
+   Tap **Clear search** and assert ZERO rows before starting the clock.
+2. **`srcs` is the wrong marker.** A probe matching it reported NO RESULTS by 46s
+   while four results sat on screen, because a single-source row reads
+   **`1 src`** - so it could never fire on a thin result set, which is exactly
+   what a serverless or unpopular query returns. Match **`Get`**: one per row,
+   regardless of source count.
+3. **The search field CONCATENATES** (below). Clear, set, and READ BACK.
+
+**And take the measurement OUT of the window where you can:** record, leave,
+record once. The in-app instruments (Stats -> Longest poll gap, the fetch funnel)
+cost the probe nothing at all and are always preferable to a polled one.
 
 GOTCHAS (each cost real time):
 - **`/wda/tap/0` and `/wda/keys` do NOT exist** in WDA 16.1.1 - they answer
