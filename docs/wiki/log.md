@@ -457,3 +457,26 @@ Append-only, timestamped record of Ingest / Query / Lint passes.
   silently if it stops - it would still fire under keepalive, but that clock
   belongs in Rust before any background posture rests on it. Clean pause/resume
   stays required either way, because every keepalive can be revoked or killed.
+
+- 2026-08-07 **SPEC written: one owning Kad read loop** (routing serve +
+  event-driven CSearch lookup), at
+  `docs/superpowers/specs/2026-08-07-kad-owning-read-loop-design.md`. Both changes
+  have the same root cause - nothing owns the socket - so they are specified
+  together and built in two verifiable steps rather than restructuring twice.
+  Decisions taken with Anthony: serve scope is ROUTING ANSWERS ONLY (no index, no
+  storage: foreground-only makes stateless answering a pure win, while storing
+  other clients' keywords and then vanishing on a background is arguably worse
+  for the network than not storing); sequencing is serve FIRST, because its
+  success test is external and unambiguous - does a real amuled keep padMule in
+  its routing table across a ping cycle - leaving the lookup change as pure
+  policy on proven plumbing. Three calls approved: answer an EMPTY SEARCH_RES
+  rather than staying silent (a deliberate deviation, justified by the 62%-silent
+  cost we measured on ourselves, recorded as a deviation regardless);
+  `Arc<Mutex<RoutingTable>>` now rather than moving lookups into the actor; and
+  the Kad panel is reshaped IN the same change as step 2, because "rounds" stops
+  existing and a panel that reads plausibly while meaning nothing is the failure
+  this project keeps catching. Self-reviewed: no placeholders, and every code
+  citation checked - `Search.cpp:281/336/347` resolve, and the `OnSmallTimer`
+  path was WRONG in the first draft (`kademlia/kademlia/` rather than
+  `kademlia/routing/`) and is corrected. Not started; awaiting Anthony's read of
+  the spec.
