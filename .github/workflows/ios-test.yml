@@ -110,6 +110,35 @@ jobs:
             -sdk iphonesimulator \
             -destination "platform=iOS Simulator,id=${{ steps.sim.outputs.udid }}" \
             -derivedDataPath build \
+            -resultBundlePath TestResults.xcresult \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY=""
+
+      # THE RENDERED BADGE STATES. VpnBadgeTests attaches a PNG of the VPN badge
+      # in both states (and inside a real toolbar) on every run, because the
+      # defect that prompted them was invisible to every assertion padMule had -
+      # the accessibility tree read "VPN on" while the screen read "... ...".
+      # An assertion says a number is right; these say what a person would see.
+      # Extracted from the result bundle so they can be looked at without Xcode.
+      - name: Extract rendered view attachments
+        if: always()
+        run: |
+          mkdir -p ios/rendered
+          # xcresulttool's legacy reader is what exposes attachments by name; the
+          # flag is required on Xcode 16+ and harmless before it.
+          xcrun xcresulttool export attachments \
+            --path ios/TestResults.xcresult \
+            --output-path ios/rendered 2>/dev/null \
+            || echo "no attachments exported (older xcresulttool) - the .xcresult still has them"
+          ls -la ios/rendered || true
+
+      - name: Upload rendered views + test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rendered-views
+          path: |
+            ios/rendered
+            ios/TestResults.xcresult
+          if-no-files-found: warn
