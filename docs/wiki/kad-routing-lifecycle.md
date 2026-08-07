@@ -115,6 +115,42 @@ at `contacts_known() == 0` ("nothing to walk from"). So a bootstrap that misses 
 an offline moment, a VPN reconnect - leaves Kad dead until the user backgrounds
 the app and returns. Nothing retries it.
 
+## padMule PUBLISHES NOTHING to Kad (2026-08-07)
+
+Opcodes `0x43`-`0x45` are not defined in `message.rs` and there is no call site.
+padMule reads the DHT and writes nothing, so **its shared files are invisible to
+every other client searching Kad**. Nothing records this as a deliberate
+deferral; it was simply never built. Wave 6 captured the opcode TABLE and never
+decoded the payloads, which is why nothing flagged the gap.
+
+The payloads, decoded 2026-08-07 from eMule `CSearch::StorePacket`
+(Search.cpp) so the research gap is closed even before the feature is built:
+
+| Opcode | | Payload |
+|---|---|---|
+| `0x43` | `PUBLISH_KEY_REQ` | `keyword_target 16 \| count u16 \| [ fileID 16 \| taglist ] x count` |
+| `0x44` | `PUBLISH_SOURCE_REQ` | `file_target 16 \| our_client_hash 16 \| taglist` |
+| `0x45` | `PUBLISH_NOTES_REQ` | `file_target 16 \| our_kad_id 16 \| taglist` |
+| `0x4B` | `PUBLISH_RES` | load factor back from the storing node |
+| `0x4C` | `PUBLISH_RES_ACK` | null |
+
+- **Keyword taglist** (`PreparePacketForTags`): `TAG_FILENAME` str,
+  `TAG_FILESIZE` (uint, or BSOB-8 above 4 GB), `TAG_SOURCES` uint,
+  `TAG_FILETYPE` str when the ed2k type is non-empty, `TAG_KADAICHHASHPUB` only
+  for a v9+ target holding an AICH hash. Batched **50 files per packet, 150
+  total** per keyword.
+- **Source taglist**: `TAG_SOURCETYPE` (1 HighID / 6 firewalled-with-direct-
+  callback), `TAG_SOURCEPORT`, `TAG_SOURCEUPORT`, `TAG_FILESIZE`, plus the
+  crypt byte - the same shape padMule already PARSES out of `SEARCH_RES`.
+- **Republish clocks** (`opcodes.h:76-78`): sources every **5 h**
+  (`KADEMLIA REPUBLISHTIMES`), keywords and notes every **24 h**. Entries age out
+  against those, so publishing that stops is forgotten rather than retracted.
+
+Building this is a genuine feature, not a bug fix: it changes what padMule puts
+on the network. It needs the codecs AND a publish lookup driver AND a scheduler,
+together - codecs alone would be dead code, which is the [[build-progress]] 8by
+mistake (`build_out_of_part_reqs` unreachable outside tests).
+
 ## Reading the instruments honestly
 
 - **"Kad contacts" now means the LIVE table** (`Engine::kad_contacts()` reads the
