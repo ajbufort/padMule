@@ -622,9 +622,83 @@ impl SearchResult {
     }
 }
 
+/// Characters that SEPARATE Kad keywords - eMule `INV_KAD_KEYWORD_CHARS`
+/// (SearchManager.h:34). Everything between them is one indexable word.
+pub const INV_KAD_KEYWORD_CHARS: &str = " ()[]{}<>,._-!?:;\\/\"";
+
+/// Minimum UTF-8 BYTE length of an indexable keyword (eMule `GetWords`, and its
+/// own comment explains the choice: bytes rather than chars works for Western
+/// locales only as long as the floor stays at 3).
+const MIN_KEYWORD_BYTES: usize = 3;
+
+/// Split a search phrase into the words Kad actually indexes, exactly as eMule's
+/// `CSearchManager::GetWords` does (SearchManager.cpp).
+///
+/// THIS IS THE WHOLE REASON MULTI-WORD KAD SEARCH WORKS. Kad indexes one entry
+/// per WORD, never per phrase - so hashing the raw query string targets a hash
+/// nobody ever published to, and the lookup converges perfectly on an empty
+/// region and reports nothing. padMule did exactly that until 2026-08-07: a
+/// search for "Yes Prime Minister" returned 0 while "minister" alone returned a
+/// full page. Single-word queries always worked, which is why it went unseen.
+///
+/// The rules, all of them from `GetWords`:
+/// - split on [`INV_KAD_KEYWORD_CHARS`];
+/// - keep a token only if its UTF-8 byte length is >= [`MIN_KEYWORD_BYTES`];
+/// - lowercase it;
+/// - de-duplicate by REMOVING an earlier copy and appending, so a repeated word
+///   takes its LAST position, not its first;
+/// - and finally, if more than one word survived and the last token examined was
+///   exactly 3 chars AND 3 bytes, drop it - upstream's reasoning is that such a
+///   trailing token "is in almost all cases a file's extension".
+pub fn kad_keywords(phrase: &str) -> Vec<String> {
+    let mut words: Vec<String> = Vec::new();
+    let (mut last_chars, mut last_bytes) = (0usize, 0usize);
+    for tok in phrase.split(|c| INV_KAD_KEYWORD_CHARS.contains(c)) {
+        // An EMPTY token still counts as an iteration, and that is load-bearing
+        // rather than pedantry: upstream's loop runs once per delimiter run and
+        // leaves `uChars`/`uBytes` at 0, so the extension rule below reads 0 and
+        // does NOT fire. The visible consequence is that a trailing delimiter
+        // SUPPRESSES the extension drop - "...[DVD]" keeps "dvd" while
+        // "...DVD" would lose it. Skipping empties here silently kept stale
+        // values and dropped the last real word.
+        last_chars = tok.chars().count();
+        last_bytes = tok.len();
+        if last_bytes < MIN_KEYWORD_BYTES {
+            continue;
+        }
+        let w = tok.to_lowercase();
+        words.retain(|e| e != &w);
+        words.push(w);
+    }
+    // The trailing-extension rule. Guarded on more than one word so a search for
+    // just "avi" still searches for "avi".
+    if words.len() > 1 && last_chars == 3 && last_bytes == 3 {
+        words.pop();
+    }
+    words
+}
+
+/// The word a Kad keyword search is actually TARGETED at: the first surviving
+/// token (eMule `m_listWords.front()`, SearchManager.cpp:140). The remaining
+/// words are not sent - they filter the results locally.
+pub fn kad_primary_keyword(phrase: &str) -> Option<String> {
+    kad_keywords(phrase).into_iter().next()
+}
+
+/// Does `filename` satisfy every word of `query`? eMule applies this to each
+/// returned result (Search.cpp:1379-1395): the wire only matched ONE keyword, so
+/// without this a search for "yes prime minister" returns everything indexed
+/// under "yes".
+pub fn kad_filename_matches(filename: &str, query: &str) -> bool {
+    let have = kad_keywords(filename);
+    kad_keywords(query).iter().all(|w| have.contains(w))
+}
+
 /// The Kad keyword-search target: `SetValueBE(MD4(utf8(keyword)))`. Keywords are
 /// lowercased so a search matches a publisher's (case-insensitive) keyword.
 /// eMule `KadGetKeywordHash` (Kademlia.cpp:500).
+///
+/// Takes ONE word. Pass [`kad_primary_keyword`] of a phrase, never the phrase.
 pub fn kad_keyword_target(keyword: &str) -> Kad128 {
     Kad128::from_hash(&md4(keyword.to_lowercase().as_bytes()))
 }
@@ -1096,5 +1170,86 @@ mod tests {
             }],
         };
         assert!(r.as_source().is_none());
+    }
+
+    /// The rules of eMule's `CSearchManager::GetWords`, each pinned separately,
+    /// because getting any one of them wrong silently returns zero results
+    /// rather than failing.
+    #[test]
+    fn kad_keywords_tokenises_exactly_as_emule_getwords() {
+        // The bug this whole function exists for: a phrase is MANY keywords.
+        assert_eq!(
+            kad_keywords("Yes Prime Minister"),
+            ["yes", "prime", "minister"]
+        );
+        // Every delimiter in INV_KAD_KEYWORD_CHARS separates.
+        assert_eq!(
+            kad_keywords("Yes.Prime-Minister_S01(1986)[DVD]"),
+            ["yes", "prime", "minister", "s01", "1986", "dvd"]
+        );
+        // Under 3 BYTES is dropped, never indexed.
+        assert_eq!(kad_keywords("a bc minister"), ["minister"]);
+        // Lowercased.
+        assert_eq!(kad_keywords("MINISTER"), ["minister"]);
+    }
+
+    /// A repeat takes its LAST position - upstream removes then push_backs,
+    /// which reorders rather than ignoring the duplicate. This matters because
+    /// position 0 decides which word goes on the wire.
+    #[test]
+    fn a_repeated_word_moves_to_the_back_which_changes_the_target() {
+        assert_eq!(
+            kad_keywords("minister prime minister"),
+            ["prime", "minister"]
+        );
+        assert_eq!(
+            kad_primary_keyword("minister prime minister").unwrap(),
+            "prime"
+        );
+    }
+
+    /// The trailing 3-char/3-byte token is dropped as a presumed extension -
+    /// but only when something else survives, or searching for "avi" would
+    /// search for nothing.
+    #[test]
+    fn a_trailing_three_byte_token_is_treated_as_a_file_extension() {
+        assert_eq!(
+            kad_keywords("Yes Prime Minister.avi"),
+            ["yes", "prime", "minister"]
+        );
+        assert_eq!(kad_keywords("avi"), ["avi"]);
+        // Four chars is not an extension by this rule.
+        assert_eq!(kad_keywords("minister.mkv4"), ["minister", "mkv4"]);
+    }
+
+    /// ONE word goes on the wire - the first - and it is NOT the hash of the
+    /// phrase. This is the regression that returned zero for every multi-word
+    /// search: the phrase hash targets a region nobody publishes to.
+    #[test]
+    fn the_target_is_the_first_word_not_the_phrase() {
+        assert_eq!(kad_primary_keyword("Yes Prime Minister").unwrap(), "yes");
+        assert_eq!(
+            kad_keyword_target(&kad_primary_keyword("Yes Prime Minister").unwrap()),
+            kad_keyword_target("yes")
+        );
+        assert_ne!(
+            kad_keyword_target(&kad_primary_keyword("Yes Prime Minister").unwrap()),
+            kad_keyword_target("Yes Prime Minister"),
+            "hashing the whole phrase is the bug; they must not agree"
+        );
+        assert!(kad_primary_keyword("  ()  ").is_none());
+    }
+
+    /// Only one keyword reached the wire, so the OTHER words have to be applied
+    /// locally or the caller gets everything indexed under "yes".
+    #[test]
+    fn results_are_filtered_by_every_remaining_query_word() {
+        let q = "Yes Prime Minister";
+        assert!(kad_filename_matches("Yes.Prime.Minister.S01E01.avi", q));
+        assert!(kad_filename_matches("YES PRIME MINISTER (1986) DVDrip", q));
+        // Has "yes" - which is all the wire matched - but not the rest.
+        assert!(!kad_filename_matches("Yes.We.Can.mp4", q));
+        // Has two of three.
+        assert!(!kad_filename_matches("Yes Minister S01E01.avi", q));
     }
 }

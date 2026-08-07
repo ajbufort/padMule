@@ -44,8 +44,21 @@ current build state is `docs/wiki/build-progress.md`.
 | `amule-3.0.1/` | Vendored upstream C++ - reference oracle only. `build-oracle/` holds a built amuled for differential tests. |
 | `refs/` | Gitignored source oracles: eMule 0.50a (the WIRE authority), eMule 0.70b (community fork), aMule master. |
 
-Authority rule: for WIRE + FILE FORMATS, eMule 0.50a is the source of truth;
-aMule for wire-neutral policy. **Where they CONFLICT, follow eMule** - and say so
+Authority rule, by domain:
+
+| Domain | Authority |
+|--------|-----------|
+| WIRE + FILE FORMATS | **eMule 0.50a** (`refs/emule-0.50a`) |
+| wire-neutral policy | **aMule** (`refs/amule-master`, `amule-3.0.1/`) - and it is the runnable oracle |
+| **GUI, Settings, per-file behaviour** | **eMule 0.70b** (`refs/emule-0.70b`) - DECIDED 2026-08-06 by Anthony |
+
+The 0.70b row is a STANDING directive, not a one-off: from 2026-08-06 on, when
+designing a screen, a setting, or how a download should behave (states, queueing,
+pause/resume, what the row says), go look at what eMule 0.70b does FIRST and
+diverge only deliberately. It does not touch the wire - 0.50a still decides that.
+See [[emule-070b-features]] for the mined backlog.
+
+**Where the authorities CONFLICT, follow eMule** - and say so
 in the commit + wiki with citations on BOTH sides. This needs active guarding,
 because aMule is the one that builds and runs and is vendored in-tree, so there
 is constant pull toward treating whatever it does as correct. Two live examples:
