@@ -1580,6 +1580,15 @@ struct ContentView: View {
         }
         .font(.system(size: 11, weight: .bold, design: .rounded))
         .kerning(0.5)
+        // BOTH WORDS TRUNCATED TO "..." ON DEVICE (2026-08-07, seen on glass:
+        // the badge read ". . .   . . ." inside its border). A ToolbarItem is
+        // free to compress its content below the ideal size, and these two short
+        // Texts are exactly the kind of thing it will squeeze to nothing rather
+        // than push anything else around. `fixedSize` says this width is not
+        // negotiable; `lineLimit(1)` states the intent that it is one line, so a
+        // future longer label wraps nowhere silently.
+        .lineLimit(1)
+        .fixedSize()
         .foregroundStyle(tint)
         .padding(.horizontal, 4)
         .padding(.vertical, 1)

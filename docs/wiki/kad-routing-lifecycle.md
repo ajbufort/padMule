@@ -121,6 +121,31 @@ this box (`mule-cli kad-keyword`, per_query 1400ms):
 | windows with a SILENT peer | 0 (0%) | 3 (**75%**) |
 | avg window | 515 ms | 1150 ms |
 
+**ON THE DEVICE IT IS WORSE, and that is the reading that decides it.** Same
+panel, read on the iPad over AirVPN (build 19d06d0, per_query **750ms**), after
+six searches:
+
+| | dev box (1400ms) | iPad over AirVPN (750ms) |
+|---|---|---|
+| rounds run | 5-6 per lookup | 29 over 6 lookups (~4.8 each) |
+| rounds with a SILENT peer | 40-50% | **62%** |
+| requests answered | 11/13, 11/14 (**85%**) | 54/80 (**67%**) |
+| avg round | 814ms of 1400ms (58%) | **633ms of 750ms (84%)** |
+| value windows with a silent peer | 0-75% | **87%**, avg 699ms of 750ms (93%) |
+
+**Nearly every round and nearly every value window runs to the full deadline.**
+The answer rate is what drives it - at 67% the barrier predicts
+`1 - 0.67^3 = 70%` of rounds having a silent member, against 62% observed - and
+the device's rate is materially worse than the dev box's, which is exactly the
+condition padMule ships into.
+
+This also explains a comparison that would otherwise look like a regression:
+searches on 19d06d0 measured 7.27 / 8.13 / 7.42s against 4.58-6.38s for 7d1b349
+the same day. The Kad search path is byte-identical between those two commits
+(`git diff` shows only counter increments and a timer), so the difference is the
+swarm answering 67% of the time instead of 85%. **That is the instrument earning
+its place on its first reading: "the app feels slower today" became a number.**
+
 **Two corrections to the model this entry carried.**
 
 1. **A lookup runs 5-6 rounds, not 12.** `next_queries` empties once the frontier
