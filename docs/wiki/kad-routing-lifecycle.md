@@ -1,6 +1,8 @@
 # Kad routing lifecycle - the two tables, and who maintains them
 
-Updated: 2026-08-06 (created by the reanalysis pass, [[build-progress]] 8ce)
+Updated: 2026-08-07 (row 8cf: keyword SEARCH added - three pieces, two of them
+missing since Wave 6, including the expression tree. Created 2026-08-06 by the
+reanalysis pass, [[build-progress]] 8ce)
 
 Where Kad contacts live, how they get there, what survives a pause, and which of
 eMule's maintenance duties padMule performs. This entry exists because its
@@ -114,6 +116,42 @@ This did not bite before 2026-08-05 because `Engine::routing` rarely exceeded
 at `contacts_known() == 0` ("nothing to walk from"). So a bootstrap that misses -
 an offline moment, a VPN reconnect - leaves Kad dead until the user backgrounds
 the app and returns. Nothing retries it.
+
+## Keyword SEARCH: three pieces, and two of them were missing until 2026-08-07
+
+Kad indexes one entry **per word**, never per phrase. A search therefore has
+three parts, all specified in `docs/raw/wave6-kad-research-2026-07-14.md` line
+246 and none of them implemented until row 8cf:
+
+1. **Tokenise** on `INV_KAD_KEYWORD_CHARS`, keep tokens of UTF-8 byte-length
+   >= 3, lowercase, de-duplicate by moving a repeat to the BACK, and drop a
+   trailing 3-char/3-byte token as a presumed file extension - unless the string
+   ended in a delimiter, which suppresses that rule (upstream still iterates on
+   the empty token and zeroes the counters the rule reads).
+2. **Hash ONE word** - the first survivor (`m_listWords.front()`) - as the
+   lookup target. Hashing the phrase targets a hash nobody publishes to, and the
+   lookup converges perfectly on empty space rather than failing.
+3. **Attach a search-expression tree** so the STORING NODE filters before it
+   chooses what to return. Without it a common first word ("yes") yields a
+   bounded sample of an enormous pool, and the wanted file is never in the
+   sample. **Local filtering cannot recover what was never sampled** - which is
+   why pieces 1 and 2 alone still returned zero for "Yes Prime Minister".
+
+Expression wire format (decoded 2026-08-07; Wave 6 had it as "UNSURE - not
+byte-decoded"), `SEARCH_KEY_REQ` = `target 16 | (start_pos | 0x8000) u16 |
+expression`, expression in PREFIX order:
+
+| Byte | Node |
+|---|---|
+| `0x00` | boolean - then op `0x00` AND / `0x01` OR / `0x02` NOT, then LEFT, then RIGHT |
+| `0x01` | string term - u16-length-prefixed UTF-8, lowercased |
+| `0x02` | meta tag - value string, then u16 name length, then name |
+| `0x03` / `0x08` | numeric relation, 32- / 64-bit |
+
+The restrictive flag rides in the **top bit of the start-position word**, not a
+field of its own; the receiver masks it with `& 0x7FFF`. **Depth limit 24** -
+exceed it and the far end discards the whole expression and answers unfiltered,
+which looks like the feature silently not working.
 
 ## padMule PUBLISHES NOTHING to Kad (2026-08-07)
 
