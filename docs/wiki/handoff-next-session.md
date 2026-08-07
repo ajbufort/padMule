@@ -157,9 +157,19 @@ measurement that looked clean *because* it was meaningless.
    Anthony asked for it plus a clear per-file state. **A build, not a bug.**
 3. **A settable max-active download cap with the rest QUEUED**, per-file status
    like eMule. Anthony suggested 20 active. Same feature family as (2).
-4. **padMule PUBLISHES NOTHING to Kad.** Opcodes 0x43-0x45 undefined, no call
-   site; its shares are invisible to every client searching Kad. Payloads decoded
-   and banked in [[kad-routing-lifecycle]]. Deliberately NOT half-built.
+4. **padMule is a PURE CLIENT on Kad - it neither publishes nor answers.**
+   Confirmed 2026-08-07 by reading the socket's call sites: three in production,
+   and the only `recv_from` is inside `request_batch`'s reply collection. No
+   listener, no inbound dispatch, no request opcode handled anywhere. So it
+   stores nothing for anyone (Anthony's eMule on the Acer carries 7,700+ indexed
+   entries the same day), answers no FIND_NODE/HELLO/PING, and publishes no
+   shares (0x43-0x45 undefined). It therefore AGES OUT of other clients' routing
+   tables - eMule's `OnSmallTimer` pings and evicts what stays silent - which
+   costs findability now and breaks any future buddy/rendezvous scheme.
+   Payloads decoded and banked in [[kad-routing-lifecycle]]. **The serve loop and
+   the event-driven `CSearch` design need the SAME restructure** (one owning read
+   loop routing datagrams to either a waiting request or a handler), so design
+   them together rather than in sequence.
 5. **Kad gaps still open** (8ce): no contact expiry or liveness ping (eMule's
    `OnSmallTimer` half), near-biased nodes.dat sample, no bootstrap retry, and
    `KadNode::add_contact` has no Kad-version gate so a peer can put a v1 contact
