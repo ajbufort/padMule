@@ -703,13 +703,93 @@ pub fn kad_keyword_target(keyword: &str) -> Kad128 {
     Kad128::from_hash(&md4(keyword.to_lowercase().as_bytes()))
 }
 
+/// The "restrictive" bit in a SEARCH_KEY_REQ's start-position word: when set, a
+/// boolean search-expression tree follows the u16 and the STORING NODE applies
+/// it before choosing which results to return. The low 15 bits are the start
+/// position (eMule `Process_KADEMLIA2_SEARCH_KEY_REQ`,
+/// KademliaUDPListener.cpp: `uRestrictive = ((uStartPosition & 0x8000) == 0x8000)`).
+pub const SEARCH_KEY_RESTRICTIVE: u16 = 0x8000;
+
+// --- Search-expression tree node types (KademliaUDPListener.cpp
+// `CreateSearchExpressionTree`, written by SearchResultsWnd.cpp:895-920). ---
+/// Boolean node: followed by a bool-op byte, then LEFT then RIGHT subtree.
+const EXPR_BOOL: u8 = 0x00;
+/// String term: followed by a u16-length-prefixed UTF-8 string.
+const EXPR_STRING: u8 = 0x01;
+/// Bool-op: AND.
+const EXPR_AND: u8 = 0x00;
+
+/// eMule refuses a tree deeper than this (`CreateSearchExpressionTree`: "if
+/// (iLevel >= 24) ... exceeds depth limit"), so an AND-chain must stay inside it
+/// or the far end silently discards the whole expression.
+pub const EXPR_MAX_DEPTH: usize = 24;
+
+/// Encode "every one of these words appears" as a search-expression tree.
+///
+/// WHY THIS MATTERS, and it is not an optimisation. A keyword search puts ONE
+/// word on the wire, so the storing node returns a bounded sample of everything
+/// indexed under it. For a common first word ("yes") that sample is drawn from
+/// an enormous pool and the file you want is almost certainly not in it - the
+/// caller then filters locally and gets nothing, which looks identical to "not
+/// published". With the tree, the node filters BEFORE choosing, so the sample is
+/// drawn from matches only.
+///
+/// Encoding is PREFIX (operator, then left, then right), so N words become a
+/// right-leaning chain: `AND w0 (AND w1 (AND w2 w3))`. Depth is therefore N-1
+/// and is capped at [`EXPR_MAX_DEPTH`]; surplus words are dropped from the WIRE
+/// expression only - the caller still filters those locally, so a very long
+/// query loses efficiency, never correctness.
+///
+/// Returns `None` for fewer than two words: one word needs no restriction (it is
+/// already the target), and eMule sends a bare term rather than a bool node.
+pub fn build_search_expression_and(words: &[String]) -> Option<Vec<u8>> {
+    if words.len() < 2 {
+        return None;
+    }
+    // Keep the chain inside the depth limit: `take` words, leaving depth = n-1.
+    let n = words.len().min(EXPR_MAX_DEPTH);
+    let mut w = Writer::new();
+    for word in &words[..n - 1] {
+        w.write_u8(EXPR_BOOL);
+        w.write_u8(EXPR_AND);
+        w.write_u8(EXPR_STRING);
+        w.write_string_u16(word.to_lowercase().as_bytes());
+    }
+    // The tail of the chain is the last word as a bare string term.
+    w.write_u8(EXPR_STRING);
+    w.write_string_u16(words[n - 1].to_lowercase().as_bytes());
+    Some(w.into_inner())
+}
+
 /// Build a KADEMLIA2_SEARCH_KEY_REQ: `target 16 | flags 2`. `flags` is 0 for a
-/// plain keyword search (0x8000 would append a boolean search-expression tree,
-/// not implemented). eMule `Search.cpp:473/506`.
+/// plain keyword search; see [`build_search_key_req_restrictive`] to attach a
+/// search-expression tree. eMule `Search.cpp:473/506`.
 pub fn build_search_key_req(target: &Kad128, flags: u16) -> (u8, Vec<u8>) {
     let mut w = Writer::new();
     w.write_bytes(&target.to_wire());
     w.write_u16(flags);
+    (OP_SEARCH_KEY_REQ, w.into_inner())
+}
+
+/// A keyword search that asks the STORING NODE to filter: `target 16 |
+/// (start_pos | 0x8000) u16 | expression-tree`.
+///
+/// Falls back to the plain form when `words` carries no restriction to express,
+/// so a single-word query is byte-identical to what padMule sent before.
+pub fn build_search_key_req_restrictive(
+    target: &Kad128,
+    start_pos: u16,
+    words: &[String],
+) -> (u8, Vec<u8>) {
+    let Some(expr) = build_search_expression_and(words) else {
+        return build_search_key_req(target, start_pos & !SEARCH_KEY_RESTRICTIVE);
+    };
+    let mut w = Writer::new();
+    w.write_bytes(&target.to_wire());
+    // The flag rides in the TOP bit of the start position, not a separate field;
+    // the receiver masks it off with & 0x7FFF before using the value.
+    w.write_u16((start_pos & !SEARCH_KEY_RESTRICTIVE) | SEARCH_KEY_RESTRICTIVE);
+    w.write_bytes(&expr);
     (OP_SEARCH_KEY_REQ, w.into_inner())
 }
 
@@ -1251,5 +1331,107 @@ mod tests {
         assert!(!kad_filename_matches("Yes.We.Can.mp4", q));
         // Has two of three.
         assert!(!kad_filename_matches("Yes Minister S01E01.avi", q));
+    }
+
+    /// The search-expression tree, byte for byte. Wave 6 left
+    /// `CreateSearchExpressionTree` "UNSURE - not byte-decoded", so this pins
+    /// the layout against BOTH sides of upstream: the writer
+    /// (SearchResultsWnd.cpp:895-920) and the decoder
+    /// (KademliaUDPListener.cpp `CreateSearchExpressionTree`).
+    #[test]
+    fn the_search_expression_tree_is_prefix_encoded_and_chain() {
+        let w = |s: &str| s.to_string();
+        // Two words: AND(bool) then the two string terms, prefix order.
+        let e = build_search_expression_and(&[w("prime"), w("minister")]).unwrap();
+        assert_eq!(
+            e,
+            vec![
+                0x00, 0x00, // boolean node, AND
+                0x01, 5, 0, b'p', b'r', b'i', b'm', b'e', // string term
+                0x01, 8, 0, b'm', b'i', b'n', b'i', b's', b't', b'e', b'r',
+            ]
+        );
+        // One word carries no restriction - nothing to AND against.
+        assert!(build_search_expression_and(&[w("minister")]).is_none());
+        assert!(build_search_expression_and(&[]).is_none());
+        // Lowercased on the wire, as the decoder expects ("the search code
+        // expects lower case strings!").
+        let up = build_search_expression_and(&[w("PRIME"), w("Minister")]).unwrap();
+        assert_eq!(up, e);
+    }
+
+    /// N words make a right-leaning chain of depth N-1, and it must stay inside
+    /// eMule's limit (`iLevel >= 24` aborts and the far end discards the WHOLE
+    /// expression, silently reverting to an unfiltered search).
+    ///
+    /// Decoded structurally rather than by counting bytes - the first version of
+    /// this test counted 0x00 bytes, which also matches the high byte of every
+    /// u16 string length, so it measured nothing.
+    #[test]
+    fn the_and_chain_stays_inside_emules_depth_limit() {
+        /// Walk the prefix encoding exactly as `CreateSearchExpressionTree`
+        /// does, returning (words seen, max depth reached).
+        fn decode(b: &[u8], i: &mut usize, level: usize) -> (usize, usize) {
+            match b[*i] {
+                0x00 => {
+                    assert_eq!(b[*i + 1], 0x00, "only AND is emitted");
+                    *i += 2;
+                    let (lw, ld) = decode(b, i, level + 1);
+                    let (rw, rd) = decode(b, i, level + 1);
+                    (lw + rw, ld.max(rd))
+                }
+                0x01 => {
+                    *i += 1;
+                    let n = u16::from_le_bytes([b[*i], b[*i + 1]]) as usize;
+                    *i += 2 + n;
+                    (1, level)
+                }
+                other => panic!("unexpected node type 0x{other:02X}"),
+            }
+        }
+
+        for count in [2usize, 5, 24, 60] {
+            let many: Vec<String> = (0..count).map(|i| format!("word{i:03}")).collect();
+            let e = build_search_expression_and(&many).unwrap();
+            let mut i = 0;
+            let (words, depth) = decode(&e, &mut i, 0);
+            assert_eq!(
+                i,
+                e.len(),
+                "trailing bytes: the encoding is not well-formed"
+            );
+            assert_eq!(words, count.min(EXPR_MAX_DEPTH), "wrong word count encoded");
+            assert_eq!(depth, words - 1, "an AND-chain of N words has depth N-1");
+            assert!(
+                depth < EXPR_MAX_DEPTH,
+                "depth {depth} hits eMule's {EXPR_MAX_DEPTH} limit; the whole \
+                 expression would be discarded"
+            );
+        }
+    }
+
+    /// The restrictive bit rides in the TOP bit of the start-position word, and
+    /// the receiver masks it off (`uStartPosition & 0x7FFF`). A single-word query
+    /// must still produce the exact plain packet padMule sent before.
+    #[test]
+    fn the_restrictive_flag_rides_in_the_start_position_word() {
+        let t = Kad128::from_hash(&[0x33; 16]);
+        let (op, p) =
+            build_search_key_req_restrictive(&t, 0, &["prime".to_string(), "minister".to_string()]);
+        assert_eq!(op, OP_SEARCH_KEY_REQ);
+        assert_eq!(&p[..16], &t.to_wire()[..]);
+        assert_eq!(u16::from_le_bytes([p[16], p[17]]), SEARCH_KEY_RESTRICTIVE);
+        assert_eq!(
+            &p[18..],
+            &build_search_expression_and(&["prime".to_string(), "minister".to_string()]).unwrap()[..]
+        );
+
+        // One word -> byte-identical to the plain builder.
+        let (_, one) = build_search_key_req_restrictive(&t, 0, &["minister".to_string()]);
+        let (_, plain) = build_search_key_req(&t, 0);
+        assert_eq!(
+            one, plain,
+            "a single-word query must not change on the wire"
+        );
     }
 }

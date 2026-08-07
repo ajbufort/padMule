@@ -17,10 +17,10 @@
 use mule_files::{IpFilter, KadContact};
 use mule_kad::{
     build_bootstrap_req, build_hello_req, build_hello_res_ack, build_kad2_req,
-    build_search_key_req, build_search_source_req, is_acceptable_contact, kad_deobfuscate,
-    kad_keyword_target, kad_obfuscate_request, pack_kad, parse_bootstrap_res, parse_hello,
-    parse_kad2_res, parse_search_res, unpack_kad, BootstrapRes, FileResult, Hello, Lookup,
-    RoutingTable, Source, WireContact, ALPHA_QUERY, K, KAD_FIND_NODE, OP_BOOTSTRAP_RES,
+    build_search_key_req_restrictive, build_search_source_req, is_acceptable_contact,
+    kad_deobfuscate, kad_keyword_target, kad_obfuscate_request, pack_kad, parse_bootstrap_res,
+    parse_hello, parse_kad2_res, parse_search_res, unpack_kad, BootstrapRes, FileResult, Hello,
+    Lookup, RoutingTable, Source, WireContact, ALPHA_QUERY, K, KAD_FIND_NODE, OP_BOOTSTRAP_RES,
     OP_HELLO_RES, OP_KAD2_RES, OP_SEARCH_RES,
 };
 use mule_proto::Kad128;
@@ -737,13 +737,20 @@ impl KadNode {
 
     /// Ask one node for keyword matches (KADEMLIA2_SEARCH_KEY_REQ) and distil the
     /// file results from its KADEMLIA2_SEARCH_RES.
+    ///
+    /// `words` are the query's tokens. When there is more than one, they ride
+    /// along as a search-expression tree so THIS NODE filters before choosing
+    /// what to send back - without that, a common primary keyword returns a
+    /// bounded sample of an enormous pool and the wanted file is simply not in
+    /// it. Local filtering cannot recover what was never sampled.
     async fn search_keyword_node(
         &mut self,
         node: &WireContact,
         target: &Kad128,
+        words: &[String],
         wait: Duration,
     ) -> Result<Vec<FileResult>, KadError> {
-        let (op, payload) = build_search_key_req(target, 0);
+        let (op, payload) = build_search_key_req_restrictive(target, 0, words);
         let frame = pack_kad(op, payload);
         let dest = contact_addr(node.ip, node.udp_port);
         let (res_payload, verified, sender_vk) = self
@@ -772,7 +779,8 @@ impl KadNode {
         // eMule sends `m_listWords.front()` (SearchManager.cpp:140-141) and
         // filters the results by the rest, which is what the tail of this
         // function now does.
-        let Some(primary) = mule_kad::kad_primary_keyword(keyword) else {
+        let words = mule_kad::kad_keywords(keyword);
+        let Some(primary) = words.first().cloned() else {
             return Ok(Vec::new()); // nothing indexable (all tokens under 3 bytes)
         };
         let target = kad_keyword_target(&primary);
@@ -815,7 +823,10 @@ impl KadNode {
             if !target.distance(&node.id).within_tolerance() {
                 continue;
             }
-            if let Ok(found) = self.search_keyword_node(&node, &target, per_query).await {
+            if let Ok(found) = self
+                .search_keyword_node(&node, &target, &words, per_query)
+                .await
+            {
                 for f in found {
                     // The wire matched ONE word. Apply the rest locally, exactly
                     // as eMule does per result (Search.cpp:1379-1395) - without
@@ -1123,9 +1134,16 @@ mod tests {
             tcp_port: 4662,
             version: 8,
         };
-        node.search_keyword_node(&wc, &target, Duration::from_secs(2))
-            .await
-            .unwrap();
+        // Single word: no expression tree, so this drives the same bytes it
+        // always did and still asserts the sender-key capture.
+        node.search_keyword_node(
+            &wc,
+            &target,
+            &["minister".to_string()],
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
         mock.await.unwrap();
         assert_eq!(
             node.routing.verify_key_for(&peer_id, peer_ip, our_ip),
