@@ -191,8 +191,18 @@ const SOURCES_WAIT: Duration = Duration::from_secs(10);
 /// How long a Kad keyword lookup may run before we take whatever it has found.
 /// Kad is the serverless half of search; bounded so a slow lookup never hangs
 /// the box, and it runs concurrently with the server search so it is usually free.
+///
+/// IT USED TO BE THE COST, NOT THE BOUND. `resolve_keyword` awaited its
+/// `ALPHA_QUERY` queries one at a time, so the lookup alone was structurally
+/// 12 x 3 x `KAD_PER_QUERY` = 27s and every search ran until this cap cut it
+/// off. That is the ~10s submit-to-results measured on device 2026-08-07, with
+/// the server arm having answered in well under a second. With the alpha queries
+/// actually concurrent the structural worst case is 12 rounds plus 4 keyword
+/// windows = 12s, so this is a bound again and a normal search finishes far
+/// inside it.
 const KAD_SEARCH_WAIT: Duration = Duration::from_secs(15);
-/// Per-node wait during a Kad keyword lookup.
+/// Per-node wait during a Kad keyword lookup. One ROUND costs this, not
+/// `ALPHA_QUERY` times this - see `KadNode::request_batch`.
 const KAD_PER_QUERY: Duration = Duration::from_millis(750);
 
 /// How often a RUNNING engine refreshes its Kad routing table.
@@ -207,12 +217,15 @@ const KAD_REFRESH_EVERY: Duration = Duration::from_secs(120);
 
 /// Wall-clock cap on ONE `maintain_kad` round.
 ///
-/// `refresh_routing` is bounded only STRUCTURALLY - `REFRESH_ROUNDS` rounds of
-/// `ALPHA_QUERY` queries, issued sequentially at `KAD_PER_QUERY` apiece - and
-/// `heartbeat()` holds the engine lock across it while the UI's 1s poll waits on
-/// the same serial queue. A structural bound is not a deadline, and this was the
-/// only Kad call in the tree without one. Pinned by test to be strictly under
-/// the structural worst case, so the cap actually binds instead of decorating.
+/// `refresh_routing` is bounded only STRUCTURALLY - `REFRESH_ROUNDS` rounds at
+/// `KAD_PER_QUERY` apiece - and `heartbeat()` holds the engine lock across it.
+/// A structural bound is not a deadline, and this was the only Kad call in the
+/// tree without one.
+///
+/// It is now a SAFETY NET rather than the thing that ends every run: the round's
+/// alpha queries go out together (2026-08-07), so a full round costs 3s instead
+/// of 9s and finishes. Pinned by `a_kad_maintenance_round_fits_inside_its_
+/// deadline`, which fails if either half of that stops being true.
 const KAD_MAINTENANCE_BUDGET: Duration = Duration::from_secs(3);
 
 /// Stop actively growing the table past this. Not a protocol rule - a battery
@@ -1291,6 +1304,11 @@ pub struct StatusPub {
     ip_paused: Arc<AtomicBool>,
     ipfilter_ranges: Arc<AtomicUsize>,
     kad_contacts: Arc<AtomicUsize>,
+    /// The live login. Not an atomic - it is a small struct - but a `std` mutex
+    /// held only long enough to clone it, never across an await, exactly like
+    /// `EngineHandles::public_ip`. That is what makes it lock-FREE in the sense
+    /// that matters here: a reader cannot end up queued behind network I/O.
+    server: Arc<std::sync::Mutex<Option<ServerInfo>>>,
 }
 
 impl StatusPub {
@@ -1366,6 +1384,16 @@ impl EngineHandles {
     pub fn sharing_paused_for_ip_change(&self) -> bool {
         self.status.ip_paused.load(Ordering::Relaxed)
     }
+    /// The live login, or `None` when no server has us.
+    ///
+    /// This one was MISSED by the 2026-08-07 lock-free round: it moved onto the
+    /// lock-free UI poll with the other four while the FFI method behind it still
+    /// took the engine lock, so the whole "fast" poll - and, because it shares a
+    /// queue with the event drain, the status banners too - still stalled for the
+    /// length of every search. Found by the 2026-08-07 reanalysis.
+    pub fn server_info(&self) -> Option<ServerInfo> {
+        self.status.server.lock().ok().and_then(|g| g.clone())
+    }
 }
 
 /// What the last successful status probe of a server said, and how many probes
@@ -1388,7 +1416,25 @@ const PROBE_MISSES_BEFORE_DEAD: u8 = 3;
 /// Collection budget for the whole status fan-out. Was 3s, which is tight once
 /// the path runs through a VPN (~200ms base RTT before the server even thinks)
 /// and the fan-out is dozens of servers.
+///
+/// A CEILING, not the cost: see `PROBE_QUIET_PERIOD`.
 const PROBE_COLLECT_BUDGET: Duration = Duration::from_secs(6);
+
+/// How long the probe keeps listening after the LAST answer arrived.
+///
+/// The budget above used to be spent in full on every round, because the collect
+/// loop had no reason to stop before the deadline - so a probe cost 6s whether
+/// the servers answered in 200ms or not at all, and it costs that under the
+/// engine lock, twice on every launch plus every Refresh and Prune. UDP answers
+/// to a fan-out arrive in a burst about one round trip after the sends; two
+/// seconds of complete silence after the last of them means the rest are not
+/// coming this round.
+///
+/// Deliberately generous against the RTT it has to cover (~200ms through a
+/// tunnel), because cutting a slow-but-live server short costs it a MISS, and
+/// three consecutive misses is what greys a server out - the exact
+/// one-datum-is-a-verdict failure `fold_probe_round` exists to prevent.
+const PROBE_QUIET_PERIOD: Duration = Duration::from_secs(2);
 
 /// What one probe round concluded about one server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1698,6 +1744,21 @@ impl Engine {
             // login" would be a lie - we simply have not been told to connect yet.
             "Not connected - pick a server".to_string()
         }
+    }
+
+    /// Publish the login for the lock-free readers, then emit the status line.
+    ///
+    /// The two say the same thing from the same two fields, so they are done
+    /// together: every path that changes whether we are connected already emits
+    /// this line, which makes it the one place that cannot be forgotten. Without
+    /// the publish the UI would still be correct within one heartbeat - see
+    /// `publish_status` - but the server row would lag a connect by up to a
+    /// second, which is exactly when the user is watching it.
+    fn emit_online_status(&self) {
+        if let Ok(mut g) = self.status.server.lock() {
+            *g = self.server_info();
+        }
+        self.emit(EngineEvent::Status(self.online_status()));
     }
 
     /// Have we any way to FIND sources right now - a connected server, or a Kad
@@ -2036,7 +2097,7 @@ impl Engine {
             // Report Running BEFORE the (time-bounded) resume pass, so the engine
             // is usable and the state is honest even while resume_fetches works.
             self.set_state(EngineState::Running);
-            self.emit(EngineEvent::Status(self.online_status()));
+            self.emit_online_status();
             // Downloads resumed from disk above were registered but have no
             // transfer task yet; now that the server + Kad are up, find sources
             // and drive them (otherwise they wait passively for a callback).
@@ -2045,7 +2106,7 @@ impl Engine {
         }
 
         self.set_state(EngineState::Running);
-        self.emit(EngineEvent::Status(self.online_status()));
+        self.emit_online_status();
     }
 
     /// Bind the inbound peer port and accept connections. This is what earns a
@@ -2511,13 +2572,13 @@ impl Engine {
             // screen that was simultaneously showing the server and "HighID"
             // (found on-device 2026-08-02). Emitted after `self.server` is set,
             // because `online_status` asks `is_online`.
-            self.emit(EngineEvent::Status(self.online_status()));
+            self.emit_online_status();
             true
         } else {
             self.emit(EngineEvent::Server(format!("could not connect to {addr}")));
             // A failed dial also DROPPED any previous link above, so the row must
             // stop claiming the connection we no longer have.
-            self.emit(EngineEvent::Status(self.online_status()));
+            self.emit_online_status();
             false
         }
     }
@@ -2531,7 +2592,7 @@ impl Engine {
         self.connection = None;
         self.search_session = None;
         self.emit(EngineEvent::Server("Disconnected from the server".into()));
-        self.emit(EngineEvent::Status(self.online_status()));
+        self.emit_online_status();
     }
 
     /// The Servers screen: read `server.met` and probe each server's UDP status
@@ -2594,10 +2655,32 @@ impl Engine {
             }
         }
         // Collect answers within a short budget; match each back by (ip, port-4).
-        let deadline = tokio::time::Instant::now() + PROBE_COLLECT_BUDGET;
+        //
+        // The budget is a CEILING and the round normally ends well inside it: it
+        // stops as soon as every server has said everything we asked it for, and
+        // failing that, `PROBE_QUIET_PERIOD` after the last answer. It used to run
+        // to the deadline unconditionally, so a list that answered in 200ms still
+        // cost six seconds under the engine lock.
+        let hard_deadline = tokio::time::Instant::now() + PROBE_COLLECT_BUDGET;
+        // What we are still waiting for: a status answer from everyone, and a name
+        // from everyone who has none. A server whose name we already have owes us
+        // nothing further, so its silence must not hold the round open.
+        let mut awaiting_status = servers.len();
+        let mut awaiting_name = servers.iter().filter(|e| e.name.is_empty()).count();
+        // The quiet period only starts once answers are actually FLOWING. Before
+        // the first one there is no burst to be at the end of, and cutting the
+        // round short there would cost every server a miss on a cold start - when
+        // the health map is empty and there is nothing to vouch for any of them.
+        let mut heard_from_anyone = false;
         let mut buf = [0u8; 2048];
-        loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        while awaiting_status > 0 || awaiting_name > 0 {
+            let now = tokio::time::Instant::now();
+            let deadline = if heard_from_anyone {
+                hard_deadline.min(now + PROBE_QUIET_PERIOD)
+            } else {
+                hard_deadline
+            };
+            let remaining = deadline.saturating_duration_since(now);
             if remaining.is_zero() {
                 break;
             }
@@ -2612,9 +2695,16 @@ impl Engine {
                                 e.addr.ip() == src.ip()
                                     && e.addr.port().checked_add(4) == Some(src.port())
                             }) {
+                                // Only the FIRST answer from a server settles its
+                                // debt - a duplicate must not drive the counter
+                                // below what is genuinely outstanding.
+                                if !e.alive {
+                                    awaiting_status -= 1;
+                                }
                                 e.alive = true;
                                 e.users = Some(users);
                                 e.files = Some(files);
+                                heard_from_anyone = true;
                             }
                         }
                     }
@@ -2634,7 +2724,9 @@ impl Engine {
                                 if e.name.is_empty() {
                                     e.name = name;
                                     learned.push((e.addr, e.name.clone()));
+                                    awaiting_name -= 1;
                                 }
+                                heard_from_anyone = true;
                             }
                         }
                     }
@@ -3081,7 +3173,7 @@ impl Engine {
         // the same "an event is not state" bug fixed for connect/disconnect in
         // 8as, which missed this path. Emitted after `self.server` is cleared,
         // because `online_status` asks `is_online`.
-        self.emit(EngineEvent::Status(self.online_status()));
+        self.emit_online_status();
         Some(addr)
     }
 
@@ -3334,7 +3426,9 @@ impl Engine {
     /// offline) - not worth an error the UI would render as "no results" anyway.
     ///
     /// The two run concurrently, so the wait is the SLOWER of the two, not the
-    /// sum. Blocks up to `SEARCH_WAIT`; the FFI facade runs it off the UI thread.
+    /// sum - and in practice that was always the Kad arm, because its own
+    /// queries were serial (see `KAD_SEARCH_WAIT`). Blocks up to `SEARCH_WAIT`;
+    /// the FFI facade runs it off the UI thread.
     /// Filters (bounds in BYTES) are applied on the server wire query and to the
     /// merged set.
     pub async fn search(&mut self, keyword: &str, filters: SearchFilters) -> SearchOutcome {
@@ -4200,7 +4294,7 @@ impl Engine {
             self.refresh_port_mapping();
         }
 
-        self.emit(EngineEvent::Status(self.online_status()));
+        self.emit_online_status();
     }
 
     /// Re-verify the UPnP port mapping after a foreground return, eMule's
@@ -4477,12 +4571,13 @@ impl Engine {
         let target = Kad128::from_hash(&bytes);
         let before = kad.contacts_known();
         // A DEADLINE, not just a round count. `refresh_routing`'s bound is
-        // structural - REFRESH_ROUNDS x ALPHA_QUERY queries, run SEQUENTIALLY at
-        // KAD_PER_QUERY each - which is up to 9s of worst case, and this runs
-        // under the engine lock via `heartbeat()` while the UI's 1s poll waits on
-        // the same serial queue. Every OTHER Kad call site already wraps in a
-        // timeout (search, find_sources); this one did not, and it was the only
-        // periodic one. Row 8bx treated a 15s lock hold as a real defect.
+        // structural - REFRESH_ROUNDS rounds at KAD_PER_QUERY each - and this runs
+        // under the engine lock via `heartbeat()`. Every OTHER Kad call site
+        // already wraps in a timeout (search, find_sources); this one did not, and
+        // it was the only periodic one. Row 8bx treated a 15s lock hold as a real
+        // defect. Since the alpha queries went concurrent the round costs 3s
+        // rather than 9s and normally completes, so this is now the net and not
+        // the knife.
         //
         // Partial work is KEPT: `add_contact` mutates the table as answers
         // arrive, so a cancelled round still leaves everything it learned. The
@@ -4522,17 +4617,22 @@ impl Engine {
         self.last_checkpoint = Instant::now();
     }
 
-    /// Refresh the status scalars that are DERIVED rather than set once.
+    /// Refresh the status values that are DERIVED rather than set once.
     ///
-    /// `kad_contacts` walks a routing table, so unlike the other three it cannot
-    /// just be published at a write site - contacts arrive continuously from
-    /// every lookup. Driven from the heartbeat, which already holds the lock, so
-    /// the published value is at most one beat stale and costs no extra locking.
-    /// The other three publish at their single write sites and are exact.
+    /// `kad_contacts` walks a routing table and the login is a function of TWO
+    /// fields (`server`'s connected state and `connection`), so unlike the flags
+    /// neither can simply be published at one write site. Driven from the
+    /// heartbeat, which already holds the lock, so the published value is at most
+    /// one beat stale and costs no extra locking - and every connect / disconnect
+    /// / drop / pause path calls this directly, so the common cases are exact
+    /// rather than merely eventual.
     pub fn publish_status(&self) {
         self.status
             .kad_contacts
             .store(self.kad_contacts(), Ordering::Relaxed);
+        if let Ok(mut g) = self.status.server.lock() {
+            *g = self.server_info();
+        }
     }
 
     /// Install or clear the live Kad node, absorbing whatever the OUTGOING node
@@ -4713,21 +4813,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The maintenance deadline must actually BIND, i.e. be strictly under what
-    /// `refresh_routing` can cost on its own. If someone raises the budget past
-    /// the structural worst case the timeout becomes decoration and the 9s lock
-    /// hold is back, silently - so the relationship is asserted rather than the
-    /// number remembered. Fails loudly if `REFRESH_ROUNDS`, `ALPHA_QUERY` or
-    /// `KAD_PER_QUERY` moves too, which is the point.
+    /// A maintenance round must FIT INSIDE its deadline, so the timeout is a
+    /// safety net rather than the thing that ends every run.
+    ///
+    /// THIS RELATIONSHIP INVERTED on 2026-08-07 and the inversion is the point.
+    /// `refresh_routing` used to issue its `ALPHA_QUERY` queries one after
+    /// another, so a round cost `REFRESH_ROUNDS * ALPHA_QUERY * KAD_PER_QUERY` =
+    /// 9s against a 3s deadline: the deadline always fired, and maintenance got
+    /// through about four of its twelve queries before being cut off. Alpha is a
+    /// CONCURRENCY parameter, and now that the queries actually go out together a
+    /// round costs `REFRESH_ROUNDS * KAD_PER_QUERY` and completes.
+    ///
+    /// Asserted rather than remembered, so re-serialising the batch - which
+    /// breaks nothing functionally - fails here instead of silently restoring a
+    /// 9s lock hold on the heartbeat.
     #[test]
-    fn the_kad_maintenance_budget_binds_below_the_structural_worst_case() {
-        let structural =
-            KAD_PER_QUERY * (crate::kad_live::REFRESH_ROUNDS * mule_kad::ALPHA_QUERY) as u32;
+    fn a_kad_maintenance_round_fits_inside_its_deadline() {
+        let structural = KAD_PER_QUERY * crate::kad_live::REFRESH_ROUNDS as u32;
         assert!(
-            KAD_MAINTENANCE_BUDGET < structural,
-            "the deadline ({KAD_MAINTENANCE_BUDGET:?}) does not bind: refresh_routing \
-             can only cost {structural:?} by itself, so the timeout never fires and \
-             heartbeat holds the engine lock for the full run"
+            structural <= KAD_MAINTENANCE_BUDGET,
+            "a refresh round can cost {structural:?} against a {KAD_MAINTENANCE_BUDGET:?} \
+             deadline, so the heartbeat cuts maintenance off part-way every time - \
+             either the alpha queries are being awaited one at a time again, or \
+             REFRESH_ROUNDS / KAD_PER_QUERY grew past the budget"
         );
     }
 
@@ -7303,6 +7411,78 @@ mod tests {
         assert!(
             !dls[0].is_complete().await,
             "still incomplete, still resumable"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE PROBE ENDS WHEN THE ANSWERS ARE IN, not when its budget runs out.
+    ///
+    /// The collect loop had no early exit, so a server list that answered in a
+    /// couple of hundred milliseconds still cost `PROBE_COLLECT_BUDGET` - six
+    /// seconds, under the engine lock, twice on every launch plus every Refresh
+    /// and Prune, with every user action queued behind it.
+    ///
+    /// One server, whose name server.met already carries, so the only thing owed
+    /// is its status answer. It fails by TIMING: restore the unconditional
+    /// deadline and this takes the full six seconds.
+    #[tokio::test]
+    async fn the_probe_stops_as_soon_as_every_server_has_answered() {
+        let dir = tmp("probe-early-exit");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A mock server on loopback. The probe pings TCP port + 4, so the entry
+        // written into server.met is the mock's port minus four.
+        let mock = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0u16)).await.unwrap();
+        let udp_port = mock.local_addr().unwrap().port();
+        let tcp_port = udp_port - 4;
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            loop {
+                let Ok((n, src)) = mock.recv_from(&mut buf).await else {
+                    return;
+                };
+                if n < 2 || buf[1] != OP_GLOBSERVSTATREQ {
+                    continue; // the description ask - this server does not answer it
+                }
+                let mut res = vec![PROT_EDONKEY, OP_GLOBSERVSTATRES];
+                res.extend_from_slice(&SERV_STAT_CHALLENGE.to_le_bytes()); // echoed
+                res.extend_from_slice(&3_651u32.to_le_bytes()); // users
+                res.extend_from_slice(&47_008u32.to_le_bytes()); // files
+                let _ = mock.send_to(&res, src).await;
+            }
+        });
+
+        let met = ServerMet {
+            header: mule_files::server_met::SERVER_MET_HEADER,
+            servers: vec![Server {
+                ip: u32::from_le_bytes(Ipv4Addr::LOCALHOST.octets()),
+                port: tcp_port,
+                // A NAME already on file, so the round owes only a status answer.
+                tags: vec![mule_proto::Tag::id(
+                    0x01,
+                    mule_proto::TagValue::Str(b"mock".to_vec()),
+                )],
+            }],
+        };
+        std::fs::write(dir.join("server.met"), write_server_met(&met)).unwrap();
+
+        let (engine, _rx) = Engine::new(&dir).unwrap();
+        let t0 = std::time::Instant::now();
+        let rows = engine.probe_server_list().await;
+        let elapsed = t0.elapsed();
+
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0].alive,
+            "the mock answered, so the row must read alive"
+        );
+        assert_eq!(rows[0].users, Some(3_651));
+        assert!(
+            elapsed < PROBE_COLLECT_BUDGET / 3,
+            "the probe took {elapsed:?} for one server that answered at once - it \
+             is running to its {PROBE_COLLECT_BUDGET:?} budget again, and it holds \
+             the engine lock for all of it"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

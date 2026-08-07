@@ -88,6 +88,14 @@ struct StatsView: View {
                 .foregroundStyle(.secondary)
                 LabeledContent("Status polls (lock-free)", value: "\(model.uiPollTicks)")
                 LabeledContent("Heartbeats (takes the lock)", value: "\(model.heartbeatTicks)")
+                // THE ONE THE COUNTS CANNOT GIVE YOU. Their queue is serial, so a
+                // poll that blocks does not lose its ticks - they queue up and all
+                // land at once, and the total over any window that outlasts the
+                // stall is unchanged. Read this row, not the counts, to answer
+                // "did the poll actually keep running": near 1s means it did.
+                LabeledContent(
+                    "Longest poll gap",
+                    value: String(format: "%.1fs", model.uiPollMaxGapSecs))
             }
 
             Section("Fetch diagnostics") {
