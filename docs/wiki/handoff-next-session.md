@@ -25,10 +25,12 @@ first direct evidence the lock-free poll really does keep running.
   though - `gh workflow run "Rust unit gate" --ref <branch>` - which is worth
   doing per commit on this branch rather than trusting the local gate alone.
   Done for `7d1b349` and `19d06d0`: both PASSED, as did the iOS builds.
-- **Installed on device: `19d06d0`**, confirmed by reading Settings > This
-  device > **Build** (`1.0 (19d06d0)`) - which is how to confirm any install,
-  never by spotting a UI change. NOT yet on device: `0e34fcf` (the VPN-badge
-  fix) and `e143b28` (docs).
+- **Installed on device: `48b5128`** (branch HEAD), confirmed by reading
+  Settings > This device > **Build** (`1.0 (48b5128)`) - which is how to confirm
+  any install, never by spotting a UI change. The VPN badge was then verified by
+  SCREENSHOT, reading `ON VPN`: its accessibility label was correct even while it
+  rendered as ". . .   . . .", so the tree cannot witness that fix and only a
+  picture can.
 
 ## THE INSTALL PATH - read this before touching Sideloadly
 
