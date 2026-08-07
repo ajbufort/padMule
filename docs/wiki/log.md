@@ -357,3 +357,33 @@ Append-only, timestamped record of Ingest / Query / Lint passes.
   Gate after: 644 tests, clippy `-D warnings`, fmt + ASCII clean. NOT measured on
   device - structural plus tests only; the device timing pass is the top next
   action ([[handoff-next-session]]).
+
+- 2026-08-07 **DEVICE PASS on row 8ch (build 7d1b349).** Committed 7d1b349, pushed,
+  dispatched BOTH CI workflows on that sha - `iOS build` and, by
+  `workflow_dispatch`, the `Rust unit gate` that this branch normally never gets -
+  and both passed. Artifact verified as that commit twice over (run `headSha` ==
+  local HEAD, and `CFBundleVersion: 7d1b349` read from the Info.plist inside a
+  FRESH extraction), delivered to Windows Downloads, staged for zsign, and the
+  stale `padmule-signed.ipa` from f946e02 deleted so it could not be installed by
+  accident. Anthony signed; installed with `pymobiledevice3` in ~30s; **WDA
+  survived**, as the zsign path promises. Build confirmed the only honest way:
+  Settings > This device > Build = `1.0 (7d1b349)`. **RESULTS, on eMule Sunrise
+  with HighID: search submit-to-results 4.58-6.38s over nine runs against a 10.3s
+  baseline; Refresh server list 2.82/2.84/2.86s against 7.5-9.31s; Longest poll
+  gap 1.1s** across all of it. Kad still contributes (`server + kad` rows, and
+  "hedda hopper" split 2 kad / 2 server), so the speedup is not an arm being
+  dropped. The residual ~6.3s is the Kad arm at round-count x RTT, which is what a
+  Kademlia lookup costs - the next lever is fewer rounds or overlapping the
+  keyword phase with the lookup, not another constant. **ATTRIBUTION STATED
+  UNEVENLY ON PURPOSE:** Refresh is mechanism-matched and the poll gap is measured
+  inside the app, so neither depends on the probe; the SEARCH comparison is weaker
+  because the baseline's probe cadence is unknown and a cheaper probe biases the
+  new number down - the A/B against f946e02 would settle it and was not run.
+  **THREE PROBES WERE WRONG BEFORE THEY WERE RIGHT, each with a plausible number
+  first:** the results list is not cleared between searches so the probe fired on
+  the PREVIOUS run's rows and reported 1.3-1.5s of pure probe latency; a `srcs`
+  matcher reported NO RESULTS by 46s while four results sat on screen, because a
+  single-source row reads `1 src`; and the probes themselves were timed before
+  being trusted (`/source` 1.70s, element query 0.53s, screenshot 2.13s) so the
+  cheapest was used. All three are now written into [[handoff-next-session]]'s
+  measurement rules, and `scripts/device-timing.sh` encodes them.
