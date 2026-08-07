@@ -134,6 +134,40 @@ strongest (verified in the iPadOS research, docs/raw/ipados-constraints-*):
    grade (OS discretion, may not fire): hash-check parts, prune sources, brief
    resume attempts while on power. Complements, never the primary runtime.
 
+**[REOPENED 2026-08-07 by Anthony: "we need to come up with a clever way to keep
+Kad, and padMule in general, always running in the background."** The 2026-08-04
+"permanent posture" decision below is therefore back on the table as a FEATURE
+question. The analysis above does not change - it was right - so this is not new
+research, it is a decision to revisit plus two measurements nobody has taken.
+
+Read the framing carefully, because it is the opposite of how it is usually put:
+there is no BACKDOOR to find. Option 1 is a documented `UIBackgroundModes` key
+that a FREE team may set - it is not a provisioning entitlement - and the only
+thing that normally forbids it is App Store review 2.5.4. padMule is never
+reviewed. **Sideloading is precisely what makes the ordinary mechanism available**,
+so the work is engineering, not evasion.
+
+WHAT ACTUALLY DECIDES IT, and it is measurable rather than arguable:
+
+1. **Jetsam, not suspension, is the enemy.** Audio keepalive stops the SUSPEND;
+   it does nothing about TERMINATION for memory. Background residency wants
+   memory under ~100MB and padMule's has never been measured, on any build.
+2. **The 1s heartbeat is a UI-owned clock** (`EngineModel.startPolling`, a
+   `Timer` on the MAIN RUNLOOP) and seven background duties fail silently if it
+   stops - see `MuleEngine::heartbeat`. Under audio keepalive the app is not
+   suspended so it would still fire, but resting a background posture on the
+   UI's runloop is fragile. **Move the clock into Rust (a tokio interval) before
+   trusting any of this.** Found 2026-08-07; not in the research above.
+3. The two open questions from the original research were never measured, and the
+   target device has since changed to an M4 iPad Pro: keepalive LONGEVITY
+   overnight, and whether `BGContinuedProcessingTask` is eligible on iPadOS 26
+   there.
+
+**Clean pause/resume stays REQUIRED whatever is decided** - every one of these
+mechanisms can be revoked or jetsam-killed, so the app must always degrade back
+to pause-and-resume. That is why the hard requirement above is not weakened by
+reopening this.]
+
 What is genuinely impossible: a fully-supported, always-on, screen-off P2P
 daemon like on desktop. Background `URLSession` (the only thing that truly
 survives suspension) is HTTP/HTTPS-only and cannot carry the eD2k/Kad wire
