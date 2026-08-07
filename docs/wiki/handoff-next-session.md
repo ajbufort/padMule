@@ -182,8 +182,9 @@ Re-measuring on another path means raising `fetch::CONNECT_TIMEOUT` first.
    gate is now on DIALABLE sources with the threshold tied by test to the Normal
    worker-pool width. STILL OPEN: whether Kad now actually contributes on
    device. Watch for a `kad` badge on the next build.
-8. **[MEASURED 2026-08-07 - Track 1] The GUI slowness is real, and it has TWO
-   stacked causes.** On device: search **10.3s**; server refresh alone
+8. **[MEASURED then HALF-FIXED 2026-08-07 - Track 1, row 8cg] The GUI slowness
+   is real, it has TWO stacked causes, and the status-freeze half is now fixed
+   (UNVERIFIED ON DEVICE - re-run the refresh-during-search timing below).** On device: search **10.3s**; server refresh alone
    **7.5-9.3s**; the same refresh tapped 1.9s into a search **20.62s**. So an
    action issued during a search waits ~12s extra.
    - **Cause 1**, the Rust engine mutex: 25 of 42 FFI methods take it, and the
@@ -196,9 +197,17 @@ Re-measuring on another path means raising `fetch::CONNECT_TIMEOUT` first.
      fix this on its own** - which is the fix a code read alone would pick.
    - The two cannot be separated from outside the app; either alone produces the
      measurement. The Swift queue being serial is provable from the declaration.
-   - **Separately: the operations are individually slow.** `SEARCH_WAIT` 20s
-     (both arms awaited), `PROBE_COLLECT_BUDGET` 6s held under the lock. Two
-     separable problems; fixing either alone leaves the other.
+   - **FIXED (8cg):** the four scalars are now lock-free atomics published
+     through `EngineHandles`, and on the Swift side they moved out of
+     `refresh()` (which sat behind `heartbeat()` on the serial queue) into
+     `refreshFast()`. Pinned by a test that HOLDS the engine mutex for 3s and
+     asserts the readers answer in 500ms - it fails by TIMING, which is the only
+     way this regression is catchable, since re-adding a lock breaks nothing
+     functionally.
+   - **STILL OPEN, and separable: the operations are individually slow.**
+     `SEARCH_WAIT` 20s (both arms awaited), `PROBE_COLLECT_BUDGET` 6s held under
+     the lock. A search still takes ~10s; it just no longer freezes the UI.
+     Two problems, one fixed.
    Portability Tier 2; Settings Tier 1/2.
 9. **THE KAD FINDINGS FROM THE 2026-08-06 REANALYSIS (row 8ce)** are items
    10-12, plus the two corrections already folded into open leads 2-3 below and
