@@ -555,17 +555,16 @@ impl MuleEngine {
     /// currently has us. HighID-vs-LowID decides whether peers can reach us, so
     /// this is the most useful line on the screen.
     pub fn server_info(&self) -> Option<ServerInfoFfi> {
-        self.rt.block_on(async {
-            self.inner
-                .lock()
-                .await
-                .server_info()
-                .map(|s| ServerInfoFfi {
-                    addr: s.addr,
-                    name: s.name,
-                    low_id: s.low_id,
-                    related_search: s.related_search,
-                })
+        // LOCK-FREE. This was the FIFTH reader on the 1s UI poll and the one the
+        // 2026-08-07 round missed: the other four moved to `EngineHandles` while
+        // this kept taking the engine lock, so the whole "fast" poll still queued
+        // behind every search - and since the Swift side runs it on the same
+        // queue as the event drain, the status banners did too.
+        self.handles.server_info().map(|s| ServerInfoFfi {
+            addr: s.addr,
+            name: s.name,
+            low_id: s.low_id,
+            related_search: s.related_search,
         })
     }
 
@@ -786,22 +785,32 @@ impl MuleEngine {
     /// progress read to queue behind a 20s search. Split deliberately; the
     /// coupling is now a caller obligation, stated here because that is the
     /// price of the split.
+    ///
+    /// ONE LOCK PER DUTY, NOT ONE FOR THE WHOLE BEAT (2026-08-07). These are
+    /// independent maintainers that already ran in sequence, but they took the
+    /// engine lock ONCE between them - so a beat that happened to include a Kad
+    /// refresh (up to 3s) and an idle-download retry (up to 6s) held the lock for
+    /// most of ten seconds, and every user action issued in that window waited
+    /// behind ALL of it. Releasing between duties makes the worst wait the
+    /// longest SINGLE duty instead of their sum; a user action simply interleaves
+    /// at the next boundary. Nothing here depends on another duty's state within
+    /// the same beat - anything that slips past one boundary is picked up by the
+    /// next beat a second later, which is what these maintainers already assume.
     pub fn heartbeat(&self) {
         self.rt.block_on(async {
-            let mut g = self.inner.lock().await;
-            g.maintain_shares().await;
-            g.finalize_completed().await;
-            g.poll_server_drop().await;
-            g.maintain_checkpoint().await;
-            g.maintain_share_verify().await;
-            g.maintain_resume_fetches().await;
-            g.maintain_server_harvest().await;
+            self.inner.lock().await.maintain_shares().await;
+            self.inner.lock().await.finalize_completed().await;
+            self.inner.lock().await.poll_server_drop().await;
+            self.inner.lock().await.maintain_checkpoint().await;
+            self.inner.lock().await.maintain_share_verify().await;
+            self.inner.lock().await.maintain_resume_fetches().await;
+            self.inner.lock().await.maintain_server_harvest().await;
             // Kad routing-table maintenance. Rate-limited to KAD_REFRESH_EVERY
             // inside, so calling it every heartbeat costs a comparison.
-            g.maintain_kad().await;
-            // Refresh the derived status scalars while we already hold the lock,
-            // so the lock-free readers above see a value at most one beat old.
-            g.publish_status();
+            self.inner.lock().await.maintain_kad().await;
+            // Refresh the derived status values LAST, so what the lock-free
+            // readers see reflects everything this beat just did.
+            self.inner.lock().await.publish_status();
         });
     }
 
@@ -1264,10 +1273,16 @@ mod tests {
     /// `Copy` enum, and an `Arc::len`. A search can hold that lock for twenty
     /// seconds.
     ///
-    /// This test HOLDS THE LOCK and asserts the four readers still answer. It
-    /// fails - by timing out rather than by assertion - the moment any of them
-    /// goes back to `inner.lock()`, which is precisely how the regression would
-    /// otherwise return unnoticed.
+    /// This test HOLDS THE LOCK and asserts the readers still answer. It fails -
+    /// by timing out rather than by assertion - the moment any of them goes back
+    /// to `inner.lock()`, which is precisely how the regression would otherwise
+    /// return unnoticed.
+    ///
+    /// IT COVERED FOUR OF THE FIVE, AND THAT IS WHY THE FIFTH SURVIVED. The
+    /// commit that added this listed `server_info` among the calls it had made
+    /// lock-free and left it on `inner.lock()`; the test went green because it
+    /// never called it. A test that pins "these readers" has to name every one of
+    /// them, or the missing name is exactly where the defect hides.
     #[test]
     fn the_status_readers_answer_while_the_engine_lock_is_held() {
         let dir = std::env::temp_dir().join(format!("padmule-ffi-lockfree-{}", std::process::id()));
@@ -1291,11 +1306,20 @@ mod tests {
         });
         rx.recv().unwrap(); // the lock is now definitely held
 
+        // EVERY read the Swift `refreshFast()` makes, in the order it makes them.
+        // Adding one to that closure without adding it here is what let
+        // `server_info` stay lock-taking on the lock-free queue.
         let t0 = std::time::Instant::now();
         let _ = e.state();
         let _ = e.kad_contacts();
         let _ = e.ip_filter_ranges();
         let _ = e.sharing_paused_for_ip_change();
+        let _ = e.server_info();
+        let _ = e.downloads();
+        let _ = e.shared_files();
+        let _ = e.is_sharing();
+        let _ = e.transfer_stats();
+        let _ = e.has_port_mapping();
         let elapsed = t0.elapsed();
 
         assert!(

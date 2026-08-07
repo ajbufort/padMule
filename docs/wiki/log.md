@@ -318,3 +318,42 @@ Append-only, timestamped record of Ingest / Query / Lint passes.
 - 2026-08-07 **Track 1's fix could not be verified from outside the app, so it got an instrument** (row 8cg annotation, commit f946e02). The obvious re-measurement - a "Refresh server list" tapped into a running search - read **16.37s** against 20.62s before, and that proves nothing: it measures operation-vs-operation contention, which 8cg deliberately did not fix, and the difference is inside the run-to-run variance of search populations and probe rounds. **Saying so BEFORE running it, rather than explaining it afterwards, is the part worth keeping** - the prediction was written down first and the number then matched it. The deeper problem: **every probe available from outside padMule needs the engine lock itself**, so none of them can observe whether the lock-free status poll keeps running while the lock is held. Instrumented instead: a PAIR of counters under Stats -> "UI responsiveness", `uiPollTicks` (bumped where the lock-free `refreshFast` publishes) and `heartbeatTicks` (where the lock-taking `refresh` completes). **The pairing is the design, not decoration:** during a search the first must climb at ~1/s while the second stalls, so the instrument carries its own control and no old build is needed for comparison - the fetch funnel's adjacent-stage-drop shape applied to the UI. Falsifier fixed in advance: if BOTH stall, the Swift move did not achieve what 8cg claims, and the Rust lock test was insufficient evidence (it proves the READERS do not block, not that the publish CYCLE keeps running). NOTE this is the third instrument of the session after two that were VACUOUS - the one-measurement test that passed with its own fix reverted, and the depth test that counted `0x00` bytes and asserted nothing - so it gets checked for its ability to FAIL before its output is believed.
 
 - 2026-08-07 **TRACK 1 CLOSED, and the root cause of the confusion was MY OWN PROBE.** The paired counter (f946e02) was read three times and the first reading REFUTED the fix: both counters flat at 0 for ~10s during a search, then a burst of +11. Every FFI call in that path is lock-free, so the block had to be Swift-side - and it was, but not in padMule. **WDA's `GET /source` walks the entire view hierarchy ON THE MAIN THREAD**, it was costing 1.4-2.4s per call, and polling it once a second starved exactly the main-thread publish blocks the counters increment in. The instrument was fine; reading it caused the freeze I was attributing to the app. **Re-measured with NO reads inside the window** (record, wait, record once): during a real search the lock-free poll runs at **0.94/s** against an idle **1.2/s**, while the lock-taking heartbeat drops to **0.69/s**, losing ~10s of ticks. The two diverge exactly as row 8cg predicts, so the fix is confirmed on device. **A SECOND SELF-INFLICTED ERROR on the way, caught by Anthony not by me:** the WDA search field CONCATENATES - a documented gotcha in [[ipad-usb-tooling]] - so a re-run silently searched `ministerminister`, which returns nothing and completes fast, producing a measurement that looked clean precisely because it was meaningless. The helper now CLEARS and READS THE FIELD BACK before submitting and aborts on mismatch, rather than relying on remembering the rule. **THE GENERAL LESSON, and it is the third observer-effect this project has hit:** the earlier two were about WDA SESSIONS disturbing the app; this one is `/source` itself. A read that costs main-thread time is not a passive observation. When measuring anything main-thread-bound, take the measurement OUT of the window - record, leave, record - rather than sampling through it. Also note the shape: the first reading refuted the fix, and the refutation was wrong. **A failed verification deserves the same scepticism as a successful one.**
+
+- 2026-08-07 **Reanalysis + THE SLOW OPERATIONS (row 8ch).** A full reacquaintance
+  pass over every crate, the iOS app and all 33 wiki files, then the fix the
+  handoff nominated as "the biggest remaining user-facing win". Gate verified
+  first, not quoted: 641 tests, clippy `-D warnings`, fmt clean. **THE CAUSE OF
+  THE 10.3s SEARCH, which no prior session had looked at:** `KadNode::
+  resolve_keyword` awaited its `ALPHA_QUERY` queries one at a time - alpha is a
+  CONCURRENCY parameter (its own doc comment says so) and padMule used it as a
+  batch size - making the lookup structurally 12x3x750ms before the keyword phase
+  even started, so `KAD_SEARCH_WAIT` was not a bound but the cost. Same in
+  `resolve_sources`, and in `refresh_routing` whose 9s worst case under a 3s
+  deadline meant Kad maintenance was cut off after ~4 of its 12 queries every
+  time. ONE UDP socket is why it was serial (`recv_from` gives a datagram to one
+  waiter, and the old loop discarded anything not from its own destination, so
+  concurrent requests would eat each other's replies); `request_batch` is one
+  receive loop owning the whole batch, matching on the exact address with the old
+  IP-only rule as fallback. Wire-identical, and closer to eMule. **THREE MORE
+  FOUND BY THE PASS RATHER THAN REPORTED:** `server_info()` was the fifth status
+  reader row 8cg claimed to have made lock-free and did not, so `refreshFast()`
+  and the event drain sharing its queue still stalled for every search;
+  `heartbeat()` held the engine lock across all eight maintainers in one
+  acquisition (up to ~10s, and every user action waited behind all of it), now one
+  lock per duty; the server probe always spent its full 6s budget with no early
+  exit, now stopping when every server has answered or 2s after the last answer.
+  **AND ONE INSTRUMENT CORRECTED:** 8cg's `uiPollTicks`/`heartbeatTicks` pair
+  cannot answer its own question - the queue is serial, so a blocked poll defers
+  its ticks rather than losing them and bursts on release, giving the same
+  cumulative total as no stall at all; the device reading drawn from it is
+  therefore not evidence. Added Stats -> "Longest poll gap", which a burst cannot
+  hide. All five new tests mutation-checked before being believed (re-serialise
+  the batch -> 1.201s; drop the exact-address match -> two peers swap answers;
+  delete `note_responder` -> both key-capture tests fail; restore
+  `inner.lock()` on `server_info` -> 3.001s; restore the probe deadline ->
+  6.002s), and the two key-capture tests were REWRITTEN to drive the public
+  lookup paths rather than the helpers, since the capture moved to the callers and
+  a helper-level test would have passed with the production call site deleted.
+  Gate after: 644 tests, clippy `-D warnings`, fmt + ASCII clean. NOT measured on
+  device - structural plus tests only; the device timing pass is the top next
+  action ([[handoff-next-session]]).

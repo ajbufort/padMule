@@ -40,6 +40,7 @@ const KAD_REQUESTED_CONTACTS: usize = 11;
 /// repeating it against fresh random targets, not from one deep dive.
 /// `pub(crate)` so `KAD_MAINTENANCE_BUDGET` can be pinned against the structural
 /// worst case this implies, rather than against a number someone remembered.
+/// A round is ONE wait, not `ALPHA_QUERY` of them - see [`KadNode::request_batch`].
 pub(crate) const REFRESH_ROUNDS: usize = 4;
 
 /// Bind the Kad UDP socket with SO_REUSEADDR set.
@@ -345,6 +346,9 @@ impl KadNode {
     /// a drop here - matching eMule, which only hard-drops HELLO_RES_ACK on an
     /// invalid receiver key; for every other opcode it just marks the contact
     /// unverified. The caller uses it to set the contact's `verified` bit.
+    ///
+    /// A batch of one, so there is exactly ONE receive loop in this file and the
+    /// single-request and batched paths cannot drift apart.
     async fn request(
         &self,
         target_id: &Kad128,
@@ -353,59 +357,152 @@ impl KadNode {
         expect: u8,
         wait: Duration,
     ) -> Result<(Vec<u8>, bool, u32), KadError> {
-        let dest_ip = ip_u32(&dest);
-        let sender_vk = mule_kad::udp_verify_key(self.udp_key, dest_ip);
-        // ECHO the verify key this contact previously handed us (send-side), so it
-        // verifies US - but only while it was minted against our current public IP.
-        // 0 for a genuine first contact / unknown / IP-mismatch, which is
-        // byte-identical to the pre-hard-verify wire. This is a FIELD flip only;
-        // the RC4 obfuscation stays NodeID-keyed, byte-faithful to eMule
-        // (EncryptedDatagramSocket.cpp: NodeID always wins when present).
-        let echo_vk = self
-            .routing
-            .verify_key_for(target_id, dest_ip, self.current_public_ip);
-        let datagram = kad_obfuscate_request(
-            frame,
-            target_id,
-            rand::random(), // random key seed
-            echo_vk,        // the peer's key we echo so IT can verify US
-            sender_vk,      // our key, want this echoed so WE can verify IT
-            rand::random(), // marker randomness
-        );
-        self.socket.send_to(&datagram, dest).await?;
+        let mut answers = self
+            .request_batch(&[(*target_id, dest, frame.to_vec())], expect, wait)
+            .await;
+        answers.pop().expect("one request in, one answer out")
+    }
 
+    /// Send SEVERAL Kad requests and collect their replies within ONE window,
+    /// demultiplexing the shared socket by source address.
+    ///
+    /// WHY THIS EXISTS. Kademlia's ALPHA is a CONCURRENCY parameter - eMule's
+    /// `CSearch` keeps alpha requests IN FLIGHT and reacts to whichever answers
+    /// first. padMule used it as a batch SIZE and then awaited each member in
+    /// turn, so a lookup round cost `alpha * per_query` instead of `per_query`:
+    /// `resolve_keyword` structurally 12 rounds x 3 queries x 750ms = 27s of
+    /// lookup before the keyword phase even started, which is the ~10s search
+    /// measured on device 2026-08-07 and the reason `refresh_routing` (4 x 3 x
+    /// 750ms = 9s against a 3s deadline) was always cut off mid-round.
+    ///
+    /// THE SINGLE SOCKET IS WHY IT WAS WRITTEN SERIALLY, and it is the whole
+    /// difficulty: `recv_from` hands each datagram to exactly one waiter, and the
+    /// old loop DISCARDED anything not from its own destination - so two
+    /// concurrent requests would silently eat each other's replies. One loop
+    /// owning the whole batch is what makes concurrency safe here: a datagram
+    /// that used to be dropped as "not mine" is now matched to the peer in this
+    /// batch that is waiting for it.
+    ///
+    /// Wire-identical. The same datagrams are sent to the same peers with the
+    /// same keys; only the order of our own waiting changes.
+    async fn request_batch(
+        &self,
+        reqs: &[(Kad128, SocketAddr, Vec<u8>)],
+        expect: u8,
+        wait: Duration,
+    ) -> Vec<Result<(Vec<u8>, bool, u32), KadError>> {
+        /// One in-flight request: what it takes to match a reply back to it.
+        struct Pending {
+            dest: SocketAddr,
+            dest_ip: u32,
+            /// Our sender verify key for this destination - the value the peer
+            /// echoes as the reply's receiver key (eMule bValidReceiverKey).
+            sender_vk: u32,
+            answer: Result<(Vec<u8>, bool, u32), KadError>,
+        }
+        impl Pending {
+            fn waiting(&self) -> bool {
+                matches!(self.answer, Err(KadError::Timeout))
+            }
+        }
+
+        let mut pending: Vec<Pending> = Vec::with_capacity(reqs.len());
+        for (target_id, dest, frame) in reqs {
+            let dest_ip = ip_u32(dest);
+            let sender_vk = mule_kad::udp_verify_key(self.udp_key, dest_ip);
+            // ECHO the verify key this contact previously handed us (send-side), so
+            // it verifies US - but only while it was minted against our current
+            // public IP. 0 for a genuine first contact / unknown / IP-mismatch,
+            // which is byte-identical to the pre-hard-verify wire. This is a FIELD
+            // flip only; the RC4 obfuscation stays NodeID-keyed, byte-faithful to
+            // eMule (EncryptedDatagramSocket.cpp: NodeID always wins when present).
+            let echo_vk = self
+                .routing
+                .verify_key_for(target_id, dest_ip, self.current_public_ip);
+            let datagram = kad_obfuscate_request(
+                frame,
+                target_id,
+                rand::random(), // random key seed
+                echo_vk,        // the peer's key we echo so IT can verify US
+                sender_vk,      // our key, want this echoed so WE can verify IT
+                rand::random(), // marker randomness
+            );
+            // A send that fails is THIS request's failure, not the batch's - the
+            // others are already on the wire and their answers are still coming.
+            let answer = match self.socket.send_to(&datagram, *dest).await {
+                Ok(_) => Err(KadError::Timeout), // replaced when the reply lands
+                Err(e) => Err(KadError::Io(e)),
+            };
+            pending.push(Pending {
+                dest: *dest,
+                dest_ip,
+                sender_vk,
+                answer,
+            });
+        }
+
+        let mut outstanding = pending.iter().filter(|p| p.waiting()).count();
         let deadline = Instant::now() + wait;
         let mut buf = vec![0u8; 8192];
-        loop {
+        // A UDP socket can surface an ICMP port-unreachable as a recv error
+        // (Linux ECONNREFUSED), which is routine when one peer in a batch is
+        // gone. Skipping it would let a persistent error spin the loop until the
+        // deadline, so bound the skips instead of trusting the clock alone.
+        let mut recv_errors = 0u32;
+        while outstanding > 0 {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return Err(KadError::Timeout);
+                break;
             }
             let (n, from) = match timeout(remaining, self.socket.recv_from(&mut buf)).await {
-                Ok(r) => r?,
-                Err(_) => return Err(KadError::Timeout),
+                Ok(Ok(v)) => v,
+                Ok(Err(_)) => {
+                    recv_errors += 1;
+                    if recv_errors > 32 {
+                        break;
+                    }
+                    continue;
+                }
+                Err(_) => break, // the deadline - every unanswered slot stays Timeout
             };
-            if ip_u32(&from) != dest_ip {
-                continue; // unsolicited traffic from another node
-            }
-            let Some(dec) = kad_deobfuscate(&buf[..n], &self.kad_id, self.udp_key, dest_ip) else {
+            let from_ip = ip_u32(&from);
+            // Match the EXACT address first, so a batch holding two contacts on one
+            // IP cannot hand one peer's answer to the other - the routing table
+            // permits up to MAX_CONTACTS_PER_IP of them, so this is reachable.
+            // Fall back to the first slot waiting on that IP, which is the looser
+            // rule a single `request` has always used: a reply arriving from a
+            // different source port than we dialled is still that peer's reply.
+            let Some(i) = pending
+                .iter()
+                .position(|p| p.dest == from && p.waiting())
+                .or_else(|| {
+                    pending
+                        .iter()
+                        .position(|p| p.dest_ip == from_ip && p.waiting())
+                })
+            else {
+                continue; // unsolicited traffic from a node this batch is not asking
+            };
+            let p = &mut pending[i];
+            let Some(dec) = kad_deobfuscate(&buf[..n], &self.kad_id, self.udp_key, from_ip) else {
                 continue; // plaintext or wrong key - not our reply
             };
             let Ok((op, payload)) = unpack_kad(&dec.payload) else {
                 continue;
             };
-            if op == expect {
-                // bValidReceiverKey = GetUDPVerifyKey(senderIP) == packet receiver
-                // key (eMule ClientUDPSocket.cpp:127). The value we issued as our
-                // sender key is exactly udp_verify_key(our_key, dest_ip), so the
-                // peer echoing it back means the key round-tripped.
-                let valid_receiver_key = dec.receiver_vk == sender_vk;
-                // dec.sender_vk is the key THIS peer wants us to echo next time; the
-                // caller stores it (note_verify_key) so a later request verifies us.
-                return Ok((payload, valid_receiver_key, dec.sender_vk));
+            if op != expect {
+                continue; // a different opcode from the same peer (e.g. HELLO_REQ)
             }
-            // A different opcode from the same peer (e.g. HELLO_REQ) - keep waiting.
+            // bValidReceiverKey = GetUDPVerifyKey(senderIP) == packet receiver key
+            // (eMule ClientUDPSocket.cpp:127). The value we issued as our sender key
+            // is exactly udp_verify_key(our_key, dest_ip), so the peer echoing it
+            // back means the key round-tripped.
+            // dec.sender_vk is the key THIS peer wants us to echo next time; the
+            // caller stores it (note_verify_key) so a later request verifies us.
+            p.answer = Ok((payload, dec.receiver_vk == p.sender_vk, dec.sender_vk));
+            outstanding -= 1;
         }
+        pending.into_iter().map(|p| p.answer).collect()
     }
 
     /// Send a BOOTSTRAP_REQ to one contact and parse its BOOTSTRAP_RES, seeding
@@ -533,60 +630,89 @@ impl KadNode {
         Ok(())
     }
 
-    /// Ask one node (KADEMLIA2_REQ, FIND_NODE) for the contacts it knows closest
-    /// to `target`, returning its KADEMLIA2_RES contacts.
-    async fn find_node(
+    /// Ask SEVERAL nodes (KADEMLIA2_REQ, FIND_NODE) for the contacts they know
+    /// closest to `target`, concurrently, returning one slot per node in the
+    /// order given. A slot is `None` when that node did not answer in time or
+    /// answered unusably.
+    ///
+    /// Alpha means concurrent, not batched-then-awaited - see [`request_batch`].
+    /// The answer filtering below is unchanged; only the waiting is.
+    ///
+    /// [`request_batch`]: Self::request_batch
+    async fn find_node_batch(
         &self,
-        node: &WireContact,
+        nodes: &[WireContact],
         target: &Kad128,
         wait: Duration,
-    ) -> Result<(Vec<WireContact>, bool, u32), KadError> {
-        let (op, payload) = build_kad2_req(KAD_FIND_NODE, target, &node.id);
-        let frame = pack_kad(op, payload);
-        let dest = contact_addr(node.ip, node.udp_port);
-        let (res_payload, verified, sender_vk) = self
-            .request(&node.id, dest, &frame, OP_KAD2_RES, wait)
-            .await?;
-        let mut contacts = parse_kad2_res(&res_payload)?.contacts;
-        // Drop a malicious over-long answer: padMule requests KAD_FIND_NODE, whose
-        // count field caps at what we asked for (11); a compliant node never
-        // exceeds it, a hostile one may pad up to 255 fabricated contacts (eMule
-        // Search.cpp:377 rejects the same way).
-        if contacts.len() > KAD_REQUESTED_CONTACTS {
-            return Err(KadError::Unexpected(OP_KAD2_RES));
-        }
-        // A node may not answer with itself, and may not list many IDs on one IP:
-        // keep at most one contact per source IP within a single answer (eMule
-        // Search.cpp:423/449 - honest nodes never do either).
-        let responder_ip = node.ip;
-        let mut seen_ips = std::collections::HashSet::new();
-        contacts.retain(|c| c.ip != responder_ip && seen_ips.insert(c.ip));
-        // ...and it may not re-point a contact we have already VERIFIED to some
-        // other address: a KadID is semi-public, so that is precisely how an
-        // attacker takes over a known node's identity (eMule
-        // CRoutingZone::IsAcceptableContact, RoutingZone.cpp:1014-1020).
-        contacts.retain(|c| self.routing.is_acceptable_answer(&c.id, c.ip, c.udp_port));
-        Ok((contacts, verified, sender_vk))
+    ) -> Vec<Option<(Vec<WireContact>, bool, u32)>> {
+        let reqs: Vec<(Kad128, SocketAddr, Vec<u8>)> = nodes
+            .iter()
+            .map(|n| {
+                let (op, payload) = build_kad2_req(KAD_FIND_NODE, target, &n.id);
+                (n.id, contact_addr(n.ip, n.udp_port), pack_kad(op, payload))
+            })
+            .collect();
+        self.request_batch(&reqs, OP_KAD2_RES, wait)
+            .await
+            .into_iter()
+            .zip(nodes)
+            .map(|(answer, node)| {
+                let (res_payload, verified, sender_vk) = answer.ok()?;
+                let mut contacts = parse_kad2_res(&res_payload).ok()?.contacts;
+                // Drop a malicious over-long answer: padMule requests
+                // KAD_FIND_NODE, whose count field caps at what we asked for (11);
+                // a compliant node never exceeds it, a hostile one may pad up to
+                // 255 fabricated contacts (eMule Search.cpp:377 rejects the same
+                // way).
+                if contacts.len() > KAD_REQUESTED_CONTACTS {
+                    return None;
+                }
+                // A node may not answer with itself, and may not list many IDs on
+                // one IP: keep at most one contact per source IP within a single
+                // answer (eMule Search.cpp:423/449 - honest nodes never do either).
+                let responder_ip = node.ip;
+                let mut seen_ips = std::collections::HashSet::new();
+                contacts.retain(|c| c.ip != responder_ip && seen_ips.insert(c.ip));
+                // ...and it may not re-point a contact we have already VERIFIED to
+                // some other address: a KadID is semi-public, so that is precisely
+                // how an attacker takes over a known node's identity (eMule
+                // CRoutingZone::IsAcceptableContact, RoutingZone.cpp:1014-1020).
+                contacts.retain(|c| self.routing.is_acceptable_answer(&c.id, c.ip, c.udp_port));
+                Some((contacts, verified, sender_vk))
+            })
+            .collect()
     }
 
-    /// Ask one node (KADEMLIA2_SEARCH_SOURCE_REQ) for sources of `file_hash`,
-    /// returning the accepted sources from its KADEMLIA2_SEARCH_RES.
-    async fn search_source(
-        &mut self,
-        node: &WireContact,
+    /// Ask SEVERAL nodes (KADEMLIA2_SEARCH_SOURCE_REQ) for sources of
+    /// `file_hash`, concurrently. One slot per node, in the order given.
+    ///
+    /// Takes `&self`: the caller applies `note_responder` for each answered slot
+    /// afterwards, because the send and the collect must not hold `&mut self`
+    /// while several requests are in flight.
+    async fn search_source_batch(
+        &self,
+        nodes: &[WireContact],
         file_hash: &Kad128,
         file_size: u64,
         wait: Duration,
-    ) -> Result<Vec<Source>, KadError> {
-        let (op, payload) = build_search_source_req(file_hash, 0, file_size);
-        let frame = pack_kad(op, payload);
-        let dest = contact_addr(node.ip, node.udp_port);
-        let (res_payload, verified, sender_vk) = self
-            .request(&node.id, dest, &frame, OP_SEARCH_RES, wait)
-            .await?;
-        self.note_responder(node, verified, sender_vk);
-        let res = parse_search_res(&res_payload)?;
-        Ok(res.results.iter().filter_map(|r| r.as_source()).collect())
+    ) -> Vec<Option<(Vec<Source>, bool, u32)>> {
+        let reqs: Vec<(Kad128, SocketAddr, Vec<u8>)> = nodes
+            .iter()
+            .map(|n| {
+                let (op, payload) = build_search_source_req(file_hash, 0, file_size);
+                (n.id, contact_addr(n.ip, n.udp_port), pack_kad(op, payload))
+            })
+            .collect();
+        self.request_batch(&reqs, OP_SEARCH_RES, wait)
+            .await
+            .into_iter()
+            .map(|answer| {
+                let (res_payload, verified, sender_vk) = answer.ok()?;
+                let res = parse_search_res(&res_payload).ok()?;
+                let sources = res.results.iter().filter_map(|r| r.as_source()).collect();
+                Some((sources, verified, sender_vk))
+            })
+            .collect()
     }
 
     /// Grow and refresh the routing table with an iterative lookup toward
@@ -633,20 +759,20 @@ impl KadNode {
             if batch.is_empty() {
                 break;
             }
-            for node in &batch {
-                if let Ok((contacts, verified, sender_vk)) =
-                    self.find_node(node, target, per_query).await
-                {
-                    // Same bookkeeping a real lookup does: the responder proved
-                    // its IP iff the receiver key was valid, and every contact it
-                    // named joins the table unverified until it answers for
-                    // itself. That second part is where the growth comes from.
-                    self.note_responder(node, verified, sender_vk);
-                    for c in &contacts {
-                        self.add_contact(c.id, c.ip, c.udp_port, c.tcp_port, c.version, false);
-                    }
-                    lookup.on_response(contacts);
+            let answers = self.find_node_batch(&batch, target, per_query).await;
+            for (node, answer) in batch.iter().zip(answers) {
+                let Some((contacts, verified, sender_vk)) = answer else {
+                    continue;
+                };
+                // Same bookkeeping a real lookup does: the responder proved its IP
+                // iff the receiver key was valid, and every contact it named joins
+                // the table unverified until it answers for itself. That second
+                // part is where the growth comes from.
+                self.note_responder(node, verified, sender_vk);
+                for c in &contacts {
+                    self.add_contact(c.id, c.ip, c.udp_port, c.tcp_port, c.version, false);
                 }
+                lookup.on_response(contacts);
             }
         }
         self.routing.len().saturating_sub(before)
@@ -688,20 +814,20 @@ impl KadNode {
             if batch.is_empty() {
                 break;
             }
-            for node in &batch {
-                out.nodes_queried += 1;
-                if let Ok((contacts, verified, sender_vk)) =
-                    self.find_node(node, file_hash, per_query).await
-                {
-                    out.find_node_responses += 1;
-                    // The node that answered proved its IP iff the receiver key was
-                    // valid; the contacts it named are unverified until they answer.
-                    self.note_responder(node, verified, sender_vk);
-                    for c in &contacts {
-                        self.add_contact(c.id, c.ip, c.udp_port, c.tcp_port, c.version, false);
-                    }
-                    lookup.on_response(contacts);
+            out.nodes_queried += batch.len();
+            let answers = self.find_node_batch(&batch, file_hash, per_query).await;
+            for (node, answer) in batch.iter().zip(answers) {
+                let Some((contacts, verified, sender_vk)) = answer else {
+                    continue;
+                };
+                out.find_node_responses += 1;
+                // The node that answered proved its IP iff the receiver key was
+                // valid; the contacts it named are unverified until they answer.
+                self.note_responder(node, verified, sender_vk);
+                for c in &contacts {
+                    self.add_contact(c.id, c.ip, c.udp_port, c.tcp_port, c.version, false);
                 }
+                lookup.on_response(contacts);
             }
         }
 
@@ -711,54 +837,74 @@ impl KadNode {
             out.closest_prefix_bits = leading_zero_bits(&file_hash.distance(&closest.id));
         }
 
-        // Query the closest nodes within the storage tolerance for sources.
-        for node in lookup.closest(K) {
-            if !file_hash.distance(&node.id).within_tolerance() {
-                continue;
-            }
-            out.nodes_searched += 1;
-            if let Ok(mut found) = self
-                .search_source(&node, file_hash, file_size, per_query)
-                .await
-            {
+        // Query the closest nodes within the storage tolerance for sources,
+        // ALPHA at a time - the same concurrency the lookup rounds now use, so
+        // ten in-tolerance nodes cost four windows instead of ten.
+        let in_tolerance: Vec<WireContact> = lookup
+            .closest(K)
+            .into_iter()
+            .filter(|n| file_hash.distance(&n.id).within_tolerance())
+            .collect();
+        for group in in_tolerance.chunks(ALPHA_QUERY) {
+            out.nodes_searched += group.len();
+            let answers = self
+                .search_source_batch(group, file_hash, file_size, per_query)
+                .await;
+            for (node, answer) in group.iter().zip(answers) {
+                let Some((found, verified, sender_vk)) = answer else {
+                    continue;
+                };
                 out.search_responses += 1;
-                for s in found.drain(..) {
+                self.note_responder(node, verified, sender_vk);
+                for s in found {
                     if !out.sources.iter().any(|e| e.client_hash == s.client_hash) {
                         out.sources.push(s);
                     }
                 }
-                if out.sources.len() >= want {
-                    break;
-                }
+            }
+            if out.sources.len() >= want {
+                break;
             }
         }
         Ok(out)
     }
 
-    /// Ask one node for keyword matches (KADEMLIA2_SEARCH_KEY_REQ) and distil the
-    /// file results from its KADEMLIA2_SEARCH_RES.
+    /// Ask SEVERAL nodes for keyword matches (KADEMLIA2_SEARCH_KEY_REQ),
+    /// concurrently, and distil the file results from each KADEMLIA2_SEARCH_RES.
+    /// One slot per node, in the order given.
     ///
     /// `words` are the query's tokens. When there is more than one, they ride
-    /// along as a search-expression tree so THIS NODE filters before choosing
+    /// along as a search-expression tree so THAT NODE filters before choosing
     /// what to send back - without that, a common primary keyword returns a
     /// bounded sample of an enormous pool and the wanted file is simply not in
     /// it. Local filtering cannot recover what was never sampled.
-    async fn search_keyword_node(
-        &mut self,
-        node: &WireContact,
+    ///
+    /// Takes `&self` for the same reason as `search_source_batch`: the caller
+    /// applies `note_responder` once the batch is collected.
+    async fn search_keyword_batch(
+        &self,
+        nodes: &[WireContact],
         target: &Kad128,
         words: &[String],
         wait: Duration,
-    ) -> Result<Vec<FileResult>, KadError> {
-        let (op, payload) = build_search_key_req_restrictive(target, 0, words);
-        let frame = pack_kad(op, payload);
-        let dest = contact_addr(node.ip, node.udp_port);
-        let (res_payload, verified, sender_vk) = self
-            .request(&node.id, dest, &frame, OP_SEARCH_RES, wait)
-            .await?;
-        self.note_responder(node, verified, sender_vk);
-        let res = parse_search_res(&res_payload)?;
-        Ok(res.results.iter().filter_map(|r| r.as_file()).collect())
+    ) -> Vec<Option<(Vec<FileResult>, bool, u32)>> {
+        let reqs: Vec<(Kad128, SocketAddr, Vec<u8>)> = nodes
+            .iter()
+            .map(|n| {
+                let (op, payload) = build_search_key_req_restrictive(target, 0, words);
+                (n.id, contact_addr(n.ip, n.udp_port), pack_kad(op, payload))
+            })
+            .collect();
+        self.request_batch(&reqs, OP_SEARCH_RES, wait)
+            .await
+            .into_iter()
+            .map(|answer| {
+                let (res_payload, verified, sender_vk) = answer.ok()?;
+                let res = parse_search_res(&res_payload).ok()?;
+                let files = res.results.iter().filter_map(|r| r.as_file()).collect();
+                Some((files, verified, sender_vk))
+            })
+            .collect()
     }
 
     /// Resolve a `keyword` to files over the live Kad network: an iterative
@@ -805,28 +951,34 @@ impl KadNode {
             if batch.is_empty() {
                 break;
             }
-            for node in &batch {
-                if let Ok((contacts, verified, sender_vk)) =
-                    self.find_node(node, &target, per_query).await
-                {
-                    self.note_responder(node, verified, sender_vk);
-                    for c in &contacts {
-                        self.add_contact(c.id, c.ip, c.udp_port, c.tcp_port, c.version, false);
-                    }
-                    lookup.on_response(contacts);
+            let answers = self.find_node_batch(&batch, &target, per_query).await;
+            for (node, answer) in batch.iter().zip(answers) {
+                let Some((contacts, verified, sender_vk)) = answer else {
+                    continue;
+                };
+                self.note_responder(node, verified, sender_vk);
+                for c in &contacts {
+                    self.add_contact(c.id, c.ip, c.udp_port, c.tcp_port, c.version, false);
                 }
+                lookup.on_response(contacts);
             }
         }
 
         let mut files: Vec<FileResult> = Vec::new();
-        for node in lookup.closest(K) {
-            if !target.distance(&node.id).within_tolerance() {
-                continue;
-            }
-            if let Ok(found) = self
-                .search_keyword_node(&node, &target, &words, per_query)
-                .await
-            {
+        let in_tolerance: Vec<WireContact> = lookup
+            .closest(K)
+            .into_iter()
+            .filter(|n| target.distance(&n.id).within_tolerance())
+            .collect();
+        for group in in_tolerance.chunks(ALPHA_QUERY) {
+            let answers = self
+                .search_keyword_batch(group, &target, &words, per_query)
+                .await;
+            for (node, answer) in group.iter().zip(answers) {
+                let Some((found, verified, sender_vk)) = answer else {
+                    continue;
+                };
+                self.note_responder(node, verified, sender_vk);
                 for f in found {
                     // The wire matched ONE word. Apply the rest locally, exactly
                     // as eMule does per result (Search.cpp:1379-1395) - without
@@ -839,9 +991,9 @@ impl KadNode {
                         files.push(f);
                     }
                 }
-                if files.len() >= want {
-                    break;
-                }
+            }
+            if files.len() >= want {
+                break;
             }
         }
         Ok(files)
@@ -949,6 +1101,130 @@ mod tests {
         );
     }
 
+    /// THE POINT OF `request_batch`: alpha is CONCURRENT, not batched-then-awaited.
+    ///
+    /// Three silent destinations at a 400ms per-query wait. Serially that is three
+    /// timeouts back to back (~1.2s), which is exactly what every Kad lookup used
+    /// to cost per round - `resolve_keyword` structurally 12 rounds x 3 x 750ms
+    /// before the keyword phase even began, and the ~10s search measured on device
+    /// 2026-08-07. One window is ~0.4s.
+    ///
+    /// It fails by TIMING rather than by assertion, which is the only way this
+    /// regression can show itself: re-serialising the sends breaks nothing
+    /// functionally, it just makes everything slow again.
+    #[tokio::test]
+    async fn a_batch_of_silent_peers_costs_one_window_not_one_per_peer() {
+        let node = KadNode::bind_with_identity(
+            "127.0.0.1:0".parse().unwrap(),
+            4662,
+            Kad128::from_words([7, 7, 7, 7]),
+            0xABCD,
+        )
+        .await
+        .unwrap();
+        // Real bound sockets that simply never answer: an unbound port would draw
+        // an ICMP unreachable and measure error handling instead of the wait.
+        let mut dests = Vec::new();
+        let mut _held = Vec::new();
+        for _ in 0..3 {
+            let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            dests.push(s.local_addr().unwrap());
+            _held.push(s);
+        }
+        let (op, payload) = build_bootstrap_req();
+        let frame = pack_kad(op, payload);
+        let reqs: Vec<(Kad128, SocketAddr, Vec<u8>)> = dests
+            .iter()
+            .map(|d| (Kad128::from_hash(&[0x11; 16]), *d, frame.clone()))
+            .collect();
+
+        let wait = Duration::from_millis(400);
+        let t0 = std::time::Instant::now();
+        let answers = node.request_batch(&reqs, OP_BOOTSTRAP_RES, wait).await;
+        let elapsed = t0.elapsed();
+
+        assert_eq!(answers.len(), 3);
+        assert!(
+            answers.iter().all(|a| a.is_err()),
+            "nobody answered, so every slot must report a timeout"
+        );
+        assert!(
+            elapsed < wait * 2,
+            "three silent peers took {elapsed:?} for a {wait:?} window - the batch \
+             is being awaited one peer at a time again, so every Kad lookup round \
+             costs ALPHA_QUERY timeouts instead of one"
+        );
+    }
+
+    /// THE RISK the concurrency creates: one socket, several replies. A datagram
+    /// must reach the slot that asked for it. Two peers answer in the OPPOSITE
+    /// order to the one they were asked in, so a loop that simply filled slots as
+    /// answers arrived would swap them and every caller would attribute one node's
+    /// contacts to another - silently, since both answers are well-formed.
+    #[tokio::test]
+    async fn a_batch_matches_each_reply_to_the_peer_that_sent_it() {
+        let our_id = Kad128::from_words([4, 4, 4, 4]);
+        let node = KadNode::bind_with_identity("127.0.0.1:0".parse().unwrap(), 4662, our_id, 0x99)
+            .await
+            .unwrap();
+
+        // Each mock answers with its OWN tcp_port, which is what identifies whose
+        // answer landed where. The second one replies FIRST.
+        let mut dests = Vec::new();
+        let mut mocks = Vec::new();
+        for (i, delay_ms) in [200u64, 20].into_iter().enumerate() {
+            let peer_id = Kad128::from_hash(&[0xA0 + i as u8; 16]);
+            let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            dests.push(peer.local_addr().unwrap());
+            let tcp_port = 5000 + i as u16;
+            mocks.push(tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                let (n, from) = peer.recv_from(&mut buf).await.unwrap();
+                let dec = kad_deobfuscate(&buf[..n], &peer_id, 0, ip_u32(&from)).unwrap();
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                let (rop, rpayload) = build_bootstrap_res(&peer_id, tcp_port, 8, &[]);
+                let dg = kad_obfuscate_response(
+                    &pack_kad(rop, rpayload),
+                    0x2468,
+                    dec.sender_vk,
+                    0,
+                    0x80,
+                );
+                peer.send_to(&dg, from).await.unwrap();
+            }));
+        }
+
+        let (op, payload) = build_bootstrap_req();
+        let frame = pack_kad(op, payload);
+        let reqs: Vec<(Kad128, SocketAddr, Vec<u8>)> = dests
+            .iter()
+            .enumerate()
+            .map(|(i, d)| (Kad128::from_hash(&[0xA0 + i as u8; 16]), *d, frame.clone()))
+            .collect();
+
+        let answers = node
+            .request_batch(&reqs, OP_BOOTSTRAP_RES, Duration::from_secs(3))
+            .await;
+
+        for (i, answer) in answers.into_iter().enumerate() {
+            let (payload, valid, _) = answer.expect("both peers answered inside the window");
+            let res = parse_bootstrap_res(&payload).unwrap();
+            assert_eq!(
+                res.tcp_port,
+                5000 + i as u16,
+                "slot {i} got another peer's reply - the batch demux is matching \
+                 datagrams to the wrong request"
+            );
+            assert!(
+                valid,
+                "each peer echoed the sender key issued for ITS address"
+            );
+        }
+        for m in mocks {
+            m.await.unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn request_reports_a_valid_receiver_key_when_the_peer_echoes_our_sender_key() {
         // A real v2 node decrypts our request, reads the sender verify key we
@@ -1043,36 +1319,58 @@ mod tests {
         let _ = udp_verify_key(our_key, 0);
     }
 
-    /// Shared shape for the search key-capture tests: a faithful mock node that
-    /// answers a search request with an (empty) SEARCH_RES carrying ITS sender
-    /// verify key, which the search path must store for the send-side echo.
+    /// The sender verify key the mock storing node hands us, which the search
+    /// path must capture for the send-side echo.
     const MOCK_SENDER_VK: u32 = 0xFEED_F00D;
 
-    fn spawn_search_res_mock(
+    /// A mock that answers ONLY the search opcodes, ignoring the FIND_NODE
+    /// requests a real lookup sends first, and loops rather than serving one
+    /// datagram - because the two tests below drive the whole public path, which
+    /// sends a lookup round before it ever searches. Aborted by the caller.
+    fn spawn_search_only_mock(
         peer: UdpSocket,
         peer_id: Kad128,
         target: Kad128,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut buf = vec![0u8; 8192];
-            let (n, from) = peer.recv_from(&mut buf).await.unwrap();
-            let dec = kad_deobfuscate(&buf[..n], &peer_id, 0, ip_u32(&from)).unwrap();
-            let (rop, rpayload) = mule_kad::build_search_res(&peer_id, &target, &[]);
-            let dg = kad_obfuscate_response(
-                &pack_kad(rop, rpayload),
-                0x2468,
-                dec.sender_vk,
-                MOCK_SENDER_VK,
-                0x80,
-            );
-            peer.send_to(&dg, from).await.unwrap();
+            loop {
+                let Ok((n, from)) = peer.recv_from(&mut buf).await else {
+                    return;
+                };
+                let Some(dec) = kad_deobfuscate(&buf[..n], &peer_id, 0, ip_u32(&from)) else {
+                    continue;
+                };
+                let Ok((op, _)) = unpack_kad(&dec.payload) else {
+                    continue;
+                };
+                if op != mule_kad::OP_SEARCH_SOURCE_REQ && op != mule_kad::OP_SEARCH_KEY_REQ {
+                    continue; // the lookup's FIND_NODE - a storing node answers neither
+                }
+                let (rop, rpayload) = mule_kad::build_search_res(&peer_id, &target, &[]);
+                let dg = kad_obfuscate_response(
+                    &pack_kad(rop, rpayload),
+                    0x2468,
+                    dec.sender_vk,
+                    MOCK_SENDER_VK,
+                    0x80,
+                );
+                let _ = peer.send_to(&dg, from).await;
+            }
         })
     }
 
     #[tokio::test]
-    async fn search_source_stores_the_responders_sender_key() {
+    async fn resolve_sources_stores_the_searched_nodes_sender_key() {
         // A node we only ever SEARCH must still get its sender key captured, or
         // the send-side echo never fires for it (2026-08-02 reanalysis gap c-1).
+        //
+        // Driven through the PUBLIC path rather than the request helper. The
+        // capture moved out of that helper when the search went concurrent - the
+        // batch collects with `&self` and the CALLER applies `note_responder` - so
+        // a test that called the helper and then stored the key itself would pass
+        // with the production call site deleted. Mutation-checked: drop the
+        // `note_responder` line from `resolve_sources` and this fails.
         let our_id = Kad128::from_words([3, 3, 3, 3]);
         let our_ip = 0x0A00_0001u32;
         let mut node =
@@ -1080,37 +1378,34 @@ mod tests {
                 .await
                 .unwrap();
         node.set_public_ip(our_ip);
-        let peer_id = Kad128::from_hash(&[0x77; 16]);
+        let target = Kad128::from_hash(&[0x44; 16]);
+        // Share the target's top bits so the node is inside the storage tolerance
+        // and the source phase actually asks it.
+        let w = target.words();
+        let peer_id = Kad128::from_words([w[0], w[1] ^ 1, w[2], w[3]]);
         let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let peer_addr = peer.local_addr().unwrap();
         let peer_ip = ip_u32(&peer_addr);
-        let target = Kad128::from_hash(&[0x44; 16]);
-        // The searched node is already in the table (a lookup put it there).
+        // Seeded straight into the table: `closest_to` hands out VERIFIED contacts
+        // only, and this stands in for one a live lookup had already proved.
         node.routing
-            .add(peer_id, peer_ip, peer_addr.port(), 4662, 8, false);
-        let mock = spawn_search_res_mock(peer, peer_id, target);
+            .add(peer_id, peer_ip, peer_addr.port(), 4662, 8, true);
+        let mock = spawn_search_only_mock(peer, peer_id, target);
 
-        let wc = WireContact {
-            id: peer_id,
-            ip: peer_ip,
-            udp_port: peer_addr.port(),
-            tcp_port: 4662,
-            version: 8,
-        };
-        node.search_source(&wc, &target, 1000, Duration::from_secs(2))
+        node.resolve_sources(&target, 1000, 1, Duration::from_millis(300))
             .await
             .unwrap();
-        mock.await.unwrap();
+        mock.abort();
         assert_eq!(
             node.routing.verify_key_for(&peer_id, peer_ip, our_ip),
             MOCK_SENDER_VK,
-            "search_source stored the responder's sender key"
+            "resolve_sources stored the searched node's sender key"
         );
     }
 
     #[tokio::test]
-    async fn search_keyword_node_stores_the_responders_sender_key() {
-        // The keyword twin of the gap above.
+    async fn resolve_keyword_stores_the_searched_nodes_sender_key() {
+        // The keyword twin of the gap above, through the same public path.
         let our_id = Kad128::from_words([4, 4, 4, 4]);
         let our_ip = 0x0A00_0001u32;
         let mut node =
@@ -1118,37 +1413,25 @@ mod tests {
                 .await
                 .unwrap();
         node.set_public_ip(our_ip);
-        let peer_id = Kad128::from_hash(&[0x88; 16]);
+        // The target is the KEYWORD's hash - the search picks it, not the test.
+        let target = kad_keyword_target("minister");
+        let w = target.words();
+        let peer_id = Kad128::from_words([w[0], w[1] ^ 1, w[2], w[3]]);
         let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let peer_addr = peer.local_addr().unwrap();
         let peer_ip = ip_u32(&peer_addr);
-        let target = Kad128::from_hash(&[0x55; 16]);
         node.routing
-            .add(peer_id, peer_ip, peer_addr.port(), 4662, 8, false);
-        let mock = spawn_search_res_mock(peer, peer_id, target);
+            .add(peer_id, peer_ip, peer_addr.port(), 4662, 8, true);
+        let mock = spawn_search_only_mock(peer, peer_id, target);
 
-        let wc = WireContact {
-            id: peer_id,
-            ip: peer_ip,
-            udp_port: peer_addr.port(),
-            tcp_port: 4662,
-            version: 8,
-        };
-        // Single word: no expression tree, so this drives the same bytes it
-        // always did and still asserts the sender-key capture.
-        node.search_keyword_node(
-            &wc,
-            &target,
-            &["minister".to_string()],
-            Duration::from_secs(2),
-        )
-        .await
-        .unwrap();
-        mock.await.unwrap();
+        node.resolve_keyword("minister", 1, Duration::from_millis(300))
+            .await
+            .unwrap();
+        mock.abort();
         assert_eq!(
             node.routing.verify_key_for(&peer_id, peer_ip, our_ip),
             MOCK_SENDER_VK,
-            "search_keyword_node stored the responder's sender key"
+            "resolve_keyword stored the searched node's sender key"
         );
     }
 

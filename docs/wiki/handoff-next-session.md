@@ -1,30 +1,32 @@
 # HANDOFF - start here next session
 
-Updated: 2026-08-07, after the Kad-search session. Living doc - replace wholesale.
+Updated: 2026-08-07, after the slow-operations session. Living doc - replace
+wholesale.
 
-Full narrative: [[build-progress]] rows 8ce-8cg and the [[log]] entries for
+Full narrative: [[build-progress]] rows 8cf-8ch and the [[log]] entries for
 2026-08-06 and 2026-08-07.
 
 ## THE ONE-LINE SUMMARY
 
-Kad keyword search was broken for EVERY multi-word query since Wave 6 and is now
-fixed and device-proven; the UI-freeze half of the GUI slowness is fixed and
-device-proven; **the operations are still individually slow and that is the
-biggest remaining user-facing win.**
+The GUI freeze (8cg) and the operation slowness (8ch) are both fixed in code and
+**neither the slowness fix nor the freeze fix has been measured on device** -
+8cg's own re-measurement was inconclusive and 8ch is structural-plus-tests only.
+**A device timing pass is the top action.**
 
 ## State of the tree
 
-- **Gate**: 641 Rust tests, 24 Swift simulator tests, clippy `-D warnings`,
+- **Gate**: 644 Rust tests, 24 Swift simulator tests, clippy `-D warnings`,
   fmt + ASCII clean.
 - **BRANCH `fetch-funnel`, nothing merged.** Do not trust prose for counts - run
   `git log --oneline main..HEAD` and `git log --oneline origin/main..main`.
   History is LINEAR and must stay that way (`gh pr merge --rebase`).
 - **`rust.yml` only fires on push to `main` and on PRs**, so the branch commits
   have NOT been through the CI Rust gate. The local gate is the only one.
-- **Installed on device: `f946e02`.** Confirm any install by reading
-  Settings > This device > **Build**, not by spotting a UI change.
+- **Installed on device: `f946e02`** - which is BEFORE this session's work.
+  Confirm any install by reading Settings > This device > **Build**, not by
+  spotting a UI change.
 
-## THE INSTALL PATH CHANGED - read this before touching Sideloadly
+## THE INSTALL PATH - read this before touching Sideloadly
 
 **zsign + `pymobiledevice3` is the default. Sideloadly is for RENEWALS ONLY.**
 
@@ -39,29 +41,45 @@ biggest remaining user-facing win.**
 
 Kits stay staged at `/home/ajbufort/padmule-resign/` and
 `/home/ajbufort/wda-resign/`. **Every Sideloadly round re-signs WebDriverAgent
-without signing its nested `.xctest` and breaks the automation** - that cost an
-hour on 2026-08-07. This capability was documented on 2026-08-02 and a stale
-MEMORY line said the opposite, so it went unused for five days.
+without signing its nested `.xctest` and breaks the automation.**
 
 **PROFILE EXPIRIES (the 7-day clock is the PROFILE; the cert runs to 2027):**
 WebDriverAgent **2026-08-10**, padMule **2026-08-14**. WDA is the binding one -
 when it lapses, agent-driven device testing stops until a Sideloadly renewal.
 
-## Shipped this session
+## Shipped this session (8ch)
 
-1. **Kad keyword search, all three pieces** (8cf). `kad_keyword_target` hashed the
-   WHOLE phrase, so every multi-word search walked toward a hash nobody publishes
-   to and reported nothing WITHOUT failing. Now: tokenise per word exactly as
-   `CSearchManager::GetWords`, hash only the primary word, filter results
-   locally, AND send the search-expression tree (flags `0x8000`) so the storing
-   node filters before choosing. **Device-proven: "Yes Prime Minister" returns
-   143 results, `server + kad` on every row.** Zero on every prior build.
-2. **The status poll no longer waits behind a search** (8cg). Four scalars were
-   taking a 20s-capable lock to read a bool, a Copy enum and an `Arc::len`.
-   `StatusPub` publishes them as atomics through `EngineHandles`; the Swift reads
-   moved from `refresh()` into `refreshFast()`. **Device-proven** - see below.
-3. **Three Kad routing fixes** (8ce): live table seeded from what we already
-   know, ONE honest contact count, `maintain_kad` capped at 3s.
+1. **Kad's alpha queries actually go out together.** `resolve_keyword` ran
+   `for node in &batch { find_node(node).await }` - alpha is a CONCURRENCY
+   parameter and padMule used it as a batch SIZE. Structurally 12 rounds x 3 x
+   750ms = 27s of lookup before the keyword phase, capped at `KAD_SEARCH_WAIT`,
+   so **the cap was the cost** and that is the 10.3s search. `request_batch` is
+   one receive loop owning the whole batch. Wire-identical.
+2. **`server_info()` was the fifth status reader 8cg never made lock-free** -
+   so `refreshFast()`, and the event drain sharing its queue, still stalled for
+   every search. Now published through `StatusPub`.
+3. **`heartbeat()` took the engine lock once for eight duties** (up to ~10s).
+   One lock per duty now.
+4. **The server probe always spent its full 6s budget.** Stops when everyone has
+   answered, or 2s after the last answer.
+5. **Stats -> "Longest poll gap"**, because the 8cg counters cannot answer their
+   own question (below).
+
+## THE TOP NEXT ACTION - MEASURE 8cg AND 8ch ON DEVICE
+
+Nothing in either row has a device number behind it. Build, install, and take
+three readings:
+
+| Reading | Before | Expect |
+|---|---|---|
+| search submit-to-results | 10.3s | materially lower; the Kad arm no longer sets the pace |
+| "Refresh server list" idle | 7.5-9.3s | lower - the probe stops when answers are in |
+| Stats -> **Longest poll gap** after a search | (new) | near 1s. Anything near the search length means something on that queue takes the engine lock again |
+
+The gap row is the honest instrument. **The tick COUNTS cannot answer this** -
+see below. If the search is still ~10s, the Kad arm is not the pace-setter and
+the next suspect is the server arm or `ranked_to_hits` (which calls
+`hit_status` per result, ~143 times, under the lock).
 
 ## HOW TO MEASURE ANYTHING ON THIS DEVICE - read before you measure
 
@@ -72,33 +90,25 @@ produced a reading that refuted a correct fix.
 
 **Take the measurement OUT of the window: record, leave, record once.**
 
-Verified numbers, unobserved, during a real search:
+**THE 8cg TICK COUNTERS CANNOT SUPPORT THE READING TAKEN FROM THEM.**
+`uiPollTicks` / `heartbeatTicks` are cumulative, and their `eventQueue` is
+SERIAL - so a poll that blocks does not LOSE its ticks, the timer keeps queueing
+work items and they all run the instant the block clears. Over any window that
+outlasts the stall, "stalled 10s then burst" and "never stalled" give the SAME
+total. The 2026-08-07 table below is therefore not evidence that the poll kept
+running, and finding (2) above makes the burst the likelier explanation:
 
-| path | idle | during a search |
-|---|---|---|
-| status polls (lock-free) | ~1.2/s | **0.94/s** - keeps running |
-| heartbeats (takes the lock) | ~1.2/s | **0.69/s** - loses ~10s of ticks |
+| path | idle | during a search | what it actually shows |
+|---|---|---|---|
+| status polls | ~1.2/s | 0.94/s | a total, which a burst reproduces |
+| heartbeats | ~1.2/s | 0.69/s | a real stall (it does take the lock) |
 
-The counters are on Stats -> **UI responsiveness**. They are a DIAGNOSTIC; if
-they stop earning their place, remove them rather than let them accumulate.
+Read **Longest poll gap** instead. It is the one statistic a burst cannot hide.
 
 **The WDA search field CONCATENATES.** The helper now clears, sets and READS THE
-FIELD BACK, aborting on mismatch. Hit again on 2026-08-07: a re-run silently
-searched `ministerminister`, which returns nothing fast and therefore produced a
+FIELD BACK, aborting on mismatch. A re-run once silently searched
+`ministerminister`, which returns nothing fast and therefore produced a
 measurement that looked clean *because* it was meaningless.
-
-## THE TOP NEXT ACTION
-
-**The operations are individually slow, and nothing has touched that.** Measured
-on device: a search is **10.3s** submit-to-results; a server probe round is
-**7.5-10.5s**. `SEARCH_WAIT` is 20s with BOTH arms awaited, and
-`PROBE_COLLECT_BUDGET` is 6s held under the engine lock throughout. The freeze is
-fixed; the slowness is not, and it is now the biggest user-facing win available.
-
-Two obvious angles, neither measured yet: return the server arm as soon as it
-answers instead of awaiting the slower Kad arm (row 8bx did exactly this for
-`add_download` and made it 75x faster), and stop holding the engine lock across
-the probe's collection budget.
 
 ## OPEN
 
@@ -112,52 +122,52 @@ the probe's collection budget.
    method, no per-download state. `pause()`/`resume()` are whole-engine lifecycle.
    Anthony asked for it plus a clear per-file state. **A build, not a bug.**
 3. **A settable max-active download cap with the rest QUEUED**, per-file status
-   like eMule. Anthony suggested 20 active. Same feature family as (2) - both
-   need a per-file state machine plus a scheduler.
+   like eMule. Anthony suggested 20 active. Same feature family as (2).
 4. **padMule PUBLISHES NOTHING to Kad.** Opcodes 0x43-0x45 undefined, no call
    site; its shares are invisible to every client searching Kad. Payloads decoded
-   and banked in [[kad-routing-lifecycle]]. Deliberately NOT half-built - codecs
-   without a driver are dead code (row 8by's mistake).
+   and banked in [[kad-routing-lifecycle]]. Deliberately NOT half-built.
 5. **Kad gaps still open** (8ce): no contact expiry or liveness ping (eMule's
    `OnSmallTimer` half), near-biased nodes.dat sample, no bootstrap retry, and
    `KadNode::add_contact` has no Kad-version gate so a peer can put a v1 contact
    in the table over the wire.
-6. **The pause teardown does not finish before iOS suspends** - 465ms to
+6. **The probe still runs UNDER THE ENGINE LOCK**, now for ~2s instead of 6s.
+   Taking it off the lock was considered and NOT done: `persist_server_names`
+   writes server.met, and the lock is the only thing serialising that against
+   `update_server_list` and `merge_discovered_servers`. Doing it properly means
+   snapshotting inputs under the lock, fanning out without it, then re-acquiring
+   to fold health and persist names. Worth it only if 2s still shows up on a
+   device reading.
+7. **The pause teardown does not finish before iOS suspends** - 465ms to
    suspension, 30.5s to completion. `pause()` now logs whether the background
    assertion was GRANTED/REFUSED and how long the work waited. One background
    round trip on a current build answers it. Do not theorise first.
-7. Housekeeping: eleven remote branches fully merged and deletable; `main` is
+8. Housekeeping: eleven remote branches fully merged and deletable; `main` is
    ahead of `origin/main`, unpushed.
 
-## STANDING DIRECTIVE ADDED THIS SESSION
+## STANDING DIRECTIVE (2026-08-06)
 
 **eMule 0.70b is the authority for GUI, Settings and per-file behaviour**
-(Anthony, 2026-08-06). Third row in the authority table in `CLAUDE.md`; 0.50a
-still decides the wire. Check 0.70b BEFORE designing a screen or a download
-state, and diverge only deliberately.
+(Anthony). Third row in the authority table in `CLAUDE.md`; 0.50a still decides
+the wire. Check 0.70b BEFORE designing a screen or a download state, and diverge
+only deliberately.
 
 ## What this session actually taught
 
-- **The answer was already in the repo, three times.** The Kad keyword spec was in
-  `docs/raw/wave6-kad-research` line 246 and unimplemented; the install path was
-  in `ipad-usb-tooling` and contradicted by a memory line; the Swift bottleneck
-  was visible in the code. None needed new information. **Grep our own research
-  against the code that claims to implement it.**
-- **A capability filed under a soft heading at the bottom of an entry reads as
-  trivia, and a memory that contradicts it wins by default.** Anything that
-  changes the DEFAULT WORKFLOW goes at the top of the entry AND in memory.
-- **An audit of the PLUMBING is not an audit of the FEATURE.** The 2026-08-06
-  reanalysis verified the Kad routing table, contact counts, maintenance timers
-  and bootstrap - and never ran one keyword search.
-- **Two thirds of a spec is not a fix.** Tokenising was correct and "Yes Prime
-  Minister" still returned zero until the expression tree landed.
-- **Three of this session's instruments were vacuous on the first attempt** - a
-  test that passed with its own fix reverted, a depth check that counted bytes
-  that meant something else, and a probe that starved what it measured. **Check
-  an instrument can FAIL before believing it.**
-- **A failed verification deserves the same scepticism as a successful one.** The
-  first counter reading refuted a correct fix, and the refutation was the thing
-  that was wrong.
+- **A fix's own commit message is a claim, not a record.** 8cg said "all five are
+  now lock-free" and converted four; the fifth kept taking the lock for a day.
+  The test that pinned the property named four readers, so it could not see it.
+  **A test that pins "these callers" has to name every one of them.**
+- **A cumulative counter cannot measure a stall on a serial queue.** Ticks are
+  not lost, they are deferred, and the total comes out the same. The 8cg
+  instrument was built to carry its own control and does not; a max GAP does.
+- **A constant that is always reached is not a bound, it is the cost.**
+  `KAD_SEARCH_WAIT` looked like a safety cap and was the actual duration of every
+  search, because the work under it was structurally 27s.
+- **Alpha is a concurrency parameter.** The name of the constant said so
+  (`ALPHA_QUERY`, "concurrent queries in flight") and the code batched three and
+  then blocked on each. The doc comment was right and unread for a month.
+- **Check an instrument can FAIL before believing it** - applied to five new
+  tests this session, and two of them were vacuous on the first attempt.
 
 ## Related
 
