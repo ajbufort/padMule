@@ -38,7 +38,9 @@ const KAD_REQUESTED_CONTACTS: usize = 11;
 /// 12 a real lookup runs: this fires on the heartbeat under the engine lock, so
 /// its worst case is a user's search waiting behind it. Breadth comes from
 /// repeating it against fresh random targets, not from one deep dive.
-const REFRESH_ROUNDS: usize = 4;
+/// `pub(crate)` so `KAD_MAINTENANCE_BUDGET` can be pinned against the structural
+/// worst case this implies, rather than against a number someone remembered.
+pub(crate) const REFRESH_ROUNDS: usize = 4;
 
 /// Bind the Kad UDP socket with SO_REUSEADDR set.
 ///
@@ -227,6 +229,44 @@ impl KadNode {
         &mut self.routing
     }
     pub fn contacts_known(&self) -> usize {
+        self.routing.len()
+    }
+
+    /// Seed this node's routing table from contacts we already hold (nodes.dat
+    /// plus whatever a previous live node folded into `Engine::routing`).
+    /// Returns the table size after seeding.
+    ///
+    /// WHY THIS EXISTS. A `KadNode` is constructed with an EMPTY table, and
+    /// `bootstrap_any` stops at the FIRST answer - so without this, the table
+    /// that every lookup reads held one responder plus the ~20 contacts its
+    /// BOOTSTRAP_RES named, on start AND on every resume, no matter how many we
+    /// already knew. That is the true content of the 2026-08-05 "138 -> 21"
+    /// device report: a table being BUILT, not one being discarded. The 8cd fix
+    /// unioned the same contacts into the bootstrap DIAL LIST, which is a
+    /// different thing and left this untouched (build-progress 8ce).
+    ///
+    /// Everything goes through the gated `add_contact`, so a seed list is held
+    /// to exactly the rules a wire-learned contact is: routable public address,
+    /// no legacy DNS-port contact, the user's ipfilter, and the anti-sybil
+    /// per-IP//24 caps. A poisoned nodes.dat therefore gains nothing by arriving
+    /// this way instead of over the wire.
+    ///
+    /// The VERIFIED bit and the stored verify key are carried across, and both
+    /// are load-bearing rather than tidiness: `closest_to` is verified-only
+    /// (eMule `CRoutingBin::GetClosestTo`, RoutingBin.cpp:244), so seeds that
+    /// lost the bit would inflate `contacts_known()` while remaining invisible
+    /// to every lookup - a worse state than not seeding, because the number
+    /// would then say the problem was fixed.
+    pub fn seed_routing(&mut self, contacts: &[KadContact]) -> usize {
+        for c in contacts {
+            self.add_contact(c.id, c.ip, c.udp_port, c.tcp_port, c.version, c.verified);
+            // Only for a contact that actually survived the gates - otherwise a
+            // blocked address could still park a key against its id.
+            if c.udp_key != 0 && self.routing.contains(&c.id) {
+                self.routing
+                    .note_verify_key(&c.id, c.ip, c.udp_key, c.udp_key_ip);
+            }
+        }
         self.routing.len()
     }
 

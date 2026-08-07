@@ -205,10 +205,30 @@ const KAD_PER_QUERY: Duration = Duration::from_millis(750);
 /// built inside one rather than maintained across days.
 const KAD_REFRESH_EVERY: Duration = Duration::from_secs(120);
 
+/// Wall-clock cap on ONE `maintain_kad` round.
+///
+/// `refresh_routing` is bounded only STRUCTURALLY - `REFRESH_ROUNDS` rounds of
+/// `ALPHA_QUERY` queries, issued sequentially at `KAD_PER_QUERY` apiece - and
+/// `heartbeat()` holds the engine lock across it while the UI's 1s poll waits on
+/// the same serial queue. A structural bound is not a deadline, and this was the
+/// only Kad call in the tree without one. Pinned by test to be strictly under
+/// the structural worst case, so the cap actually binds instead of decorating.
+const KAD_MAINTENANCE_BUDGET: Duration = Duration::from_secs(3);
+
 /// Stop actively growing the table past this. Not a protocol rule - a battery
 /// and bandwidth one: past a few hundred well-spread contacts a lookup already
 /// converges, and a foreground-only client on a tablet should not keep paying
-/// UDP for contacts it will never use. Refresh resumes if the table shrinks.
+/// UDP for contacts it will never use.
+///
+/// NOTE what this guard does NOT do, corrected 2026-08-06: it used to claim
+/// "Refresh resumes if the table shrinks", and the table cannot shrink -
+/// `RoutingTable` has no removal path anywhere, because padMule implements
+/// eMule's `OnBigTimer` random lookup but not its `OnSmallTimer` contact expiry
+/// and liveness ping. So once a live table reaches this ceiling, maintenance is
+/// off for the rest of that session even if most of those contacts are dead.
+/// Tolerable only because the live table is rebuilt on every `start_kad` and a
+/// foreground session rarely gets there; it stops being tolerable the day
+/// contact expiry lands. [[kad-routing-lifecycle]].
 const KAD_TABLE_TARGET: usize = 600;
 
 /// DIALABLE sources a server answer must carry before `find_sources` skips the
@@ -1649,9 +1669,26 @@ impl Engine {
         self.public_ip.lock().map(|g| g.is_some()).unwrap_or(false)
     }
 
-    /// The number of Kad contacts currently held.
+    /// The number of Kad contacts currently held - the LIVE node's table
+    /// whenever there is one, and the persisted table only when Kad is not
+    /// running (before `start_kad`, or while paused).
+    ///
+    /// ONE FIELD, ONE MEASUREMENT. This used to return `self.routing.len()`
+    /// unconditionally while `EngineEvent::Kad` carried the LIVE count from
+    /// `start_kad` and `maintain_kad` - and the UI writes BOTH into the same
+    /// `kadContacts` field, so the number on screen alternated between two
+    /// different quantities at 1s resolution. Worse, `RoutingTable` has no
+    /// removal path anywhere, so the persisted count is MONOTONIC: it cannot
+    /// fall, which made it useless as evidence about anything and specifically
+    /// useless as the verdict on Kad maintenance it had been nominated for.
+    ///
+    /// The live table is the honest answer because it is the only one
+    /// `closest_to` reads, so it is the only one that describes whether a lookup
+    /// can converge. [[kad-routing-lifecycle]], build-progress 8ce.
     pub fn kad_contacts(&self) -> usize {
-        self.routing.len()
+        self.kad
+            .as_ref()
+            .map_or_else(|| self.routing.len(), |k| k.contacts_known())
     }
 
     /// Total file-data bytes moved this session as `(downloaded, uploaded)`. The
@@ -1887,8 +1924,13 @@ impl Engine {
                     .load_nodes(&gate_loaded_nodes(&nd.contacts, self.ip_filter.as_deref()));
             }
         }
+        // Through the accessor, not `self.routing.len()` directly: every emit
+        // site of this event has to carry the SAME quantity as the poll, or the
+        // one UI field they share means two things (see `kad_contacts`). Kad is
+        // not up yet here, so this is still the persisted count - by the
+        // accessor's own rule rather than by coincidence.
         self.emit(EngineEvent::Kad {
-            contacts: self.routing.len(),
+            contacts: self.kad_contacts(),
         });
         // In-progress downloads.
         let resumed = resume_downloads(&self.config_dir);
@@ -3157,6 +3199,21 @@ impl Engine {
         // optimization (the echo gate is IP-equality), it never mis-verifies.
         let pub_ip = self.public_ip.lock().ok().and_then(|g| *g);
         node.set_public_ip(pub_ip.map_or(0, u32::from));
+        // SEED THE TABLE LOOKUPS WILL ACTUALLY READ, before dialing anything.
+        //
+        // `contacts` above is the bootstrap DIAL LIST; this is the routing TABLE,
+        // and they are not the same thing. A fresh node's table is empty and
+        // `bootstrap_any` stops at the first answer, so without this every
+        // start/resume left lookups running against one bootstrap response - the
+        // "21" in the 2026-08-05 syslog - while `Engine::routing` held hundreds.
+        // See `KadNode::seed_routing` for why the verified bit has to survive.
+        //
+        // BEFORE the bootstrap, deliberately: a bootstrap that fails entirely
+        // then still leaves a usable table, which is also what keeps
+        // `maintain_kad` (guarded on `contacts_known() > 0`) able to run at all
+        // on a session whose bootstrap missed. `set_ip_filter` above has already
+        // run, so the seeding is gated by the user's blocklist like any insert.
+        node.seed_routing(&contacts);
         // Cap the OVERALL bootstrap: 40 contacts * 1200ms is ~48s worst case, and
         // start_kad runs while the single shared engine lock is held (start/resume
         // via the FFI), so an uncapped bootstrap would block pause()'s socket
@@ -4353,9 +4410,27 @@ impl Engine {
         let mut bytes = [0u8; 16];
         rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut bytes);
         let target = Kad128::from_hash(&bytes);
-        let gained = kad.refresh_routing(&target, KAD_PER_QUERY).await;
+        let before = kad.contacts_known();
+        // A DEADLINE, not just a round count. `refresh_routing`'s bound is
+        // structural - REFRESH_ROUNDS x ALPHA_QUERY queries, run SEQUENTIALLY at
+        // KAD_PER_QUERY each - which is up to 9s of worst case, and this runs
+        // under the engine lock via `heartbeat()` while the UI's 1s poll waits on
+        // the same serial queue. Every OTHER Kad call site already wraps in a
+        // timeout (search, find_sources); this one did not, and it was the only
+        // periodic one. Row 8bx treated a 15s lock hold as a real defect.
+        //
+        // Partial work is KEPT: `add_contact` mutates the table as answers
+        // arrive, so a cancelled round still leaves everything it learned. The
+        // gain is measured from the table itself rather than taken from the
+        // return value, which a timed-out round never produces.
+        let _ = timeout(
+            KAD_MAINTENANCE_BUDGET,
+            kad.refresh_routing(&target, KAD_PER_QUERY),
+        )
+        .await;
+        let total = kad.contacts_known();
+        let gained = total.saturating_sub(before);
         if gained > 0 {
-            let total = kad.contacts_known();
             let _ = self.events.send(EngineEvent::Kad { contacts: total });
         }
         gained
@@ -4551,6 +4626,235 @@ mod tests {
             ),
             "the in-memory table was ignored, so a resume threw away everything \
              learned since the last checkpoint; got {evs:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The maintenance deadline must actually BIND, i.e. be strictly under what
+    /// `refresh_routing` can cost on its own. If someone raises the budget past
+    /// the structural worst case the timeout becomes decoration and the 9s lock
+    /// hold is back, silently - so the relationship is asserted rather than the
+    /// number remembered. Fails loudly if `REFRESH_ROUNDS`, `ALPHA_QUERY` or
+    /// `KAD_PER_QUERY` moves too, which is the point.
+    #[test]
+    fn the_kad_maintenance_budget_binds_below_the_structural_worst_case() {
+        let structural =
+            KAD_PER_QUERY * (crate::kad_live::REFRESH_ROUNDS * mule_kad::ALPHA_QUERY) as u32;
+        assert!(
+            KAD_MAINTENANCE_BUDGET < structural,
+            "the deadline ({KAD_MAINTENANCE_BUDGET:?}) does not bind: refresh_routing \
+             can only cost {structural:?} by itself, so the timeout never fires and \
+             heartbeat holds the engine lock for the full run"
+        );
+    }
+
+    /// Seeding must not be a way around the contact rules - a nodes.dat is a
+    /// DOWNLOADABLE file, so a poisoned one arriving by this path has to be held
+    /// to what a wire-learned contact is held to.
+    ///
+    /// Driven through `start_kad` rather than by calling `seed_routing` directly,
+    /// because the guarantee is a COMPOSITION and testing either half alone
+    /// overstates it: `gate_loaded_nodes` (engine layer) rejects Kad1 and
+    /// ipfilter-blocked contacts, while `KadNode::add_contact` (live layer)
+    /// rejects unroutable addresses, legacy DNS-port contacts and anti-sybil
+    /// floods. The first version of this test asserted the combined result
+    /// against `seed_routing` alone and failed on the Kad1 entry - correctly, as
+    /// it happens: `add_contact` has no version gate of its own.
+    ///
+    /// THE FIXTURE MUST EXERCISE BOTH LAYERS, or it silently tests only one. The
+    /// four poisoned contacts are all caught by `gate_loaded_nodes` BEFORE the
+    /// live layer ever sees them, so with only those the test passed even with
+    /// `add_contact` bypassed entirely - proving nothing about seeding. The three
+    /// contacts sharing ONE IP are what close that: `gate_loaded_nodes` has no
+    /// per-IP cap and passes all three, and only the live layer's anti-sybil
+    /// `MAX_CONTACTS_PER_IP` cuts them to one.
+    #[tokio::test]
+    async fn seeding_the_live_table_applies_the_same_gates_as_the_wire() {
+        let dir = tmp("kad-seed-gates");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mk = |ip: u32, udp: u16, ver: u8, seed: u8| KadContact {
+            id: Kad128::from_hash(&[seed; 16]),
+            ip,
+            udp_port: udp,
+            tcp_port: 4662,
+            version: ver,
+            udp_key: 0,
+            udp_key_ip: 0,
+            verified: true,
+        };
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+        engine.routing.load_nodes(&[
+            // Caught by the ENGINE layer (gate_loaded_nodes).
+            mk(0x7F00_0001, 4672, 8, 1), // loopback
+            mk(0xC0A8_0105, 4672, 8, 2), // private LAN
+            mk(0x0808_0808, 4672, 1, 3), // Kad1 - the protocol cannot talk to it
+            mk(0x0909_0909, 53, 5, 4),   // legacy node on the DNS port
+            // Pass the engine layer; only the LIVE layer's per-IP cap cuts these
+            // three down to one.
+            mk(0x0101_0101, 4672, 8, 5),
+            mk(0x0101_0101, 4672, 8, 6),
+            mk(0x0101_0101, 4672, 8, 7),
+        ]);
+        assert_eq!(
+            engine.routing.len(),
+            7,
+            "the fixture itself must survive intact"
+        );
+
+        engine.start_kad().await;
+
+        assert_eq!(
+            engine.kad.as_ref().unwrap().contacts_known(),
+            1,
+            "seeding let a poisoned contact or an anti-sybil flood into the live table"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Five routable, mutually /24-distinct contacts, so none is dropped by the
+    /// live layer's anti-sybil per-IP//24 caps.
+    fn seed_contacts() -> Vec<KadContact> {
+        [
+            (0x0808_0404u32, 0x11u8), // 8.8.4.4
+            (0x0909_0909, 0x22),      // 9.9.9.9
+            (0x0101_0101, 0x33),      // 1.1.1.1
+            (0xD043_DEDE, 0x44),      // 208.67.222.222
+            (0x4006_4006, 0x55),      // 64.6.64.6
+        ]
+        .into_iter()
+        .map(|(ip, seed)| KadContact {
+            id: Kad128::from_hash(&[seed; 16]),
+            ip,
+            udp_port: 4672,
+            tcp_port: 4662,
+            version: 8,
+            udp_key: 0,
+            udp_key_ip: 0,
+            // VERIFIED, as a contact reloaded from nodes.dat or folded in by
+            // `absorb_kad_routing` would be - and the bit is load-bearing:
+            // `closest_to` is verified-only, so an unverified seed populates
+            // `len()` while remaining invisible to every lookup.
+            verified: true,
+        })
+        .collect()
+    }
+
+    /// The live `KadNode` must START from what we already know, not from one
+    /// bootstrap response.
+    ///
+    /// `bind_with_identity` constructs an EMPTY `RoutingTable`, `bootstrap_any`
+    /// returns on the FIRST success, and `bootstrap_from` adds only the responder
+    /// plus the ~20 contacts it names - so every `start_kad`, on START and on
+    /// every RESUME, left the table that lookups actually read at about 21
+    /// entries no matter how many `Engine::routing` held. That is the real
+    /// content of the 2026-08-05 "138 -> 21" report: not a table being discarded,
+    /// but a fresh one being built. The 8cd union fixed the bootstrap DIAL LIST
+    /// and did not touch this ([[kad-routing-lifecycle]], build-progress 8ce).
+    ///
+    /// Driven with NO nodes.dat and an unreachable seed set, so the bootstrap
+    /// CANNOT contribute a single contact: anything in the live table came from
+    /// the seeding this test exists to pin.
+    #[tokio::test]
+    async fn start_kad_seeds_the_live_node_from_what_we_already_know() {
+        let dir = tmp("kad-seed-live");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+        let seeds = seed_contacts();
+        engine.routing.load_nodes(&seeds);
+        engine.start_kad().await;
+
+        let live = engine
+            .kad
+            .as_ref()
+            .expect("the node is kept even when the bootstrap fails");
+        assert_eq!(
+            live.contacts_known(),
+            seeds.len(),
+            "the live table starts EMPTY and only the bootstrap fills it, so every \
+             lookup after a resume runs against one bootstrap response"
+        );
+        // The bit has to survive the seeding or the contacts are invisible to
+        // every lookup while still counting toward `len()`.
+        assert_eq!(
+            live.routing().closest_to(&engine.identity.kad_id, 50).len(),
+            seeds.len(),
+            "seeded contacts lost their verified bit, so closest_to hands out none"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ONE FIELD, ONE MEASUREMENT.
+    ///
+    /// `Engine::kad_contacts()` (polled every second) returned the PERSISTED
+    /// table while `EngineEvent::Kad` carried the LIVE node's count from
+    /// `start_kad` and `maintain_kad` - two different quantities written to the
+    /// same `kadContacts` field in the UI. That is what made the on-screen number
+    /// monotonic (nothing ever removes a contact from `Engine::routing`) and
+    /// therefore useless as the verdict on Kad maintenance.
+    ///
+    /// THE TWO TABLES ARE FORCED TO DIVERGE HERE, and that is the whole design of
+    /// the test. Once seeding works the live and persisted counts normally AGREE,
+    /// which makes the assertion vacuous - the first version of this test passed
+    /// with `kad_contacts` reverted to `self.routing.len()`, i.e. it could not see
+    /// the bug it was written for. So the fixture loads three contacts sharing ONE
+    /// IP: `RoutingTable::add` (the persisted path) has no per-IP cap and keeps
+    /// all three, while the live layer's anti-sybil `MAX_CONTACTS_PER_IP` keeps
+    /// exactly one. 3 against 1, deterministically, every run.
+    #[tokio::test]
+    async fn the_polled_kad_count_and_the_kad_event_report_the_same_thing() {
+        let dir = tmp("kad-one-measurement");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let (mut engine, mut rx) = Engine::new(&dir).unwrap();
+        let crowded: Vec<KadContact> = [0x11u8, 0x22, 0x33]
+            .into_iter()
+            .map(|seed| KadContact {
+                id: Kad128::from_hash(&[seed; 16]),
+                ip: 0x0808_0404, // all three at 8.8.4.4 - one IP, three IDs
+                udp_port: 4672,
+                tcp_port: 4662,
+                version: 8,
+                udp_key: 0,
+                udp_key_ip: 0,
+                verified: true,
+            })
+            .collect();
+        engine.routing.load_nodes(&crowded);
+        assert_eq!(
+            engine.routing.len(),
+            3,
+            "the fixture must actually divide the two tables, or this proves nothing"
+        );
+
+        engine.start_kad().await;
+
+        let live = engine.kad.as_ref().unwrap().contacts_known();
+        assert_eq!(live, 1, "the anti-sybil per-IP cap should keep exactly one");
+        assert_eq!(
+            engine.kad_contacts(),
+            live,
+            "the polled count must describe the table lookups actually use, not the \
+             monotonic persisted one"
+        );
+        let emitted: Vec<usize> = drain(&mut rx)
+            .await
+            .into_iter()
+            .filter_map(|e| match e {
+                EngineEvent::Kad { contacts } => Some(contacts),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            emitted.iter().all(|&n| n == live),
+            "the Kad event carried a different quantity than the poll: {emitted:?} vs {live}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
