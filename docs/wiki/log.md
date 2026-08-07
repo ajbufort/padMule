@@ -421,3 +421,23 @@ Append-only, timestamped record of Ingest / Query / Lint passes.
   ping, and ages out of other clients' routing tables. Its fix needs the same
   restructure as the CSearch design, so the two are now flagged to be designed
   together.
+
+- 2026-08-07 **The VPN badge, and why CI now renders views (row 8ci).** Anthony
+  saw the badge reading ". . .   . . ." on glass. Nothing automated could have:
+  every UI assertion padMule has runs against the accessibility tree, and the
+  tree read "VPN on" correctly the whole time - the label was right while the
+  screen was wrong. Cause: a `ToolbarItem` proposes its content a width smaller
+  than ideal, and two short `Text`s get squeezed to nothing; `.lineLimit(1)
+  .fixedSize()` refuses that. `VpnBadge` extracted from `ContentView` into its
+  own `View` taking `on: Bool` - not tidiness, but because as a private property
+  reading `model.vpnActive` the OFF state could only be seen with a tunnel
+  actually down on a device, which is why it had never been looked at. **The
+  lesson kept is why the obvious test would have been vacuous:** `fixedSize()`
+  only acts when the parent proposes less than ideal, so a lone snapshot passes
+  with the fix DELETED. The test therefore MAKES a proposal
+  (`ImageRenderer.proposedSize`, the same mechanism a ToolbarItem uses) and
+  asserts the badge still takes its ideal width - reproducing the squeeze rather
+  than imitating it. Plus a record with no assertion at all: both states attached
+  as PNGs, and one inside a real toolbar, uploaded by `ios-test.yml`. CI green on
+  1605c9a (27 tests, 0 failures) and the OFF state was seen for the FIRST time in
+  that artifact. Device-verified separately by screenshot on 48b5128.
