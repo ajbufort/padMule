@@ -40,6 +40,20 @@ targets:
         # LSSupportsOpeningDocumentsInPlace: show it in the Files app, on-device.
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
+        # BACKGROUND SEEDING. An app with the `audio` background mode and an
+        # ACTIVE audio session is not suspended, so padMule's raw eD2k sockets
+        # keep running with the screen off and peers can keep downloading from
+        # us. Declaring it is not using it: nothing starts an audio session
+        # unless the user turns "Keep sharing in the background" on
+        # (BackgroundKeepAlive.swift, default OFF).
+        #
+        # App Store review 2.5.4 would reject this. padMule is sideload-only by
+        # necessity - a P2P client can never ship there - so it is never
+        # reviewed, and `audio` is an ordinary Info.plist key a FREE
+        # provisioning team may set. Sideloading is what makes the ORDINARY
+        # mechanism available; there is no private API here.
+        UIBackgroundModes:
+          - audio
         UISupportedInterfaceOrientations~ipad:
           - UIInterfaceOrientationPortrait
           - UIInterfaceOrientationPortraitUpsideDown

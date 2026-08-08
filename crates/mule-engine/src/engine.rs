@@ -1163,6 +1163,19 @@ pub enum EngineState {
     Running,
     /// Backgrounded: sockets released, state checkpointed, transfers paused.
     Paused,
+    /// Backgrounded but STILL SERVING: the inbound listener and the server
+    /// login stay up so peers can keep downloading from us, while everything
+    /// that initiates work - Kad, new fetches - is stopped.
+    ///
+    /// This state only means anything while an iOS audio keepalive is holding
+    /// the app awake; without one the process is suspended moments later and
+    /// this is indistinguishable from `Paused`. It is a SEPARATE state rather
+    /// than a flag on `Running` because the honest-status rule
+    /// (docs/wiki/lifecycle-and-reactivation.md) turns on the user being told
+    /// which of these three things is true, and "Running" while backgrounded
+    /// would be the dishonest-status failure that entry calls a hard
+    /// requirement.
+    Seeding,
 }
 
 /// An observable engine event. Kept simple (no lifetimes/generics) so the Wave-8
@@ -1319,6 +1332,7 @@ impl StatusPub {
         match self.state.load(Ordering::Relaxed) {
             1 => EngineState::Running,
             2 => EngineState::Paused,
+            3 => EngineState::Seeding,
             _ => EngineState::Stopped,
         }
     }
@@ -4221,7 +4235,67 @@ impl Engine {
     /// App foregrounded: rebuild sockets, reconnect, re-bootstrap. Idempotent - a
     /// no-op unless currently `Paused`. `Paused` -> `Running`. The real reconnect
     /// (listener rebind, server link, Kad) runs between the two status lines.
+    /// Background WITHOUT going quiet: keep serving what we already have.
+    ///
+    /// The difference from [`pause`](Self::pause), which is the whole feature:
+    /// the inbound listener and the server login STAY UP, so peers can keep
+    /// downloading from us and the server keeps handing us out as a source.
+    /// Everything that INITIATES work stops - the Kad node is dropped, and
+    /// `maintain_resume_fetches` / `maintain_kad` / `maintain_share_verify`
+    /// already gate on `Running`, so they fall silent for free.
+    ///
+    /// WHY SEEDING IS THE PART WORTH KEEPING ALIVE. It is the cheapest thing
+    /// the engine does - no source hunting, no lookups, no block scheduling -
+    /// and on eD2k it is what earns standing: the credit system rewards upload,
+    /// so a client that only ever takes is one every queue puts last.
+    ///
+    /// KAD IS DROPPED DELIBERATELY, not overlooked. Nothing about serving needs
+    /// it: peers find us through the server's index and through source exchange,
+    /// and padMule publishes nothing to Kad anyway. Keeping a UDP node alive to
+    /// answer nobody would spend battery for no one's benefit.
+    ///
+    /// THIS ONLY MEANS ANYTHING UNDER AN AUDIO KEEPALIVE. Without one iOS
+    /// suspends the process seconds later and every socket here dies with it -
+    /// so the caller must have the keepalive running BEFORE calling this, and
+    /// must fall back to `pause()` when it cannot. Being jetsam-killed remains
+    /// possible at any moment, which is why this still persists and checkpoints
+    /// on the way in.
+    pub async fn pause_for_seeding(&mut self) {
+        if self.state != EngineState::Running {
+            return;
+        }
+        // Drop the Kad node through set_kad so its live table is absorbed into
+        // the persisted one first - the rule set_kad exists to make unforgettable.
+        self.set_kad(None);
+        // Persist NOW rather than trusting the background to last: jetsam can
+        // take the process at any moment and gives no warning.
+        self.persist_downloads().await;
+        self.checkpoint();
+        self.emit(EngineEvent::Status("Sharing in the background".into()));
+        self.set_state(EngineState::Seeding);
+    }
+
+    /// Come back to the foreground from [`pause_for_seeding`].
+    ///
+    /// Much smaller than `resume()` because much less was torn down: the
+    /// listener and the server link never stopped, so only Kad has to come
+    /// back. Calling the full `resume()` here would abort a LIVE listener and
+    /// re-dial a server we are still logged into.
+    async fn resume_from_seeding(&mut self) {
+        self.set_state(EngineState::Running);
+        if !self.offline {
+            self.start_kad().await;
+        }
+        self.emit_online_status();
+    }
+
     pub async fn resume(&mut self) {
+        // Coming back from a background SEED is a different, much smaller job -
+        // see `resume_from_seeding`. Routed here so callers keep one entry point.
+        if self.state == EngineState::Seeding {
+            self.resume_from_seeding().await;
+            return;
+        }
         if self.state != EngineState::Paused {
             return;
         }
@@ -7484,6 +7558,95 @@ mod tests {
              is running to its {PROBE_COLLECT_BUDGET:?} budget again, and it holds \
              the engine lock for all of it"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE WHOLE POINT OF SEEDING: the listener and the server login SURVIVE
+    /// backgrounding, where `pause()` tears both down. If either stopped, peers
+    /// could not reach us and the mode would be an expensive way to do nothing.
+    ///
+    /// Mutation check: make `pause_for_seeding` call `pause()` and this fails on
+    /// the listener assertion - which is the only difference that matters.
+    #[tokio::test]
+    async fn seeding_keeps_the_listener_up_where_pause_tears_it_down() {
+        let dir = tmp("seed-keeps-listener");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+        // Offline so no server is dialled; the listener is what this is about.
+        // `start()` skips the listener entirely when offline, so bind it
+        // explicitly - otherwise the assertion below passes on a listener that
+        // was never there, which is the first thing this test did wrong.
+        engine.set_offline(true);
+        engine.start().await;
+        engine.start_listener().await;
+        assert_eq!(engine.state(), EngineState::Running);
+        assert!(
+            engine.listener.is_some(),
+            "precondition: there must BE a listener for the test to be about \
+             whether seeding keeps it"
+        );
+
+        engine.pause_for_seeding().await;
+        assert_eq!(engine.state(), EngineState::Seeding);
+        assert!(
+            engine.listener.is_some(),
+            "seeding dropped the inbound listener - peers cannot reach us, so \
+             there is nothing to seed WITH"
+        );
+        // ...and Kad IS dropped, deliberately: nothing about serving needs it.
+        assert!(
+            engine.kad.is_none(),
+            "seeding kept the Kad node alive - that is battery spent answering \
+             nobody, since padMule publishes nothing to Kad"
+        );
+
+        // Coming back is the small path, not the full resume: still one listener.
+        engine.resume().await;
+        assert_eq!(engine.state(), EngineState::Running);
+        assert!(engine.listener.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `pause()` remains the honest fallback, and must still tear everything
+    /// down - the seeding path must not have weakened it.
+    #[tokio::test]
+    async fn a_plain_pause_still_releases_the_listener() {
+        let dir = tmp("pause-releases-listener");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+        engine.set_offline(true);
+        engine.start().await;
+        engine.start_listener().await;
+        assert!(engine.listener.is_some(), "precondition: a listener exists");
+        engine.pause().await;
+        assert_eq!(engine.state(), EngineState::Paused);
+        assert!(
+            engine.listener.is_none(),
+            "pause must release the port - iPadOS reclaims it anyway, and doing \
+             it explicitly is what makes resume honest"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Seeding is only reachable from Running. A second call, or a call while
+    /// paused, must not resurrect anything.
+    #[tokio::test]
+    async fn seeding_is_only_reachable_from_running() {
+        let dir = tmp("seed-guard");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+        engine.set_offline(true);
+        // Stopped -> no-op.
+        engine.pause_for_seeding().await;
+        assert_eq!(engine.state(), EngineState::Stopped);
+        engine.start().await;
+        engine.pause().await;
+        // Paused -> no-op; a paused engine must not silently start serving.
+        engine.pause_for_seeding().await;
+        assert_eq!(engine.state(), EngineState::Paused);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -39,6 +39,7 @@ fn state_str(s: EngineStateFfi) -> &'static str {
         EngineStateFfi::Stopped => "Stopped",
         EngineStateFfi::Running => "Running",
         EngineStateFfi::Paused => "Paused",
+        EngineStateFfi::Seeding => "Seeding (background)",
     }
 }
 
