@@ -650,6 +650,36 @@ async fn run_read_loop(ctx: ReadLoop) {
         if !flood_allows(&ctx.flood, op, from_ip, now) {
             continue;
         }
+        // THE USER'S BLOCKLIST DECIDES WHO WE TALK TO, not just who we remember.
+        //
+        // A DELIBERATE, DOCUMENTED DIVERGENCE from eMule, and the only one on
+        // this path. eMule's `ProcessPacket` (KademliaUDPListener.cpp:236-256)
+        // gates an inbound datagram on exactly two things before dispatch - the
+        // port-53 unencrypted guard and `InTrackListIsAllowedPacket` - and
+        // consults the ipfilter only when INSERTING contacts (`:835`). So a
+        // stock eMule will answer an address its user blocklisted.
+        //
+        // padMule does not, because a blocklist is an explicit instruction
+        // ("do not talk to these people") and answering is talking: our reply
+        // confirms we exist, at our address, running Kad. It is interop-safe by
+        // construction - the only peers it can cut off are ones the user chose
+        // to cut off - and fail-open when no filter is loaded, so it changes
+        // nothing for a user who never set one.
+        //
+        // NOT DONE, and checked rather than assumed: the design spec also said
+        // "never answer a request whose source is unroutable or private". The
+        // source does not support it - see above - and it would break both the
+        // loopback mock-peer shape the spec's own Testing section prescribes
+        // and the namespaced amuled oracle. Left faithful on purpose.
+        if ctx
+            .ip_filter
+            .lock()
+            .expect(LOCK_POISONED)
+            .as_ref()
+            .is_some_and(|f| f.is_blocked_u32(from_ip))
+        {
+            continue;
+        }
         // An inbound HELLO carries enough to be RECORDED (the other served
         // requests name no sender id). Through the gated path only: an inbound
         // requester faces the ipfilter, the port-53 guard and the anti-sybil
@@ -2725,6 +2755,19 @@ mod tests {
     /// a sender whose IP is already proven, anything else to play an unproven
     /// one.
     async fn drive_hello(ours: SocketAddr, node_id: &Kad128, echo_vk: u32) -> Hello {
+        drive_hello_within(ours, node_id, echo_vk, Duration::from_secs(3))
+            .await
+            .expect("the HELLO must be answered")
+    }
+
+    /// `drive_hello` that can report SILENCE instead of panicking on it, for the
+    /// tests whose subject is a refusal. Same mock-peer role either way.
+    async fn drive_hello_within(
+        ours: SocketAddr,
+        node_id: &Kad128,
+        echo_vk: u32,
+        wait: Duration,
+    ) -> Option<Hello> {
         let peer_id = Kad128::from_hash(&[0x77; 16]);
         let peer_key = 0x5A5Au32;
         let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -2748,14 +2791,11 @@ mod tests {
         );
         peer.send_to(&dg, ours).await.unwrap();
         let mut buf = vec![0u8; 8192];
-        let (n, from) = timeout(Duration::from_secs(3), peer.recv_from(&mut buf))
-            .await
-            .expect("the HELLO must be answered")
-            .unwrap();
+        let (n, from) = timeout(wait, peer.recv_from(&mut buf)).await.ok()?.unwrap();
         let dec = kad_deobfuscate(&buf[..n], &peer_id, peer_key, ip_u32(&from)).unwrap();
         let (rop, rpayload) = unpack_kad(&dec.payload).unwrap();
         assert_eq!(rop, OP_HELLO_RES);
-        parse_hello(&rpayload).unwrap()
+        Some(parse_hello(&rpayload).unwrap())
     }
 
     /// DROPPING THE NODE MUST STOP ITS READ LOOP, or `pause()` never releases
@@ -3141,6 +3181,57 @@ mod tests {
             node.contacts_known(),
             0,
             "...but a loopback sender must not enter the routing table"
+        );
+    }
+
+    /// A BLOCKLISTED SOURCE GETS NO ANSWER - a deliberate divergence, and the
+    /// only one on the serve path.
+    ///
+    /// eMule WOULD answer: `ProcessPacket` (KademliaUDPListener.cpp:236-256)
+    /// gates an inbound datagram on the port-53 guard and
+    /// `InTrackListIsAllowedPacket` alone, and reaches for the ipfilter only
+    /// when INSERTING contacts (`:835`). padMule refuses, because a blocklist
+    /// is an explicit "do not talk to these people" and an answer IS talking -
+    /// it confirms we exist, at this address, running Kad. Interop-safe by
+    /// construction: the only peers it can cut off are the ones the user chose
+    /// to cut off.
+    ///
+    /// The test asserts SILENCE, so it must distinguish "refused" from "slow":
+    /// it waits for a real timeout with the filter on, then proves the very
+    /// same exchange succeeds with the filter off. Without that second half a
+    /// broken read loop would pass just as happily.
+    #[tokio::test]
+    async fn a_blocklisted_source_is_not_answered_at_all() {
+        use mule_files::{IpFilter, DEFAULT_IPFILTER_LEVEL};
+        use std::sync::Arc;
+        let our_id = Kad128::from_words([4, 4, 4, 4]);
+        let node =
+            KadNode::bind_with_identity("127.0.0.1:0".parse().unwrap(), 4662, our_id, 0x7373)
+                .await
+                .unwrap();
+        let ours = node.local_addr();
+
+        // Block the loopback the mock will dial us from.
+        node.set_ip_filter(Some(Arc::new(IpFilter::parse(
+            "127.0.0.0 - 127.255.255.255 , 0 , blocked\n",
+            DEFAULT_IPFILTER_LEVEL,
+        ))));
+        assert!(
+            drive_hello_within(ours, &our_id, 0, Duration::from_secs(1))
+                .await
+                .is_none(),
+            "a blocklisted source must get SILENCE, not a HELLO_RES"
+        );
+
+        // THE CONTROL: same node, same exchange, filter cleared. If this also
+        // came back empty the assertion above would be meaningless.
+        node.set_ip_filter(None);
+        assert!(
+            drive_hello_within(ours, &our_id, 0, Duration::from_secs(3))
+                .await
+                .is_some(),
+            "with no filter the identical exchange must still be answered - \
+             otherwise the test above proves nothing"
         );
     }
 

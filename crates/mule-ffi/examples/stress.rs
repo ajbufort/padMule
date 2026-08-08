@@ -23,7 +23,7 @@
 //! Usage:
 //!   cargo run --release -p mule-ffi --example stress -- [config] [dl] [keyword] [n] [secs]
 
-use mule_ffi::{fetch_report, MuleEngine, SearchFilters, SearchOutcome};
+use mule_ffi::{fetch_report, AddOutcome, MuleEngine, SearchFilters, SearchOutcome};
 use std::collections::{BTreeMap, HashSet};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -66,6 +66,19 @@ fn main() {
     let keyword = a.get(3).cloned().unwrap_or_else(|| "linux".into());
     let want: usize = a.get(4).and_then(|s| s.parse().ok()).unwrap_or(30);
     let secs: u64 = a.get(5).and_then(|s| s.parse().ok()).unwrap_or(600);
+    // START FROM A CLEAN CONFIG DIR. `Engine::start()` calls
+    // `resume_downloads(config_dir)` and registers every partial `.part` it
+    // finds, so on a second run against the documented fixed paths
+    // (`/tmp/cfg /tmp/dl`) the leftovers from the previous run were present at
+    // tick one with `have > 0` - and went straight into `ever_received` without
+    // a single byte arriving during THIS run. That is precisely the starvation
+    // signal the harness exists to measure, so it was the one number that had
+    // to be trustworthy. Opt out with STRESS_KEEP_CONFIG=1 when deliberately
+    // measuring resume behaviour.
+    if std::env::var("STRESS_KEEP_CONFIG").is_err() {
+        let _ = std::fs::remove_dir_all(&config);
+        let _ = std::fs::remove_dir_all(&dldir);
+    }
     let _ = std::fs::create_dir_all(&config);
     let _ = std::fs::create_dir_all(&dldir);
 
@@ -110,10 +123,14 @@ fn main() {
     println!("== QUEUE {want} DOWNLOADS ==");
     let mut queued: Vec<(String, String, u64, u32)> = Vec::new(); // hash,name,size,srcs
     let mut seen: HashSet<String> = HashSet::new();
-    // Deliberately narrow, safe keywords: Blender's open movies and similar
-    // freely-distributable material. A bare "video" query on eD2k returns a
-    // great deal that has no place in a technical test, so the queries name
-    // known content rather than trawling.
+    // Deliberately narrow, safe keywords aimed at freely-distributable
+    // technical material - distro images, docs, tutorials - because a bare
+    // untargeted query on eD2k returns a great deal that has no place in a
+    // technical test. Paired with `name_is_acceptable` below, which is the
+    // actual filter. (This comment used to promise "Blender's open movies and
+    // similar ... the queries name known content"; the list below has never
+    // contained any Blender content and, with the default keyword, names no
+    // specific content at all.)
     for kw in [
         keyword.clone(),
         format!("{keyword} pdf"),
@@ -141,15 +158,28 @@ fn main() {
                 continue;
             }
             // Skip the enormous ones: this measures BREADTH of progress, and a
-            // 2GB ISO cannot show progress inside the window.
-            // Videos are the point of this run, so the ceiling is generous.
-            // Still bounded: a 4GB file cannot show progress in the window and
-            // would just soak sources.
+            // file too big to move inside the window would just soak sources
+            // without ever showing one. 300MB is the ceiling; three stacked and
+            // mutually inconsistent rationales here (2GB, "videos are the
+            // point", 4GB) each named a number the code never used.
             if h.size > 300 * 1_048_576 {
                 continue;
             }
-            engine.add_download(h.hash.clone(), h.size, h.name.clone());
-            queued.push((h.hash, h.name, h.size, h.sources));
+            // COUNT WHAT THE ENGINE ACCEPTED, not what we offered it. The
+            // outcome used to be discarded and the row pushed unconditionally,
+            // so a hit refused for NoSources / NotConnected / Rejected still
+            // inflated the `queued` denominator - and `queued` is half of the
+            // headline this harness exists to produce ("queued=N ... EVER
+            // received bytes=M"). Every rejection made the engine look worse
+            // than it was, most often when the server was simply slow to answer
+            // a source query.
+            match engine.add_download(h.hash.clone(), h.size, h.name.clone()) {
+                AddOutcome::Started => queued.push((h.hash, h.name, h.size, h.sources)),
+                other => {
+                    println!("  skipped {}: {:?}", h.name, other);
+                    continue;
+                }
+            }
         }
         for _ in 0..3 {
             sleep(Duration::from_secs(1));
