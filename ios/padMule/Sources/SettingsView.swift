@@ -17,6 +17,10 @@ struct SettingsView: View {
     @AppStorage(SettingsKey.shareUploads) private var shareUploads = true
     @AppStorage(SettingsKey.pauseSharingOnCellular) private var pauseOnCellular = true
     @AppStorage(SettingsKey.keepAwakeWhileTransferring) private var keepAwake = true
+    // Must agree with the registered default (false). Background running costs
+    // battery, so the honest default for something that runs while the user is
+    // not looking is off.
+    @AppStorage(SettingsKey.backgroundSeeding) private var backgroundSeeding = false
     @AppStorage(SettingsKey.beepOnDownloadComplete) private var beepOnComplete = true
     @AppStorage(SettingsKey.updateServerListAtLaunch) private var updateAtLaunch = false
     @AppStorage(SettingsKey.askServersForServers) private var askServers = true
@@ -107,6 +111,8 @@ struct SettingsView: View {
                 get: { pauseOnCellular },
                 set: { pauseOnCellular = $0; model.applyEffectiveSharing() }
             ))
+            Toggle("Keep sharing in the background", isOn: $backgroundSeeding)
+                .disabled(!shareUploads)
         } header: {
             Text("Sharing")
         } footer: {
@@ -115,7 +121,17 @@ struct SettingsView: View {
             if model.sharingPausedForMeteredLink {
                 Text("Sharing is paused right now because you are on a metered network. It resumes automatically on Wi-Fi. This pauses uploading only - downloads continue and still use data.")
             } else if shareUploads {
+                // Two paragraphs, because they answer different questions: what
+                // sharing buys, and what the background option costs. The second
+                // is deliberately blunt about the limits - a user who thinks
+                // this is a guarantee will conclude the app is broken the first
+                // time iOS reclaims it, which it can do at any moment.
                 Text("padMule serves your finished files to other peers while it is open. Sharing earns you better standing in their queues, so your own downloads go faster.")
+                Text(
+                    backgroundSeeding
+                        ? "padMule will keep serving after you switch away, so you keep earning standing while you are not looking. It uses more battery, and downloads still stop - only uploads continue. iPadOS can still reclaim the app at any time; when it does, padMule pauses cleanly and resumes when you come back."
+                        : "With this off, padMule stops the moment you switch away, and other peers stop being able to download from you until you open it again."
+                )
             } else {
                 Text("Leech Mode: downloading only. padMule is not serving any files to peers.")
             }
