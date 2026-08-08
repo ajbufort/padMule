@@ -657,3 +657,47 @@ Append-only, timestamped record of Ingest / Query / Lint passes.
   irony: this is the same test row 8cj records as mutation-checked after its
   first version was vacuous. Being mutation-checked and being robust are
   different properties.
+
+- 2026-08-07 **padMule ANSWERS on Kad - the owning read loop landed, and a
+  reported mutation table is a claim like any other.** One task now owns
+  `Arc<UdpSocket>` for the node's life; each datagram is delivered to the
+  pending outbound request it answers, answered via `kad_serve`, or dropped. The
+  routing table moved behind `Arc<Mutex<RoutingTable>>`, guard never held across
+  an await. `request_batch` kept its signature and both of its mutation-checked
+  tests are BYTE-IDENTICAL after the move - verified by diffing them against
+  HEAD rather than asserted. **AMENDMENT 2 was the one that mattered:**
+  `start_kad` configures a node AFTER binding it, so a loop capturing config at
+  bind would have seen `ip_filter: None` (inbound contacts bypassing the user's
+  blocklist, silently regressing an OPERATIONAL [[security-model]] row) and
+  `advertised_udp_port: None` (answering HELLOs with the BOUND port, entering us
+  in a VPN peer's table at an address nobody forwards - worse than not
+  answering). **Checking eMule for the ACK rule found a gate the spec had
+  MISSED:** an ACK from an IP we did not send a HELLO_RES to within 180s is
+  dropped (`IsOnOutTrackList`, PacketTracking.cpp:65 + :84-97, entry CONSUMED on
+  match) - anti-spoofing surface, without which anyone could name any Kad ID and
+  try to get it marked verified. That is the third time in one day the spec lost
+  to the source.
+  **THE VERIFICATION IS THE LESSON.** Re-running the sub-agents' mutation checks
+  rather than accepting them confirmed the load-bearing ones AND found a real
+  gap: `Drop { read_loop.abort() }` was added beyond the plan and correctly (the
+  loop otherwise holds the socket forever, `pause()` never releases the Kad
+  port, and a resumed node RACES the stale loop for datagrams, each datagram
+  going to exactly one reader so the loser silently loses replies) - but NO test
+  covered it. Deleting the line left 453 tests green. Clean pause/resume is a
+  HARD requirement, so an unpinned fix is one refactor from vanishing. Now
+  pinned through a `Weak` view of the socket, because the property is about a
+  task nobody holds a handle to once the node is gone; stable over 6 runs, red
+  when the abort is removed.
+  **AND A METHOD NOTE WORTH KEEPING:** two of my first re-check attempts came
+  back falsely GREEN and both were BROKEN MUTATIONS, not defects -
+  `None.or_else(f)` still calls `f`, and `error: test failed` is cargo's summary
+  line for a failing test rather than a compile error, so a naive
+  grep-for-"error" detector reads a RED as inconclusive. **A mutation check
+  needs its own sanity check: confirm the mutant actually COMPILED, and that
+  your RED/GREEN detector reads the right signal.** Otherwise the mutation
+  check - the very instrument that exists to catch tests that cannot fail -
+  becomes an instrument that cannot fail. Gate: 673 tests over three consecutive
+  full runs, clippy -D warnings, fmt + ASCII clean. STILL OPEN: the flood
+  limiter (`FloodTracker` still has no call site), storing an inbound HELLO
+  sender's verify key, wiring `accept_hello_res_ack` into the loop, and the
+  external oracle proof - nothing here is device- or oracle-verified.
