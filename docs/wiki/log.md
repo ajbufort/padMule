@@ -598,3 +598,62 @@ Append-only, timestamped record of Ingest / Query / Lint passes.
   re-soak, which separates "the audio session costs 7%" from "our own loop costs
   7%". Ties to the standing item of moving the clock into Rust as a tokio
   interval keyed off `EngineState`.
+
+- 2026-08-07 **The Kad serve loop, step 1: the PURE half landed, and the
+  mutation check paid for itself on its first use.** Tasks 1-5 of
+  `docs/superpowers/plans/2026-08-07-kad-serve-loop.md`: `build_ping`/`build_pong`
+  in mule-kad, and `crates/mule-engine/src/kad_serve.rs` - the answering RULES
+  with no I/O, so who gets a reply, what it contains and when the ACK bit is set
+  are all testable without a socket. PING, HELLO, FIND_NODE and BOOTSTRAP are
+  answered; a search and a publish get SILENCE. **THREE AMENDMENTS were made to
+  the plan before executing it, all recorded in its own AMENDMENTS section.** (1)
+  The planned empty `SEARCH_RES` was REVERSED: the spec deferred "check 0.50a
+  during implementation", the check was run, and eMule STAYS SILENT
+  (`CIndexed::SendValidKeywordResult`, Indexed.cpp:696, emits only inside
+  `if (m_mapKeyword.Lookup(...))`; there is no empty-SEARCH_RES path in stock
+  eMule at all). Since padMule stores nothing it would have answered empty to
+  nearly every search reaching it, and no stock client sends that packet - a
+  padMule FINGERPRINT broadcast to the network, a cost the draft never weighed
+  against the 750ms it saved strangers. Anthony reversed it on that evidence. A
+  bonus: padMule now never parses an attacker-supplied search payload or
+  expression tree. (2) The read loop must NOT capture config at bind time -
+  `start_kad` configures the node AFTER binding, so a captured `ip_filter: None`
+  would let inbound contacts bypass the user's blocklist (regressing an
+  OPERATIONAL [[security-model]] row) and a captured `advertised_udp_port: None`
+  would answer HELLOs with the BOUND port, putting us in peers' tables at an
+  address nobody forwards. (3) Nothing in the plan handled inbound
+  `HELLO_RES_ACK` while Task 3 makes padMule ASK for one - the "advertise no
+  capability you do not honour" bug for the third time on this codebase, and
+  worse here because `closest_to` is verified-only (8ao), so a peer that proves
+  its IP and is never recorded verified can never appear in any answer we give.
+
+- 2026-08-07 **TWO VACUOUS TESTS, and a real defect hiding behind them.** Seven
+  serve rules were mutated; five went red and **two did not** - both contact-cap
+  tests. Cause: the test's `closest` closure did `pool.iter().take(want)`, so it
+  limited itself to the very constant the assertion then compared against. The
+  assertion could not fail; raising the cap from 11 to 100 sailed through.
+  **Fixing the test exposed the defect it was masking:** `answer_request` PASSED
+  the cap to the closure and never enforced it, so a routing table returning more
+  than 11 contacts would have put an over-long `KADEMLIA2_RES` on the wire - and
+  eMule REJECTS an over-long answer wholesale (Search.cpp:377), from precisely
+  the node we are trying to stay known to. The cap is now truncated where it is
+  STATED rather than requested from whoever supplies the contacts ("moved the
+  check == removed the check"), the closures deliberately ignore `want`, and the
+  assertions use literals instead of the constant they are meant to police.
+  **The general rule, worth more than the fix: a test that derives its input
+  bound from the same constant it asserts against is tautological.** Banked in
+  the [[interop-test-fidelity]] memory.
+
+- 2026-08-07 **A pre-existing GATE FLAKE, found by accident and fixed.**
+  `seeding_keeps_the_listener_up_where_pause_tears_it_down` and
+  `a_plain_pause_still_releases_the_listener` both call `start_listener()`, which
+  binds `listen_port` - defaulting to 4662 for both. cargo runs them on separate
+  threads, `start_listener` treats a bind failure as SURVIVABLE (it stays LowID
+  and returns, leaving `listener: None`), so the loser tripped its own
+  precondition assertion. It passed alone and failed in the full suite, which is
+  the worst way for a gate to fail and reads exactly like a real regression -
+  it briefly did, in the middle of unrelated work. Both now bind an ephemeral
+  port (0). Verified across three consecutive full-workspace runs. Note the
+  irony: this is the same test row 8cj records as mutation-checked after its
+  first version was vacuous. Being mutation-checked and being robust are
+  different properties.
