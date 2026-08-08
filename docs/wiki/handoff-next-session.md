@@ -1,66 +1,76 @@
-# HANDOFF - start here next session
+# HANDOFF - the state of the tree
 
-Updated: 2026-08-08, after the Kad serve loop shipped and was device-verified.
-Living doc - replace wholesale.
+Updated: 2026-08-08 by the reanalysis pass, after the event-driven CSearch
+landed. Living doc - replace wholesale.
 
-Full narrative: [[build-progress]] rows 8ck-8cm and the [[log]] entries for
+**[[handoff-for-fable]] IS THE AUTHORITY** (Anthony, 2026-08-08). It says what to
+do next and how this project judges work. THIS entry is the companion: what is
+true of the tree right now, and what is proven versus assumed. Where the two
+disagree, the Fable handoff wins and this one is stale - say so and fix it.
+
+Full narrative: [[build-progress]] rows 8ck-8cn and the [[log]] entries for
 2026-08-07 and 2026-08-08.
 
 ## THE ONE-LINE SUMMARY
 
-**padMule ANSWERS on Kad now** - step 1 of the owning-read-loop spec is built,
-oracle-proven against a real amuled, and on the device with no UI regression.
-A real amuled EVICTED a silent control padMule and KEPT the answering one in the
-same sweep.
+**padMule ANSWERS on Kad (proven against a real amuled, and on the device), and
+its lookup is now event-driven (offline-green, never run on hardware).** Steps 1
+and 2 of the owning-read-loop spec are both built; only step 1 is verified.
 
-## State of the tree
+## State of the tree - VERIFIED 2026-08-08, not remembered
 
-- **Gate**: **678** Rust tests, clippy `-D warnings`, fmt + ASCII clean. Swift
-  suite is **6 files and GREEN AGAIN** - see the warning below.
-- **BRANCH `fetch-funnel`, 83 commits ahead of `main`, nothing merged.**
-  `main` is 4 ahead of `origin/main`, unpushed. **HEAD is currently UNPUSHED** -
-  push before shipping (see the ship loop).
-- **Installed on device: `cadace2`**, confirmed by reading Settings > This
-  device > **Build**. The version string now reads **`0.1`** - it read `1.0` on
-  every prior build because `MARKETING_VERSION` never reached the bundle.
-- **THE DEVICE IS A FRESH INSTALL** (the app was deleted mid-session): no
-  nodes.dat, no server.met, regenerated identity, EMPTY share library, no
-  downloads. Any measurement that assumes warm state is not comparable to
+- **Gate**: **700** Rust tests (0 failed, 2 ignored - both documented
+  live-network tests), `clippy --workspace --all-targets -- -D warnings` clean,
+  `fmt --check` clean, ASCII clean. Swift suite is 6 files and GREEN again.
+- **Branch `kad-csearch`**, ahead of `main` (`54384f2`, which equals
+  `origin/main`). **The last CODE commit is `9b3402b`** (the CSearch rewrite);
+  `eb7ee3c` is the tree the off-device A/B below was measured on, and anything
+  after it is docs. **Check `git status` and `git log` for the tip rather than
+  trusting a sha written here** - a "state of the tree" line that names its own
+  HEAD is stale the moment it is committed, which is exactly how row 8cn came to
+  say "NOT committed" in the commit that committed it.
+- **UNPUSHED as of this writing.** `ship.sh` guard 5 aborts unless
+  `origin/<branch>` is already at HEAD, because `gh workflow run --ref` builds
+  the REMOTE ref. Push before shipping.
+- **`fetch-funnel` is a DELETABLE DUPLICATE**: 89/89 diverged from `main`,
+  because its content reached `main` by rebase. Merged-ness there must be checked
+  by **patch-id (`git cherry`), not ancestry** - a rebase changes every SHA and
+  ancestry calls it unmerged. Recorded in [[log]] 2026-08-08.
+- `worktree-wave11-aich` is a LOCKED worktree (10 ahead / 122 behind). A lock is
+  a deliberate signal; do not override it.
+- **NO CI HAS RUN FOR `eb7ee3c`.** See the CI hole below.
+- **Installed on device: `cadace2`** (the row-8cm device pass). **The CSearch
+  work has never been on the device.**
+- **THE DEVICE IS A FRESH INSTALL** (the app was deleted mid-session on
+  2026-08-08): no nodes.dat, no server.met, regenerated identity, EMPTY share
+  library, no downloads. Any measurement assuming warm state is not comparable to
   2026-08-07's.
 
-## WHAT JUST SHIPPED (rows 8ck / 8cl / 8cm)
+## THE CI HOLE, stated correctly
 
-**One task owns the Kad socket.** padMule answers PING, HELLO, FIND_NODE and
-BOOTSTRAP, plus the inbound HELLO_RES_ACK. Before this it answered NOTHING and
-aged out of every routing table that learned it.
+**All THREE workflows** (`rust.yml`, `ios-build.yml`, `ios-test.yml`) fire only
+on `push` to `main`, on pull requests, and on `workflow_dispatch`. **A branch-only
+workflow never runs any of them.**
 
-**The oracle proof is the strongest this project has produced.**
-`scripts/kad-verify-oracle.sh` is an A/B inside ONE real amuled's routing table:
-a CONTROL running the old one-shot `kad-bootstrap` (silence - literally what
-padMule used to be) beside a SERVE node running the new `mule-cli kad-serve`.
-Same sweep, same second: `EVICTED contact (77.77.0.8)` and
-`REFRESH contact (77.77.0.9) type=2`. The counterfactual OBSERVED, not argued.
-Reproduced on an independent second run. No timer was shortened.
+The 2026-08-08 handoff recorded this against `ios-test.yml` alone, which invites
+the assumption that the Rust gate at least covers branch work. It does not. What
+made `ios-test.yml` uniquely dangerous was different: `ship.sh` dispatched the
+other two and never dispatched or checked it, so the Swift bundle stayed
+un-compiled for three builds while everything looked green. `ship.sh` now
+requires all three green for the exact sha.
 
-**Device pass: the bar was no regression and it is met.** `Longest poll gap`
-1.1s, identical to 2026-08-07.
-
-**Flood limiter live** with eMule's exact budgets (BOOTSTRAP 2/min, HELLO 3,
-KADEMLIA2_REQ 10, PING 2; ignore over, ban over 5x). `FloodTracker` had been
-written and unused since there was no inbound path.
+Practical consequence: on a branch, the LOCAL gate is the only gate. Run it.
 
 ## READ THIS BEFORE TRUSTING ANY GREEN
 
 **THE SWIFT SUITE WAS RED FOR THREE BUILDS AND NOBODY KNEW (2026-08-08).**
 `SettingsTests` called `Settings.register()`; no such type exists (it is
 `SettingsDefaults`), so the ENTIRE padMuleTests bundle failed to COMPILE from
-e3ed990 onward. Two gaps let it run: `ios-test.yml` only fires on push to `main`
-and on PRs, and `ship.sh` neither dispatched nor checked it. Row 8cj cites that
-very test as its evidence. **A test you never SAW run is not a test - green is
-evidence, absent is not, and a suite that cannot compile reports nothing at
-all.** Fixed; `ship.sh` now requires all three workflows green.
+e3ed990 onward. Row 8cj cites that very test as its evidence. **A test you never
+SAW run is not a test - green is evidence, absent is not, and a suite that cannot
+compile reports nothing at all.** Fixed.
 
-## THE SHIP LOOP - repaired, and its guards now earn their keep
+## THE SHIP LOOP - repaired, and its guards earn their keep
 
 `scripts/ship.sh` = commit -> push -> CI(x3) -> verify -> sign -> install ->
 confirm. **Anthony granted the signing key 2026-08-07**, so this is closed.
@@ -74,13 +84,16 @@ Guards, each paid for by a session it already cost:
 3. The run's headSha must equal local HEAD.
 4. `CFBundleVersion` read from a FRESH extraction of the downloaded ipa.
 5. The installed build read back off the device.
+6. `flock` - ONE ship at a time. Two overlapping runs both reached the install
+   and both LOST it ("Coordinator superseded").
 
-**PROFILE EXPIRIES: WebDriverAgent 2026-08-10, padMule 2026-08-14.** WDA is the
-binding one - when it lapses, agent-driven device testing stops until a
+**PROFILE EXPIRIES: WebDriverAgent 2026-08-10 02:29:05 UTC, padMule 2026-08-14.**
+WDA is the binding one - when it lapses, agent-driven UI testing stops until a
 Sideloadly renewal (which breaks WDA's nested `.xctest` every time; budget a
-re-sign).
+re-sign). `pymobiledevice3` (install, syslog, sysmon, dvt launch, screenshot)
+keeps working past it. Only Anthony can renew. Runbook in [[ipad-usb-tooling]].
 
-## MEASURING ON THIS DEVICE - every session so far has produced a probe that lied
+## MEASURING ON THIS DEVICE - every session has produced a probe that lied
 
 Budget for it. Never let a first reading into the record. Full runbook in
 [[ipad-usb-tooling]]; the ones that have actually bitten:
@@ -100,9 +113,8 @@ Budget for it. Never let a first reading into the record. Full runbook in
   cleared between searches. A token must survive capitalisation AND be
   distinctive against the PREVIOUS query, or you get stale rows at t=0 and a
   ~1.2s reading that is probe latency wearing a search time's clothes.
-- **A SwiftUI Toggle's element is the whole ROW.** Clicking it, or its rect
-  centre, hits the label and does nothing. Tap `x = rect.x + rect.width - 30`
-  and READ THE VALUE BACK.
+- **A SwiftUI Toggle's element is the whole ROW.** Tap
+  `x = rect.x + rect.width - 30` and READ THE VALUE BACK.
 - The search field is an `XCUIElementTypeTextField`, not a `SearchField`.
 - `GET /source` costs 1.70s ON THE MAIN THREAD - polling it manufactures the
   freeze you are measuring. One element query is 0.53s.
@@ -111,95 +123,105 @@ Budget for it. Never let a first reading into the record. Full runbook in
 
 ## MEASURED
 
-**Device, build cadace2, FRESH install, over AirVPN:**
+**Device, build `cadace2`, FRESH install, over AirVPN (row 8cm) - this is the
+BEFORE-figure for the CSearch A/B:**
 
 | Reading | Value | Note |
 |---|---|---|
-| Longest poll gap | **1.1s** | unchanged from 2026-08-07 - no regression |
-| connect (HighID) | 6.5s | cold; 2.6s warm yesterday |
-| search submit-to-results | 9.57 / 3.28 / 8.40 / 7.41 / 4.97s | fresh table; NOT comparable to yesterday's warm 4.58-6.38 (n=9) |
-| Kad FIND_NODE rounds | 57, 57% with a silent peer, 73% answered, avg 601ms | |
+| Longest poll gap | **1.1s** | unchanged from 2026-08-07 - the serve loop cost the UI nothing |
+| connect (HighID) | 6.5s | cold; 2.6s warm the day before |
+| search submit-to-results | 9.57 / 3.28 / 8.40 / 7.41 / 4.97s | fresh table; NOT comparable to the warm 4.58-6.38 (n=9) |
+| Kad FIND_NODE rounds | 57, 57% with a silent peer, 73% answered, avg 601ms | the round barrier WAS the cost |
 | Kad value windows | 18, 44% silent, 75% answered, avg 560ms | |
 
 Every Kad figure is modestly better than 2026-08-07's, **and none of it is
 attributed to the serve loop** - different hour, different contact mix, fresh
-table. What it establishes: the barrier is still the dominant cost, so **step
-2's case is unchanged**.
+table. These figures are preserved verbatim in `stats.rs`, the FFI doc and
+[[build-progress]], because the panel that produced them no longer exists.
+
+**THE CSEARCH A/B, off-device, 2026-08-08.** Old (`main` @ `54384f2`) vs new
+(`kad-csearch` @ `eb7ee3c`), alternating against the live network, same seed
+nodes.dat, CLI `per_query` 1400ms both arms. Bootstrap is unchanged code and so a
+CONTROL; it tracked within ~1s inside every pair.
+
+| keyword | hits | old median search | new median search | delta | pairs won by new |
+|---|---|---|---|---|---|
+| "yes prime minister" | 50-55 | 8.26s | **2.56s** | **-69%** | 5 of 5 |
+| "hedda hopper" | 4 | 9.12s | **5.64s** | **-38%** | 4 of 4 |
+
+9 of 9 pairs won, result counts identical in both arms. **Quote it as "1.6x when
+the lookup must run to exhaustion, 3.2x when it can stop early", never a flat
+multiplier** - the spread is caused by which termination leg fires, and the
+pre-build 2-3x estimate only counted the round barrier and missed that killing
+the value PHASE is the bigger win. **This predicts nothing about the device**
+(750ms + AirVPN + a 67% answer rate there, against 1400ms + no VPN + 85% here).
+Detail and caveats in [[kad-routing-lifecycle]]; raw logs under
+`$CLAUDE_JOB_DIR/tmp/ab-*.log`.
 
 **Background seeding, 2026-08-07 soak:** 60 samples, ~70 minutes, ZERO deaths,
-`physFootprint` flat at 32.1-32.2MB against a ~100MB jetsam budget. Survival is
-settled. CPU was NOT: samples split almost exactly evenly above/below 5% (27/58)
-against 0.1% foreground-idle.
+`physFootprint` flat at 32.1-32.2MB against a ~100MB jetsam budget.
 
-## THE TOP NEXT ACTION
+**Background-seeding CPU: SETTLED 2026-08-08, and the hypothesis was WRONG.**
+Re-soak with ONE variable changed (`shouldRunFastPoll` throttles the UI snapshot
+to 1 tick in 5 while `.seeding`): 30 samples, 15 above 5% CPU / 15 below, zero
+deaths, footprint flat. Against the baseline's 27-of-58 that is the SAME
+distribution at a fifth the poll rate. **padMule's poll is not the cost; the
+audio keepalive is.** Do not re-open it as posed, and do not let any write-up
+claim the clock move buys CPU. The open battery question is a NEW one: what the
+audio session itself spends.
 
-**Finish the seeding-CPU experiment.** A re-soak is running as of 2026-08-08
-with the ONE variable changed: `EngineModel.shouldRunFastPoll` throttles the
-full UI snapshot to 1 tick in 5 while `.seeding`. Compare the above/below-5%
-split against 27/58. **If the split survives, the audio keepalive owns the cost
-and padMule's own poll is exonerated** - which is worth knowing before anyone
-redesigns the clock. The obvious "it is our poll" hypothesis has a hole: a 1 Hz
-signal would be caught by nearly any sampling window, not half of them.
-Log: `$CLAUDE_JOB_DIR/tmp/soak2.log`, script beside it.
+## WHAT TO DO NEXT
 
-## THEN
-
-1. **Step 2 of the Kad spec: the event-driven `CSearch`.** Now unblocked - step
-   1 is device-verified, which was the stated precondition. Worth ~2-3x on the
-   Kad arm. `docs/superpowers/specs/2026-08-07-kad-owning-read-loop-design.md`.
-   **The instrument must change with it**: `stats::kad_report` counts ROUNDS,
-   which stop existing. Take a final old-panel reading first.
-2. **Kad PUBLISHING (task #2).** padMule publishes nothing, so its shares are
-   invisible to anyone searching Kad - findable only via the server index and
-   source exchange. That sits badly against turning seeding on to "be a good
-   neighbor". Settle first, do not assume: is a foreground-only publisher a net
-   positive, given it vanishes and leaves stale source records? Read eMule's
-   real republish/expiry intervals before building.
-3. **Track 2 - concurrency under load. NOT STARTED.** No cap at all on
-   concurrent downloads; each gets ~4 workers, so 20 downloads is ~80 dials.
-   Use the Acer as the controlled swarm.
-4. **Per-file pause/resume DOES NOT EXIST**, nor a max-active cap with the rest
-   queued. Anthony asked for both. A build, not a bug.
-5. **Move the 1s clock out of the UI runloop** into Rust as a tokio interval
-   keyed off `EngineState`. Eight duties fail SILENTLY if it stops.
-6. Housekeeping: eleven remote branches fully merged and deletable; `main`
-   unpushed; **83 commits on `fetch-funnel` unmerged and never PR'd**.
+**See [[handoff-for-fable]] - it is the authority and it carries the task list.**
+In one line: **the off-device A/B is DONE and the rewrite works (see MEASURED);
+what is left is the DEVICE pass**, and the WDA profile expires 2026-08-10, so
+that is the deadline on the UI-driving half of it.
 
 ## STILL OPEN ON KAD
 
-Contact expiry and the liveness ping (eMule's `OnSmallTimer` half) still do not
-exist on OUR side - nothing evicts a contact anywhere. Near-biased nodes.dat
-sample. No bootstrap retry. `KadNode::add_contact` has no Kad-version gate, so a
-peer's answer can still insert a v1 contact even though the nodes.dat path gates
-`version > 1`.
+- Contact expiry and the liveness ping (eMule's `OnSmallTimer` half) do not exist
+  on OUR side - nothing evicts a contact anywhere. We ANSWER other nodes' pings;
+  we never send our own.
+- `KadNode::add_contact` has **no Kad-version gate**, so a peer's answer can
+  insert a v1 contact even though the nodes.dat path gates `version > 1`.
+  `CSearch::add` rejects `version <= 1` for the FRONTIER only, and
+  `absorb_find_answer` feeds the TABLE first - so the gap is real, not closed by
+  the rewrite.
+- `request_batch` still carries the stale-slot hazard on its OWN cancellation
+  path (bootstrap/hello only). The lookup path was guarded by `SlotGuard`.
+- Near-biased nodes.dat sample. No bootstrap retry.
+- padMule PUBLISHES NOTHING (0x43-0x45). Payloads decoded and banked in
+  [[kad-routing-lifecycle]]; deliberately not half-built.
 
 ## STANDING DIRECTIVES
 
+- **[[handoff-for-fable]] is the authority for what to do next** (Anthony,
+  2026-08-08).
 - **eMule 0.70b is the authority for GUI, Settings and per-file behaviour**
   (Anthony, 2026-08-06). 0.50a still decides the wire.
-- **Where the authorities conflict, follow eMule** - and say so with citations
-  on both sides.
+- **Where the authorities conflict, follow eMule** - with citations on both sides.
 - Keep the KB current as part of the work, not after it.
 
 ## What these sessions actually taught
 
-- **The spec lost to the source three times in one day** - the empty
-  `SEARCH_RES` (eMule stays silent), the missing ACK solicitation gate, and the
-  `OnSmallTimer` probe being a HELLO_REQ rather than a PING. Check the authority
-  during implementation, not before it.
-- **A reported mutation table is a claim like any other.** Re-running a
-  sub-agent's checks found a real gap (`Drop { read_loop.abort() }` covered by
-  no test) - and two of my own first attempts came back falsely GREEN because
-  the MUTANT DID NOT COMPILE. **A mutation check needs its own sanity check.**
+- **The spec lost to the source four times in two days** - the empty
+  `SEARCH_RES` (eMule stays silent), the missing ACK solicitation gate, the
+  `OnSmallTimer` probe being a HELLO_REQ rather than a PING, and the
+  frontier/table split. Check the authority DURING implementation.
+- **A reported mutation table is a claim like any other**, and two first attempts
+  came back falsely GREEN because the MUTANT DID NOT COMPILE. **A mutation check
+  needs its own sanity check.**
 - **A test whose fixture derives its bound from the constant it asserts against
   is tautological** - and the vacuity was hiding a real defect underneath.
 - **A guard that fires correctly can still fail the reader.**
-- **Doc comments drift onto the wrong item** when a new item is inserted after
-  an existing block. Twelve had. The tell: an item with NO doc beside one
-  carrying two summaries.
+- **Doc comments drift onto the wrong item** when a new item is inserted after an
+  existing block. Twelve had.
+- **A status line written from a pre-commit draft outlives the commit.** Row 8cn
+  said "NOT committed" in the commit that committed it.
 
 ## Related
 
+- [[handoff-for-fable]] - THE AUTHORITY: what to do, and how work is judged.
 - [[build-progress]] / [[kad-routing-lifecycle]] / [[kad-verify-oracle]] / [[log]]
 - [[ipad-usb-tooling]] - install path, WDA runbook, every probe trap above.
 - [[decisions-and-lessons]] / [[interop-test-fidelity]] (memory)

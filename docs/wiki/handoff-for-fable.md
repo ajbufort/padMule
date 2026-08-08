@@ -57,16 +57,41 @@ preserved verbatim in `stats.rs`, the FFI doc and build-progress:
 | search submit-to-results | 9.57 / 3.28 / 8.40 / 7.41 / 4.97s (FRESH install) |
 | Longest poll gap | 1.1s |
 
-**The cleanest experiment is OFF the device**: `mule-cli kad-keyword` calls
-`resolve_keyword` directly, so old binary vs new, alternating against the live
-network, measures the function with no probe, no UI and no server arm. That is
-how the last Kad win was settled (median -25%, quoted honestly as "a quarter to
-a half" rather than the 3x the arithmetic implied). Do that FIRST; the device
-pass then only has to show no regression.
+**The off-device A/B is DONE (2026-08-08) - the rewrite works. Only the device
+pass is left.**
+
+`mule-cli kad-keyword` calls `resolve_keyword` directly, so old binary
+(`main` @ `54384f2`) vs new (`kad-csearch` @ `eb7ee3c`), alternating against the
+live network, measures the function with no probe, no UI and no server arm.
+Same `nodes-fresh.dat` seed every run; `bootstrap_any`/`request_batch` are
+unchanged between the two commits, so bootstrap is a CONTROL and it tracked
+within ~1s inside every pair.
+
+| keyword | hits | old median | new median | delta | pairs |
+|---|---|---|---|---|---|
+| "yes prime minister" | 50-55 | 8.26s | **2.56s** | **-69%** | 5/5 to new |
+| "hedda hopper" | 4 | 9.12s | **5.64s** | **-38%** | 4/4 to new |
+
+**9 of 9 pairs won, result counts IDENTICAL in both arms.** The spread is the
+finding: with plenty of hits both arms stop on "enough results" and the new one
+gets there fast because value asks INTERLEAVE (killing the value phase is the
+bigger win); with a rare keyword `want` is never reached, both run to
+exhaustion, and only the round-barrier saving is left - which lands at -38%,
+matching the 8ch A/B's "quarter to a half". **Say "1.6x to exhaustion, 3.2x when
+it can stop early", never a flat multiplier.**
+
+This says NOTHING about the device: 750ms and AirVPN there against 1400ms and no
+VPN here, and the device answered 67% of requests against this box's 85%. A
+worse answer rate is where a barrier costs most, so the device number could land
+either side. Measure it; do not carry these numbers over.
 
 **The bar on device is: `Longest poll gap` stays ~1.1s**, and time-to-first-result
-from the new panel. Expected win 2-3x on the Kad arm - **do not assert it, measure
-it, and if it is smaller say the smaller number.**
+from the new panel. The off-device A/B above says 1.6x-3.2x depending on whether
+the search can stop early - **do not assert it on the device, measure it, and if
+it is smaller say the smaller number.** The pre-build arithmetic said a flat
+2-3x and was wrong in BOTH directions at once (too low for an abundant keyword,
+too high for a rare one), which is the reason to distrust a multiplier that was
+never measured on the surface you are standing on.
 
 ## MEASURING ON THE DEVICE - read before you touch it
 
@@ -160,9 +185,15 @@ depends on a list the next agent cannot see is not a handoff.
   not send our own.
 - **`KadNode::add_contact` has no Kad-version gate**, so a peer's answer can
   insert a v1 contact even though the nodes.dat path gates `version > 1`.
-- **`ios-test.yml` only fires on push to `main` and on PRs.** A branch-only
-  workflow never runs it. That is how the Swift suite stayed broken for three
-  builds.
+- **ALL THREE workflows only fire on push to `main`, on PRs, and on
+  `workflow_dispatch`** - `rust.yml` and `ios-build.yml` as much as
+  `ios-test.yml`. A branch-only workflow never runs ANY of them, so **on a branch
+  the LOCAL gate is the only gate**, and no CI has run for `eb7ee3c`. (Corrected
+  2026-08-08: this hazard used to name `ios-test.yml` alone, which reads as
+  though the Rust gate at least covers branch work. It does not. What made
+  `ios-test.yml` uniquely dangerous was that `ship.sh` dispatched the other two
+  and never dispatched or checked it - that is how the Swift suite stayed broken
+  for three builds. `ship.sh` now requires all three green.)
 
 ## Related
 

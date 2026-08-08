@@ -1032,3 +1032,63 @@ Append-only, timestamped record of Ingest / Query / Lint passes.
   verbatim in three places so the A/B survives the rewrite.
   Gate: 700 tests x3, clippy, fmt, ASCII. **NOT device-verified** - that is the
   next action.
+
+- 2026-08-08 **Lint (reanalysis pass) + INGEST: the off-device CSearch A/B.**
+  Anthony set [[handoff-for-fable]] as THE AUTHORITY and asked for the doc drift
+  first, then the A/B.
+  **Gate re-verified rather than quoted: 700 tests (0 failed, 2 ignored - both
+  documented live-network), clippy -D warnings, fmt, ASCII all clean.** Three
+  live docs each claimed a different number (CLAUDE.md 677, handoff 678,
+  handoff-for-fable 700); only the last was right.
+  **Ten drifts found and fixed.** The one that mattered: **[[kad-routing-lifecycle]]
+  still described the ROUND-BASED lookup as current code** - the entry
+  [[index]] points at for "how much a lookup costs" - complete with "this is the
+  evidence for eMule's event-driven CSearch ... it WOULD cut each hop", written
+  about something that shipped the day before. Fixed by ADDING a "How a lookup
+  runs today" section at the top and annotating the round-based sections in place
+  as the before-figure that bought the rewrite, per the house rule about not
+  rewriting dated history. The rest: row 8cn said "NOT committed" in the very
+  commit that committed it (a status written from a pre-commit draft and never
+  re-read - a new shape, worth naming); `stats.rs` dated the preserved 8cm
+  before-figure 2026-08-07 when row 8cm is 2026-08-08; CLAUDE.md's test count and
+  its "29 subcommands" (30 since `kad-serve`); two stale `Updated:` headers;
+  [[security-model]]'s ipfilter row cited a function name that no longer exists
+  AND a "we only ever hear replies" clause the serve loop retired; README
+  understated `mule-kad`; and [[handoff-next-session]] was stale on branch, gate
+  and next action, so it was rewritten as the VERIFIED-state companion that
+  defers to the Fable handoff.
+  **A hazard was stated too narrowly and is now correct:** "ios-test.yml only
+  fires on push to main and on PRs" is true of ALL THREE workflows, so on a
+  branch the LOCAL gate is the only gate and **no CI has run for `eb7ee3c`**. What
+  made ios-test uniquely dangerous was that `ship.sh` dispatched the other two
+  and never dispatched it.
+- 2026-08-08 **THE OFF-DEVICE A/B: the event-driven CSearch is a real win, and it
+  beat its own estimate for a reason worth keeping.** Old (`main` @ `54384f2`) vs
+  new (`kad-csearch` @ `eb7ee3c`), ALTERNATING against the live network, same
+  `nodes-fresh.dat` for every run (`kad-keyword` only READS it), CLI `per_query`
+  1400ms both arms. **`bootstrap_any`/`request_batch` are unchanged between the
+  two commits, so bootstrap is a CONTROL** - verified by diff, not assumed - and
+  it tracked within ~1s inside every pair, which is what licenses the comparison.
+  "yes prime minister" (50-55 hits): median search **8.26s -> 2.56s, -69%, 5/5
+  pairs**. "hedda hopper" (4 hits): **9.12s -> 5.64s, -38%, 4/4 pairs**. **9 of 9
+  pairs won, with IDENTICAL result counts in both arms** - ruled out "faster
+  because it returns less" before anything else.
+  **THE SPREAD IS THE FINDING.** With plenty of hits both arms terminate on the
+  "enough results" leg and the new one gets there fast because value asks
+  INTERLEAVE; with a rare keyword `want` is never reached, both run to
+  exhaustion, and only the round-barrier saving is left - landing at -38%,
+  squarely in the "quarter to a half" the 8ch batching A/B measured, which
+  cross-checks both measurements. So the claim is **"1.6x to exhaustion, 3.2x
+  when it can stop early", never a flat multiplier.** The pre-build arithmetic
+  said 2-3x and was wrong in BOTH directions at once, because it only ever
+  counted the barrier and missed that killing the value PHASE is the bigger win.
+  **A result that BEATS its estimate deserves the same scrutiny as one that
+  misses it** - which is why the second keyword was run before anything went into
+  the record, and why the control was diffed rather than asserted.
+  **NOT ESTABLISHED:** anything about the device. 750ms + AirVPN + a 67% answer
+  rate there against 1400ms + no VPN + 85% here, and a worse answer rate is
+  exactly where a barrier costs most, so the device figure could land either
+  side. n=5/n=4; bootstrap drifted 1.4s -> ~11s across the runs, so absolute
+  times are not comparable BETWEEN pairs - the pairing is what controls it.
+  Nothing committed: the tree carries the doc changes and `stats.rs`'s one-word
+  date fix, per the handoff's "do not commit unless asked".

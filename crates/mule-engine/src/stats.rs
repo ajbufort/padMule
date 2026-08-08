@@ -333,7 +333,7 @@ pub fn fetch_report() -> String {
 // previous panel counted lookup ROUNDS and "rounds with a silent peer", because
 // the lookup was round-based and the one question was whether the round barrier
 // (a batch window held open by a peer that never answers) was the cost. It
-// answered - final reading, device 2026-08-07 (build-progress row 8cm, the
+// answered - final reading, device 2026-08-08 (build-progress row 8cm, the
 // before-figure for the rewrite): 57 FIND_NODE rounds, 57% with a silent peer,
 // 73% of requests answered, avg round 601ms against a 750ms cap; 18 value
 // windows, 44% silent, 75% answered, avg 560ms. The barrier WAS the cost, the

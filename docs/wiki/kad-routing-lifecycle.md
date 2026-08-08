@@ -1,10 +1,14 @@
 # Kad routing lifecycle - the two tables, and who maintains them
 
-Updated: 2026-08-07 (row 8ch: ALPHA is a CONCURRENCY parameter and padMule used
-it as a batch size - see "How much a lookup costs" below, which changes what
-every Kad timeout in the tree means. Row 8cf: keyword SEARCH added - three
-pieces, two of them missing since Wave 6, including the expression tree. Created
-2026-08-06 by the reanalysis pass, [[build-progress]] 8ce)
+Updated: 2026-08-08 (row 8cn: **THE LOOKUP IS NO LONGER ROUND-BASED.** eMule's
+event-driven `CSearch` shipped - per-request deadlines, alpha kept in flight,
+value asks interleaved, no value phase - so every section below that measures or
+reasons about ROUNDS is a BEFORE-figure, annotated in place rather than deleted,
+because it is the evidence that bought the rewrite. Row 8ck/8cl: padMule ANSWERS
+on Kad. Row 8ch: ALPHA is a CONCURRENCY parameter and padMule used it as a batch
+size. Row 8cf: keyword SEARCH added - three pieces, two of them missing since
+Wave 6, including the expression tree. Created 2026-08-06 by the reanalysis pass,
+[[build-progress]] 8ce)
 
 Where Kad contacts live, how they get there, what survives a pause, and which of
 eMule's maintenance duties padMule performs. This entry exists because its
@@ -66,7 +70,84 @@ across: without the bit the seeds would inflate `contacts_known()` while staying
 invisible to `closest_to`, which is worse than not seeding at all, because the
 number would then claim the problem was solved.
 
+## HOW A LOOKUP RUNS TODAY - the event-driven CSearch (2026-08-08, row 8cn)
+
+**Read this before the two sections below it.** Those sections measure a lookup
+shape that no longer exists in the tree; they are kept because they are the
+evidence that bought this rewrite, not because they describe the code.
+
+The pure state machine is `mule_kad::lookup::CSearch` (no sockets, no timers);
+the driver is `KadNode::drive_lookup` (kad_live.rs). `resolve_keyword`,
+`resolve_sources` and `refresh_routing` all sit on top of it and kept their
+signatures.
+
+| | round-based (until 2026-08-08) | event-driven `CSearch` (now) |
+|---|---|---|
+| unit of progress | a ROUND of `ALPHA_QUERY` requests | ONE request |
+| deadline | per-ROUND window; the round ends when the SLOWEST member answers or the window expires | **per-REQUEST**; each races its own `per_query` |
+| a silent peer costs | the whole round (57% of rounds, avg 601ms of a 750ms cap - row 8cm) | only its own slot |
+| next hop fires | after the round barrier | INSIDE the response handler, for a contact closer than its responder that makes the top-alpha `best` set (Search.cpp:508) |
+| value asks | a separate PHASE after the iteration | INTERLEAVED, strict closest-first, while FIND_NODEs are still outstanding - **there is no value phase** |
+| termination | rounds exhausted or the cap | enough results, candidates exhausted, or the overall deadline |
+
+Budgets are UNCHANGED on purpose - 36 FIND_NODEs, `K` value asks, an overall
+deadline of `LOOKUP_DEADLINE_QUERIES` (16) x `per_query`. **The rewrite changes
+WHEN requests go out, not how many.**
+
+Four things worth knowing that are not obvious from the table:
+
+- **The FRONTIER and the ROUTING TABLE are fed by separate paths.** eMule's
+  `Process_KADEMLIA2_RES` hands every acceptable contact to
+  `RoutingZone::AddUnfiltered` (KademliaUDPListener.cpp:846) BEFORE `CSearch`
+  sees the list; only the search's copy faces the per-answer rules. padMule fed
+  one filtered list to both, so putting the new subnet cap where the old dedupe
+  lived would have STARVED the table - working directly against the serve loop's
+  purpose. `absorb_find_answer` keeps the two apart, pinned by a test that puts
+  four contacts from one /24 in the table while the frontier sees two.
+- **New per-answer rule: at most 2 contacts per public /24** within ONE answer,
+  the responder's own subnet pre-seeded at 1, LAN exempt. eMule's comment at
+  Search.cpp:457 says "/28"; the mask is `0xFFFFFF00`, a /24. The code is right,
+  the comment is wrong, and `frontier_filter` says so.
+- **Only a node that ANSWERED a FIND_NODE is ever value-asked.** The old code
+  asked non-responders too. eMule's walk erases tried-unresponded entries unasked.
+- **`CSearch` carries a `failed` set eMule does not have.** eMule has no
+  per-request deadline and infers death from 3s of silence in JumpStart; padMule
+  gives every request its own deadline, so death is an explicit event and the
+  walk never has to guess whether the closest entry is dead or still in flight.
+
+Deliberate divergences from eMule, all stated: the walk runs after every state
+change rather than only on the 3s-gated JumpStart tick (that tick would put a ~3s
+floor under time-to-first-result and erase the win; it remains as stall
+recovery); an over-long answer is dropped EVERYWHERE, where eMule's table keeps
+it; a timed-out request refills the in-flight set at once, where eMule recovers
+one dead peer per 3s tick. SKIPPED deliberately: JumpStart's "best FIND_VALUE
+nodes all dead -> re-ask" recovery (Search.cpp:291-322) - it exists because
+eMule requests only 2 contacts per hop on a value lookup and can starve on
+duplicates of dead nodes, and padMule requests 11 on every hop.
+
+**The instrument was replaced in the same change.** `stats::kad_report` counted
+ROUNDS, which stopped existing; leaving it would have produced a panel that reads
+plausibly and means nothing. It now reports time-to-first-result and
+time-to-completion per value lookup, requests sent / answered / timed out per
+kind, a reply-RTT histogram with **TIMEOUT as its own row** (folding timeouts
+into a top bucket would let a dead network read as merely slow), and the
+in-flight high-water mark. The row-8cm before-figures are preserved verbatim in
+`stats.rs`, the FFI doc and [[build-progress]] so the A/B survives the rewrite.
+
+**Fixed en route:** a stale-slot hazard. `KAD_SEARCH_WAIT` and
+`KAD_MAINTENANCE_BUDGET` CANCEL these futures, and a cancelled future never runs
+its trailing withdraw, so a pending slot outlived its lookup and would swallow
+the next reply from that peer. `SlotGuard` withdraws on drop. **The same hazard
+remains on `request_batch`'s OWN cancellation path** (bootstrap/hello only) and
+is recorded rather than silently carried.
+
 ## How much a lookup COSTS - alpha is concurrency, not a batch size
+
+> **[SUPERSEDED 2026-08-08 by row 8cn - see the section above.]** Everything
+> below this line describes the ROUND-BASED lookup and the 8ch batching fix that
+> preceded the event-driven rewrite. It is kept verbatim because it is the
+> measurement that justified the rewrite, and because the A/B against it is how
+> the rewrite gets judged. Do not read it as current behaviour.
 
 Until 2026-08-07 every lookup in `kad_live.rs` did this:
 
@@ -165,6 +246,58 @@ interleave with the lookup, Search.cpp:278-350): it would cut each hop from
 the separate value phase entirely. Estimated on these numbers at roughly 2-3x on
 the Kad arm - which is the search's remaining cost.
 
+> **[BUILT 2026-08-08, row 8cn, AND NOW MEASURED - see "What the rewrite
+> actually bought" below.]** The 2-3x above was an ESTIMATE derived from this
+> table. The measured answer is **-69% on an abundant keyword and -38% on a rare
+> one**, and the spread is the interesting part: the estimate only ever counted
+> the round barrier, and missed that removing the value PHASE is the bigger win
+> whenever a search has enough results to stop early.
+
+## What the rewrite actually bought - measured 2026-08-08 (off-device A/B)
+
+Old binary (`main` @ `54384f2`, round-based) vs new (`kad-csearch` @ `eb7ee3c`,
+event-driven), **alternating** runs against the live network so swarm drift hits
+both arms, same `nodes-fresh.dat` seed for every run (`kad-keyword` only READS
+it), CLI `per_query` 1400ms in both. `bootstrap_any` / `request_batch` are
+byte-identical between the two commits, so **bootstrap is a CONTROL** - and it
+tracked within ~1s inside every pair, which is what says the two arms met
+comparable network conditions.
+
+| keyword | hits | old median SEARCH | new median SEARCH | delta | pairs won by new |
+|---|---|---|---|---|---|
+| "yes prime minister" | 50-55 | 8.26s | **2.56s** | **-69%** (3.2x) | 5 of 5 |
+| "hedda hopper" | 4 | 9.12s | **5.64s** | **-38%** (1.6x) | 4 of 4 |
+
+**9 of 9 pairs won by the new lookup**, and the RESULT COUNTS are the same in
+both arms (50-55 and 4) - so it is not winning by returning less, which was the
+first thing to rule out.
+
+**Why the two keywords differ, and this is the finding:**
+
+- "yes prime minister" has plenty of hits, so BOTH arms terminate on the
+  "enough results" leg (`want` = 30 in the CLI). The new lookup reaches it fast
+  because value asks are **interleaved** - the closest responded in-tolerance
+  node is asked while FIND_NODEs are still outstanding. The old one had to finish
+  its FIND_NODE iteration before the value PHASE started at all.
+- "hedda hopper" has 4 hits network-wide, so `want` is never reached and the
+  lookup runs to candidate exhaustion or the overall deadline in both arms. The
+  only saving left is the round barrier itself - and -38% lands squarely in the
+  "quarter to a half" the 8ch batching A/B produced, which is a good consistency
+  check on both measurements.
+
+So the honest one-liner is **"1.6x when the lookup must run to exhaustion, 3.2x
+when it can stop early"**, not a flat multiplier.
+
+**What this does NOT establish.** This is the DEV BOX, at `per_query` 1400ms,
+with no VPN. The device runs 750ms over AirVPN and answered only 67% of requests
+against this box's 85% (see the table above). A worse answer rate is exactly the
+condition where a round barrier costs most, so the device figure could land
+either side of these - **it is not predicted here, it has to be measured.** n=5
+and n=4. Bootstrap drifted from 1.4s to ~11s across the runs, so absolute times
+are not comparable BETWEEN pairs; the pairing is what controls for it.
+
+Raw logs: `$CLAUDE_JOB_DIR/tmp/ab-ypm.log`, `ab-hh.log`, driver `ab.py`.
+
 Consequences that were being read as other problems:
 
 - **The search cap WAS the search cost.** `KAD_SEARCH_WAIT` looked like a safety
@@ -174,7 +307,13 @@ Consequences that were being read as other problems:
   in under a second and `tokio::join!` waiting for the slower one.
 - **Kad maintenance never completed a round.** 9s of work under a 3s deadline
   got through about four of its twelve queries, every 120 seconds, which is a
-  large part of why the table grows as slowly as it does.
+  large part of why the table grows as slowly as it does. **[8ch cut the 9s to
+  3s; 8cn removed rounds entirely. Note the two clocks now COINCIDE:
+  `KAD_MAINTENANCE_BUDGET` is 3s and `REFRESH_DEADLINE_QUERIES` x
+  `KAD_PER_QUERY` is 4 x 750ms = 3s, so for a refresh that runs its full length
+  the outer `timeout` and the lookup's own deadline fire together and
+  cancellation is the NORMAL path, not the exceptional one. `SlotGuard` is what
+  makes that safe - it is load-bearing here, not a belt-and-braces extra.]**
 
 **ONE SOCKET IS WHY IT WAS SERIAL, and it is the real difficulty.**
 `UdpSocket::recv_from` hands each datagram to exactly one waiter, and the old
@@ -196,6 +335,17 @@ and into the callers, because the batch collects with `&self`; the two tests tha
 pin that capture were rewritten to drive `resolve_sources` / `resolve_keyword`
 rather than the helpers, or they would have passed with the production call site
 deleted.
+
+> **[SUPERSEDED IN PART, 2026-08-07 (8ck) and 2026-08-08 (8cn).]** The batch
+> demultiplexer was the right answer to "who reads the socket", and it was then
+> generalised twice. 8ck moved the demux into ONE owning read loop that runs for
+> the node's LIFE (`run_read_loop`), so a datagram is delivered to the pending
+> request it answers, answered as an inbound request via `kad_serve`, or dropped
+> - which is what let padMule start answering at all. 8cn then took LOOKUPS off
+> `request_batch` entirely: they now register slots one at a time through
+> `begin_request` and park each reply-or-deadline future in a `JoinSet`.
+> `request_batch` survives for BOOTSTRAP and HELLO only, and it is the one path
+> still carrying the stale-slot-on-cancel hazard.
 
 ## Which eMule maintenance duties padMule performs
 
