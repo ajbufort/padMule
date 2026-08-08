@@ -154,15 +154,25 @@ final class SettingsTests: XCTestCase {
         XCTAssertEqual(SettingsView.buildLabel(short: "?", build: "?"), "? (?)")
     }
 
-    /// The registered default and the @AppStorage initializer must AGREE.
+    /// The REGISTERED default for background seeding is OFF.
     ///
-    /// When they disagree the toggle renders one state while the engine is in
-    /// the other, which reads as "the setting does nothing" - a trap this file
-    /// already carries a comment about for another key. Background seeding is
-    /// the one where being wrong matters most: a user who believes it is on
-    /// while it is off concludes padMule simply stopped sharing.
-    func testBackgroundSeedingDefaultsToOffEverywhere() {
-        Settings.register()
+    /// It runs while the user is not looking and costs battery, so off is the
+    /// only honest default; and when the registered default and the
+    /// `@AppStorage` initializer disagree the toggle renders one state while the
+    /// engine is in the other, which reads as "the setting does nothing".
+    ///
+    /// SCOPE, stated because the name used to over-claim: this checks the
+    /// REGISTERED half only. The `@AppStorage` initializer lives in a
+    /// `SettingsView` property wrapper that a unit test cannot read, so the two
+    /// are kept in agreement by the comment at each site rather than by an
+    /// assertion. Calling that "everywhere" implied a guard that does not exist.
+    ///
+    /// THIS TEST NEVER RAN UNTIL 2026-08-08. It called `Settings.register()` -
+    /// no such type; it is `SettingsDefaults` - so the whole padMuleTests bundle
+    /// failed to COMPILE from e3ed990 onward, and three device builds shipped
+    /// with the Swift suite red because ship.sh did not check it.
+    func testBackgroundSeedingRegisteredDefaultIsOff() {
+        SettingsDefaults.register()
         XCTAssertFalse(
             UserDefaults.standard.bool(forKey: SettingsKey.backgroundSeeding),
             "background seeding must default OFF - it runs while the user is not "
