@@ -123,6 +123,33 @@ WDA at all.
    **This buys NO CPU** - that hypothesis was tested and refuted 2026-08-08. Do
    it for robustness and say so.
 
+## THE TRACKED TASK LIST, as it stands 2026-08-08
+
+The session task list is ephemeral - it does not survive into your context, so
+it is written out here. Two items, one closed and one open.
+
+**#1 - Separate the background-seeding CPU cost: keepalive vs padMule's own 1 Hz
+poll. COMPLETED 2026-08-08, AND THE HYPOTHESIS WAS WRONG.** Same conditions as
+the 2026-08-07 baseline with ONE variable changed (`shouldRunFastPoll` throttles
+the UI snapshot to 1 tick in 5 while `.seeding`): 30 samples, **15 above 5% CPU,
+15 below, zero deaths**, footprint flat. Against the baseline's 27-of-58 that is
+the SAME distribution at a fifth the poll rate. **padMule's poll is not the cost;
+the audio keepalive is.** Do not re-open it as posed, and do not let any
+write-up claim the clock move buys CPU. The remaining battery question is a NEW
+one: what the audio session itself spends, and whether it can be made cheaper.
+
+**#2 - Publish padMule's shares to Kad (Store File + Store Keyword, 0x43-0x45).
+OPEN.** This is item 1 of the priority list above; the full statement of the
+problem and the question to settle FIRST are there. Short version: padMule
+publishes nothing, so its shares are invisible to anyone searching Kad -
+findable only through the connected server's index and source exchange. Observed
+on Anthony's own eMule the same week: 13,326 Kad operations in one session
+publishing his shares as `Store File` and `Store Keyword`, one publish per WORD
+carved out of each filename. padMule does none of it.
+
+If you add tasks, restate them here on the way out. An agent handoff that
+depends on a list the next agent cannot see is not a handoff.
+
 ## KNOWN CARRIED HAZARDS - inherit these knowingly
 
 - **`request_batch` still has the stale-slot hazard on its OWN cancellation
