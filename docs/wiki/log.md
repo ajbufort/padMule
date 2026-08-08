@@ -822,3 +822,36 @@ Append-only, timestamped record of Ingest / Query / Lint passes.
   in their table, which is the state that gets a contact evicted, so the serve
   loop would have solved half its own problem. Gate: 678 tests x3, clippy, fmt,
   ASCII.
+
+- 2026-08-08 **THE SHIP LOOP BUILT THE WRONG TREE, and the guard caught it.**
+  The first real use of the new three-workflow gate aborted immediately:
+  `gh workflow run --ref <branch>` dispatches against the **REMOTE** branch, and
+  twelve commits were local-only - so CI cheerfully built `b047f66` while HEAD
+  was `c3bff65`. Guard 2 (the run's headSha must equal local HEAD) refused the
+  artifact. **Without it the install would have carried NONE of the day's Kad
+  work and reported success**, which is the same failure the script's own header
+  records from 2026-08-07 ("a two-day-old artifact one step from being delivered
+  as current") arriving by a completely different route.
+  The guard was right and its MESSAGE was useless: "no 'iOS build (unsigned
+  IPA)' run found for c3bff65" names the symptom and hides the cause. There is
+  now an explicit up-front check that origin/<branch> is already at HEAD, which
+  says what is wrong and gives the command to fix it. Deliberately an ABORT
+  rather than an auto-push: this script also signs and installs, and the push is
+  the one step in the loop that changes something other people can see.
+  **The transferable shape: a guard that fires correctly can still fail the
+  person reading it.** Catching the fault is half the job; naming it is the other
+  half, and an abort message that describes the symptom sends the next session
+  hunting in the wrong place. Also worth stating plainly - the ship loop is
+  "closed" only from a PUSHED commit; it always was, and nothing said so until
+  it cost a run.
+
+- 2026-08-08 **Two stale facts the device corrected on contact.** Reading the
+  iPad before shipping showed `CFBundleVersion e3ed990`, not the `48b5128` the
+  handoff claimed was installed - the handoff had been stale on that since the
+  background-seeding round. And `CFBundleShortVersionString` read **1.0** while
+  `ios/project.yml` set `MARKETING_VERSION: "0.1"`, confirming EMPIRICALLY what
+  had only been inferred from XcodeGen's behaviour: the setting never reached the
+  bundle, so every build ever shipped reported 1.0 for a pre-1.0 app. The fix
+  (pinning `CFBundleShortVersionString` in `info.properties`) makes this a
+  testable prediction rather than an argument - the next install should read
+  `0.1 (<sha>)`.
