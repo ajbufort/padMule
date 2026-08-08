@@ -3424,7 +3424,8 @@ impl Engine {
         // timed-out bootstrap may have found contacts). Keep the node either way:
         // it owns a live UDP socket + our persisted identity, and downloads pull
         // Kad sources through it.
-        self.routing.load_nodes(&routing_to_nodes(node.routing()));
+        self.routing
+            .load_nodes(&node.with_routing(|t| routing_to_nodes(t)));
         self.emit(EngineEvent::Kad {
             contacts: node.contacts_known(),
         });
@@ -4736,7 +4737,10 @@ impl Engine {
     fn absorb_kad_routing(&mut self) {
         // Bind the conversion first so the borrow of `self.kad` ends before
         // `self.routing` is borrowed mutably.
-        let learned = self.kad.as_ref().map(|n| routing_to_nodes(n.routing()));
+        let learned = self
+            .kad
+            .as_ref()
+            .map(|n| n.with_routing(|t| routing_to_nodes(t)));
         if let Some(learned) = learned {
             self.routing.load_nodes(&learned);
         }
@@ -4753,7 +4757,13 @@ impl Engine {
         // any caller that checkpoints while the node is still alive; the callers
         // that DROP it first are covered by `set_kad`, which absorbs the table on
         // the way out. Both are needed: this one alone silently missed pause().
-        let contacts = checkpoint_contacts(&self.routing, self.kad.as_ref().map(|k| k.routing()));
+        // Folded UNDER the live node's routing lock: `with_routing` hands out a
+        // borrow, never the table itself, so the union happens inside the
+        // closure (the lock is held for this one call, no await in sight).
+        let contacts = match self.kad.as_ref() {
+            Some(k) => k.with_routing(|live| checkpoint_contacts(&self.routing, Some(live))),
+            None => checkpoint_contacts(&self.routing, None),
+        };
         let nd = NodesDat {
             version: 2,
             contacts,
@@ -5047,7 +5057,8 @@ mod tests {
         // The bit has to survive the seeding or the contacts are invisible to
         // every lookup while still counting toward `len()`.
         assert_eq!(
-            live.routing().closest_to(&engine.identity.kad_id, 50).len(),
+            live.closest_wire_contacts(&engine.identity.kad_id, 50)
+                .len(),
             seeds.len(),
             "seeded contacts lost their verified bit, so closest_to hands out none"
         );
@@ -5250,11 +5261,10 @@ mod tests {
             udp_key_ip: 0x0303_0303,
             verified: true,
         };
-        let mut node = KadNode::bind("127.0.0.1:0".parse().unwrap(), 4662)
+        let node = KadNode::bind("127.0.0.1:0".parse().unwrap(), 4662)
             .await
             .unwrap();
-        node.routing_mut()
-            .load_nodes(std::slice::from_ref(&learned));
+        node.with_routing(|t| t.load_nodes(std::slice::from_ref(&learned)));
         engine.kad = Some(node);
         engine.state = EngineState::Running;
 
@@ -5620,12 +5630,10 @@ mod tests {
             udp_key_ip: 0x0404_0404,
             verified: true,
         };
-        let mut outgoing = KadNode::bind("127.0.0.1:0".parse().unwrap(), 4662)
+        let outgoing = KadNode::bind("127.0.0.1:0".parse().unwrap(), 4662)
             .await
             .unwrap();
-        outgoing
-            .routing_mut()
-            .load_nodes(std::slice::from_ref(&learned));
+        outgoing.with_routing(|t| t.load_nodes(std::slice::from_ref(&learned)));
         engine.set_kad(Some(outgoing));
 
         // A fresh node replaces it, as a re-bootstrap would.
@@ -5673,11 +5681,10 @@ mod tests {
             udp_key_ip: 0x0202_0202,
             verified: true,
         };
-        let mut node = KadNode::bind("127.0.0.1:0".parse().unwrap(), 4662)
+        let node = KadNode::bind("127.0.0.1:0".parse().unwrap(), 4662)
             .await
             .unwrap();
-        node.routing_mut()
-            .load_nodes(std::slice::from_ref(&learned));
+        node.with_routing(|t| t.load_nodes(std::slice::from_ref(&learned)));
         engine.kad = Some(node);
         engine.state = EngineState::Running;
 
