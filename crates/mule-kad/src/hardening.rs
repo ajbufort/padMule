@@ -54,6 +54,17 @@ struct Entry {
     banned_until: Option<Instant>,
 }
 
+/// The most source addresses one [`FloodTracker`] will hold.
+///
+/// `entries` is keyed by an ATTACKER-CONTROLLED UDP source address, so without
+/// a ceiling the limiter becomes the memory-exhaustion vector it exists to
+/// prevent - and a banned entry pins itself for the whole ban, making the
+/// busiest attacker the most persistent. eMule prunes on a desktop timer;
+/// padMule has a ~100MB jetsam budget and no such timer, so it prunes on insert
+/// and then refuses to grow. Same value and same reasoning as the out-track
+/// list bound in `kad_live`.
+pub const MAX_TRACKED_IPS: usize = 4096;
+
 /// Per-IP request-rate limiter with ignore-then-ban escalation (eMule 0.70b:
 /// "If Kad receives more requests of a specific type from one IP than expected,
 /// it starts ignoring those requests and eventually bans the source"). Time is
@@ -82,6 +93,19 @@ impl FloodTracker {
 
     /// Record a request from `ip` at `now` and return the verdict.
     pub fn record(&mut self, ip: u32, now: Instant) -> FloodVerdict {
+        // BOUND THE MAP BEFORE ADMITTING A NEW SOURCE - see [`MAX_TRACKED_IPS`].
+        // Only on the new-key path, so the ordinary case stays O(1) and the
+        // O(n) prune is paid only when the map is actually full. FAIL-OPEN if
+        // it is still full after pruning: declining to TRACK an address costs
+        // us rate-limiting for it alone, while declining to SERVE every unknown
+        // source under a spoofed spray would hand the attacker the outage the
+        // limiter exists to prevent.
+        if self.entries.len() >= MAX_TRACKED_IPS && !self.entries.contains_key(&ip) {
+            self.evict_expired(now);
+            if self.entries.len() >= MAX_TRACKED_IPS {
+                return FloodVerdict::Allow;
+            }
+        }
         let e = self.entries.entry(ip).or_insert(Entry {
             count: 0,
             window_start: now,
@@ -109,6 +133,13 @@ impl FloodTracker {
             return FloodVerdict::Ignore;
         }
         FloodVerdict::Allow
+    }
+
+    /// How many source addresses are currently tracked. The observable for the
+    /// [`MAX_TRACKED_IPS`] bound - without it the memory property can only be
+    /// asserted by proxy.
+    pub fn tracked(&self) -> usize {
+        self.entries.len()
     }
 
     /// Is `ip` currently banned?
@@ -164,6 +195,50 @@ mod tests {
     fn contact_needs_a_usable_udp_port() {
         assert!(is_acceptable_contact(ip(95, 236, 36, 250), 4672, false));
         assert!(!is_acceptable_contact(ip(95, 236, 36, 250), 0, false));
+    }
+
+    /// THE LIMITER MUST NOT BECOME THE EXHAUSTION VECTOR IT PREVENTS.
+    ///
+    /// `entries` is keyed by an ATTACKER-CONTROLLED UDP source address, and a
+    /// spoofed spray names a fresh one every datagram. `evict_expired` was
+    /// written for this and had NO caller, so on a device with a ~100MB jetsam
+    /// budget the anti-flood map grew without limit - and a BANNED entry pins
+    /// itself for the full 2h ban, so the busiest attacker was the most
+    /// persistent memory.
+    ///
+    /// FAIL-OPEN when full, deliberately, and the reasoning is padMule's own
+    /// (the identical rule already guards the out-track list): refusing to
+    /// track a new IP only costs us rate-limiting for that address, whereas
+    /// refusing to SERVE every unknown source under a spoofed spray would be a
+    /// self-inflicted outage - the attacker would have achieved by flooding
+    /// exactly what the limiter exists to prevent.
+    #[test]
+    fn flood_tracking_is_bounded_and_prunes_before_it_refuses() {
+        let window = Duration::from_secs(60);
+        let mut ft = FloodTracker::new(window, 3, 5, Duration::from_secs(7200));
+        let t0 = Instant::now();
+
+        // A spoofed spray: far more distinct sources than the bound allows.
+        for i in 0..(MAX_TRACKED_IPS as u32 + 500) {
+            ft.record(0x0100_0000 + i, t0);
+        }
+        assert!(
+            ft.tracked() <= MAX_TRACKED_IPS,
+            "the tracker grew to {} entries - it IS the exhaustion vector now",
+            ft.tracked()
+        );
+
+        // Everything above lapses once the window passes, so a later arrival
+        // finds room and is tracked again rather than being permanently
+        // untracked: the bound must not be a one-way door.
+        let later = t0 + window + Duration::from_secs(1);
+        for _ in 0..6 {
+            ft.record(0x0900_0001, later);
+        }
+        assert!(
+            ft.is_banned(0x0900_0001, later),
+            "after the spray lapses, a real flooder must still be catchable"
+        );
     }
 
     #[test]

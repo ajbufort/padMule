@@ -93,13 +93,30 @@ pub fn answer_request(
             if req.receiver != me.kad_id {
                 return None;
             }
-            let mut contacts = closest(&req.target, KAD_FIND_NODE_ANSWER_CAP);
-            // TRUNCATE HERE, do not merely ASK for the cap. Passing the limit to
-            // the closure and trusting it is the "moved the check == removed the
-            // check" shape: the rule is ours, the wire consequence is ours, so
-            // the enforcement belongs here rather than in whatever happens to
+            // ANSWER THE COUNT THE REQUESTER ASKED FOR. The type byte IS the
+            // count upstream: eMule hands it straight to the table
+            // (`GetClosestTo(2, uTarget, uDistance, (uint32)byType, &results)`,
+            // KademliaUDPListener.cpp:737) and `GetRequestContactCount`
+            // (Search.cpp:1782-1809) picks it per search type -
+            // KADEMLIA_FIND_VALUE = 2 for FILE/KEYWORD/FINDSOURCE/NOTES,
+            // KADEMLIA_STORE = 4 for the store types, 11 for a plain FIND_NODE.
+            // Over-answering is not generosity: the searcher DISCARDS a reply
+            // longer than it asked for (Search.cpp:377, "not only a protocol
+            // violation but most likely a malicious answer"), so every value
+            // lookup we over-answered was thrown away by the very node we are
+            // trying to stay known to - and since no stock client over-answers,
+            // it was a padMule fingerprint too.
+            //
+            // Our own cap still binds on top: `req_type` is attacker-controlled
+            // and only masked to 5 bits (message.rs:481), so it can reach 31.
+            let want = (req.req_type as usize).min(KAD_FIND_NODE_ANSWER_CAP);
+            let mut contacts = closest(&req.target, want);
+            // TRUNCATE HERE, do not merely ASK for the count. Passing the limit
+            // to the closure and trusting it is the "moved the check == removed
+            // the check" shape: the rule is ours, the wire consequence is ours,
+            // so the enforcement belongs here rather than in whatever happens to
             // supply the contacts.
-            contacts.truncate(KAD_FIND_NODE_ANSWER_CAP);
+            contacts.truncate(want);
             let (o, p) = build_kad2_res(&req.target, &contacts);
             ServeAnswer::plain(o, p)
         }
@@ -359,6 +376,97 @@ mod tests {
             res.contacts.len(),
             11,
             "20 contacts offered, 11 is eMule's requested count, got {}",
+            res.contacts.len()
+        );
+    }
+
+    /// A VALUE lookup asks for 2 contacts, not 11 - and the request type byte
+    /// IS the count. eMule's handler passes it straight through:
+    /// `GetClosestTo(2, uTarget, uDistance, (uint32)byType, &results)`
+    /// (KademliaUDPListener.cpp:737), and `GetRequestContactCount`
+    /// (Search.cpp:1782-1809) returns KADEMLIA_FIND_VALUE = 2 for
+    /// FILE/KEYWORD/FINDSOURCE/NOTES and KADEMLIA_STORE = 4 for the store
+    /// types. The searcher then DISCARDS any answer longer than it asked for
+    /// (Search.cpp:377) - the same rule the find_node test above cites - so
+    /// over-answering a value lookup gets the whole reply thrown away by the
+    /// node we are trying to stay known to, and no stock client over-answers,
+    /// which makes it a padMule fingerprint besides.
+    ///
+    /// The test above cannot catch this: it only ever sends KAD_FIND_NODE,
+    /// whose count (11) happens to equal our own cap, so the cap and the
+    /// requested count were indistinguishable in it.
+    #[test]
+    fn a_value_lookup_is_answered_with_the_two_contacts_it_asked_for() {
+        let target = Kad128::from_hash(&[0x44; 16]);
+        let (_, req) = mule_kad::build_kad2_req(mule_kad::KAD_FIND_VALUE, &target, &me().kad_id);
+        let pool: Vec<WireContact> = (1..=20)
+            .map(|i| contact(i, 0x0A00_0000 + i as u32))
+            .collect();
+
+        // Ignores `want` for the same reason as the test above: a closure that
+        // self-limits makes the assertion tautological.
+        let a = answer_request(OP_KAD2_REQ, &req, 5000, &me(), false, |_, _want| {
+            pool.clone()
+        })
+        .expect("a value lookup must be answered");
+
+        let res = mule_kad::parse_kad2_res(&a.payload).unwrap();
+        assert_eq!(
+            res.contacts.len(),
+            2,
+            "KAD_FIND_VALUE asks for 2; eMule discards a longer answer wholesale, got {}",
+            res.contacts.len()
+        );
+    }
+
+    /// A STORE request asks for 4 (KADEMLIA_STORE, Search.cpp:1795-1801).
+    /// Pinned separately from the value case so a fix that hard-codes 2 rather
+    /// than reading the requested count goes red here.
+    #[test]
+    fn a_store_lookup_is_answered_with_the_four_contacts_it_asked_for() {
+        let target = Kad128::from_hash(&[0x55; 16]);
+        let (_, req) = mule_kad::build_kad2_req(mule_kad::KAD_STORE, &target, &me().kad_id);
+        let pool: Vec<WireContact> = (1..=20)
+            .map(|i| contact(i, 0x0A00_0000 + i as u32))
+            .collect();
+
+        let a = answer_request(OP_KAD2_REQ, &req, 5000, &me(), false, |_, _want| {
+            pool.clone()
+        })
+        .expect("a store lookup must be answered");
+
+        let res = mule_kad::parse_kad2_res(&a.payload).unwrap();
+        assert_eq!(
+            res.contacts.len(),
+            4,
+            "KAD_STORE asks for 4, got {}",
+            res.contacts.len()
+        );
+    }
+
+    /// The cap still binds when a peer asks for MORE than we will ever send.
+    /// The request type byte is attacker-controlled and masked to 5 bits
+    /// (message.rs:481), so it can reach 31 - our own 11-contact ceiling is
+    /// what stops an amplification ask, and it must survive the fix that
+    /// starts honouring the requested count.
+    #[test]
+    fn a_request_for_more_than_the_cap_is_still_truncated_to_the_cap() {
+        let target = Kad128::from_hash(&[0x66; 16]);
+        let (_, req) = mule_kad::build_kad2_req(0x1F, &target, &me().kad_id);
+        let pool: Vec<WireContact> = (1..=30)
+            .map(|i| contact(i, 0x0A00_0000 + i as u32))
+            .collect();
+
+        let a = answer_request(OP_KAD2_REQ, &req, 5000, &me(), false, |_, _want| {
+            pool.clone()
+        })
+        .expect("an over-large ask is still answered, just capped");
+
+        let res = mule_kad::parse_kad2_res(&a.payload).unwrap();
+        assert_eq!(
+            res.contacts.len(),
+            11,
+            "a 31-contact ask must still be cut to our 11 ceiling, got {}",
             res.contacts.len()
         );
     }

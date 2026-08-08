@@ -8,25 +8,78 @@ import XCTest
 /// wrong either leaks uploads onto a data plan or refuses to seed on Wi-Fi.
 @MainActor
 final class SettingsTests: XCTestCase {
-    /// A private UserDefaults suite so these never touch the real store or each
-    /// other. The rule is small and pure, so it is re-implemented here exactly as
-    /// EngineModel computes it and checked across the truth table - this pins the
-    /// CONTRACT (what the four inputs must produce) even before it is refactored
-    /// into a shared helper.
-    private func effectiveSharing(wants: Bool, pauseOnMetered: Bool, metered: Bool) -> Bool {
-        wants && !(pauseOnMetered && metered)
+    /// Calls the REAL rule (`EngineModel.sharingDecision`), not a copy of it.
+    /// This test used to re-implement the expression in this file, which pinned
+    /// the arithmetic and nothing else - it stayed green through a live bug in
+    /// the CALLER, because the caller was never invoked. See
+    /// `testAnIncidentalRecomputeCannotCancelThePublicAddressPause`.
+    private func effectiveSharing(wants: Bool, pauseOnMetered: Bool, metered: Bool) -> Bool? {
+        EngineModel.sharingDecision(
+            wanted: wants,
+            pauseOnMetered: pauseOnMetered,
+            metered: metered,
+            pausedForIpChange: false,
+            userInitiated: false
+        )
     }
 
     func testMeteredPauseOnlyBitesWhenAllThreeLineUp() {
         // Shares on Wi-Fi.
-        XCTAssertTrue(effectiveSharing(wants: true, pauseOnMetered: true, metered: false))
+        XCTAssertEqual(effectiveSharing(wants: true, pauseOnMetered: true, metered: false), true)
         // Pauses on a metered link - the safety case.
-        XCTAssertFalse(effectiveSharing(wants: true, pauseOnMetered: true, metered: true))
+        XCTAssertEqual(effectiveSharing(wants: true, pauseOnMetered: true, metered: true), false)
         // Metered but the user opted out of the pause: their choice wins.
-        XCTAssertTrue(effectiveSharing(wants: true, pauseOnMetered: false, metered: true))
+        XCTAssertEqual(effectiveSharing(wants: true, pauseOnMetered: false, metered: true), true)
         // Leech mode stays leech mode regardless of network.
-        XCTAssertFalse(effectiveSharing(wants: false, pauseOnMetered: true, metered: false))
-        XCTAssertFalse(effectiveSharing(wants: false, pauseOnMetered: false, metered: true))
+        XCTAssertEqual(effectiveSharing(wants: false, pauseOnMetered: true, metered: false), false)
+        XCTAssertEqual(effectiveSharing(wants: false, pauseOnMetered: false, metered: true), false)
+    }
+
+    /// THE PUBLIC-ADDRESS PAUSE SURVIVES AN UNRELATED RECOMPUTE.
+    ///
+    /// When padMule notices its public address changed it pauses sharing and
+    /// says so, because on iOS there is no VPN kill switch - continuing to seed
+    /// would announce the new address. `Engine::set_sharing(true)` clears that
+    /// pause on purpose ("the user has decided"), so anything that pushes `true`
+    /// without the user deciding silently cancels the protection AND its banner.
+    /// Walking onto cellular and back, or toggling "pause on cellular", both did
+    /// exactly that.
+    func testAnIncidentalRecomputeCannotCancelThePublicAddressPause() {
+        // A network event or an unrelated Settings toggle: push NOTHING.
+        XCTAssertNil(
+            EngineModel.sharingDecision(
+                wanted: true, pauseOnMetered: true, metered: false,
+                pausedForIpChange: true, userInitiated: false
+            ),
+            "an incidental recompute must not resume seeding from a changed address"
+        )
+        // The user turning sharing on IS the decision that ends the pause.
+        XCTAssertEqual(
+            EngineModel.sharingDecision(
+                wanted: true, pauseOnMetered: true, metered: false,
+                pausedForIpChange: true, userInitiated: true
+            ),
+            true,
+            "an explicit user choice still resumes sharing"
+        )
+        // Turning sharing OFF is always safe, so it is never suppressed - even
+        // while paused, even when not user-initiated.
+        XCTAssertEqual(
+            EngineModel.sharingDecision(
+                wanted: false, pauseOnMetered: false, metered: false,
+                pausedForIpChange: true, userInitiated: false
+            ),
+            false,
+            "the OFF direction is never gated"
+        )
+        // And with no pause in force the flag changes nothing.
+        XCTAssertEqual(
+            EngineModel.sharingDecision(
+                wanted: true, pauseOnMetered: true, metered: false,
+                pausedForIpChange: false, userInitiated: false
+            ),
+            true
+        )
     }
 
     func testDefaultsRegisterTheProtectiveValues() {

@@ -783,7 +783,39 @@ final class EngineModel: ObservableObject {
     /// which may differ while a metered-network pause is in force.
     func setSharing(_ on: Bool) {
         UserDefaults.standard.set(on, forKey: SettingsKey.shareUploads)
-        applyEffectiveSharing()
+        // USER-INITIATED: this is the one path where the person actually decided
+        // about sharing, so it is the one allowed to end a public-address pause.
+        applyEffectiveSharing(userInitiated: true)
+    }
+
+    /// The sharing decision as a PURE rule: the value to push into the engine,
+    /// or `nil` to push nothing at all.
+    ///
+    /// Pure and static so the real rule is testable without an engine - it used
+    /// to be inline in `applyEffectiveSharing`, which forced the test to
+    /// re-implement it, and a test that restates a rule cannot catch the CALLER
+    /// getting it wrong. That is exactly what happened: see the `nil` case.
+    ///
+    /// THE `nil` CASE IS A SAFETY RULE, not an optimisation. `Engine::set_sharing(true)`
+    /// CLEARS `sharing_paused_for_ip_change` - deliberately, because "the user
+    /// has decided" should end the pause. But this function is also reached from
+    /// events the user did not initiate: the metered-state change
+    /// (`setMetered`), the Settings "pause on cellular" toggle, and boot. Left
+    /// unguarded, flipping an unrelated switch - or simply walking onto cellular
+    /// and back - RESUMED SEEDING FROM A CHANGED PUBLIC ADDRESS and cleared the
+    /// banner explaining why it had stopped. On iOS there is no kill switch, so
+    /// that guard is the whole protection. Turning sharing OFF is always safe
+    /// and is never suppressed; only the ON direction is gated.
+    static func sharingDecision(
+        wanted: Bool,
+        pauseOnMetered: Bool,
+        metered: Bool,
+        pausedForIpChange: Bool,
+        userInitiated: Bool
+    ) -> Bool? {
+        let effective = wanted && !(pauseOnMetered && metered)
+        if effective && pausedForIpChange && !userInitiated { return nil }
+        return effective
     }
 
     /// Push the sharing decision into the engine.
@@ -797,11 +829,24 @@ final class EngineModel: ObservableObject {
     /// Also the fix for a live bug: sharing was initialised true in the engine and
     /// never persisted, so turning it OFF silently turned itself back ON at the
     /// next launch.
-    func applyEffectiveSharing() {
+    func applyEffectiveSharing(userInitiated: Bool = false) {
         guard let e = engine else { return }
         let wanted = UserDefaults.standard.bool(forKey: SettingsKey.shareUploads)
         let pauseOnMetered = UserDefaults.standard.bool(forKey: SettingsKey.pauseSharingOnCellular)
-        let effective = wanted && !(pauseOnMetered && meteredNow)
+        guard
+            let effective = Self.sharingDecision(
+                wanted: wanted,
+                pauseOnMetered: pauseOnMetered,
+                metered: meteredNow,
+                pausedForIpChange: sharingPausedForIpChange,
+                userInitiated: userInitiated
+            )
+        else {
+            engineLog.notice(
+                "sharing stays paused - the public address changed and the user has not resumed it"
+            )
+            return
+        }
         if effective != sharing {
             let detail = "user wants \(wanted ? "on" : "off"), metered \(meteredNow ? "yes" : "no")"
             engineLog.notice(

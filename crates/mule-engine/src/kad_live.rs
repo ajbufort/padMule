@@ -7,10 +7,12 @@
 //! IP byte convention (confirmed by live capture, Wave 6b gate): eMule keeps a
 //! contact IP in HOST order (MSByte = first octet) and `WriteUInt32`s it
 //! little-endian to disk/wire, so our `read_u32` (LE) recovers that host-order
-//! value directly - e.g. 95.236.36.250 -> 0x5FEC24FA. The dotted quad is thus
+//! value directly - e.g. 5.6.7.250 -> 0x050607FA. The dotted quad is thus
 //! the BIG-endian view of `ip` (`Ipv4Addr::from(ip)`), NOT `to_le_bytes` (which
-//! yields the reversed 250.36.236.95, a multicast address the packet never
-//! reaches). A peer's socket IP converts back with `u32::from(Ipv4Addr)`. The
+//! yields the reversed 250.7.6.5, a RESERVED address the packet never reaches).
+//! (The example used to be an address captured off the live network; this repo
+//! is public, so it is now a synthetic one chosen to reverse into reserved
+//! space exactly as the captured one did.) A peer's socket IP converts back with `u32::from(Ipv4Addr)`. The
 //! same u32 feeds `udp_verify_key`, so the key we issue on send matches the one
 //! we recompute on receive (same peer, same convention both directions).
 
@@ -1445,7 +1447,17 @@ impl KadNode {
                         continue;
                     };
                     if ev.kind == ReqKind::Find {
-                        finds_inflight -= 1;
+                        // SATURATING, and the difference is a wedge vs a wobble.
+                        // The panic arm above cannot tell which KIND died (there
+                        // is no `ev` to read), so it decrements unconditionally -
+                        // meaning one panicking VALUE task can leave this at 0
+                        // while a real Find is still outstanding. A plain `-= 1`
+                        // then wraps in release, `ALPHA_QUERY.saturating_sub` of
+                        // a huge number is 0, and the lookup never dispatches
+                        // another FIND_NODE until the overall deadline. Counting
+                        // slightly low merely over-parallelises for one round;
+                        // wrapping stops the search dead.
+                        finds_inflight = finds_inflight.saturating_sub(1);
                     }
                     match ev.outcome {
                         Some((payload, verified, sender_vk)) => {
@@ -1719,13 +1731,15 @@ mod tests {
 
     #[test]
     fn contact_ip_uses_the_big_endian_view_confirmed_live() {
-        // A real fresh-nodes.dat contact: wire bytes FA 24 EC 5F -> read_u32 LE
-        // 0x5FEC24FA -> the real IP is 95.236.36.250 (a valid public host), NOT
-        // the byte-reversed 250.36.236.95 (multicast). This convention is what
-        // made the live Wave-6 bootstrap gate pass.
-        let ip: u32 = 0x5FEC_24FA;
+        // A nodes.dat contact: wire bytes FA 07 06 05 -> read_u32 LE
+        // 0x050607FA -> the IP is 5.6.7.250 (a valid public host), NOT the
+        // byte-reversed 250.7.6.5 (reserved). This convention is what made the
+        // live Wave-6 bootstrap gate pass. The address is SYNTHETIC but keeps
+        // the property the captured one had - reversing it lands in reserved
+        // space, which is how the original bug announced itself.
+        let ip: u32 = 0x0506_07FA;
         let addr = contact_addr(ip, 4672);
-        assert_eq!(addr, "95.236.36.250:4672".parse().unwrap());
+        assert_eq!(addr, "5.6.7.250:4672".parse().unwrap());
         // Round-trips back to the same host-order u32 the record stored.
         assert_eq!(ip_u32(&addr), ip);
     }

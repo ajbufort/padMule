@@ -1,13 +1,16 @@
 //! mule-cli: the headless dev + live-network harness for the engine on Linux.
-//! 26 subcommands across the whole surface: server login + lifecycle (login,
+//! 30 subcommands across the whole surface: server login + lifecycle (login,
 //! login-any, listen), server search + offers (global-search, server-search,
 //! related-search, offer-search, offer-hold), hashing + serving (hash-file,
 //! serve-file), peer transfer + diagnostics (peer-download, peer-probe,
 //! sec-ident), the full Kad surface (kad-bootstrap, kad-serve, kad-search,
-//! kad-fetch, kad-keyword), links + filters (link, ipfilter), port mapping (upnp,
-//! upnp-unicast, upnp-query, upnp-unmap, natpmp), and the completion-optimized
-//! fetchers (search-download, fetch-complete). Run with no arguments for
-//! usage; the match in `main` is the authoritative list.
+//! kad-fetch, kad-keyword), AICH (aich-hash, aich-probe), links + filters (link,
+//! ipfilter), discovery (server-crawl), port mapping (upnp, upnp-unicast,
+//! upnp-query, upnp-unmap, natpmp), and the completion-optimized fetchers
+//! (search-download, fetch-complete). Run with no arguments for usage; the match
+//! in `main` is the authoritative list. (This header read "26" and listed 27
+//! while shipping 30 until the 2026-08-08 reanalysis - keep the count honest
+//! when adding a subcommand.)
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::path::Path;
