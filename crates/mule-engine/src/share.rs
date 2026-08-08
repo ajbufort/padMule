@@ -1120,8 +1120,21 @@ where
                     Err(e) => return Err(FrameError::Protocol(e)),
                 };
                 for (s, e) in blocks {
-                    // The range came off the network: never read past the file.
-                    if s <= e && e <= f.size {
+                    // The range came off the network: never read past the file,
+                    // and never let one request name a slab of arbitrary size.
+                    // `read_range` allocates `end - start` bytes, so without the
+                    // width bound the only ceiling is the shared file itself and
+                    // a single packet could exhaust a ~100MB jetsam budget.
+                    // BOTH authorities agree and neither is subtle: eMule 0.50a
+                    // throws IDS_ERR_LARGEREQBLOCK ("Client requested too large
+                    // of a block") on `i64uTogo > EMBLOCKSIZE*3`
+                    // (UploadClient.cpp:316-317); aMule drops the block with
+                    // "AddReqBlock: Block request too large" on the identical
+                    // condition (UploadClient.cpp:320). Three blocks is the
+                    // entire legitimate window - it is what a real eMule keeps
+                    // pending (see `a_restated_block_window_is_not_served_twice`),
+                    // so this refuses nothing an honest downloader asks for.
+                    if s <= e && e <= f.size && e - s <= 3 * EMBLOCKSIZE {
                         // Already streamed on this connection: the peer is
                         // re-stating its 3-block window (see `recently_sent`),
                         // not asking again. Sending it a second time is pure
@@ -2352,6 +2365,156 @@ mod tests {
         assert_eq!(
             start, 3000,
             "the re-stated blocks 1 and 2 must be SKIPPED - only the new block 3 is sent"
+        );
+
+        drop(fs);
+        up.await.unwrap();
+    }
+
+    /// A peer cannot make us allocate an arbitrary slab by asking for one huge
+    /// block. `read_range` does `vec![0u8; end - start]`, so without a size
+    /// bound the only ceiling is the shared file itself - and on a ~100MB
+    /// jetsam budget a single request naming a large shared file is enough to
+    /// end the app. BOTH authorities agree on the limit and neither is subtle
+    /// about it: eMule 0.50a throws `IDS_ERR_LARGEREQBLOCK` ("Client requested
+    /// too large of a block") on `i64uTogo > EMBLOCKSIZE*3`
+    /// (UploadClient.cpp:316-317), and aMule drops the block with
+    /// "AddReqBlock: Block request too large" on the identical condition
+    /// (UploadClient.cpp:320). Three blocks is the whole legitimate window -
+    /// it is exactly what a real eMule keeps pending
+    /// (`a_restated_block_window_is_not_served_twice` above).
+    ///
+    /// Driven through the REAL serve loop rather than against `read_range`,
+    /// because the allocation is a property of that loop: a bound proven on a
+    /// helper says nothing about whether the packet path reaches it, which is
+    /// the row-8bk mistake (an AICH answer that was correct and unreachable).
+    /// The legal request afterwards is the other half of the assertion - it
+    /// proves the refusal is SELECTIVE and did not simply kill the session,
+    /// which a "no data came back" test alone would happily accept.
+    #[tokio::test]
+    async fn an_oversized_block_request_is_refused_without_killing_the_session() {
+        use crate::transfer::{build_request_parts, OP_SENDINGPART};
+        use mule_proto::{Packet, PROT_EMULE};
+        let hash = [0x7E; 16];
+        let size = 4 * EMBLOCKSIZE;
+        let shared = vec![SharedFile {
+            hash,
+            size,
+            name: b"oversize.bin".to_vec(),
+            part_hashes: vec![],
+            path: fixture_file("oversize", size as usize),
+            rating: 0,
+            comment: String::new(),
+            aich_root: None,
+        }];
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let up = tokio::spawn(async move {
+            let me = HelloInfo::baseline([0xBB; 16], 0, 4662, 4672, "seed");
+            if let Ok((_p, mut fs)) = accept_peer(&listener, &me).await {
+                let _ = serve_shared(&mut fs, &shared, None, None, 0, Default::default()).await;
+            }
+        });
+        let me = HelloInfo::baseline([0xAA; 16], 0x0A00_0001, 4663, 4673, "dl");
+        let (_p, mut fs) = connect_peer(addr, &me).await.unwrap();
+
+        fs.write_packet(&Packet::new(PROT_EMULE, OP_SETREQFILEID, hash.to_vec()))
+            .await
+            .unwrap();
+
+        // ONE byte past the limit: the boundary is the whole rule, and a test
+        // that overshoots by a megabyte would still pass against a bound set
+        // anywhere in between.
+        let over = 3 * EMBLOCKSIZE + 1;
+        fs.write_packet(&build_request_parts(&hash, &[(0u64, over)]))
+            .await
+            .unwrap();
+        // Then a plainly legal block, distinct offset so the two are telling apart.
+        fs.write_packet(&build_request_parts(&hash, &[(1000u64, 2000u64)]))
+            .await
+            .unwrap();
+
+        // BOUNDED: a refusal produces no packet at all, so an unbounded read
+        // would hang instead of failing - and a test that hangs on regression
+        // reads as an infrastructure problem rather than the defect it caught.
+        let p = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let p = fs.read_packet_unpacked().await.unwrap();
+                if p.opcode == OP_SENDINGPART {
+                    break p;
+                }
+            }
+        })
+        .await
+        .expect("the legal block must still be served - nothing came back at all");
+        let start = u32::from_le_bytes(p.payload[16..20].try_into().unwrap()) as u64;
+        assert_eq!(
+            start, 1000,
+            "the oversized block must be refused and the legal one still served; \
+             a stream starting at 0 means the {over}-byte ask was honoured"
+        );
+
+        drop(fs);
+        up.await.unwrap();
+    }
+
+    /// The bound is `> EMBLOCKSIZE * 3`, so a request of EXACTLY three blocks
+    /// is legitimate and must still be served. Pinned separately because a fix
+    /// that used `>=`, or that clamped to one block, would leave the test above
+    /// green while breaking every real eMule downloader - they all request the
+    /// full three-block window.
+    #[tokio::test]
+    async fn a_request_of_exactly_three_blocks_is_still_served() {
+        use crate::transfer::{build_request_parts, OP_SENDINGPART};
+        use mule_proto::{Packet, PROT_EMULE};
+        let hash = [0x7F; 16];
+        let size = 4 * EMBLOCKSIZE;
+        let shared = vec![SharedFile {
+            hash,
+            size,
+            name: b"exact3.bin".to_vec(),
+            part_hashes: vec![],
+            path: fixture_file("exact3", size as usize),
+            rating: 0,
+            comment: String::new(),
+            aich_root: None,
+        }];
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let up = tokio::spawn(async move {
+            let me = HelloInfo::baseline([0xBB; 16], 0, 4662, 4672, "seed");
+            if let Ok((_p, mut fs)) = accept_peer(&listener, &me).await {
+                let _ = serve_shared(&mut fs, &shared, None, None, 0, Default::default()).await;
+            }
+        });
+        let me = HelloInfo::baseline([0xAA; 16], 0x0A00_0001, 4663, 4673, "dl");
+        let (_p, mut fs) = connect_peer(addr, &me).await.unwrap();
+
+        fs.write_packet(&Packet::new(PROT_EMULE, OP_SETREQFILEID, hash.to_vec()))
+            .await
+            .unwrap();
+        fs.write_packet(&build_request_parts(&hash, &[(0u64, 3 * EMBLOCKSIZE)]))
+            .await
+            .unwrap();
+
+        // Bounded for the same reason as the test above: if a fix set the
+        // boundary one block too tight, this must FAIL rather than hang.
+        let p = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let p = fs.read_packet_unpacked().await.unwrap();
+                if p.opcode == OP_SENDINGPART {
+                    break p;
+                }
+            }
+        })
+        .await
+        .expect("exactly 3 blocks is the LEGAL window - refusing it breaks every real eMule");
+        let start = u32::from_le_bytes(p.payload[16..20].try_into().unwrap()) as u64;
+        assert_eq!(
+            start, 0,
+            "exactly 3 blocks is the legal window, not one over"
         );
 
         drop(fs);

@@ -2874,6 +2874,7 @@ impl Engine {
                 servers: Vec::new(),
             });
         let before = base.servers.len() as u32;
+        let incoming = Self::vet_downloaded_servers(incoming, self.ip_filter.as_deref());
         let merged = merge_server_met(&base, &incoming);
         let total = merged.servers.len() as u32;
         if write_bytes_atomic(&path, &write_server_met(&merged)).is_err() {
@@ -2915,14 +2916,64 @@ impl Engine {
     /// hostile, and adding it would later point the UDP status probe (and the
     /// crawl itself) at our own network - the SSRF posture from build-progress
     /// 8z/B8 applies to anything that becomes a datagram target.
+    /// Drop entries a DOWNLOADED server list must never be able to introduce:
+    /// unroutable/private/loopback addresses, port 0, and anything the user's
+    /// blocklist covers.
+    ///
+    /// Same posture as [`Engine::merge_discovered_servers`] and for the same
+    /// reason - "anything that becomes a datagram target" - but this is the
+    /// path that actually needed it. A list is fetched over PLAIN HTTP from a
+    /// user-configured URL (`update_server_list` rejects anything but
+    /// `http://`), so both the publisher and any intermediary can choose its
+    /// contents; every entry then becomes a UDP target of the status probe and
+    /// the global search. The crawl was gated from the start and this was not,
+    /// which is the more dangerous way round: the crawl only ever learns
+    /// addresses from servers, while this ingests a file wholesale.
+    ///
+    /// Vetting happens HERE, at ingestion, rather than at the fan-out on
+    /// purpose: a LAN or loopback server the user added themselves is
+    /// legitimate and stays usable (padMule's own eserver oracle runs on
+    /// 127.0.0.1), so gating the send sites would have broken a supported setup
+    /// while leaving the injection path open.
+    fn vet_downloaded_servers(met: ServerMet, filter: Option<&IpFilter>) -> ServerMet {
+        let servers = met
+            .servers
+            .into_iter()
+            .filter(|s| {
+                let ip = ip_from_met_u32(s.ip);
+                s.port != 0
+                    && crate::fetch::is_routable_public_v4(ip)
+                    // HOST ORDER, not the met u32. `is_blocked_u32` compares
+                    // against ranges parsed from dotted quads, so the met
+                    // convention (low byte = first octet) is byte-REVERSED
+                    // relative to it and silently matches the wrong ranges.
+                    && filter.is_none_or(|f| !f.is_blocked_u32(u32::from(ip)))
+            })
+            .collect();
+        ServerMet {
+            header: met.header,
+            servers,
+        }
+    }
+
     async fn merge_discovered_servers(&mut self, pending: Vec<(u32, u16)>) -> u32 {
         let filter = self.ip_filter.clone();
         let fresh: Vec<Server> = pending
             .into_iter()
             .filter(|&(ip, port)| {
+                let addr = ip_from_met_u32(ip);
                 port != 0
-                    && crate::fetch::is_routable_public_v4(ip_from_met_u32(ip))
-                    && filter.as_deref().is_none_or(|f| !f.is_blocked_u32(ip))
+                    && crate::fetch::is_routable_public_v4(addr)
+                    // HOST ORDER. This passed the raw met u32 until 2026-08-08,
+                    // which is byte-REVERSED relative to the ranges
+                    // `is_blocked_u32` holds - so the user's blocklist was
+                    // consulted with a scrambled address and never actually
+                    // filtered a discovered server. Verified empirically:
+                    // 85.17.116.222 reads unblocked as the met u32 and blocked
+                    // as the host-order one, against the same filter.
+                    && filter
+                        .as_deref()
+                        .is_none_or(|f| !f.is_blocked_u32(u32::from(addr)))
             })
             .map(|(ip, port)| Server {
                 ip,
@@ -4406,7 +4457,26 @@ impl Engine {
                         Ok(crate::upnp::RefreshOutcome::Remapped) => {
                             format!("UPnP: re-mapped port {port} after resume")
                         }
-                        Err(e) => format!("UPnP: could not refresh port {port} ({e})"),
+                        Err(e) => {
+                            // STOP CLAIMING A MAPPING WE JUST FAILED TO CONFIRM.
+                            // `public_ip` is documented as "set only on a
+                            // successful map and cleared when the mapping is
+                            // released", and `has_port_mapping()` is exactly
+                            // that Option being Some - so leaving it set after a
+                            // failed refresh makes the Status row keep saying
+                            // "mapped" for a port that may no longer be
+                            // forwarded, which is the very failure the doc above
+                            // this function describes. It also stops the Kad
+                            // verify-key echo minting keys against an address
+                            // we can no longer vouch for. Clearing is
+                            // self-healing rather than pessimistic: the next
+                            // trigger sees no mapping and takes the Map retry
+                            // arm below.
+                            if let Ok(mut g) = public_ip.lock() {
+                                *g = None;
+                            }
+                            format!("UPnP: could not refresh port {port} ({e})")
+                        }
                     }
                 }
                 // The RETRY: start()'s attempt failed, so try again on the very
@@ -4939,6 +5009,71 @@ mod tests {
     /// contacts sharing ONE IP are what close that: `gate_loaded_nodes` has no
     /// per-IP cap and passes all three, and only the live layer's anti-sybil
     /// `MAX_CONTACTS_PER_IP` cuts them to one.
+    /// A DOWNLOADED server list cannot point padMule at private space.
+    ///
+    /// `update_server_list` fetches over PLAIN HTTP from a user-configured URL,
+    /// so the publisher - or anyone between - chooses the bytes, and every
+    /// entry that lands in server.met becomes a UDP target for the status probe
+    /// and the global search. The crawl path was gated from the beginning; this
+    /// one was not, which is the wrong way round, because the crawl only learns
+    /// addresses one at a time from servers while this ingests a whole file.
+    ///
+    /// The vetting sits at INGESTION, not at the send sites, so a loopback or
+    /// LAN server the USER added stays usable - padMule's own eserver oracle
+    /// runs on 127.0.0.1, and gating the fan-out would have broken it while
+    /// leaving this hole open.
+    #[test]
+    fn a_downloaded_server_list_cannot_smuggle_in_private_space() {
+        let met_ip = |a: u8, b: u8, c: u8, d: u8| u32::from_le_bytes([a, b, c, d]);
+        let srv = |ip: u32, port: u16| Server {
+            ip,
+            port,
+            tags: Vec::new(),
+        };
+        let hostile = ServerMet {
+            header: 0xE0,
+            servers: vec![
+                srv(met_ip(85, 17, 116, 222), 4242), // routable - kept
+                srv(met_ip(127, 0, 0, 1), 4242),     // loopback - our own machine
+                srv(met_ip(192, 168, 0, 5), 4242),   // the user's LAN
+                srv(met_ip(10, 1, 2, 3), 4242),      // private
+                srv(met_ip(169, 254, 1, 1), 4242),   // link-local
+                srv(met_ip(77, 42, 68, 79), 0),      // port 0
+                srv(met_ip(77, 42, 68, 80), 5000),   // routable - kept
+            ],
+        };
+
+        let vetted = Engine::vet_downloaded_servers(hostile, None);
+        assert_eq!(
+            vetted.servers.len(),
+            2,
+            "only the two routable public entries may survive"
+        );
+        assert!(
+            vetted
+                .servers
+                .iter()
+                .all(|s| crate::fetch::is_routable_public_v4(ip_from_met_u32(s.ip))),
+            "no unroutable address may reach server.met"
+        );
+
+        // The user's blocklist applies to a downloaded list as well - it gates
+        // sources and Kad contacts, so a server list must not be the way around it.
+        let filter = IpFilter::parse("85.17.116.0 - 85.17.116.255 , 0 , blocked\n", 127);
+        let vetted = Engine::vet_downloaded_servers(
+            ServerMet {
+                header: 0xE0,
+                servers: vec![
+                    srv(met_ip(85, 17, 116, 222), 4242),
+                    srv(met_ip(77, 42, 68, 80), 5000),
+                ],
+            },
+            Some(&filter),
+        );
+        assert_eq!(vetted.servers.len(), 1, "a blocklisted server is dropped");
+        assert_eq!(vetted.servers[0].port, 5000);
+    }
+
     #[tokio::test]
     async fn seeding_the_live_table_applies_the_same_gates_as_the_wire() {
         let dir = tmp("kad-seed-gates");
@@ -4960,8 +5095,15 @@ mod tests {
             // Caught by the ENGINE layer (gate_loaded_nodes).
             mk(0x7F00_0001, 4672, 8, 1), // loopback
             mk(0xC0A8_0105, 4672, 8, 2), // private LAN
-            mk(0x0808_0808, 4672, 1, 3), // Kad1 - the protocol cannot talk to it
             mk(0x0909_0909, 53, 5, 4),   // legacy node on the DNS port
+            // Caught EARLIER, by the routing table itself: a Kad1 contact never
+            // enters ANY routing table, because eMule runs its whole insert
+            // inside `uVersion > 1` (RoutingZone.cpp:494) and aMule applies the
+            // same filter when loading nodes.dat (RoutingZone.cpp:192-203).
+            // This is why the fixture count below is 6 and not 7 - the entry is
+            // refused before `Engine::routing` ever holds it, so it cannot
+            // reach the engine gate that used to catch it.
+            mk(0x0808_0808, 4672, 1, 3), // Kad1 - the protocol cannot talk to it
             // Pass the engine layer; only the LIVE layer's per-IP cap cuts these
             // three down to one.
             mk(0x0101_0101, 4672, 8, 5),
@@ -4970,8 +5112,9 @@ mod tests {
         ]);
         assert_eq!(
             engine.routing.len(),
-            7,
-            "the fixture itself must survive intact"
+            6,
+            "the fixture must survive intact EXCEPT the Kad1 contact, which the \
+             table refuses outright"
         );
 
         engine.start_kad().await;
@@ -5354,10 +5497,23 @@ mod tests {
             h.push((met_ip(192, 168, 0, 5), 4242)); // LAN - dropped
             h.push((met_ip(127, 0, 0, 1), 4242)); // loopback - dropped
             h.push((met_ip(8, 8, 8, 8), 0)); // port 0 - dropped
+            h.push((met_ip(91, 200, 13, 76), 4242)); // blocklisted below - dropped
         }
+        // THE USER'S BLOCKLIST MUST REACH THIS PATH, and it did not: the filter
+        // was consulted with the raw met u32, which is byte-REVERSED relative to
+        // the ranges `is_blocked_u32` holds, so a blocked address read as some
+        // unrelated one and sailed through. The address below is only ever
+        // dropped if the conversion is right.
+        engine.ip_filter = Some(std::sync::Arc::new(IpFilter::parse(
+            "91.200.13.0 - 91.200.13.255 , 0 , blocked\n",
+            DEFAULT_IPFILTER_LEVEL,
+        )));
 
         let added = engine.maintain_server_harvest().await;
-        assert_eq!(added, 2, "only the two routable public servers are added");
+        assert_eq!(
+            added, 2,
+            "only the two routable, non-blocklisted servers are added"
+        );
 
         // Persisted, and re-harvesting the SAME set adds nothing (dedup).
         let bytes = std::fs::read(dir.join("server.met")).unwrap();

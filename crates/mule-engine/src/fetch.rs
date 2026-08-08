@@ -629,17 +629,21 @@ mod tests {
 
     #[test]
     fn kad_highid_source_uses_the_big_endian_ip_view() {
-        // A real resolved Kad source: host-order ip 0x3176F386 -> 49.118.243.134.
+        // A Kad source, host-order ip 0x01020304 -> 1.2.3.4. A SYNTHETIC
+        // placeholder, not a captured peer: this repo is public and a real
+        // address harvested off the live network identifies a real person.
+        // It must stay ROUTABLE though - `is_routable_public_v4` rejects the
+        // RFC5737 documentation ranges, so those cannot be used here.
         let s = Source {
             client_hash: Kad128::from_hash(&[0xAB; 16]),
             source_type: 1,
-            ip: Some(0x3176_F386),
+            ip: Some(0x0102_0304),
             tcp_port: Some(4662),
             udp_port: Some(4672),
             crypt: None,
         };
         let ps = PeerSource::from_kad(&s).unwrap();
-        assert_eq!(ps.addr, "49.118.243.134:4662".parse().unwrap());
+        assert_eq!(ps.addr, "1.2.3.4:4662".parse().unwrap());
         assert_eq!(ps.origin, SourceOrigin::Kad);
         // The userhash is the canonical form of the client hash.
         assert_eq!(ps.user_hash, Some([0xAB; 16]));
@@ -656,7 +660,7 @@ mod tests {
         let base = Source {
             client_hash: Kad128::from_hash(&[0xAB; 16]),
             source_type: 1,
-            ip: Some(0x3176_F386),
+            ip: Some(0x0102_0304),
             tcp_port: Some(4662),
             udp_port: Some(4672),
             crypt: None,
@@ -734,7 +738,7 @@ mod tests {
             let s = Source {
                 client_hash: Kad128::default(),
                 source_type: t,
-                ip: Some(0x3176_F386),
+                ip: Some(0x0102_0304),
                 tcp_port: Some(4662),
                 udp_port: Some(4672),
                 crypt: None,
@@ -748,8 +752,8 @@ mod tests {
 
     #[test]
     fn server_source_uses_the_ed2k_low_byte_ip_view() {
-        // eD2k low-byte: 49.118.243.134 -> 49 | 118<<8 | 243<<16 | 134<<24.
-        let ip = 49u32 | (118 << 8) | (243 << 16) | (134 << 24);
+        // eD2k low-byte: 1.2.3.4 -> 1 | 2<<8 | 3<<16 | 4<<24.
+        let ip = 1u32 | (2 << 8) | (3 << 16) | (4 << 24);
         let s = FoundSource {
             ip,
             port: 4662,
@@ -757,7 +761,7 @@ mod tests {
             user_hash: Some([0xCD; 16]),
         };
         let ps = PeerSource::from_found(&s).unwrap();
-        assert_eq!(ps.addr, "49.118.243.134:4662".parse().unwrap());
+        assert_eq!(ps.addr, "1.2.3.4:4662".parse().unwrap());
         assert_eq!(ps.origin, SourceOrigin::Server);
     }
 
@@ -886,14 +890,14 @@ mod tests {
         let kad = Source {
             client_hash: Kad128::default(),
             source_type: 1,
-            ip: Some(0x3176_F386), // 49.118.243.134
+            ip: Some(0x0102_0304), // 1.2.3.4
             tcp_port: Some(4662),
             udp_port: Some(4672),
             crypt: None,
         };
-        // The same peer from the server (eD2k low-byte 49.118.243.134, same port).
+        // The same peer from the server (eD2k low-byte 1.2.3.4, same port).
         let srv = FoundSource {
-            ip: 49u32 | (118 << 8) | (243 << 16) | (134 << 24),
+            ip: 1u32 | (2 << 8) | (3 << 16) | (4 << 24),
             port: 4662,
             crypt: None,
             user_hash: None,

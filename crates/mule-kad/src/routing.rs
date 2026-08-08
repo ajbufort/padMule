@@ -121,6 +121,31 @@ impl Zone {
         if let Node::Leaf(bin) = &mut self.node {
             // Already known? Move to back (most-recently-seen).
             if let Some(pos) = bin.iter().position(|c| c.id == contact.id) {
+                // ANTI-HIJACK, at the TABLE (eMule RoutingZone.cpp:525-533).
+                // A contact we hold a sender key for is one we have actually
+                // corresponded with; eMule refuses to update such an entry from
+                // a packet that does not carry the SAME key, and an EMPTY key
+                // explicitly fails that test ("failed to provide the proper
+                // sender key (Sent Empty: Yes) ... denying update"). A contact
+                // named inside a third party's KADEMLIA2_RES payload carries no
+                // key, so that is precisely the packet being refused.
+                //
+                // NARROWER THAN eMULE, DELIBERATELY, and this is the one place
+                // it matters: eMule denies the whole update, but its incoming
+                // contact carries the sender's key, so a peer refreshing itself
+                // still passes. padMule records keys OUT OF BAND
+                // (`note_verify_key`), so `add` NEVER carries one - denying
+                // every update would also kill honest same-address refreshes.
+                // Refusing only the ADDRESS CHANGE keeps the security property
+                // (a third party cannot move a contact we have talked to) while
+                // leaving refreshes working. Left un-refreshed too: an attacker
+                // must not be able to forge a liveness signal either.
+                if bin[pos].udp_key != 0
+                    && contact.udp_key == 0
+                    && (bin[pos].ip != contact.ip || bin[pos].udp_port != contact.udp_port)
+                {
+                    return;
+                }
                 let old = bin.remove(pos);
                 let mut contact = contact;
                 // The verified bit is monotonic ONLY while the IP is unchanged
@@ -258,7 +283,12 @@ impl RoutingTable {
         version: u8,
         verified: bool,
     ) {
-        if id == self.self_id {
+        // eMule runs its entire insert inside `if (uID != uMe && uVersion > 1)`
+        // (RoutingZone.cpp:494), so BOTH conditions belong at this one gate
+        // rather than at each caller. Kad1 contacts cannot speak the Kad2 wire
+        // padMule sends, so every request to one is a wasted datagram - and
+        // `closest_to` would pass it on to other nodes as a lead.
+        if id == self.self_id || version <= 1 {
             return;
         }
         let c = Contact::new(
@@ -499,6 +529,121 @@ mod tests {
         // the id: a different address is allowed to replace it.
         rt.add(id(2), 0x0202_0202, 4672, 4662, 8, false);
         assert!(rt.is_acceptable_answer(&id(2), 0x0606_0606, 4672));
+    }
+
+    /// THE TABLE needs its own anti-hijack rule, not just the search does.
+    ///
+    /// `is_acceptable_answer` (tested above) protects the SEARCH FRONTIER, and
+    /// that split is faithful - eMule feeds the table through `AddUnfiltered`
+    /// and applies `IsAcceptableContact` only to what the search sees
+    /// (KademliaUDPListener.cpp:848, `if (bWasAdded || IsAcceptableContact)`).
+    /// But eMule's table path carries its OWN protection that padMule had lost:
+    /// a contact holding a sender key may only be updated by a packet carrying
+    /// the SAME key, and an EMPTY key explicitly fails the test - eMule logs
+    /// "failed to provide the proper sender key (Sent Empty: Yes) ... denying
+    /// update" (RoutingZone.cpp:525-533). A contact named inside a third
+    /// party's KADEMLIA2_RES payload carries no key at all, so that is exactly
+    /// the packet the rule refuses.
+    ///
+    /// Without it, one hostile answer naming a known KadID at an attacker IP
+    /// re-points the contact and drops its verified bit - and since
+    /// `closest_to` is verified-only, repeating that drains the seed pool every
+    /// future lookup starts from.
+    #[test]
+    fn a_keyed_contact_cannot_be_repointed_by_a_keyless_answer() {
+        let mut rt = RoutingTable::new(id(0));
+        let our_ip = 0x0A00_0001;
+        rt.add(id(1), 0x0101_0101, 4672, 4662, 8, true);
+        // We have CORRESPONDED with this contact: it handed us a sender key.
+        rt.note_verify_key(&id(1), 0x0101_0101, 0xDEAD_BEEF, our_ip);
+
+        // The hijack: a third party's answer names id(1) at ITS address. Adds
+        // from a RES payload never carry a key (see `RoutingTable::add`).
+        rt.add(id(1), 0x0505_0505, 4672, 4662, 8, false);
+
+        assert_eq!(
+            rt.ip_of(&id(1)),
+            Some(0x0101_0101),
+            "a keyed contact must keep its address against a keyless re-point"
+        );
+        assert_eq!(
+            rt.verify_key_for(&id(1), 0x0101_0101, our_ip),
+            0xDEAD_BEEF,
+            "and must keep the key that makes it echo-able"
+        );
+        assert!(
+            rt.is_acceptable_answer(&id(1), 0x0101_0101, 4672),
+            "the contact is still verified at its real address"
+        );
+    }
+
+    /// The rule above must not break the ordinary case: a contact we hold a key
+    /// for still refreshes at its OWN address, and an UNKEYED contact (one we
+    /// have only ever heard about second-hand) is still free to move, because
+    /// we hold no evidence tying it to an address.
+    #[test]
+    fn the_repoint_refusal_is_narrow_refresh_and_unkeyed_moves_still_work() {
+        let mut rt = RoutingTable::new(id(0));
+        let our_ip = 0x0A00_0001;
+
+        rt.add(id(1), 0x0101_0101, 4672, 4662, 8, true);
+        rt.note_verify_key(&id(1), 0x0101_0101, 0xDEAD_BEEF, our_ip);
+        // Same address = a genuine refresh, still accepted.
+        rt.add(id(1), 0x0101_0101, 4672, 4662, 8, false);
+        assert_eq!(rt.ip_of(&id(1)), Some(0x0101_0101));
+        assert_eq!(
+            rt.verify_key_for(&id(1), 0x0101_0101, our_ip),
+            0xDEAD_BEEF,
+            "a refresh keeps the key"
+        );
+
+        // A contact with NO stored key has proved nothing, so it may move -
+        // this is what stops the rule freezing a table full of hearsay.
+        rt.add(id(2), 0x0202_0202, 4672, 4662, 8, false);
+        rt.add(id(2), 0x0606_0606, 4672, 4662, 8, false);
+        assert_eq!(
+            rt.ip_of(&id(2)),
+            Some(0x0606_0606),
+            "an unkeyed contact still moves"
+        );
+    }
+
+    /// KAD1 CONTACTS NEVER ENTER THE TABLE. eMule gates this at the single
+    /// insert point - `AddUnfiltered` runs its whole body inside
+    /// `if (uID != uMe && uVersion > 1)` (RoutingZone.cpp:494) - so a Kad1
+    /// contact is refused no matter which path offered it. padMule gated it
+    /// only where contacts came off DISK (`read_nodes_dat`) and in
+    /// `CSearch::add` for the FRONTIER, so a peer's answer could still put a
+    /// v0/v1 contact in the live table: the same frontier-guarded/table-open
+    /// asymmetry as the re-point above, one layer down.
+    ///
+    /// It matters because a Kad1 contact cannot speak the Kad2 wire we send -
+    /// every request addressed to it is a datagram spent on a peer that will
+    /// never answer, and `closest_to` would hand it out to others as a lead.
+    #[test]
+    fn a_kad1_contact_is_refused_by_the_table_whatever_offered_it() {
+        let mut rt = RoutingTable::new(id(0));
+        rt.add(id(1), 0x0101_0101, 4672, 4662, 1, false);
+        rt.add(id(2), 0x0202_0202, 4672, 4662, 0, false);
+        assert_eq!(rt.len(), 0, "version 0 and 1 are Kad1 - never routable");
+
+        // The same gate must hold for contacts arriving from nodes.dat, which
+        // is a separate public entry point onto the same table.
+        rt.load_nodes(&[KadContact {
+            id: id(3),
+            ip: 0x0303_0303,
+            udp_port: 4672,
+            tcp_port: 4662,
+            version: 1,
+            verified: false,
+            udp_key: 0,
+            udp_key_ip: 0,
+        }]);
+        assert_eq!(rt.len(), 0, "a Kad1 contact from disk is refused too");
+
+        // Kad2 and later are accepted, as they must be.
+        rt.add(id(4), 0x0404_0404, 4672, 4662, 2, false);
+        assert_eq!(rt.len(), 1, "version 2 is Kad2 - accepted");
     }
 
     #[test]
