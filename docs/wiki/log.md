@@ -788,3 +788,37 @@ Append-only, timestamped record of Ingest / Query / Lint passes.
   flood-limiter caveat), [[build-progress]] 8cl, [[index]] one-liner. NOT
   committed yet - left in-tree for review with the gate green (677/clippy/fmt/
   ASCII).
+
+- 2026-08-07 **A REAL amuled KEEPS padMule now - the spec's success test, passed
+  A/B, and INDEPENDENTLY RE-RUN.** `scripts/kad-verify-oracle.sh` became an
+  experiment rather than an assertion: one real amuled routing table holding TWO
+  padMules - a CONTROL at 77.77.0.8 running the old one-shot `kad-bootstrap`
+  (handshake, exit, silence, i.e. exactly what padMule used to be) and a SERVE
+  node at 77.77.0.9 running the new `mule-cli kad-serve`. Same amuled, same
+  sweeps; **the asymmetry IS the proof**, so nothing rests on reading a timer
+  value correctly. In the same second: `EVICTED contact (77.77.0.8) - probe
+  unanswered past expiry` and `REFRESH contact (77.77.0.9) type=2`. The
+  counterfactual OBSERVED rather than argued, which is the strongest shape an
+  oracle in this project has taken. Reproduced on a second, independent run.
+  **No timer was shortened** - the feasibility worry was unfounded once the real
+  cadence was READ instead of assumed: 60s sweeps per zone (aMule
+  Kademlia.cpp:254-257; eMule 0.50a Kademlia.cpp:276-277) and +2min type=4
+  expiry (Contact.cpp:90 / 0.50a Contact.cpp:223), so the cycle fits in ~5
+  minutes. The instrumentation grew 2 -> 7 hunks because stock amuled logs
+  nothing about probes or evictions; verified by hand as pure insertion with
+  zero removed lines, every added line a log call or a comment, and the pristine
+  `amule-3.0.1/` untouched.
+  **THE PLAN AND SPEC WERE BOTH WRONG ABOUT THE PROBE:** OnSmallTimer sends a
+  HELLO_REQ, not a PING (RoutingZone.cpp:792-816). That is load-bearing for the
+  flood limiter - liveness rides HELLO at 1/min against a 3/min budget, so the
+  limiter and survival coexist, and the PONG gaps in the log are amuled's
+  extern-port pings exceeding our 2/min PING budget, i.e. the limiter working BY
+  DESIGN. Anyone reading that log must not score it as a serve-loop failure.
+  Also noted: `FloodTracker`'s window RESETS rather than slides, so "2/min" is
+  approximate at window boundaries.
+  Last engine gap closed alongside: an inbound HELLO's sender verify key is now
+  STORED, so our next request echoes it and the peer can verify US. Without it
+  verification was one-directional - they prove their IP to us, we stay unproven
+  in their table, which is the state that gets a contact evicted, so the serve
+  loop would have solved half its own problem. Gate: 678 tests x3, clippy, fmt,
+  ASCII.
