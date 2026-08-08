@@ -9,7 +9,11 @@
 # THE GUARDS ARE THE POINT, not the convenience. Each one exists because its
 # absence already cost a session:
 #
-#   1. CI must be GREEN for the exact sha. A red build never reaches the device.
+#   1. ALL THREE CI workflows must be GREEN for the exact sha - the iOS build,
+#      the Rust unit gate AND the Swift simulator tests. Until 2026-08-07 this
+#      only checked the iOS build: the Rust gate was dispatched and its result
+#      never read, and the Swift tests were never dispatched at all, so a red
+#      workspace would ship.
 #   2. The artifact's headSha must equal local HEAD. On 2026-08-07 a
 #      `gh run download` hit a pre-existing file, errored, and a two-day-old
 #      artifact was one step from being delivered as current.
@@ -48,23 +52,47 @@ if [ -n "$(git status --porcelain)" ]; then
   exit 1
 fi
 
+BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 echo "-- dispatching CI on this sha"
-gh workflow run "iOS build (unsigned IPA)" --ref "$(git rev-parse --abbrev-ref HEAD)"
-gh workflow run "Rust unit gate" --ref "$(git rev-parse --abbrev-ref HEAD)"
+# ALL THREE, and all three are CHECKED below. Until 2026-08-07 this script
+# dispatched the Rust gate and never read its conclusion, and never dispatched
+# the Swift tests at all - so guard 1 ("CI must be GREEN for the exact sha")
+# was true only of the iOS build, and a red workspace would ship. That matters
+# more since row 8ci, because the Swift suite is what RENDERS the views, and
+# rendering is the only thing that can catch a layout bug the accessibility
+# tree reads as correct.
+for wf in "iOS build (unsigned IPA)" "Rust unit gate" "iOS unit tests (simulator)"; do
+  gh workflow run "$wf" --ref "$BRANCH"
+done
 sleep 15
 
-RID=$(gh run list --workflow="iOS build (unsigned IPA)" --limit 1 --json databaseId,headSha \
-      -q "[.[] | select(.headSha==\"$SHA\")][0].databaseId")
-[ -n "$RID" ] || { echo "ABORT: no iOS run found for $SHORT" >&2; exit 1; }
-echo "-- iOS run $RID"
+# Find a workflow's run FOR THIS EXACT SHA, wait for it, and require success.
+# --limit 20, not 1: the newest run of a workflow is not necessarily ours (a
+# parallel branch, a re-run), and with --limit 1 a mismatch looked identical to
+# "CI has not started yet".
+run_id_for () {
+  gh run list --workflow="$1" --limit 20 --json databaseId,headSha \
+    -q "[.[] | select(.headSha==\"$SHA\")][0].databaseId"
+}
+require_green () {
+  local wf="$1" rid=""
+  for _ in $(seq 1 12); do
+    rid=$(run_id_for "$wf"); [ -n "$rid" ] && break; sleep 10
+  done
+  [ -n "$rid" ] || { echo "ABORT: no '$wf' run found for $SHORT" >&2; exit 1; }
+  echo "-- $wf: run $rid" >&2
+  until [ "$(gh run view "$rid" --json status -q .status)" = "completed" ]; do sleep 20; done
+  local conc; conc=$(gh run view "$rid" --json conclusion -q .conclusion)
+  [ "$conc" = "success" ] || { echo "ABORT: '$wf' $conc - nothing reaches the device" >&2; exit 1; }
+  # GUARD 2 per workflow: the run must BE this commit.
+  local head; head=$(gh run view "$rid" --json headSha -q .headSha)
+  [ "$SHA" = "$head" ] || { echo "ABORT: '$wf' run is $head, HEAD is $SHA" >&2; exit 1; }
+  echo "$rid"
+}
 
-until [ "$(gh run view "$RID" --json status -q .status)" = "completed" ]; do sleep 20; done
-CONC=$(gh run view "$RID" --json conclusion -q .conclusion)
-[ "$CONC" = "success" ] || { echo "ABORT: iOS build $CONC - nothing reaches the device" >&2; exit 1; }
-
-# GUARD 2: the artifact must BE this commit.
-HEADSHA=$(gh run view "$RID" --json headSha -q .headSha)
-[ "$SHA" = "$HEADSHA" ] || { echo "ABORT: run is $HEADSHA, HEAD is $SHA" >&2; exit 1; }
+RID=$(require_green "iOS build (unsigned IPA)")
+require_green "Rust unit gate" >/dev/null
+require_green "iOS unit tests (simulator)" >/dev/null
 
 echo "-- downloading into a FRESH directory"
 rm -rf "$WORK"; mkdir -p "$WORK/x"
