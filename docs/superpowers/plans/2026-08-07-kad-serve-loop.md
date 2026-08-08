@@ -1045,17 +1045,26 @@ verdict instead of the placeholder Task 3 wired."
 - Modify: `scripts/kad-verify-oracle.sh`
 - Modify: `docs/wiki/kad-verify-oracle.md`
 
-- [ ] **Step 1: Extend the oracle**
+- [x] **Step 1: Extend the oracle**
 
 The log-patched amuled already proves a real node marks padMule IP-VERIFIED.
 Extend the run so it then PINGS padMule on its `OnSmallTimer` sweep and keeps it
 in its routing table. Capture the amuled log lines showing the contact surviving
 a sweep it would previously have been evicted by.
 
-- [ ] **Step 2: Run it**
+(Done 2026-08-07. Note: the OnSmallTimer probe is a HELLO_REQ, not a PING -
+RoutingZone.cpp:792-816; the PING/PONG round trips captured come from amuled's
+extern-port path. Required `mule-cli kad-serve` - a node that stays up - plus
+five more logging-only insertions in the committed patch.)
+
+- [x] **Step 2: Run it**
 
 Run: `scripts/kad-verify-oracle.sh`
 Expected: padMule present in the real amuled's routing table AFTER a ping cycle.
+
+(PASS 2026-08-07, first attempt: serve node probed 23:18:08 and REFRESHED
+type=2; the one-shot control probed 23:19:09 and EVICTED 23:21:12 by the same
+sweeps. See [[kad-verify-oracle]].)
 
 - [ ] **Step 3: Record the result and commit**
 

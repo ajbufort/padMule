@@ -171,7 +171,11 @@ pub struct KadNode {
     /// verify key is `udp_verify_key(peer_secret, THIS)`, so we only echo a stored
     /// key while this still matches what it was minted against. 0 = unknown (echo
     /// no key - byte-identical to the pre-hard-verify wire).
-    current_public_ip: u32,
+    /// SHARED, not a plain field, for AMENDMENT 2's reason: `start_kad` calls
+    /// `set_public_ip` AFTER binding, and the read loop needs it. A verify key
+    /// is minted against OUR public ip, so a loop holding a stale 0 would bind
+    /// every inbound peer's key to the wrong address and then never echo it.
+    current_public_ip: Arc<AtomicU32>,
     /// Outbound requests waiting for their reply, matched by the read loop.
     pending: Arc<Mutex<Vec<PendingSlot>>>,
     /// Slot id source, so `request_batch` can remove exactly its own slots.
@@ -308,6 +312,7 @@ struct ReadLoop {
     /// gate that makes an inbound HELLO_RES_ACK *solicited*. See
     /// [`ACK_SOLICITED_WINDOW`].
     hello_res_sent: Arc<Mutex<HashMap<u32, StdInstant>>>,
+    current_public_ip: Arc<AtomicU32>,
 }
 
 /// How long a sent HELLO_RES makes an ACK from that IP acceptable.
@@ -509,6 +514,23 @@ async fn run_read_loop(ctx: ReadLoop) {
                     },
                     valid_receiver_key,
                 );
+                // STORE THE KEY IT HANDED US, exactly as `note_responder` does
+                // for a node that answered US. eMule's `AddContact2` takes the
+                // senderUDPKey on this path too.
+                //
+                // Without it the verification is one-directional: the peer can
+                // prove its IP to us, but our next request to it echoes NO key,
+                // so it cannot prove OURS and we stay unverified in its table -
+                // which is the state that gets us evicted. An inbound HELLO is
+                // often the FIRST contact, so this is the earliest moment the
+                // key is available.
+                let our_ip = ctx.current_public_ip.load(Ordering::Relaxed);
+                ctx.routing.lock().expect(LOCK_POISONED).note_verify_key(
+                    &h.id,
+                    from_ip,
+                    dec.sender_vk,
+                    our_ip,
+                );
             }
         }
         // Read at ANSWER time through the shared handle, never captured at
@@ -588,10 +610,12 @@ impl KadNode {
         // HANDLES above rather than capturing values, so configuration applied
         // after this point (`set_ip_filter`, `set_advertised_udp_port`) is
         // visible to it - see AMENDMENT 2 in the kad-serve-loop plan.
+        let current_public_ip = Arc::new(AtomicU32::new(0));
         let flood = Arc::new(Mutex::new(HashMap::new()));
         let hello_res_sent = Arc::new(Mutex::new(HashMap::new()));
         let read_loop = tokio::spawn(run_read_loop(ReadLoop {
             flood: Arc::clone(&flood),
+            current_public_ip: Arc::clone(&current_public_ip),
             hello_res_sent: Arc::clone(&hello_res_sent),
             socket: Arc::clone(&socket),
             kad_id,
@@ -612,7 +636,7 @@ impl KadNode {
             advertised_udp_port,
             routing,
             ip_filter,
-            current_public_ip: 0,
+            current_public_ip,
             pending,
             next_seq: AtomicU64::new(0),
             read_loop,
@@ -621,7 +645,11 @@ impl KadNode {
 
     /// Advertise a UDP port different from the one we bound (a VPN remote->local
     /// remap). `None` restores "advertise what we bound".
-    pub fn set_advertised_udp_port(&mut self, port: Option<u16>) {
+    /// Takes `&self`: all three of these setters now write through the SHARED
+    /// handles the read loop reads (AMENDMENT 2), so none of them needs
+    /// exclusive access - and that is the property that makes it safe to call
+    /// them AFTER the loop is already running, which `start_kad` does.
+    pub fn set_advertised_udp_port(&self, port: Option<u16>) {
         let p = port.filter(|&p| p != 0).map_or(0, u32::from);
         self.advertised_udp_port.store(p, Ordering::Relaxed);
     }
@@ -637,13 +665,13 @@ impl KadNode {
     /// Set our current public IPv4 (from the UPnP/SSDP HighID path), against which
     /// stored verify keys are minted + gated. Changing it invalidates the echo of
     /// keys minted for the old IP (they simply stop matching in `verify_key_for`).
-    pub fn set_public_ip(&mut self, ip: u32) {
-        self.current_public_ip = ip;
+    pub fn set_public_ip(&self, ip: u32) {
+        self.current_public_ip.store(ip, Ordering::Relaxed);
     }
 
     /// Install the user IP blocklist so blocklisted ranges are dropped from every
     /// routing insert (matching eMule). `None` = no filter (fail-open).
-    pub fn set_ip_filter(&mut self, filter: Option<std::sync::Arc<IpFilter>>) {
+    pub fn set_ip_filter(&self, filter: Option<std::sync::Arc<IpFilter>>) {
         *self.ip_filter.lock().expect(LOCK_POISONED) = filter;
     }
 
@@ -770,7 +798,7 @@ impl KadNode {
     /// dropping it).
     fn note_responder(&mut self, c: &WireContact, verified: bool, sender_vk: u32) {
         self.add_contact(c.id, c.ip, c.udp_port, c.tcp_port, c.version, verified);
-        let our_ip = self.current_public_ip;
+        let our_ip = self.current_public_ip.load(Ordering::Relaxed);
         self.with_routing(|t| t.note_verify_key(&c.id, c.ip, sender_vk, our_ip));
     }
 
@@ -845,7 +873,7 @@ impl KadNode {
             // which is byte-identical to the pre-hard-verify wire. This is a FIELD
             // flip only; the RC4 obfuscation stays NodeID-keyed, byte-faithful to
             // eMule (EncryptedDatagramSocket.cpp: NodeID always wins when present).
-            let our_ip = self.current_public_ip;
+            let our_ip = self.current_public_ip.load(Ordering::Relaxed);
             let echo_vk = self.with_routing(|t| t.verify_key_for(target_id, dest_ip, our_ip));
             let datagram = kad_obfuscate_request(
                 frame,
@@ -943,7 +971,7 @@ impl KadNode {
         );
         // Store the verify key it handed us (bound to our current public IP) so a
         // later request to it echoes the key and it verifies us in return.
-        let our_ip = self.current_public_ip;
+        let our_ip = self.current_public_ip.load(Ordering::Relaxed);
         self.with_routing(|t| t.note_verify_key(&res.id, contact.ip, sender_vk, our_ip));
         for c in &res.contacts {
             self.add_contact(c.id, c.ip, c.udp_port, c.tcp_port, c.version, false);
@@ -1832,7 +1860,7 @@ mod tests {
         // can verify US. A faithful loopback peer reads back that field.
         let our_id = Kad128::from_words([7, 7, 7, 7]);
         let our_ip = 0x0A00_0001u32;
-        let mut node =
+        let node =
             KadNode::bind_with_identity("127.0.0.1:0".parse().unwrap(), 4662, our_id, 0x1111)
                 .await
                 .unwrap();
@@ -1883,7 +1911,7 @@ mod tests {
         // IP-bound: after our public IP changes, the stored key no longer matches,
         // so we fall back to echoing 0 (byte-identical to the pre-hard-verify wire).
         node.set_public_ip(0x0B00_0002);
-        let now_ip = node.current_public_ip;
+        let now_ip = node.current_public_ip.load(Ordering::Relaxed);
         assert_eq!(
             node.with_routing(|t| t.verify_key_for(&peer_id, peer_ip, now_ip)),
             0
@@ -2269,6 +2297,64 @@ mod tests {
         panic!("the ack was accepted but the contact was never marked verified");
     }
 
+    /// AN INBOUND HELLO'S VERIFY KEY IS STORED, so our next request to that
+    /// peer echoes it and IT can verify US.
+    ///
+    /// Without this the verification is one-directional: the peer proves its IP
+    /// to us and we stay unproven in ITS table - which is precisely the state
+    /// that gets a contact evicted, so the serve loop would have solved half its
+    /// own problem. An inbound HELLO is often the FIRST contact, making it the
+    /// earliest moment the key exists at all.
+    #[tokio::test]
+    async fn an_inbound_hello_stores_the_senders_verify_key_for_the_echo() {
+        let node_id = Kad128::from_words([0x1, 0x2, 0x3, 0x4]);
+        let node =
+            KadNode::bind_with_identity("127.0.0.1:0".parse().unwrap(), 4662, node_id, 0x7777)
+                .await
+                .unwrap();
+        // A public ip must be set BEFORE the hello, because a key is minted
+        // against it - and it is set after bind in production, which is exactly
+        // what a captured value would get wrong.
+        let our_public = 0x0B00_0007u32;
+        node.set_public_ip(our_public);
+        let ours = node.local_addr();
+
+        let peer_id = Kad128::from_hash(&[0x44; 16]);
+        let peer_ip = ip_u32(&ours);
+        // Seeded for the same reason as the ACK test: on loopback the HELLO's
+        // own contact-add is refused by the routable-public gate, so without
+        // this there is no contact for the key to attach to.
+        node.with_routing(|t| t.add(peer_id, peer_ip, 4672, 4662, 8, false));
+        assert_eq!(
+            node.with_routing(|t| t.verify_key_for(&peer_id, peer_ip, our_public)),
+            0,
+            "precondition: no key stored yet, so we would echo nothing"
+        );
+
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_key = 0xBEEFu32;
+        let its_vk = udp_verify_key(peer_key, our_public);
+        let (op, payload) = build_hello_req(
+            &peer_id,
+            4662,
+            Some(peer.local_addr().unwrap().port()),
+            None,
+        );
+        let dg = kad_obfuscate_request(&pack_kad(op, payload), &node_id, 0x1212, 0, its_vk, 0x40);
+        peer.send_to(&dg, ours).await.unwrap();
+
+        for _ in 0..200 {
+            if node.with_routing(|t| t.verify_key_for(&peer_id, peer_ip, our_public)) == its_vk {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "the inbound hello's sender key was not stored - our next request \
+             would echo nothing and the peer could never verify us"
+        );
+    }
+
     /// AN UNSOLICITED ACK CHANGES NOTHING. eMule drops an ACK from an IP it did
     /// not send a HELLO_RES to inside 180s (`IsOnOutTrackList`,
     /// PacketTracking.cpp:84-97) - the spec omitted this gate entirely. Without
@@ -2435,7 +2521,7 @@ mod tests {
     #[tokio::test]
     async fn an_inbound_hello_is_answered_with_config_applied_after_bind() {
         let our_id = Kad128::from_words([8, 8, 8, 8]);
-        let mut node =
+        let node =
             KadNode::bind_with_identity("127.0.0.1:0".parse().unwrap(), 4662, our_id, 0x4242)
                 .await
                 .unwrap();

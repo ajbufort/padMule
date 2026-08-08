@@ -1,6 +1,30 @@
---- a/src/kademlia/routing/RoutingZone.cpp	2026-06-24 05:54:18.000000000 -0700
-+++ b/src/kademlia/routing/RoutingZone.cpp	2026-08-02 06:11:54.191264396 -0700
-@@ -488,6 +488,12 @@
+--- a/src/kademlia/net/KademliaUDPListener.cpp	2026-08-07 23:13:17.705084417 -0700
++++ b/src/kademlia/net/KademliaUDPListener.cpp	2026-08-07 23:14:04.476896015 -0700
+@@ -602,6 +602,10 @@
+ 	CUInt128 contactID;
+ 	bool sendACK = false;
+ 	bool addedOrUpdated = AddContact2(packetData, lenPacket, ip, port, &contactVersion, senderKey, validReceiverKey, true, false, &sendACK, &contactID);
++	// PADMULE-ORACLE (logging-only): a HELLO_RES arrived and was accepted as an
++	// answer to a HELLO_REQ we actually sent (CHECK_TRACKED_PACKET above) - the
++	// other side ANSWERED our liveness probe.
++	AddDebugLogLineC(logClientKadUDP, "PADMULE-ORACLE-HELLO-RES from " + KadIPToString(ip) + (addedOrUpdated ? " (contact added/updated)" : " (no table change)"));
+ 
+ 	if (sendACK) {
+ 		// the client requested us to send an ACK packet, which proves that we're not a spoofed fake contact
+@@ -1554,6 +1558,10 @@
+ {
+ 	CHECK_PACKET_MIN_SIZE(2);
+ 	CHECK_TRACKED_PACKET(KADEMLIA2_PING);
++	// PADMULE-ORACLE (logging-only): a PONG that answers a PING we actually
++	// sent (CHECK_TRACKED_PACKET above) - the full KADEMLIA2_PING/PONG round
++	// trip against the peer.
++	AddDebugLogLineC(logClientKadUDP, "PADMULE-ORACLE-PONG from " + KadIPToString(ip));
+ 
+ 	// Is this one of our legacy challenge packets?
+ 	CUInt128 contactID;
+--- a/src/kademlia/routing/RoutingZone.cpp	2026-08-07 23:13:17.705084417 -0700
++++ b/src/kademlia/routing/RoutingZone.cpp	2026-08-07 23:13:57.904230104 -0700
+@@ -488,9 +488,20 @@
  						// don't unset the verified flag (will clear itself on ipchanges)
  						if (!contactUpdate->IsIPVerified()) {
  							contactUpdate->SetIPVerified(contact->IsIPVerified());
@@ -13,7 +37,37 @@
  						}
  						outIpVerified = contactUpdate->IsIPVerified();
  						m_bin->SetAlive(contactUpdate);
-@@ -879,6 +885,11 @@
++						// PADMULE-ORACLE (logging-only): the routing-table REFRESH - an
++						// answered HELLO lands here via AddContact2's update path, so
++						// this line is the proof a probed contact was KEPT (SetAlive ->
++						// UpdateType resets its type/expiry) rather than evicted.
++						AddDebugLogLineC(logKadRouting, CFormat("PADMULE-ORACLE-REFRESH contact (%s) type=%u") % KadIPToString(contactUpdate->GetIPAddress()) % contactUpdate->GetType());
+ 						if (contact->GetReceivedHelloPacket()) {
+ 							contactUpdate->SetReceivedHelloPacket();
+ 						}
+@@ -770,6 +781,10 @@
+ 		if (c->GetType() == 4) {
+ 			if ((c->GetExpireTime() > 0) && (c->GetExpireTime() <= now)) {
+ 				if (!c->InUse()) {
++					// PADMULE-ORACLE (logging-only): the EVICTION - a type-4
++					// contact whose probe went unanswered past its expiry is
++					// removed from the routing table right here.
++					AddDebugLogLineC(logKadRouting, "PADMULE-ORACLE-EVICTED contact (" + KadIPToString(c->GetIPAddress()) + ") - probe unanswered past expiry");
+ 					m_bin->RemoveContact(c);
+ 					delete c;
+ 				}
+@@ -791,6 +806,10 @@
+ 
+ 	if (c != NULL) {
+ 		c->CheckingType();
++		// PADMULE-ORACLE (logging-only): the liveness PROBE - OnSmallTimer sends
++		// a HELLO_REQ to the oldest expired contact; silence past this point is
++		// what evicts it (CheckingType has just set type=4, expiry now+2min).
++		AddDebugLogLineC(logKadRouting, CFormat("PADMULE-ORACLE-SMALLTIMER probe -> %s (type now %u)") % KadIPToString(c->GetIPAddress()) % c->GetType());
+ 		if (c->GetVersion() >= 6) {
+ 			DebugSend(Kad2HelloReq, c->GetIPAddress(), c->GetUDPPort());
+ 			CUInt128 clientID = c->GetClientID();
+@@ -879,6 +898,11 @@
  			AddDebugLogLineN(logKadRouting, "Sender already verified (sender: " + KadIPToString(ip) + ")");
  		} else {
  			contact->SetIPVerified(true);

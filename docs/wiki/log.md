@@ -775,3 +775,16 @@ Append-only, timestamped record of Ingest / Query / Lint passes.
   behind; amended via `-F` with a quoted heredoc. **Use a file or a quoted
   heredoc for any message containing backticks, which in this repo is most of
   them.**
+- 2026-08-07 **Ingest: row 8cl - a real amuled KEEPS padMule (the serve-loop
+  success test), proven as an A/B experiment.** `mule-cli kad-serve` added (a
+  KadNode that stays up while its read loop answers); the logging-only oracle
+  patch grew five insertions (probe/evict/refresh/tracked HELLO-RES/tracked
+  PONG); `kad-verify-oracle.sh` rewritten to run the OLD one-shot behaviour as
+  a CONTROL beside the new serve node against one amuled table. First run:
+  control probed 23:19:09, EVICTED 23:21:12; serve probed 23:18:08, REFRESHED
+  type=2, never evicted. Full fidelity - the real 60s sweep and 2-min expiry
+  read out of both aMule and eMule 0.50a source, no timer shortened. Updated
+  [[kad-verify-oracle]] (A/B section, timing citations, the PONG-gap
+  flood-limiter caveat), [[build-progress]] 8cl, [[index]] one-liner. NOT
+  committed yet - left in-tree for review with the gate green (677/clippy/fmt/
+  ASCII).
