@@ -3,7 +3,9 @@
 //! padMule answers ROUTING queries only: PING, HELLO, FIND_NODE and BOOTSTRAP.
 //! It stores nothing and publishes nothing, so a search or a publish gets no
 //! answer at all - see `answer_request` for why silence is the faithful choice
-//! there rather than the lazy one.
+//! there rather than the lazy one. It also judges one inbound RESPONSE: the
+//! HELLO_RES_ACK that completes the three-way handshake our own HELLO_RES asks
+//! for - see [`accept_hello_res_ack`].
 //!
 //! Pure on purpose. The socket loop lives in `kad_live`; everything decided
 //! here (who gets a reply, what it contains, when the ACK bit is set) is a rule
@@ -11,8 +13,9 @@
 //! socket.
 
 use mule_kad::{
-    build_bootstrap_res, build_hello_res, build_kad2_res, build_pong, parse_hello, parse_kad2_req,
-    WireContact, KADEMLIA_VERSION, OP_BOOTSTRAP_REQ, OP_HELLO_REQ, OP_KAD2_REQ, OP_PING,
+    build_bootstrap_res, build_hello_res, build_kad2_res, build_pong, parse_hello,
+    parse_hello_res_ack, parse_kad2_req, WireContact, KADEMLIA_VERSION, OP_BOOTSTRAP_REQ,
+    OP_HELLO_REQ, OP_KAD2_REQ, OP_PING,
 };
 use mule_proto::Kad128;
 
@@ -157,6 +160,73 @@ pub fn answer_hello(
         payload: p,
         request_ack,
     })
+}
+
+/// What one inbound KADEMLIA2_HELLO_RES_ACK means. Returned by
+/// [`accept_hello_res_ack`]; there is no packet to send back in either case -
+/// eMule's handler (`Process_KADEMLIA2_HELLO_RES_ACK`,
+/// KademliaUDPListener.cpp:631-657) never emits one.
+///
+/// This is an enum whose accept arm CARRIES the data the action needs, rather
+/// than a bool or an Option, so the socket layer cannot mark anything verified
+/// without first destructuring the verdict - and `must_use` makes discarding
+/// the whole verdict a build error under our `-D warnings` gate.
+#[must_use = "an ignored verdict throws away the IP-verification the peer just completed"]
+#[derive(Debug, PartialEq, Eq)]
+pub enum AckVerdict {
+    /// The ACK passed every gate. The caller MUST now mark the contact with
+    /// this Kad ID verified IN ITS ROUTING TABLE - and only if that contact's
+    /// STORED address equals the datagram's source IP, which is the half of
+    /// eMule's `VerifyContact` (RoutingZone.cpp:980-996, IP check at :985-986)
+    /// that needs the table and so cannot live here. A lookup miss or an IP
+    /// mismatch is a no-op, exactly as there.
+    ///
+    /// This mark is what makes the whole handshake matter: `closest_to` hands
+    /// out only IP-verified contacts when `enforce_verified` is on, so a peer
+    /// never marked verified can never appear in any answer we give.
+    MarkSenderVerified { sender_id: Kad128 },
+    /// Drop the packet: no reply, no state change. eMule's reject paths are a
+    /// `throw` (caught and merely logged, ClientUDPSocket.cpp:178,199-213) or a
+    /// bare `return` - either way a silent drop, never a ban.
+    Drop,
+}
+
+/// Judge an inbound KADEMLIA2_HELLO_RES_ACK - the third leg of the handshake
+/// that [`answer_hello`]'s `0x04` misc-option asks for, proving the sender
+/// really receives at its claimed IP.
+///
+/// Gates, in eMule's order (`Process_KADEMLIA2_HELLO_RES_ACK`,
+/// KademliaUDPListener.cpp:631-657):
+///
+/// 1. Well-formed: at least 17 bytes, `senderID 16 | tags u8` (:633-638;
+///    [`parse_hello_res_ack`] enforces the same bound).
+/// 2. SOLICITED: eMule drops the ACK unless it sent a HELLO_RES to that IP
+///    within the last 180 seconds - `IsOnOutTrackList(uIP, KADEMLIA2_HELLO_RES)`
+///    (:639-643; PacketTracking.cpp:84-97, entry added for EVERY sent HELLO_RES
+///    at KademliaUDPListener.cpp:2049 via the opcode list PacketTracking.cpp:65,
+///    and CONSUMED on match). Note the gate is "a HELLO_RES was sent", not "the
+///    ACK bit was set in it". That clock and list belong to the socket owner;
+///    its verdict arrives here as `hello_res_recently_sent`.
+/// 3. `valid_receiver_key`: the packet echoed the verify key we issue for this
+///    sender's address. eMule hard-drops on an invalid key (:644-647) - the
+///    whole point is proving the IP, and the key is that proof.
+///
+/// All three failures are silent drops (see [`AckVerdict::Drop`]).
+pub fn accept_hello_res_ack(
+    payload: &[u8],
+    hello_res_recently_sent: bool,
+    valid_receiver_key: bool,
+) -> AckVerdict {
+    let Ok(sender_id) = parse_hello_res_ack(payload) else {
+        return AckVerdict::Drop;
+    };
+    if !hello_res_recently_sent {
+        return AckVerdict::Drop;
+    }
+    if !valid_receiver_key {
+        return AckVerdict::Drop;
+    }
+    AckVerdict::MarkSenderVerified { sender_id }
 }
 
 #[cfg(test)]
@@ -383,5 +453,60 @@ mod tests {
         for op in [0x43u8, 0x44, 0x45] {
             assert!(answer_request(op, &[0u8; 40], 5000, &me(), false, no_contacts).is_none());
         }
+    }
+
+    fn ack_from(seed: u8) -> Vec<u8> {
+        mule_kad::build_hello_res_ack(&Kad128::from_hash(&[seed; 16])).1
+    }
+
+    /// The happy path of the three-way handshake: a well-formed, solicited ACK
+    /// with a valid receiver key must come back as MarkSenderVerified CARRYING
+    /// THE SENDER'S PARSED ID - the id is what the caller marks, so a wrong or
+    /// constant id here would verify the wrong contact.
+    #[test]
+    fn a_solicited_ack_with_a_valid_key_marks_the_sender_verified() {
+        let peer = Kad128::from_hash(&[0x55; 16]);
+        match accept_hello_res_ack(&ack_from(0x55), true, true) {
+            AckVerdict::MarkSenderVerified { sender_id } => assert_eq!(
+                sender_id, peer,
+                "the verdict must carry the ID parsed from the packet"
+            ),
+            AckVerdict::Drop => panic!("an ACK that passes every gate must verify the sender"),
+        }
+    }
+
+    /// eMule hard-drops an ACK whose receiver key is invalid
+    /// (Process_KADEMLIA2_HELLO_RES_ACK, KademliaUDPListener.cpp:644-647). The
+    /// key IS the IP proof; accepting without it would let a spoofed source
+    /// address become a verified contact.
+    #[test]
+    fn an_ack_without_a_valid_receiver_key_is_dropped() {
+        assert_eq!(
+            accept_hello_res_ack(&ack_from(0x55), true, false),
+            AckVerdict::Drop
+        );
+    }
+
+    /// eMule drops an ACK from an IP it did not recently send a HELLO_RES to -
+    /// `IsOnOutTrackList(uIP, KADEMLIA2_HELLO_RES)`
+    /// (KademliaUDPListener.cpp:639-643). The design spec omitted this gate;
+    /// the source is the authority.
+    #[test]
+    fn an_unsolicited_ack_is_dropped() {
+        assert_eq!(
+            accept_hello_res_ack(&ack_from(0x55), false, true),
+            AckVerdict::Drop
+        );
+    }
+
+    /// Shorter than `senderID 16 | tags u8` is malformed and dropped
+    /// (KademliaUDPListener.cpp:633-638), never guessed at.
+    #[test]
+    fn a_malformed_ack_is_dropped() {
+        assert_eq!(
+            accept_hello_res_ack(&ack_from(0x55)[..16], true, true),
+            AckVerdict::Drop
+        );
+        assert_eq!(accept_hello_res_ack(&[], true, true), AckVerdict::Drop);
     }
 }
