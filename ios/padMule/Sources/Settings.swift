@@ -24,6 +24,10 @@ enum SettingsKey {
     static let shareUploads = "padMule.shareUploads"
     static let pauseSharingOnCellular = "padMule.pauseSharingOnCellular"
     static let keepAwakeWhileTransferring = "padMule.keepAwakeWhileTransferring"
+    /// Keep SERVING files after the app is backgrounded, using an audio
+    /// keepalive. OFF by default: it costs battery, and the honest default for
+    /// something that runs while the user is not looking is off.
+    static let backgroundSeeding = "padMule.backgroundSeeding"
     /// Play a short sound when a download finishes, verifies and is saved.
     /// padMule is foreground-only, so a long transfer means the iPad is sitting
     /// there with the app open - a sound is the only way to be told it is done

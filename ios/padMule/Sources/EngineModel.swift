@@ -266,6 +266,7 @@ final class EngineModel: ObservableObject {
         switch state {
         case .stopped: return "Stopped"
         case .paused: return "Paused"
+        case .seeding: return "Sharing in the background"
         case .running:
             if reconnecting { return "Reconnecting..." }
             return server != nil ? "Connected" : "Not connected"
@@ -418,6 +419,11 @@ final class EngineModel: ObservableObject {
     /// keeps painting, banners and status text keep arriving, and it stays
     /// interactive, which is the difference between "busy" and "hung".
     private let eventQueue = DispatchQueue(label: "us.ajbconsulting.padMule.events")
+    /// Holds the app awake in the background so it can keep SERVING. Only ever
+    /// started when the user has turned background seeding on AND sharing is
+    /// actually enabled - see `enterBackground()`.
+    private let keepAlive = BackgroundKeepAlive()
+
     /// The background-task assertion held while pause() finishes; see pause().
     private var pauseBackgroundTask: UIBackgroundTaskIdentifier = .invalid
     /// The Documents directory `boot()` handed to the engine as `downloadsDir` -
@@ -1044,6 +1050,49 @@ final class EngineModel: ObservableObject {
     /// assertion gets the app killed for overstaying it), and refresh()'s
     /// in-flight guard (below) keeps the 1s poll timer from stacking up ahead
     /// of this call in the same queue.
+    /// THE BACKGROUND DECISION, in one place.
+    ///
+    /// Either padMule keeps serving with an audio keepalive holding it awake, or
+    /// it pauses honestly. What it must never do is claim the first while
+    /// actually getting the second - iOS suspends an app without a keepalive
+    /// within about thirty seconds and takes its sockets, so a "seeding" badge
+    /// over a suspended process would be exactly the dishonest status
+    /// docs/wiki/lifecycle-and-reactivation.md calls a hard requirement to avoid.
+    ///
+    /// So the keepalive is started FIRST and its result decides the path. Three
+    /// conditions must all hold to seed: the user asked for it, sharing is
+    /// actually on (seeding with uploads off would burn battery to serve
+    /// nothing), and the keepalive actually started.
+    func enterBackground() {
+        let wanted = UserDefaults.standard.bool(forKey: SettingsKey.backgroundSeeding)
+        guard wanted, sharing, keepAlive.start() else {
+            if wanted && !sharing {
+                engineLog.notice(
+                    "lifecycle: background seeding SKIPPED - sharing is off, so there would be nothing to serve"
+                )
+            } else if wanted {
+                engineLog.error(
+                    "lifecycle: background seeding wanted but the keepalive did not start - pausing instead"
+                )
+            }
+            pause()
+            return
+        }
+        engineLog.notice("lifecycle: entering background SEEDING (keepalive held)")
+        guard let e = engine else { return }
+        work.async { [weak self] in
+            e.pauseForSeeding()
+            DispatchQueue.main.async { self?.refreshAll() }
+        }
+    }
+
+    /// Returning to the foreground: drop the keepalive before resuming, so the
+    /// audio session is not held any longer than the background actually lasted.
+    func leaveBackground() {
+        keepAlive.stop()
+        resume()
+    }
+
     func pause() {
         engineLog.notice("lifecycle: pause (backgrounded)")
         guard let e = engine else { return }

@@ -88,7 +88,7 @@ struct PadMuleApp: App {
                 // Retry a failed cold-boot on foreground (no-op once booted), THEN
                 // resume; without the boot() a transient launch failure was terminal.
                 model.boot()
-                model.resume()
+                model.leaveBackground()
                 // A tunnel that collapsed while padMule was suspended produces
                 // no path callback we were awake to hear, and "the VPN dropped
                 // while you were away" is exactly the case worth catching.
@@ -97,7 +97,10 @@ struct PadMuleApp: App {
                 // Only on .background - .inactive fires for transient things
                 // (app switcher, a notification) and tearing down there would
                 // thrash the connection.
-                model.pause()
+                // Either keep serving under a keepalive or pause honestly -
+                // enterBackground() decides, and never claims the first while
+                // getting the second.
+                model.enterBackground()
             default:
                 break
             }
