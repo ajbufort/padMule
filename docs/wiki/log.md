@@ -552,3 +552,49 @@ Append-only, timestamped record of Ingest / Query / Lint passes.
   idle is 0.1%), so the keepalive plus the 1s heartbeat is not free and is the
   next battery question; and longevity past a minute, for which a soak is
   running.
+
+- 2026-08-07 **REANALYSIS: twelve doc comments were filed against the wrong
+  item, and the top next action was planned but unlinked.** A full re-read of
+  the tree (gate re-verified: 650 tests, clippy -D warnings, fmt + ASCII clean;
+  wiki link integrity clean; no TODOs anywhere) found a defect class nothing in
+  the toolchain can catch: inserting a new item immediately after an existing
+  doc block orphans that block onto the new item, and each block still reads
+  correctly on its own. Twelve instances, leaving nine significant items
+  undocumented - `Engine`, `EngineHandles`, `resume()`, `maintain_checkpoint`,
+  `maintain_share_verify`, `download_from_peer_at`, `source_origins`,
+  `MuleEngine`, and Swift's `refresh()`/`refreshFast()`. The worst put
+  `maintain_checkpoint`'s DELIBERATE DEVIATION from both authorities on
+  `nodes.dat` timer writes, eMule/aMule citations and all, onto
+  `maintain_resume_fetches`; a reader chasing "why do we checkpoint on a clock"
+  landed on the idle-download retry and read a true statement about a different
+  function. All twelve moved, gate re-run green. **The tell, for next time: an
+  item with NO doc sitting next to one carrying two summary sentences.**
+  Separately, `docs/superpowers/plans/2026-08-07-kad-serve-loop.md` - 1042
+  lines, committed in `6963447`, the task-by-task plan for the top next action -
+  was referenced from index.md, log.md and the handoff NOWHERE, so the handoff
+  still asked for an A/B/C sequencing decision the spec had already recorded
+  under "Decisions taken before this spec". Now indexed, and the handoff
+  rewritten to point at it. **A plan nobody links to does not exist.** Also
+  banked, unfixed: `ship.sh` dispatches the Rust gate and never reads its
+  conclusion (and never dispatches the Swift tests), CLAUDE.md says 628 tests and
+  still calls padMule foreground-only after 8cj, [[security-model]]'s "Release
+  blockers" section contradicts its own 24/0/2 scorecard, `MARKETING_VERSION`
+  is inert so the device reports 1.0, and `heartbeat`'s doc counts seven duties
+  where there are eight. Listed in [[handoff-next-session]].
+
+- 2026-08-07 **The background-seeding soak says the memory objection is
+  answered and the CPU one is ours.** 29 samples over 34 minutes with padMule
+  backgrounded and seeding: ALIVE every sample, `physFootprint` 32.2 -> 32.1MB
+  and FLAT against a ~100MB jetsam budget. CPU is **bimodal - ~0.1% or ~6-11%,
+  alternating** - which is the shape of a periodic BURST caught or missed by the
+  sampler, not of a continuously-playing audio session, whose cost would be a
+  steady floor. That points at padMule's own clock rather than the keepalive:
+  `EngineModel.startPolling` is a 1 Hz `Timer` that is not state-aware, so in
+  `.seeding` it still marshals the whole downloads list and shared library
+  across the FFI every second and still drives a `heartbeat()` that takes and
+  releases the engine mutex nine times a second to run maintainers that mostly
+  early-return - all publishing to a UI nobody is looking at. The cheap
+  experiment before any redesign: gate the poll on `state != .seeding` and
+  re-soak, which separates "the audio session costs 7%" from "our own loop costs
+  7%". Ties to the standing item of moving the clock into Rust as a tokio
+  interval keyed off `EngineState`.

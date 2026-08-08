@@ -213,6 +213,28 @@ pub fn build_bootstrap_req() -> (u8, Vec<u8>) {
     (OP_BOOTSTRAP_REQ, Vec::new())
 }
 
+// --- PING / PONG ---
+
+/// KADEMLIA2_PING: empty payload, like the bootstrap request.
+pub fn build_ping() -> (u8, Vec<u8>) {
+    (OP_PING, Vec::new())
+}
+
+/// KADEMLIA2_PONG, carrying the UDP port we received the ping FROM.
+///
+/// The payload is NOT empty and it is not about us: eMule's own comment is that
+/// a ping "is however only used to determine ones external port"
+/// (`Process_KADEMLIA2_PING`, KademliaUDPListener.cpp:1970-1977), and it writes
+/// back `uUDPPort` - the port the ping arrived from - so the pinging peer learns
+/// its own external port. Its `Process_KADEMLIA2_PONG` THROWS on a payload
+/// shorter than 2 bytes, so an empty pong is rejected outright rather than
+/// merely being unhelpful.
+pub fn build_pong(requester_udp_port: u16) -> (u8, Vec<u8>) {
+    let mut w = Writer::new();
+    w.write_u16(requester_udp_port);
+    (OP_PONG, w.into_inner())
+}
+
 /// A contact as it appears on the wire (25 bytes; no UDP key / verified flag,
 /// unlike the 34-byte nodes.dat record).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -884,6 +906,25 @@ mod tests {
     #[test]
     fn bootstrap_req_is_empty() {
         assert_eq!(build_bootstrap_req(), (0x01, Vec::new()));
+    }
+
+    #[test]
+    fn ping_is_bodiless() {
+        assert_eq!(build_ping(), (OP_PING, Vec::new()));
+    }
+
+    #[test]
+    fn pong_carries_the_requesters_udp_port() {
+        // NOT empty, and the payload is not ours. eMule's own comment on
+        // Process_KADEMLIA2_PING is "currently it is however only used to
+        // determine ones external port", and it writes the port it RECEIVED the
+        // ping from (KademliaUDPListener.cpp:1970-1977, WriteUInt16(uUDPPort)).
+        // Its Process_KADEMLIA2_PONG THROWS on uLenPacket < 2, so an empty pong
+        // is not merely unhelpful - it is rejected.
+        let (op, payload) = build_pong(4672);
+        assert_eq!(op, OP_PONG);
+        assert_eq!(payload, vec![0x40, 0x12]); // 4672 LE
+        assert_eq!(build_pong(5000).1, vec![0x88, 0x13]); // 5000 LE
     }
 
     #[test]
