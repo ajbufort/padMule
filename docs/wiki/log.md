@@ -855,3 +855,28 @@ Append-only, timestamped record of Ingest / Query / Lint passes.
   (pinning `CFBundleShortVersionString` in `info.properties`) makes this a
   testable prediction rather than an argument - the next install should read
   `0.1 (<sha>)`.
+
+- 2026-08-08 **THE SWIFT SUITE HAD BEEN RED FOR THREE BUILDS AND NOBODY KNEW.**
+  The first use of `ship.sh`'s three-workflow gate aborted on
+  `iOS unit tests (simulator)`: `SettingsTests.swift` called `Settings.register()`
+  and no type of that name exists - it is `SettingsDefaults` - so the ENTIRE
+  padMuleTests bundle failed to COMPILE. Introduced by e3ed990 (the
+  background-seeding Settings control, 2026-08-07). CI history is unambiguous:
+  success at 1605c9a, then failure at e3ed990, b047f66 and the tip.
+  **Two things let it run for three builds.** `ios-test.yml` only fires on push
+  to `main` and on PRs, so a branch-only workflow never ran it; and `ship.sh`
+  neither dispatched nor checked it, so the device kept receiving builds whose
+  Swift suite was red. Row 8cj cites that very test as evidence the default is
+  OFF - a test that had never compiled, let alone run. **This is the exact
+  failure the ship-gate fix was written for, caught on its first use, which is
+  the best possible outcome for a guard and the worst possible news about what
+  it was guarding.**
+  Two smaller corrections fell out of it. The test's name -
+  `testBackgroundSeedingDefaultsToOffEverywhere` - over-claimed: it checks the
+  REGISTERED default only, because the `@AppStorage` initializer lives in a
+  property wrapper no unit test can read. That half is held by comments at each
+  site, not by an assertion, and the name implied a guard that does not exist.
+  Renamed and scoped honestly. **The general lesson is one this project keeps
+  relearning from a new angle: a test you never SAW run is not a test.** Green is
+  evidence; absent is not. A suite that cannot compile reports nothing at all,
+  and "the gate is 24 Swift tests" was repeated in the handoff throughout.
