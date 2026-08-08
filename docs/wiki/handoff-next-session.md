@@ -81,6 +81,34 @@ FIND_NODE answer rate was the same in both arms, so the win is structural.
   PRESERVES the data container**, so shipping a build does not reset it - only
   deleting the app does. Share library and downloads are still empty.
 
+## CI FOR THIS WORK, and a RED that is not what it looks like
+
+`9d9a031` (code) and `5d83d01` (docs) are pushed to `main`; `3ba50e5` followed
+with the 8cr round. **Rust gate GREEN and iOS build GREEN for every one of them.**
+
+**`ios-test.yml` came back FAILURE for `5d83d01`, and it is NOT the Swift
+change.** Read the log before believing the colour: `SettingsTests.swift`
+COMPILED (the `SwiftCompile ... SettingsTests.swift` line is present with no
+diagnostics, so the ec37/e3ed990 "bundle does not build" hole stays closed), and
+the actual failure is
+
+    padMule (4899) encountered an error (The test runner timed out while
+    preparing to run tests.)
+    ** TEST FAILED ** ... exit code 65
+
+A grep of the failed log for `XCTAssert`, `error:` and `failed -` returns ZERO.
+So no assertion failed and nothing failed to build - the simulator runner timed
+out before it started the tests, roughly six minutes after launch. That is an
+infrastructure flake on the macOS runner, in the same family as the local
+2s-deadline loopback flake below: **a failure has to be verified the way a
+success does, and a red badge is a claim like any other.**
+
+**WHAT IS THEREFORE STILL UNPROVEN:** `EngineModel.sharingDecision` and the
+rewritten `SettingsTests` have COMPILED but have never been EXECUTED anywhere.
+There is no Apple toolchain on this box, so CI is the only thing that can run
+them. Re-run `ios-test.yml` (or check `3ba50e5`'s run) and read the result before
+treating the sharing-decision fix as verified.
+
 ## THE CI HOLE, stated correctly
 
 **All THREE workflows** (`rust.yml`, `ios-build.yml`, `ios-test.yml`) fire only

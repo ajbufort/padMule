@@ -1415,3 +1415,23 @@ Append-only, timestamped record of Ingest / Query / Lint passes.
   every other instrument that has lied here: it answered confidently about a set
   it could not see. Fixed with `startswith`. Gate: **711 tests**, clippy
   `-D warnings`, fmt, ASCII clean.
+
+- 2026-08-08 **CI CAME BACK RED AND IT IS NOT THE CHANGE - verify a failure the
+  way you verify a success.** `ios-test.yml` reported FAILURE for `5d83d01`, the
+  push carrying the iOS sharing-decision fix I had already flagged as locally
+  unverifiable (no Apple toolchain on this box). The tempting read is "the Swift
+  change broke it". The log says otherwise: `SettingsTests.swift` COMPILED - the
+  `SwiftCompile ... SettingsTests.swift` line is there with no diagnostics, so
+  the e3ed990 "the bundle does not build" hole is still closed - and the failure
+  is `padMule (4899) encountered an error (The test runner timed out while
+  preparing to run tests.)`, exit 65, about six minutes after launch. Grepping
+  the failed log for `XCTAssert`, `error:` and `failed -` returns ZERO. **No
+  assertion failed and nothing failed to build; the simulator runner never got
+  to the tests.** Same family as the local 2s-deadline loopback flake measured
+  the same day, and the same lesson as `ideviceinfo` answering "No device found"
+  for a device that was plainly there.
+  **WHAT THAT LEAVES UNPROVEN, stated rather than glossed:** `sharingDecision`
+  and the rewritten `SettingsTests` have COMPILED but have never EXECUTED
+  anywhere - not locally, not in CI. A compile is not a run. The `3ba50e5` run
+  is the next chance to execute them; read its conclusion before calling that
+  fix verified. The Rust gate and the iOS BUILD were green for every pushed sha.
