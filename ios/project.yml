@@ -31,6 +31,13 @@ targets:
       path: padMule/Info.plist
       properties:
         CFBundleDisplayName: padMule
+        # SET HERE, not via MARKETING_VERSION. XcodeGen writes a LITERAL
+        # CFBundleShortVersionString into the generated Info.plist, so the
+        # MARKETING_VERSION build setting below never reached the bundle and
+        # the device reported XcodeGen's default 1.0 for a pre-1.0 app - the
+        # first thing any bug report quotes. CFBundleVersion is stamped with
+        # the git sha by CI (.github/workflows/ios-build.yml).
+        CFBundleShortVersionString: "0.1"
         UILaunchScreen: {}
         UIRequiresFullScreen: false
         # Completed downloads land in Documents/. These two keys are what make

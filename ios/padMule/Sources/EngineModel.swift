@@ -1200,13 +1200,53 @@ final class EngineModel: ObservableObject {
         }
     }
 
+    /// How many 1s ticks between full UI snapshots while background-SEEDING.
+    ///
+    /// While seeding there is no UI on screen, and `refreshFast()` is not free:
+    /// it marshals the whole downloads list and the whole shared library across
+    /// the FFI every second, plus stats and five scalars, and then publishes all
+    /// of it to views nobody is looking at.
+    static let seedingPollDivisor = 5
+
+    /// Should the FULL UI snapshot run on this tick?
+    ///
+    /// Pure, so the rule is testable without a runtime - and because it is the
+    /// independent variable in an experiment. The 2026-08-07 soak proved
+    /// background seeding SURVIVES (60 samples, ~70 min, footprint flat at
+    /// 32.2MB) but left CPU unexplained: samples split almost exactly evenly
+    /// above and below 5%, against 0.1% foreground-idle.
+    ///
+    /// DO NOT read this as "we know the poll is the cost" - that hypothesis has
+    /// a hole in it, since a 1 Hz signal would be caught by essentially any
+    /// sampling window rather than half of them. This exists to SEPARATE the two
+    /// candidates: if the split survives with the snapshot throttled, the cost is
+    /// the audio keepalive and the poll is exonerated.
+    ///
+    /// The heartbeat cadence is deliberately NOT changed here. It genuinely
+    /// needs the engine lock and drives duties that must keep running while
+    /// seeding (re-offer, finalize, server-drop detection), and an experiment
+    /// with two variables answers neither.
+    static func shouldRunFastPoll(state: EngineStateFfi, tick: Int) -> Bool {
+        guard state == .seeding else { return true }
+        return tick % seedingPollDivisor == 0
+    }
+
+    private var pollTick = 0
+
     private func startPolling() {
         timer?.invalidate()
         let t = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             Task { @MainActor in
-                self?.pumpEvents()
-                self?.refreshFast()
-                self?.refresh()
+                guard let self else { return }
+                self.pollTick &+= 1
+                // Events ALWAYS drain: they are cheap (a try_recv loop on a
+                // channel, never the engine lock) and they are how `state`
+                // itself stays current once the snapshot is throttled.
+                self.pumpEvents()
+                if Self.shouldRunFastPoll(state: self.state, tick: self.pollTick) {
+                    self.refreshFast()
+                }
+                self.refresh()
             }
         }
         RunLoop.main.add(t, forMode: .common)
