@@ -87,7 +87,15 @@ run is in progress, only two things are safe:
 Creating a WebDriverAgent **session** disturbs the app, and this is not limited
 to passing a `bundleId`: a session created with EMPTY capabilities backgrounded
 padMule, which on a foreground-only app pauses every transfer; the screen then
-slept and recovery needed a relaunch. Download progress survived (byte counts
+slept and recovery needed a relaunch.
+
+**AND A SESSION FOR A DIFFERENT BUNDLE KILLS THE APP THAT WAS RUNNING (2026-08-07).**
+Not merely backgrounds it - TERMINATES it. This produced four straight "the
+process is DEAD" samples that read exactly like background seeding failing, and
+nearly went into the record as a failed feature. **To background an app for a
+test, use `pymobiledevice3 developer dvt launch <other.bundle.id>`**, which does
+not go through WDA at all; the app being tested then survives, which is the
+whole point of the measurement. Download progress survived (byte counts
 matched exactly) but the process-global fetch counters did not. If the run
 matters, screenshot and read `/source` - do not open a session.
 

@@ -118,9 +118,29 @@ on device against 85% on the dev box. **So the barrier IS the remaining cost**,
 and eMule's event-driven `CSearch` - no rounds, value requests interleaved -
 is worth roughly 2-3x on the Kad arm. See [[kad-routing-lifecycle]].
 
-## THE TOP NEXT ACTION - VERIFY BACKGROUND SEEDING ON DEVICE
+## BACKGROUND SEEDING IS VERIFIED - two things remain
 
-Row 8cj ships untested on glass. The build is offline-verified (650 tests,
+**It works.** Build e3ed990, toggle on, padMule backgrounded: ALIVE at 32.2 MB
+and ~7% CPU, where before the change the process simply ended.
+
+**OPEN 1 - the CPU.** ~7% while serving NOBODY, against 0.1% foreground-idle.
+The audio keepalive plus the 1s heartbeat is not free, and on a tablet left
+seeding overnight that is the number that matters. Look there before adding
+anything else to the background path.
+
+**OPEN 2 - longevity.** Verified for a minute, not a night. Jetsam ends this, not
+suspension, so on a death record the FOOTPRINT at the time rather than the hours.
+A soak script is at `$CLAUDE_JOB_DIR/tmp/soak.sh` if it is still around; it is
+three lines to rewrite if not.
+
+**HOW TO BACKGROUND AN APP FOR A TEST - this cost a false verdict.** Use
+`pymobiledevice3 developer dvt launch <other.bundle>`. Do NOT create a WDA
+session for another bundle: that TERMINATES the app that was running, which
+produced four "DEAD" samples that read exactly like the feature failing.
+
+## THE OLD TOP NEXT ACTION, now done
+
+Row 8cj shipped untested on glass and has since been verified. The build is offline-verified (650 tests,
 mutation-checked) and the memory gate is measured (30.8MB against ~100MB), but
 the thing that actually matters has NOT been observed: **does padMule keep
 serving after the home button, and for how long?**

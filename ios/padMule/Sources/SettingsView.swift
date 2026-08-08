@@ -126,12 +126,21 @@ struct SettingsView: View {
                 // is deliberately blunt about the limits - a user who thinks
                 // this is a guarantee will conclude the app is broken the first
                 // time iOS reclaims it, which it can do at any moment.
+                // ONE view, not two. A Section footer built from two sibling
+                // Texts renders only the FIRST - confirmed by screenshot on
+                // device 2026-08-07, where the background-seeding caveat simply
+                // was not on screen while the source clearly contained it. The
+                // accessibility tree agreed with the screen and neither agreed
+                // with the code, so nothing but a picture could have caught it.
+                // A VStack makes the grouping explicit and both paragraphs show.
+                VStack(alignment: .leading, spacing: 6) {
                 Text("padMule serves your finished files to other peers while it is open. Sharing earns you better standing in their queues, so your own downloads go faster.")
                 Text(
                     backgroundSeeding
                         ? "padMule will keep serving after you switch away, so you keep earning standing while you are not looking. It uses more battery, and downloads still stop - only uploads continue. iPadOS can still reclaim the app at any time; when it does, padMule pauses cleanly and resumes when you come back."
                         : "With this off, padMule stops the moment you switch away, and other peers stop being able to download from you until you open it again."
                 )
+                }
             } else {
                 Text("Leech Mode: downloading only. padMule is not serving any files to peers.")
             }
