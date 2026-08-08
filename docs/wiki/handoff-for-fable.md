@@ -1,7 +1,7 @@
 # HANDOFF TO FABLE 5 - padMule, next round
 
-Updated: 2026-08-08 (rows 8cp + 8cq - the reanalysis and the fix round that
-followed it. Nine defects fixed and COMMITTED as `9d9a031`; the ledger below
+Updated: 2026-08-08 (rows 8cp + 8cq + 8cr - the reanalysis and the two fix
+rounds that followed it. Nine defects fixed and COMMITTED as `9d9a031`; the ledger below
 records what is CLOSED and what is still open, and two findings that named the
 WRONG remedy until the eMule source was read.)
 
@@ -48,8 +48,8 @@ the tree; where the two disagree, this one wins and that one is stale.
 - **Report what you OBSERVED.** Quote log lines. Say what you could not prove. An
   honestly reported partial beats a confident overstatement - the second gets
   written into the KB and believed.
-- **Gate before claiming done:** `cargo test --workspace` (**710** pass on `main`
-  as of the 8cq fix round - 700 before 8cp, 705 after it; none may regress), `cargo clippy
+- **Gate before claiming done:** `cargo test --workspace` (**711** pass as of the
+  8cr round - 700 before 8cp, 705 after it, 710 after 8cq; none may regress), `cargo clippy
   --workspace --all-targets -- -D warnings`, `cargo fmt --all -- --check`,
   changed files ASCII-only. Run the suite 3x - this codebase has had parallelism
   flakes from fixed-port binds; use ephemeral ports (0) in tests.
@@ -172,16 +172,33 @@ except where noted; the Swift one is CI-verified only, see below):
 **STILL OPEN - verified in code, deliberately NOT fixed.** Ranked. **If you
 close one, strike it here.**
 
-1. **The serve loop answers before checking the source address.** No
-   routable/private check and no ipfilter consultation before replying; only the
-   contact INSERT is gated. So padMule reflects to RFC1918/loopback and answers
-   an IP the user blocklisted. The spec's Security section requires the check,
-   and a test currently PINS the permissive behaviour - read it before changing,
-   and decide deliberately, because the same "is this faithful or is it a gap?"
-   question is what the item-1 correction above turned on.
-2. **`related_search` poisons "Load more"**: it issues a fresh server query
-   without resetting `search_session`, so a later `search_more()` splices the
-   related query's page 2 into the keyword result set.
+~~1. The serve loop answers before checking the source address.~~ **SPLIT AND
+   SETTLED 2026-08-08 - half implemented, half REFUTED, and the refuted half is
+   the point.** Checking `ProcessPacket` (KademliaUDPListener.cpp:236-256)
+   rather than trusting the spec: eMule gates an inbound Kad datagram on exactly
+   TWO things before dispatch - the port-53 unencrypted guard and
+   `InTrackListIsAllowedPacket` - and reaches for the ipfilter only when
+   INSERTING contacts (`:835`). **So "never answer a request whose source is
+   unroutable or private" is an aspiration the spec author wrote and the source
+   does not support** - the FIFTH time the spec has lost to eMule. Implementing
+   it would also have broken the loopback mock-peer shape the spec's OWN Testing
+   section prescribes, and the namespaced amuled oracle. NOT DONE, deliberately,
+   and the test that "pinned the permissive behaviour" turns out to be correct.
+   **What WAS done, as a documented divergence:** padMule now refuses to ANSWER
+   an address the user blocklisted, because a blocklist is an explicit "do not
+   talk to these people" and a reply is talking - it confirms we exist, at this
+   address, running Kad. Interop-safe by construction (it can only cut off peers
+   the user chose to cut off) and fail-open with no filter loaded. eMule would
+   answer; we do not, and the code says why.
+~~2. `related_search` poisons "Load more".~~ **CLOSED 2026-08-08.** It issued a
+   fresh server query without resetting `search_session`, and
+   `OP_QUERY_MORE_RESULT` is BODILESS - it continues whatever query the SERVER
+   last received - so a later `search_more()` passed its own staleness check and
+   spliced page 2 of the RELATED query into the KEYWORD result set, silently.
+   The session is now dropped, which turns "Load more" off; that is honest,
+   since the related result already reports `more_available: false`. **NOT
+   UNIT-TESTED - the seam needs a connected related-search-capable server, so no
+   test in that file can reach it; the eserver oracle is where it is provable.**
 3. **The 2-worker FFI runtime writes every received block synchronously.**
    `part_store` uses `File::write_all` from `Download::add_block` with no
    `spawn_blocking`, the one uninsulated blocking call in an engine that
@@ -189,11 +206,18 @@ close one, strike it here.**
    runtime, with ~4 workers per download and NO cap on concurrent downloads.
    **A live suspect for "concurrency under load" below; measure it before
    assuming a download cap is the whole story.**
-4. **The stress harness corrupts the two numbers it exists to produce**:
-   `add_download`'s outcome is discarded so rejected hits still inflate the
-   `queued` denominator, and it reuses fixed dirs, so `resume_downloads` puts
-   previous-run part-files into `ever_received` on tick one without a byte
-   arriving. Fix before trusting it for the item above.
+~~4. The stress harness corrupts the two numbers it exists to produce.~~
+   **CLOSED 2026-08-08.** It now counts what the engine ACCEPTED
+   (`AddOutcome::Started`) rather than what it was offered, so a hit refused for
+   NoSources/NotConnected no longer inflates the `queued` denominator; and it
+   CLEARS the config and download dirs on start, so `resume_downloads` cannot
+   put a previous run's part-files into `ever_received` at tick one without a
+   byte arriving - the starvation signal the harness exists to produce, and the
+   one number that had to be trustworthy. `STRESS_KEEP_CONFIG=1` opts out when
+   resume behaviour is deliberately the subject. Three stale comment blocks
+   fixed with it (a promised Blender keyword list that was never there, and a
+   size cap explained by three mutually inconsistent rationales naming numbers
+   the code never used).
 5. **Format fidelity, low severity**: `read_part_met` accepts the eDonkey
    `0xE1` version but parses it with the `0xE0` layout (aMule switches layouts,
    PartFile.cpp:432-456) - and its test only flips the version byte on an

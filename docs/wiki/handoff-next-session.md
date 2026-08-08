@@ -20,10 +20,10 @@ FIND_NODE answer rate was the same in both arms, so the win is structural.
 
 ## State of the tree - VERIFIED 2026-08-08, not remembered
 
-- **Gate**: **710** Rust tests (0 failed, 2 ignored - both documented
+- **Gate**: **711** Rust tests (0 failed, 2 ignored - both documented
   live-network tests); `clippy --workspace --all-targets -- -D warnings` clean,
   `fmt --check` clean, ASCII clean. It read 700 until 8cp added 5 tests, and 705
-  until 8cq added 5 more.
+  until 8cq added 5 more, and 8cr added 1.
   **ONE KNOWN FLAKE, measured rather than waved off:**
   `request_reports_a_valid_receiver_key_when_the_peer_echoes_our_sender_key`
   failed once in six full-suite runs and passes 15/15 in ISOLATION - a
@@ -37,7 +37,7 @@ FIND_NODE answer rate was the same in both arms, so the win is structural.
   (8 commits, `--ff-only`, so history stays LINEAR - still 0 merge commits), the
   gate was re-run on the merged `main` ITSELF at 700 tests, and `main` is pushed.
   `kad-csearch` has since been DELETED (local and remote), as has `fetch-funnel`.
-- **The last CODE commit is `9d9a031`** (the 8cp/8cq fix round: the Kad answer
+- **The last CODE commit is `9d9a031` plus the uncommitted 8cr round in the tree** (the 8cp/8cq fix round: the Kad answer
   count, the upload block bound, the table sender-key rule, the Kad1 gate, the
   flood-map bound, server-list vetting + the byte-reversed blocklist, the
   saturating `finds_inflight`, the UPnP honesty fix and the iOS sharing

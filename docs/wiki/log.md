@@ -1359,3 +1359,59 @@ Append-only, timestamped record of Ingest / Query / Lint passes.
   three of the new tests. Every later gate check reads each command's own exit
   code separately. Gate: **710 tests** (from 705) with the flake above, clippy
   `-D warnings`, fmt, changed files ASCII-clean.
+
+- 2026-08-08 **THE LEDGER ROUND (row 8cr): three more closed, and the top item
+  was CLOSED BY REFUTING IT.** Committed `9d9a031` (code) + `5d83d01` (docs) went
+  to `main` and all three workflows fired; the Rust gate and the iOS build came
+  back green, and the iOS unit tests - the only thing that can validate the Swift
+  sharing-decision fix, since this box has no Apple toolchain - were still
+  running when this was written. **Check their conclusion before believing that
+  fix.**
+  **THE SERVE LOOP'S "MISSING" SOURCE CHECK WAS NOT MISSING.** The reanalysis
+  ranked it first: the spec's Security section says "never answer a request whose
+  source is unroutable or private", and padMule does not. Reading
+  `ProcessPacket` (KademliaUDPListener.cpp:236-256) instead of the spec: eMule
+  gates an inbound Kad datagram on exactly TWO things before dispatch - the
+  port-53 unencrypted guard and `InTrackListIsAllowedPacket` - and consults the
+  ipfilter only when INSERTING contacts (`:835`). **So the spec line is an
+  aspiration the source does not support - the FIFTH time the spec has lost to
+  eMule**, and implementing it would have broken both the loopback mock-peer
+  shape the spec's OWN Testing section prescribes and the namespaced amuled
+  oracle. The test that appeared to "pin the permissive behaviour" was right all
+  along. NOT DONE, deliberately, and recorded so nobody re-opens it.
+  **What WAS done is the half that survives the check:** padMule now refuses to
+  ANSWER an address the user blocklisted. eMule would answer; we do not, because
+  a blocklist is an explicit "do not talk to these people" and a reply is
+  talking - it confirms we exist, at this address, running Kad. Interop-safe by
+  construction (it can only cut off peers the user chose to cut off) and
+  fail-open with no filter loaded. **The test asserts SILENCE, so it carries a
+  CONTROL:** it waits out a real timeout with the filter on, then proves the
+  identical exchange succeeds with the filter off - without that second half a
+  broken read loop would pass just as happily. Mutation-checked; the mutant
+  compiled and the named test went red.
+  **THE BYTE-ORDER LESSON APPLIED IMMEDIATELY.** Having just fixed a blocklist
+  that never worked because it was fed a byte-reversed address, the first thing
+  checked on the new gate was that `from_ip` is host-order (`ip_u32` ->
+  `Ipv4Addr::into`) and therefore matches what `is_blocked_u32` wants. It does.
+  A lesson learned an hour earlier is worth nothing if the next call site
+  repeats it.
+  **ALSO CLOSED.** `related_search` left `search_session` intact while issuing a
+  fresh server query - and `OP_QUERY_MORE_RESULT` is BODILESS, continuing
+  whatever query the SERVER last received - so a later `search_more()` passed its
+  own staleness check and spliced page 2 of the RELATED query into the KEYWORD
+  results, silently and with no error anywhere. The session is now dropped.
+  **Not unit-tested and said so:** the seam needs a connected
+  related-search-capable server, so no test in that file can reach it.
+  And the stress harness now counts what the engine ACCEPTED rather than what it
+  was offered (a hit refused for NoSources no longer inflates the `queued`
+  denominator) and CLEARS its dirs on start, so `resume_downloads` cannot put a
+  previous run's part-files into `ever_received` at tick one without a byte
+  arriving. Those are the two numbers the harness exists to produce, so they were
+  the two that had to be trustworthy. `STRESS_KEEP_CONFIG=1` opts out.
+  **A PROBE OF MINE LIED, AGAIN, AND IN THE DOCUMENTED WAY.** The CI waiter
+  compared `headSha` to a 7-character prefix while the API returns the full sha,
+  so the filter matched nothing, "zero unfinished runs" was trivially true, and
+  it reported CI DONE while all three workflows were still queued. Same family as
+  every other instrument that has lied here: it answered confidently about a set
+  it could not see. Fixed with `startswith`. Gate: **711 tests**, clippy
+  `-D warnings`, fmt, ASCII clean.

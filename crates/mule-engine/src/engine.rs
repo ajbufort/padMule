@@ -3656,6 +3656,20 @@ impl Engine {
         };
         let link = self.server.as_mut().expect("checked supported just above");
         let files = link.search(&params, SEARCH_WAIT).await.unwrap_or_default();
+        // THE PAGING CURSOR NOW BELONGS TO THIS QUERY, so the keyword session
+        // that was using it is void. `OP_QUERY_MORE_RESULT` is bodiless - it
+        // continues whatever query the SERVER last received - and the line above
+        // just made that this related search. Leaving the old session in place
+        // let a later `search_more()` pass its own staleness check (same server,
+        // still `server_more`, under the page cap) and splice page 2 of the
+        // RELATED query into the KEYWORD result set, silently and with no error
+        // anywhere. Dropping it turns "Load more" off instead, which is honest:
+        // the related result itself already reports `more_available: false`.
+        //
+        // NOT UNIT-TESTED: the seam needs a connected, related-search-capable
+        // server link, so no test in this file can reach it - the eserver oracle
+        // is where it would be provable. Said plainly rather than implied.
+        self.search_session = None;
         SearchOutcome::Results {
             ranked: catalog(&files),
             more_available: false,
