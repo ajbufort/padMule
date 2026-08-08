@@ -880,3 +880,39 @@ Append-only, timestamped record of Ingest / Query / Lint passes.
   relearning from a new angle: a test you never SAW run is not a test.** Green is
   evidence; absent is not. A suite that cannot compile reports nothing at all,
   and "the gate is 24 Swift tests" was repeated in the handoff throughout.
+
+- 2026-08-08 **DEVICE PASS: the Kad serve loop costs the UI nothing, and I hit
+  four probe traps taking the readings.** Build `cadace2` on the iPad, confirmed
+  by reading Settings > This device > Build, not by spotting a change. **The bar
+  was NO REGRESSION and it is met: `Longest poll gap` reads 1.1s, identical to
+  2026-08-07** - one task owning the Kad socket, plus the state-aware poll, cost
+  the UI nothing. HighID in 6.5s cold. Kad panel on a fresh table: 11 lookups, 57
+  rounds, 57% held open by a silent peer, 73% answered, avg round 601ms; 18 value
+  windows, 44% silent, 75% answered, avg 560ms. Every figure is modestly better
+  than yesterday's, **and that is NOT attributed to the serve loop** - different
+  hour, different contact mix, freshly bootstrapped table, nothing isolating a
+  cause. What it does establish: the barrier is still the dominant cost (57% of
+  rounds paying a full timeout, avg round 80% of cap), so step 2's case is
+  unchanged. Search on a fresh install ran 9.57 / 3.28 / 8.40 / 7.41 / 4.97s
+  against 4.58-6.38s warm yesterday - slower, consistent with a thin table, and
+  explicitly NOT like-for-like. `prime minister` returns 195 results all badged
+  `server + kad`, so 8cf's multi-word fix holds on glass.
+  **THE FOUR PROBE TRAPS, all mine.** (1) The search field is an
+  `XCUIElementTypeTextField`, not a `SearchField` - [[ipad-usb-tooling]] said to
+  re-find it every run but never recorded its CLASS, so the lookup returned
+  nothing. (2) **WDA's `partial link text` is CASE-SENSITIVE.** Polling for
+  `ministe` missed `Minister` (capital M) and also missed the Catalan `ministre`
+  (t-r-e, not t-e), so a search returning 195 results read as returning NOTHING -
+  and I nearly filed it as a regression of row 8cf. A screenshot settled it in
+  one look. (3) The results list is still not cleared between searches, so a
+  token shared with the PREVIOUS query (`inister` right after `prime minister`)
+  matched stale rows at t=0 and produced 1.22s - probe latency wearing a search
+  time's clothes, the exact trap the runbook documents. **Discarded rather than
+  reported.** The rule needs sharpening: a content token must be distinctive
+  against the PREVIOUS query, not merely present in the current one. (4) The
+  field read-back guard aborted a run outright rather than timing a search that
+  never happened - the one probe rule that worked first time, because it was
+  written after it had already cost a session.
+  **The pattern is now unmistakable: every single device measurement session
+  produces at least one probe that is confidently wrong before it is right.**
+  Budget for it, and never let a first reading into the record.
