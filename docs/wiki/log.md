@@ -981,3 +981,9 @@ Append-only, timestamped record of Ingest / Query / Lint passes.
   the repo, recoverable with `git push origin <sha>:refs/heads/<name>`.
   `worktree-wave11-aich` kept its LOCAL branch because a LOCKED worktree still
   holds it; a lock is a deliberate signal and was not overridden.
+- 2026-08-08 Ingest: Kad step 2 built OFFLINE (not committed) - the event-driven
+  CSearch (no rounds, per-request deadlines, interleaved value asks) with the
+  Kad panel reshaped in the same change; build-progress row 8cn carries the
+  full account (the frontier-vs-table split, the skipped FIND_VALUE-dead
+  re-ask, the /24-not-/28 comment error, 8 compiled-and-red mutation checks).
+  Updated [[build-progress]]; stats.rs preserves the 8cm before-figure.
