@@ -288,6 +288,20 @@ which looks like the feature silently not working.
 
 ## padMule ANSWERS NOTHING either - it is a pure client (2026-08-07)
 
+> **[CLOSED the same day - see [[build-progress]] 8ck.]** One task now owns the
+> Kad socket and answers PING, HELLO, FIND_NODE and BOOTSTRAP, plus the inbound
+> HELLO_RES_ACK that completes the three-way verification handshake. A search and
+> a publish still get SILENCE, and that is faithful rather than lazy: eMule stays
+> silent too when it holds nothing (`CIndexed::SendValidKeywordResult`,
+> Indexed.cpp:696, emits only inside `if (m_mapKeyword.Lookup(...))`), and since
+> padMule stores nothing it would otherwise emit a packet no stock client sends
+> on nearly every search reaching it - a padMule fingerprint.
+> **Offline-verified only: no device pass, and the external proof the spec names
+> - does a real amuled KEEP padMule across a ping cycle ([[kad-verify-oracle]]) -
+> has NOT been run.** So "we answer" is true of the code and unproven against
+> another implementation. The section below stays as the record of what was
+> broken and why it mattered.
+
 Bigger than the publish gap below, and previously unrecorded. The Kad socket is
 touched in exactly THREE production places: `request_batch`'s `send_to` and its
 single `recv_from`, plus `send_hello_res_ack`. **There is no listener task, no
