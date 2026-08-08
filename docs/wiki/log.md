@@ -533,3 +533,22 @@ Append-only, timestamped record of Ingest / Query / Lint passes.
   and the lock says so. Also worth remembering: a hanging `apps install` after
   such a collision is not a broken build; `pymobiledevice3 apps list` gives the
   installed CFBundleVersion in one call and settles what is actually on there.
+
+- 2026-08-07 **Background seeding DEVICE-VERIFIED - and the first result was a
+  wrong TEST, not a failed feature.** With the toggle on, padMule backgrounded
+  stayed ALIVE at 32.2 MB / ~7% CPU, where before the change the process ended.
+  But the first four samples read DEAD, and the cause was the method:
+  **creating a WDA session for a DIFFERENT bundle TERMINATES the previous app**
+  rather than backgrounding it. [[ipad-usb-tooling]] warned that creating a
+  session disturbs the app; it did not say that a session for another bundle
+  kills the old one. Re-run with `pymobiledevice3 developer dvt launch`, which
+  does not touch WDA, and it survives - confirmed by screenshot (Files
+  foreground with the `padMule` back-indicator, process alive behind it). That
+  is twice in one feature that a wrong instrument nearly wrote a false verdict
+  into the record: the other was a Settings footer whose SECOND paragraph never
+  rendered, because a Section footer built from two sibling Texts shows only the
+  first - source and accessibility tree both disagreed with the screen, so only
+  a screenshot could find it. **Open: ~7% CPU while serving nobody** (foreground
+  idle is 0.1%), so the keepalive plus the 1s heartbeat is not free and is the
+  next battery question; and longevity past a minute, for which a soak is
+  running.
