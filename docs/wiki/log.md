@@ -987,3 +987,48 @@ Append-only, timestamped record of Ingest / Query / Lint passes.
   full account (the frontier-vs-table split, the skipped FIND_VALUE-dead
   re-ask, the /24-not-/28 comment error, 8 compiled-and-red mutation checks).
   Updated [[build-progress]]; stats.rs preserves the 8cm before-figure.
+
+- 2026-08-08 **STEP 2 LANDED: the event-driven CSearch, and the correction that
+  saved it.** The lookup was round-based - alpha requests out together, round
+  ends when the SLOWEST answers - so the barrier WAS the cost (row 8cm, on
+  device: 57% of rounds held open by a peer that never answered, avg round 601ms
+  against a 750ms cap). It is now eMule's shape: per-request deadlines, alpha
+  kept in flight, closer top-alpha contacts dispatched INSIDE the response
+  handler, and the value ask interleaved closest-first while FINDs are still
+  outstanding. No value phase. Same request budget - what changed is WHEN they
+  go out.
+  **THE FRONTIER/TABLE SPLIT IS THE PART TO REMEMBER.** eMule's
+  `Process_KADEMLIA2_RES` adds EVERY acceptable contact to the routing table in
+  the listener (`AddUnfiltered`), and only THEN hands the list to `CSearch`,
+  where the per-answer rules govern the FRONTIER alone. padMule fed ONE filtered
+  list to both, so dropping the new 2-per-/24 cap where the old dedupe lived
+  would have starved the routing table - working directly against the serve
+  loop's purpose, since a broad table is what makes lookups converge AND what
+  keeps us useful to other nodes. Caught by tracing the listener rather than
+  trusting the summary, and sent to the implementer mid-flight; the first design
+  draft had the cap in the shared path. Pinned by a test that puts four contacts
+  from one /24 into the TABLE while the FRONTIER sees two - a frontier-only
+  assertion would pass with the table starved.
+  **A real bug fixed en route:** `KAD_SEARCH_WAIT` / `KAD_MAINTENANCE_BUDGET`
+  CANCEL these futures, and a cancelled future never runs its trailing cleanup -
+  so a pending slot outlived its lookup and would swallow the next reply from
+  that peer. Guarded on drop. **The same hazard remains on `request_batch`'s own
+  cancellation path** (bootstrap/hello only) and is recorded rather than
+  silently carried.
+  Deliberate divergences, all stated: only nodes that ANSWERED are value-asked
+  (the old code asked non-responders); the walk runs after every state change
+  rather than only on eMule's 3s-gated tick, which would put a ~3s floor under
+  time-to-first-result and erase the win; a timed-out request refills
+  immediately. SKIPPED: JumpStart's FIND_VALUE-dead recovery - it exists because
+  eMule requests only 2 contacts per hop on a value lookup, and padMule requests
+  11, so that starvation cannot arise.
+  **THE INSTRUMENT WAS REPLACED IN THE SAME CHANGE**, because `kad_report`
+  counted ROUNDS and rounds stopped existing - leaving it would have produced a
+  panel that reads plausibly and means nothing, the exact failure this project
+  keeps catching. Now: time-to-first-result and completion per value lookup, a
+  reply-RTT histogram with TIMEOUT as its own row (folding timeouts into a top
+  bucket lets a dead network read as merely slow), in-flight high-water mark,
+  and sent/answered/timed-out per kind. The 8cm before-figures are preserved
+  verbatim in three places so the A/B survives the rewrite.
+  Gate: 700 tests x3, clippy, fmt, ASCII. **NOT device-verified** - that is the
+  next action.
