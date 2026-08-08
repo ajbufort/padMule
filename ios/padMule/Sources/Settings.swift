@@ -93,6 +93,11 @@ enum SettingsDefaults {
             SettingsKey.shareUploads: true,
             SettingsKey.pauseSharingOnCellular: true,
             SettingsKey.keepAwakeWhileTransferring: true,
+            // OFF: it runs while the user is not looking and costs battery, so
+            // off is the only honest default. Must agree with the @AppStorage
+            // initializer in SettingsView, or the toggle shows one state while
+            // the engine is in the other.
+            SettingsKey.backgroundSeeding: false,
             SettingsKey.beepOnDownloadComplete: true,
             SettingsKey.serverListUrls: [EngineModel.defaultServerListUrl],
             SettingsKey.updateServerListAtLaunch: false,

@@ -153,4 +153,19 @@ final class SettingsTests: XCTestCase {
         // brackets that reads like a rendering bug.
         XCTAssertEqual(SettingsView.buildLabel(short: "?", build: "?"), "? (?)")
     }
+
+    /// The registered default and the @AppStorage initializer must AGREE.
+    ///
+    /// When they disagree the toggle renders one state while the engine is in
+    /// the other, which reads as "the setting does nothing" - a trap this file
+    /// already carries a comment about for another key. Background seeding is
+    /// the one where being wrong matters most: a user who believes it is on
+    /// while it is off concludes padMule simply stopped sharing.
+    func testBackgroundSeedingDefaultsToOffEverywhere() {
+        Settings.register()
+        XCTAssertFalse(
+            UserDefaults.standard.bool(forKey: SettingsKey.backgroundSeeding),
+            "background seeding must default OFF - it runs while the user is not "
+                + "looking and costs battery")
+    }
 }
