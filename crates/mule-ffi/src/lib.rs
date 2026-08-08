@@ -36,6 +36,10 @@ pub enum EngineStateFfi {
     Stopped,
     Running,
     Paused,
+    /// Backgrounded but still SERVING - the listener and server login are up so
+    /// peers keep downloading from us. Only reachable while an audio keepalive
+    /// holds the app awake; see `MuleEngine::pause_for_seeding`.
+    Seeding,
 }
 
 impl From<EngineState> for EngineStateFfi {
@@ -44,6 +48,7 @@ impl From<EngineState> for EngineStateFfi {
             EngineState::Stopped => EngineStateFfi::Stopped,
             EngineState::Running => EngineStateFfi::Running,
             EngineState::Paused => EngineStateFfi::Paused,
+            EngineState::Seeding => EngineStateFfi::Seeding,
         }
     }
 }
@@ -517,6 +522,19 @@ impl MuleEngine {
     pub fn pause(&self) {
         self.rt
             .block_on(async { self.inner.lock().await.pause().await });
+    }
+
+    /// App backgrounded but STILL SERVING: keep the inbound listener and the
+    /// server login up so peers can keep downloading from us, and stop
+    /// everything that initiates work.
+    ///
+    /// THE CALLER MUST ALREADY HOLD AN AUDIO KEEPALIVE. Without one iOS
+    /// suspends the process within seconds and every socket this preserves dies
+    /// anyway - so a caller that cannot start the keepalive must call `pause()`
+    /// instead, and be honest on screen about which happened.
+    pub fn pause_for_seeding(&self) {
+        self.rt
+            .block_on(async { self.inner.lock().await.pause_for_seeding().await });
     }
 
     /// App foregrounded again: rebuild and reconnect.
