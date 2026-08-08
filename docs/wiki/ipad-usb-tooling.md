@@ -1,6 +1,6 @@
 # Driving the iPad from this box over USB (WSL2 + usbipd + pymobiledevice3)
 
-Updated: 2026-08-07 (THE INSTALL PATH is zsign + pymobiledevice3; Sideloadly is
+Updated: 2026-08-08 (the 8co/8cp device+reanalysis passes added the session-killing traps recorded below - a WDA session RELAUNCHES the app, an active XCUITest session BLOCKS apps install, /wda/keyboard/return does not exist in WDA 16.1.1, label=Search now matches the TAB, and a pgrep -f waiter matches its own command line. THE INSTALL PATH is zsign + pymobiledevice3; Sideloadly is
 for RENEWALS ONLY, and every Sideloadly round breaks WebDriverAgent - re-verified
 this day, padMule f946e02 -> 7d1b349 with WDA still answering ready:True on the
 same session. Plus MEASURING ANYTHING THROUGH WDA: the probe costs and the three

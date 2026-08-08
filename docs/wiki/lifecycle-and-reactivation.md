@@ -1,6 +1,6 @@
 # Lifecycle Status + Clean Reactivation (hard requirement)
 
-Updated: 2026-08-06 (annotated: the clean-pause requirement below is currently
+Updated: 2026-08-08 (date corrected by the 8cp reanalysis - the body already carried 2026-08-07 background-seeding content under an 08-06 stamp. Annotated: the clean-pause requirement below is currently
 NOT MET on device - see the banner. Seedbox mode DROPPED 2026-08-04 -
 foreground-only is now the PERMANENT posture, so the research below is retained
 as background, not as a roadmap)

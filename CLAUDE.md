@@ -35,7 +35,7 @@ current build state is `docs/wiki/build-progress.md`.
 | Path | Responsibility |
 |------|----------------|
 | `crates/mule-proto` | Pure codecs + crypto, no I/O: MD4/ed2k hashing, AICH, LE io, MET tags, packet framing + zlib, RC4, Kad128, ed2k/magnet link parsing. |
-| `crates/mule-files` | On-disk formats, byte-compatible with upstream: server.met, known.met, part.met (+gaps), clients.met, nodes.dat, preferences. |
+| `crates/mule-files` | On-disk formats, byte-compatible with upstream: server.met, known.met, part.met (+gaps), known2_64.met (AICH hashsets), clients.met, nodes.dat, preferences, ipfilter.dat/.p2p. Plus `pins` - padMule's own pinned.txt, the one format here with no upstream counterpart. |
 | `crates/mule-kad` | Kad2: UDP framing + obfuscation, message codecs, routing bin-tree, iterative lookup, anti-abuse hardening. Offline-testable. |
 | `crates/mule-engine` | The live engine: server link, peer transfer, TCP obfuscation, secure ident, credits, Kad node, fetch/search/catalog, share/upload, UPnP + NAT-PMP, and the `Engine` lifecycle facade. |
 | `crates/mule-cli` | Dev + live-network harness (30 subcommands: login, listen, peer-*, kad-* incl. `kad-serve`, upnp-*, *-search, offer-*, link, fetch-complete, aich-*, ...). |

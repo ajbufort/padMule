@@ -1,14 +1,14 @@
 # HANDOFF - the state of the tree
 
-Updated: 2026-08-08 by the reanalysis pass, after the event-driven CSearch
-landed. Living doc - replace wholesale.
+Updated: 2026-08-08 by the row-8cp reanalysis pass, after the event-driven
+CSearch landed AND was device-verified. Living doc - replace wholesale.
 
 **[[handoff-for-fable]] IS THE AUTHORITY** (Anthony, 2026-08-08). It says what to
 do next and how this project judges work. THIS entry is the companion: what is
 true of the tree right now, and what is proven versus assumed. Where the two
 disagree, the Fable handoff wins and this one is stale - say so and fix it.
 
-Full narrative: [[build-progress]] rows 8ck-8cn and the [[log]] entries for
+Full narrative: [[build-progress]] rows 8ck-8cp and the [[log]] entries for
 2026-08-07 and 2026-08-08.
 
 ## THE ONE-LINE SUMMARY
@@ -20,14 +20,30 @@ FIND_NODE answer rate was the same in both arms, so the win is structural.
 
 ## State of the tree - VERIFIED 2026-08-08, not remembered
 
-- **Gate**: **700** Rust tests (0 failed, 2 ignored - both documented
-  live-network tests), `clippy --workspace --all-targets -- -D warnings` clean,
-  `fmt --check` clean, ASCII clean. Swift suite is 6 files and GREEN again.
+- **Gate**: **710** Rust tests (0 failed, 2 ignored - both documented
+  live-network tests); `clippy --workspace --all-targets -- -D warnings` clean,
+  `fmt --check` clean, ASCII clean. It read 700 until 8cp added 5 tests, and 705
+  until 8cq added 5 more.
+  **ONE KNOWN FLAKE, measured rather than waved off:**
+  `request_reports_a_valid_receiver_key_when_the_peer_echoes_our_sender_key`
+  failed once in six full-suite runs and passes 15/15 in ISOLATION - a
+  pre-existing 2s-deadline loopback test that is sensitive to machine load, the
+  same family as the fixed-port flake row 8ck found. Run a failing test ALONE
+  before believing it is about your change.
+  **The Swift suite has NOT been run for the 8cq change** - there is no Apple
+  toolchain on this box, so `ios-test.yml` in CI is the only thing that compiles
+  and runs it. The sharing-decision fix is UNPROVEN until that is green.
 - **MERGED TO `main` 2026-08-08.** `kad-csearch` was fast-forwarded into `main`
   (8 commits, `--ff-only`, so history stays LINEAR - still 0 merge commits), the
   gate was re-run on the merged `main` ITSELF at 700 tests, and `main` is pushed.
   `kad-csearch` has since been DELETED (local and remote), as has `fetch-funnel`.
-- **The last CODE commit is `9b3402b`** (the CSearch rewrite). Nothing under
+- **The last CODE commit is `9d9a031`** (the 8cp/8cq fix round: the Kad answer
+  count, the upload block bound, the table sender-key rule, the Kad1 gate, the
+  flood-map bound, server-list vetting + the byte-reversed blocklist, the
+  saturating `finds_inflight`, the UPnP honesty fix and the iOS sharing
+  decision). **The device is therefore running OLDER code than `main`** - the
+  build on it is `c656555`, so a reship is needed before any on-glass claim
+  about this round. Previously `9b3402b` (the CSearch rewrite). Nothing under
   `crates/`, `ios/` or the manifests has changed since `c656555`, so **the build
   installed on the device IS `main`'s current shipped code** - a doc-only tip does
   not need a reship. **Check `git log` for the tip rather than trusting a sha
@@ -217,10 +233,15 @@ audio session itself spends.
 
 ## WHAT TO DO NEXT
 
-**See [[handoff-for-fable]] - it is the authority and it carries the task list.**
-In one line: **the off-device A/B is DONE and the rewrite works (see MEASURED);
-what is left is the DEVICE pass**, and the WDA profile expires 2026-08-10, so
-that is the deadline on the UI-driving half of it.
+**See [[handoff-for-fable]] - it is the authority and it carries the task list**,
+including the 8cp findings ledger (twelve verified items found and deliberately
+not fixed, ranked).
+In one line: **the Kad spec is FINISHED - both steps built, oracle- and
+device-verified (see MEASURED) - so the next round starts at Kad PUBLISHING**,
+with concurrency-under-load behind it. The WDA profile expires 2026-08-10, which
+is the deadline on anything needing UI driving.
+[This section said "what is left is the DEVICE pass" until 2026-08-08, a day
+after row 8co ran it - the same stale-status shape row 8cn hit.]
 
 ## STILL OPEN ON KAD
 

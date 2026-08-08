@@ -1,6 +1,6 @@
 # Decisions and Lessons
 
-Updated: 2026-08-02 (reanalysis lint: two superseded claims annotated in place)
+Updated: 2026-08-08 (row 8cp reanalysis: date corrected - the file already carried a 2026-08-04 entry, the seedbox drop, under an 08-02 stamp)
 
 Locked decisions, rejected approaches, gotchas, measured facts. One dated
 bullet each; Locked decisions newest first, Lessons in the order learned.

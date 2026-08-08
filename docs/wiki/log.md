@@ -50,8 +50,8 @@ Append-only, timestamped record of Ingest / Query / Lint passes.
 - 2026-07-15 Wave 6a COMPLETE. New crate mule-kad with the Kad routing table (RoutingTable): binary tree of zones, each leaf a bin of K=10 contacts; descend by XOR-distance bit (bit 0 = closer half); split only if shallow (level<KBASE=4) or near self (index<KK=5) and not past MAXLEVELS=127 (eMule CanSplit); full unsplittable far bin drops the contact (caps far capacity). closest_to(target,n) = the n nearest by XOR (the lookup candidate set). Test loads the real 179-contact nodes.dat -> retains ~142 (rest overflow far bins, correct since saved vs a different self_id), tree splits beyond one bin, closest-lookups XOR-sorted. 240 tests. Next 6b: Kad UDP framing (0xE4/0xE5) + obfuscation (5b, 16-B overhead, no RC4 discard) + bootstrap(empty req)/hello handshake; differential gate = talk to a real Kad bootstrap node.
 - 2026-07-15 Wave 6b codecs DONE (source-verified + adversarial-reviewed). mule-kad gains frame.rs / udp_obf.rs / message.rs for the Kad UDP wire. Every layout verified against amule-3.0.1 source (EncryptedDatagramSocket.cpp, KademliaUDPListener.cpp SendMyDetails/AddContact2/Bootstrap, SafeFile.cpp WriteTag, Tag.h CTagVarInt), not the research summary. KEY FACT: aMule ENDIAN_SWAP_32 == wxUINT32_SWAP_ON_BE == no-op on our LE target, so the sentinel (0x395F2EC1) and both 4-byte verify keys are plain little-endian on the wire == our to_le_bytes(). 3 bugs found+fixed: (1) is_protocol_byte used the TCP set {E3,C5,D4,E4,E5,F4,F5}; correct UDP set is {C5,D4,E4,E5,A3,B2} - old set dropped inbound 0xF4-marked Kad packets and could emit 0xB2 that a real aMule drops; (2) deobfuscate must reject a zero-payload Kad packet (eMule `if result<=8`) BEFORE learning verify keys, not after; (3) pack threshold is PAYLOAD>200 (GetPacketSize excludes the opcode/header), not frame>200 - was an off-by-2 over-compressing at payload 199/200 [caught by the adversarial-review workflow]. Refuted (correctly): flate2/miniz_oxide != aMule zlib byte-for-byte, but both inflate identically -> interop-safe, not a wire defect (only matters for a future outbound-byte-exact oracle compare). 264 tests. Next 6c iterative FIND_NODE, then the live UDP gate.
 - 2026-07-15 Wave 6c DONE (codec + pure lookup) + source-verified. mule-kad message.rs gains KADEMLIA2_REQ (0x21: type&0x1F|target 16|receiver 16 = 33B; receiver must == recipient KadID) and KADEMLIA2_RES (0x29: target 16|count u8|count x 25B contact; exact-len 17+25*count; Kad1 version<=1 dropped) - verified vs ProcessKademlia2Request/Response + Search.cpp SendFindValue. Request-type byte = GetRequestContactCount: FIND_VALUE 0x02, STORE 0x04, FIND_NODE/FIND_VALUE_MORE 0x0B. New lookup.rs: Lookup - deterministic iterative CSearch core; candidates BTreeMap<distance,contact> (XOR distance injective per id => sort key), next_queries(ALPHA=3, frontier=K) returns closest-untried and marks tried, on_response folds in closer contacts, converges when the frontier is fully queried; ALPHA_QUERY=3 (eMule; aMule=5, behavior-not-wire). Timers/JumpStart/reask + IP anti-poisoning dedup deferred to the live layer. Convergence test dogfoods the 6a RoutingTable as each sim node's knowledge (bucketed => navigable; a naive M-nearest graph strands greedy routing) -> converges to the exact k-closest over 160 nodes. 272 tests. NEXT: live UDP gate (real socket: BOOTSTRAP_REQ -> RES, HELLO 3-way -> IP-verified, self-lookup fills routing table), then 6d source search + the Wave-6 differential goal.
-- 2026-07-15 WAVE 6 LIVE GATE PASSES. mule-engine::kad_live::KadNode (tokio UdpSocket) + mule-cli `kad-bootstrap <nodes.dat>` join the REAL Kad network: obfuscated BOOTSTRAP_REQ (NodeID-keyed) -> BOOTSTRAP_RES from a live v10 node (20 contacts, decrypted via the ReceiverKey path since the peer echoes the senderVerifyKey we issued) -> routing table seeded -> HELLO_REQ/HELLO_RES with a real peer. Advertising aMule version 0x08 is accepted by a v10 peer. Reliable across runs. LIVE-GATE BUG FOUND+FIXED: the contact IP byte order. eMule keeps a contact IP in HOST order (MSByte=first octet) and WriteUInt32s it LE, so mule-files read_u32 (LE) recovers the host-order value directly (95.236.36.250 -> 0x5FEC24FA); the dotted quad is the BIG-endian view = Ipv4Addr::from(ip), NOT to_le_bytes (which reversed it to the multicast 250.36.236.95 and dropped every packet). This was the research's UNSURE IP-endianness item; the live capture (first octets 224-250 = reserved) confirmed it. Locked with a regression test. The verify-key dance works because the same host-order u32 feeds udp_verify_key on both send(dest) and receive(source). Fresh nodes.dat fetched via curl http://upd.emule-security.org/nodes.dat (6302B, 185 v2 contacts). 274 tests. NEXT 6d: SEARCH_SOURCE_REQ/RES + resolve a known ed2k hash to sources (Wave-6 goal), driving the 6c lookup live.
-- 2026-07-15 WAVE 6 (Kad) COMPLETE - GOAL MET LIVE. 6d adds the source search: SEARCH_SOURCE_REQ (0x34: target 16|startPos 2 &0x7FFF|fileSize 8 u64 = 26B) + SEARCH_RES (0x3B: responderID 16|keyID 16|count 2|count x {answer 16|taglist}); SearchResult::as_source pulls SOURCETYPE 0xFF/SOURCEIP 0xFE/SOURCEPORT 0xFD/SOURCEUPORT 0xFC and accepts eMule source types {1,3,4,5,6}. Verified vs Process2SearchSourceRequest/Process2SearchResponse/SendValidSourceResult. read_kad_tag RELAXED to eMule behavior: the tag name is a length-prefixed string (ReadTag: ReadString) - tolerate any name length (first byte = name id), only an unknown TYPE errors (can't skip unknown length). ed2k file hash -> Kad target via Kad128::from_hash (SetValueBE, confirmed vs CUInt128 ctor + PartFile.cpp:1661). Live driver kad_live: request() loops past interleaved stray datagrams until the awaited opcode arrives from the peer; find_node (KADEMLIA2_REQ FIND_NODE) + search_source drive resolve_sources (iterative 6c lookup toward the hash, then SEARCH_SOURCE_REQ to closest-in-tolerance nodes). mule-cli kad-search <nodes.dat> <hash> <size>. LIVE RESULT (reliable): bootstrap -> 15/16 real nodes answer FIND_NODE (lookup converges toward hash) -> 5/10 in-tolerance nodes return a SEARCH_RES -> resolves a real source (type 3 firewalled+buddy, real IP:port 49.118.243.134). 278 tests. Wave 6 done: routing + UDP wire/obfuscation + iterative lookup + source search, all validated live. NEXT: Wave 7 (mule-ec + CLI parity) or return to eD2k integration (5d live multi-source, server DH obfuscation).
+- 2026-07-15 WAVE 6 LIVE GATE PASSES. mule-engine::kad_live::KadNode (tokio UdpSocket) + mule-cli `kad-bootstrap <nodes.dat>` join the REAL Kad network: obfuscated BOOTSTRAP_REQ (NodeID-keyed) -> BOOTSTRAP_RES from a live v10 node (20 contacts, decrypted via the ReceiverKey path since the peer echoes the senderVerifyKey we issued) -> routing table seeded -> HELLO_REQ/HELLO_RES with a real peer. Advertising aMule version 0x08 is accepted by a v10 peer. Reliable across runs. LIVE-GATE BUG FOUND+FIXED: the contact IP byte order. eMule keeps a contact IP in HOST order (MSByte=first octet) and WriteUInt32s it LE, so mule-files read_u32 (LE) recovers the host-order value directly (<peer-ip> -> <peer-ip-hex>) [ADDRESS REDACTED 2026-08-08: it was a real captured peer and this repo is public]; the dotted quad is the BIG-endian view = Ipv4Addr::from(ip), NOT to_le_bytes (which reversed it into reserved space and dropped every packet). This was the research's UNSURE IP-endianness item; the live capture (first octets 224-250 = reserved) confirmed it. Locked with a regression test. The verify-key dance works because the same host-order u32 feeds udp_verify_key on both send(dest) and receive(source). Fresh nodes.dat fetched via curl http://upd.emule-security.org/nodes.dat (6302B, 185 v2 contacts). 274 tests. NEXT 6d: SEARCH_SOURCE_REQ/RES + resolve a known ed2k hash to sources (Wave-6 goal), driving the 6c lookup live.
+- 2026-07-15 WAVE 6 (Kad) COMPLETE - GOAL MET LIVE. 6d adds the source search: SEARCH_SOURCE_REQ (0x34: target 16|startPos 2 &0x7FFF|fileSize 8 u64 = 26B) + SEARCH_RES (0x3B: responderID 16|keyID 16|count 2|count x {answer 16|taglist}); SearchResult::as_source pulls SOURCETYPE 0xFF/SOURCEIP 0xFE/SOURCEPORT 0xFD/SOURCEUPORT 0xFC and accepts eMule source types {1,3,4,5,6}. Verified vs Process2SearchSourceRequest/Process2SearchResponse/SendValidSourceResult. read_kad_tag RELAXED to eMule behavior: the tag name is a length-prefixed string (ReadTag: ReadString) - tolerate any name length (first byte = name id), only an unknown TYPE errors (can't skip unknown length). ed2k file hash -> Kad target via Kad128::from_hash (SetValueBE, confirmed vs CUInt128 ctor + PartFile.cpp:1661). Live driver kad_live: request() loops past interleaved stray datagrams until the awaited opcode arrives from the peer; find_node (KADEMLIA2_REQ FIND_NODE) + search_source drive resolve_sources (iterative 6c lookup toward the hash, then SEARCH_SOURCE_REQ to closest-in-tolerance nodes). mule-cli kad-search <nodes.dat> <hash> <size>. LIVE RESULT (reliable): bootstrap -> 15/16 real nodes answer FIND_NODE (lookup converges toward hash) -> 5/10 in-tolerance nodes return a SEARCH_RES -> resolves a real source (type 3 firewalled+buddy, real IP:port <peer-ip>) [ADDRESS REDACTED 2026-08-08]. 278 tests. Wave 6 done: routing + UDP wire/obfuscation + iterative lookup + source search, all validated live. NEXT: Wave 7 (mule-ec + CLI parity) or return to eD2k integration (5d live multi-source, server DH obfuscation).
 - 2026-07-15 Wave 7 RE-SCOPED (user decision) from EC protocol to END-TO-END FETCH integration - "give a hash, get the file" in one driver. Rationale: the iPad UI seam is in-process FFI (Wave 8 = mule-ffi), NOT a separate EC daemon, so EC would be interop/dev-tooling only; wiring the validated pieces (Kad source search + server/peer source exchange + peer download) into one cohesive flow is higher value. mule-engine::fetch: PeerSource normalises a source across origins - THE place the two IP conventions are reconciled: Kad TAG_SOURCEIP is host-order (dotted quad = Ipv4Addr::from(ip), big-endian view; eMule does ED2KID=SWAP(ip) then displays low-byte-first, DownloadQueue.cpp:1592), server OP_FOUNDSOURCES is eD2k low-byte. Only HighID Kad types {1,4} + non-LowID (>=0x01000000) server ids are directly connectable; firewalled/callback skipped. SourceRegistry dedups by addr across backends. fetch_from_sources drives Download across sources (connect_peer_obf when userhash known else connect_peer, per-peer timeouts, skip dead/queued/no-file). mule-cli kad-fetch. 5 unit tests + loopback integration (serve_file peer -> fetch_from_sources -> complete -> ed2k hash verifies) + dead-source test. LIVE run: bootstrapped Kad, resolved a HighID source, completed an obfuscated handshake with a real internet peer (peers_connected 1/1), 0 bytes only because the degenerate empty-file hash isn't shared by that peer. Loopback proves the download half; live proves discovery+connection. 285 tests. EC protocol DEFERRED (optional interop). NEXT: Wave 8 (mule-ffi + iOS shell) needs Apple toolchain; or 5d live multi-source integration; or a real live fetch with a hash a HighID Kad seeder actually holds.
 - 2026-07-15 LIVE MILESTONE: real eD2k search-to-download. New mule-cli `search-download <server.met> <keyword> <out>`: login -> keyword search -> rank results by advertised source count (TAG_SOURCES 0x15) -> probe OP_GETSOURCES per candidate until one has a connectable HighID source -> fetch_from_sources with RESUME across reconnects -> verify ed2k hash. Live run: logged into 45.87.41.16:6262 (LowID), searched 'pdf' -> 200 results parsed correctly, found 'Practical Electronics 2026-07.pdf' (14MB) with a HighID source, DOWNLOADED REAL BYTES 0->575K->1.15M->1.78M over 6 resumed rounds (13%). Progress persisted across reconnects (disk-backed .part). Incomplete only because one eD2k source serves ~575KB bursts then queues us (upload-slot rationing) - completing needs multiple HighID sources or queue-position/reask handling (a real download manager). Proves the full pipeline end-to-end vs the real network: server login + search + get-sources + connect + transfer + resume. Ranking candidates by source count is what found a connectable file (most .pdf results had only LowID/firewalled sources). 285 tests.
 - 2026-07-15 WAVE 8 TOOLCHAIN (Anthony's hardware: 2011 Mac mini + iPad Pro 4th gen): the 2011 mini maxes at macOS 10.13 High Sierra -> Xcode 10.1 -> iOS 12 SDK; the iPad Pro 4th gen is on iPadOS 17/18 and can't downgrade, so THE MAC MINI ALONE CANNOT BUILD FOR THE IPAD (needs Xcode 15 / macOS Ventura). Working path with existing hardware: (1) build the .ipa in CI (GitHub Actions macOS runners have modern Xcode; also cross-compiles the Rust mule-ffi -> aarch64-apple-ios xcframework); (2) sideload from the WINDOWS host (the WSL2 box) via AltServer (runs on Windows, not just macOS) + AltStore/SideStore; free Apple ID = 7-day signing (auto-refresh), $99 dev acct = 1yr. The mini is optional (iOS 12 simulator, or OCLP'd to run AltServer). Only the final link+sign needs Apple tooling; the Rust core builds+tests on this WSL box.
@@ -1183,3 +1183,179 @@ Append-only, timestamped record of Ingest / Query / Lint passes.
   Also true and worth not re-deriving: nothing under `crates/`, `ios/` or the
   manifests changed after `c656555`, so the build on the DEVICE is `main`'s
   current shipped code. A doc-only tip needs no reship.
+
+- 2026-08-08 **THE REANALYSIS PASS (row 8cp): the gate was honest, and two real
+  defects were hiding behind it.** A full reacquaintance sweep - seven parallel
+  read-only agents over `mule-proto`/`mule-files`, the Kad path, the engine, the
+  CLI/FFI seam, the iOS app, the scripts/CI layer and the wiki, plus a live gate
+  run and my own spot-checks of every high-severity claim before it was written
+  down. **What held up:** 700 tests re-run and re-counted rather than remembered,
+  clippy `-D warnings` and fmt clean, tracked tree ASCII-clean but for five
+  binary fixtures, git state matching the handoffs exactly (linear history, only
+  `main` plus the deliberately locked `worktree-wave11-aich`). Every wire and
+  format constant in the two foundational crates was re-derived against
+  `refs/emule-0.50a` and matched; AICH is a faithful line-by-line transcription
+  of `SHAHashSet.cpp` including its quirks; the 8cg heartbeat-lock split and the
+  8cb reservation-leak fix are both PRESENT and complete.
+  **DEFECT 1, and the sharper of the two: the Kad answer ignored the COUNT the
+  requester asked for.** `kad_serve` parsed `req_type`, masked it to 5 bits, and
+  then answered every KADEMLIA2_REQ with the 11-contact FIND_NODE cap. Upstream
+  the type byte IS the count - eMule hands it straight to the table
+  (`GetClosestTo(2, uTarget, uDistance, (uint32)byType, ...)`,
+  KademliaUDPListener.cpp:737) and `GetRequestContactCount` (Search.cpp:1782-1809)
+  yields 2 for FILE/KEYWORD/FINDSOURCE/NOTES and 4 for the store types. So every
+  VALUE lookup padMule answered was DISCARDED WHOLESALE by the asker
+  (Search.cpp:377, "not only a protocol violation but most likely a malicious
+  answer") - and row 8ck cites that exact line as the reason its own cap exists.
+  **The rule was known, cited, and applied to the wrong quantity.** No stock
+  client over-answers, so it was a padMule fingerprint besides.
+  **WHY THE EXISTING TEST COULD NOT SEE IT:**
+  `find_node_is_answered_and_capped_at_the_requested_count` only ever sent
+  KAD_FIND_NODE, whose count (11) HAPPENS TO EQUAL our cap - so "the cap" and
+  "the requested count" were indistinguishable inside it. A near-miss of the
+  same tautology 8ck caught in the cap closures, surviving because the two
+  quantities coincide for exactly one opcode. Three new tests pin value=2,
+  store=4, and a 31-ask still cut to 11.
+  **DEFECT 2: the upload serve path had no block-size bound.** `read_range` does
+  `vec![0u8; end - start]` and the serve arm checked only `s <= e && e <= f.size`,
+  so a peer holding a slot could name a range spanning the whole shared file and
+  force that allocation from ONE packet, against a ~100MB jetsam budget. Both
+  authorities enforce the same limit and neither is subtle: eMule 0.50a throws
+  IDS_ERR_LARGEREQBLOCK on `i64uTogo > EMBLOCKSIZE*3` (UploadClient.cpp:316-317),
+  aMule drops the block on the identical condition (UploadClient.cpp:320) - a
+  rare case where citing both sides costs nothing. Bounded at `EMBLOCKSIZE * 3`,
+  the entire legitimate window, so no honest downloader is refused.
+  **Tested through the REAL serve loop, not against the helper** - a bound proven
+  on `read_range` says nothing about whether the packet path reaches it, which is
+  the row-8bk mistake. The refusal test sends a LEGAL block afterwards and
+  asserts it is still served, so it proves the refusal is SELECTIVE rather than a
+  dead session; a companion test pins that EXACTLY three blocks still streams,
+  because a `>=` fix would have left the first test green while breaking every
+  real eMule downloader.
+  **A TEST-QUALITY LESSON, found by mutating rather than by reading.** The
+  boundary mutation initially failed by HANGING for 60 seconds instead of
+  failing: a refused request produces no packet, so the unbounded read loop
+  waited forever. Both loops now carry a 5s timeout and fail in 5s with a message
+  naming the consequence. **A test that hangs on regression reads as an
+  infrastructure problem rather than the defect it just caught** - which is
+  exactly how a real regression gets waved off as a flake. Banked in
+  [[handoff-for-fable]] under how this project judges work.
+  Gate: **705 tests (700 + 5) over THREE consecutive full runs**, clippy
+  `-D warnings`, fmt, changed files ASCII-clean. Mutation checks on both fixes,
+  each mutant confirmed to have COMPILED (the other tests still ran and passed,
+  so the red was an assertion, not a build error).
+  **TWELVE FINDINGS VERIFIED AND DELIBERATELY NOT FIXED**, ranked in
+  [[handoff-for-fable]] rather than half-built (the row-8by rule). The one that
+  should be read first: **the CSearch rewrite itself introduced a regression** -
+  the frontier/table split left `absorb_find_answer` feeding raw answered
+  contacts to the ROUTING TABLE while filtering only the FRONTIER, so the
+  anti-hijack refusal eMule applies at the table level (`RoutingZone::Add`) is
+  gone on our side. It drains the verified seed pool rather than forging entry,
+  because the monotonic-bit rule still stops an attacker inheriting verification.
+  **The same asymmetry, one layer down, is the already-known missing Kad-version
+  gate - they are one seam, not three.** Also carried: the Kad flood maps have no
+  pruner wired (`evict_expired` has zero call sites, and `MAX_TRACKED_IPS` guards
+  only the out-track list, so the very vector it was written to close is open);
+  the serve loop answers without checking the source address is routable or
+  unfiltered; two UDP fan-outs skip the SSRF gate the crawler enforces; a failed
+  UPnP refresh leaves `public_ip` stale; the 2-worker FFI runtime writes every
+  received block synchronously with no `spawn_blocking`, which is a live suspect
+  for the many-downloads complaint; and on iOS `applyEffectiveSharing()` clears
+  `sharing_paused_for_ip_change`, so the cellular toggle silently cancels the
+  public-address-change guard - **invisible to the suite because the test
+  re-implements the rule in the test file instead of calling the method.** That
+  is the tautology shape one level up: a test that re-states a rule cannot catch
+  the CALLER getting it wrong.
+  **DOC DRIFT, all in one seam and now closed:** four live entries still said the
+  CSearch work was offline-only and sitting on `kad-csearch`, a branch deleted
+  the same day - `index.md` (twice), `build-progress`'s own header,
+  `kad-routing-lifecycle`'s serve annotation, and `handoff-next-session`'s
+  "what is left is the DEVICE pass", written a day after row 8co ran it. The
+  same stale-status shape row 8cn hit, four more times. Also corrected:
+  `security-model`'s anti-flood row still said "padMule serves no inbound Kad
+  requests" a day after the serve loop gave FloodTracker its first production
+  call site; three `Updated:` dates that predated their own content; the
+  `mule-cli` header claiming 26 subcommands while listing 27 and shipping 30; and
+  CLAUDE.md's `mule-files` row, which omitted known2_met, ipfilter and pins - the
+  last being the one format in that crate with no upstream counterpart, which the
+  row's blanket "byte-compatible with upstream" did not cover.
+  **NOT ACTED ON, left for Anthony:** real third-party residential IPs captured
+  off the live network are baked into test code and asserted on (`fetch.rs`,
+  `kad_live.rs`, and `log.md` above), which the CLAUDE.md privacy rule forbids
+  verbatim - the RFC5737 pattern is already used one file over. Same call on the
+  Apple Team ID committed in two scripts.
+
+- 2026-08-08 **THE FIX ROUND (row 8cq): seven 8cp findings closed, and TWO of my
+  own findings named the WRONG REMEDY.** Anthony said proceed, so the ledger was
+  worked top-down. **The corrections are the part worth keeping, because both
+  would have shipped a regression had the report been trusted over the source.**
+  **(1) The "CSearch anti-hijack regression" was not one.** 8cp said the
+  frontier/table split had lost the anti-hijack refusal and proposed applying
+  `is_acceptable_answer` to the routing table. Reading eMule instead of the
+  report: the split is FAITHFUL - `Process_KADEMLIA2_RES` feeds the table via
+  `AddUnfiltered` and applies `IsAcceptableContact` only to what the SEARCH sees
+  (KademliaUDPListener.cpp:848). Doing what my own finding said would have
+  STARVED the table - the exact self-inflicted regression Anthony caught
+  mid-build in 8cn, re-introduced by the agent that was reviewing it. What the
+  table genuinely lacked is eMule's SENDER-KEY rule (RoutingZone.cpp:525-533): an
+  entry holding a key may only be updated by a packet carrying the SAME key, and
+  an EMPTY key explicitly fails it ("Sent Empty: Yes") - which is what a third
+  party's RES payload always is. Implemented in `Zone::add` and NARROWED to the
+  address change on purpose: padMule records keys out of band, so `add` never
+  carries one and a literal transcription would have refused honest same-address
+  refreshes too.
+  **(2) The "two UDP fan-outs skip the SSRF gate" fix was in the wrong place.**
+  Gating them would have broken a SUPPORTED setup - padMule's own eserver oracle
+  runs on 127.0.0.1, and a LAN server the user added is legitimate. The real hole
+  was upstream: `update_server_list` fetches a server.met over PLAIN HTTP from a
+  user-configured URL and merged it with NO vetting at all, so the publisher or
+  any intermediary could inject loopback/LAN/link-local entries that then became
+  UDP targets of the status probe and the global search. Vetting now happens at
+  INGESTION, where the crawl was always gated.
+  **AND THAT FIX UNCOVERED A LIVE BUG NOBODY HAD FILED:** the crawl's blocklist
+  check passed the raw met-u32 to `is_blocked_u32`, which takes HOST order. The
+  two are byte-reversed, so **the user's IP blocklist has never once filtered a
+  discovered server.** Verified empirically BEFORE fixing (85.17.116.222 reads
+  unblocked as the met u32 and blocked as the host-order one, same filter), then
+  corrected at both call sites and pinned by a case that goes red under mutation.
+  **ALSO CLOSED:** the Kad1 gate at the single table insert, matching
+  `AddUnfiltered`'s `uVersion > 1` - this dropped an existing test's fixture
+  count from 7 to 6, which is a rule getting correctly stricter rather than a
+  break, and was annotated in place rather than silently retuned. `FloodTracker`
+  is bounded at `MAX_TRACKED_IPS` INSIDE `record`, so every user of the type is
+  bounded rather than one call site; prune-then-refuse, fail-open for the reason
+  padMule already documents for its out-track list. `finds_inflight` is
+  saturating, so a panicking value task costs one over-parallel round instead of
+  wedging the lookup until its overall deadline. The failed-UPnP-refresh arm now
+  CLEARS `public_ip`, so `has_port_mapping()` stops claiming a mapping it just
+  failed to confirm - the contract that field documents for itself. And the
+  captured third-party peer addresses are gone from `fetch.rs`, `kad_live.rs` and
+  `log.md`; the replacements are SYNTHETIC but keep each test's property -
+  routable, because `is_routable_public_v4` rejects the RFC5737 ranges, and for
+  the byte-order test one that still reverses into RESERVED space, which is how
+  the original bug announced itself.
+  **iOS, stated plainly: NOT LOCALLY VERIFIED.** The cellular toggle silently
+  cancelled the public-address-change pause, because `applyEffectiveSharing`
+  unconditionally called `setSharing` and `set_sharing(true)` clears that pause by
+  design ("the user has decided") - except a network event is not the user
+  deciding. The rule is now the pure `EngineModel.sharingDecision(...)`, which
+  returns `nil` for "push nothing" when an ON decision would lift a pause the user
+  did not lift; only `setSharing` passes `userInitiated: true`, and the OFF
+  direction is never gated. `SettingsTests` now calls the REAL rule - it
+  previously RE-IMPLEMENTED it in the test file, which is exactly why a live
+  caller bug sat there green for weeks. **There is no Apple toolchain on this
+  box, so the Swift half compiles and runs in CI only; it is UNPROVEN until
+  `ios-test.yml` goes green, and this entry does not claim otherwise.**
+  **A FLAKE WAS MEASURED RATHER THAN WAVED OFF.**
+  `request_reports_a_valid_receiver_key_when_the_peer_echoes_our_sender_key`
+  failed once in six full-suite runs. Run ALONE it passed 15/15, and the diff does
+  not touch `request()` - it is a pre-existing test with a 2s deadline on a
+  loopback round trip, sensitive to machine load, the same family as the
+  fixed-port flake row 8ck found. Recorded with its rate so the next reader does
+  not spend an hour re-deriving it.
+  **ONE PROCESS SLIP, recorded because it nearly became a false green:** the
+  first gate check ran `cargo fmt --check | tail -3 && echo "FMT OK"`, which
+  reports TAIL's exit code - so it printed OK while fmt was actually failing on
+  three of the new tests. Every later gate check reads each command's own exit
+  code separately. Gate: **710 tests** (from 705) with the flake above, clippy
+  `-D warnings`, fmt, changed files ASCII-clean.

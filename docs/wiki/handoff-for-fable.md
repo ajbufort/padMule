@@ -1,5 +1,10 @@
 # HANDOFF TO FABLE 5 - padMule, next round
 
+Updated: 2026-08-08 (rows 8cp + 8cq - the reanalysis and the fix round that
+followed it. Nine defects fixed and COMMITTED as `9d9a031`; the ledger below
+records what is CLOSED and what is still open, and two findings that named the
+WRONG remedy until the eMule source was read.)
+
 Rewritten 2026-08-08 by the Opus session that shipped the Kad serve loop, the
 event-driven CSearch, and the device pass that verified both. **This entry is THE
 AUTHORITY** (Anthony, 2026-08-08): it says what to do and how this project judges
@@ -43,11 +48,16 @@ the tree; where the two disagree, this one wins and that one is stale.
 - **Report what you OBSERVED.** Quote log lines. Say what you could not prove. An
   honestly reported partial beats a confident overstatement - the second gets
   written into the KB and believed.
-- **Gate before claiming done:** `cargo test --workspace` (**700** pass on
-  `kad-csearch`; none may regress), `cargo clippy --workspace --all-targets --
-  -D warnings`, `cargo fmt --all -- --check`, changed files ASCII-only. Run the
-  suite 3x - this codebase has had parallelism flakes from fixed-port binds; use
-  ephemeral ports (0) in tests.
+- **Gate before claiming done:** `cargo test --workspace` (**710** pass on `main`
+  as of the 8cq fix round - 700 before 8cp, 705 after it; none may regress), `cargo clippy
+  --workspace --all-targets -- -D warnings`, `cargo fmt --all -- --check`,
+  changed files ASCII-only. Run the suite 3x - this codebase has had parallelism
+  flakes from fixed-port binds; use ephemeral ports (0) in tests.
+- **A test that HANGS on regression is a defective test**, not a slow one. The
+  8cp boundary mutation took 60s to fail because a refused request produces no
+  packet and the read loop had no timeout - and a hang reads as an
+  infrastructure problem rather than the defect it just caught, which is how a
+  real regression gets waved off as a flake. Bound every wire read in a test.
 - **On a branch, the LOCAL gate is the only gate.** All three workflows fire only
   on push-to-`main`, PRs and `workflow_dispatch`; `ship.sh` dispatches them
   explicitly.
@@ -93,6 +103,116 @@ what the audio session itself spends, and whether it can be made cheaper.
 OPEN.** Item 1 below.
 
 **#3 - Device-verify the CSearch rewrite. CLOSED 2026-08-08** (row 8co).
+
+## WHAT THE REANALYSIS FOUND (2026-08-08, rows 8cp/8cq) - the carried ledger
+
+Two defects were FIXED (see [[build-progress]] 8cp): the Kad answer ignored the
+contact COUNT the requester asked for, so every value lookup we answered was
+discarded wholesale by the asker; and the upload serve path had no block-size
+bound, so one packet could make us allocate the whole shared file. Both
+eMule-grounded, test-first, mutation-checked.
+
+**CLOSED by the follow-up round, same day** (all TDD, all mutation-checked
+except where noted; the Swift one is CI-verified only, see below):
+
+- ~~1. The CSearch split lost the anti-hijack refusal on the routing table.~~
+  **CLOSED - and the finding NAMED THE WRONG REMEDY, which is the part worth
+  keeping.** Reading eMule rather than the report: the frontier/table split IS
+  faithful - `Process_KADEMLIA2_RES` feeds the table via `AddUnfiltered` and
+  applies `IsAcceptableContact` only to what the SEARCH sees
+  (KademliaUDPListener.cpp:848). Applying the frontier filter to the table, as
+  the finding proposed, would have STARVED the table - the exact regression
+  Anthony caught mid-build in 8cn. What eMule's table path really carries is a
+  SENDER-KEY check: an entry holding a key may only be updated by a packet
+  carrying the same key, and an empty key explicitly fails ("Sent Empty: Yes",
+  RoutingZone.cpp:525-533) - which is precisely what a third party's RES payload
+  is. Implemented in `Zone::add`, narrowed to the ADDRESS CHANGE because
+  padMule records keys out of band so `add` never carries one.
+- ~~2. The Kad flood maps have no pruner.~~ **CLOSED.** `MAX_TRACKED_IPS` (4096)
+  now lives in `hardening.rs` and `FloodTracker::record` prunes then refuses to
+  grow, fail-open, bounding every user of the type rather than one call site.
+- ~~4. Two UDP fan-outs skip the SSRF gate.~~ **CLOSED, AT A DIFFERENT PLACE
+  THAN PROPOSED.** Gating the fan-outs would have broken a supported setup -
+  padMule's own eserver oracle runs on 127.0.0.1, and a LAN server the user
+  added is legitimate. The actual hole was upstream: `update_server_list`
+  fetches a server.met over PLAIN HTTP from a user-configured URL and merged it
+  with NO vetting, so a hostile or MITM'd list could inject loopback/LAN entries
+  that later became UDP targets. Vetting now happens at INGESTION
+  (`vet_downloaded_servers`), matching where the crawl is gated.
+  **AND IT UNCOVERED A LIVE BUG NOBODY HAD FILED:** the crawl's blocklist check
+  passed the raw met-u32 to `is_blocked_u32`, which wants HOST order - the two
+  are byte-reversed, so **the user's IP blocklist has never actually filtered a
+  discovered server.** Verified empirically before fixing (85.17.116.222 reads
+  unblocked as the met u32, blocked as the host-order one), fixed at both sites,
+  and pinned by a case in `harvested_servers_are_filtered_and_merged`.
+- ~~5. iOS: the cellular toggle cancels the public-address pause.~~ **CLOSED.**
+  The rule is now the pure `EngineModel.sharingDecision(...)`, which returns
+  `nil` ("push nothing") when an ON decision would clear a pause the user did
+  not lift; only `setSharing` passes `userInitiated: true`. The OFF direction is
+  never gated. `SettingsTests` now calls the REAL rule instead of re-stating it,
+  which is what let this hide. **NOT LOCALLY VERIFIED - there is no Apple
+  toolchain on this box, so the Swift half compiles and runs in CI only
+  (`ios-test.yml`). Treat it as unproven until that goes green.**
+- ~~6. A failed UPnP refresh leaves `public_ip` stale.~~ **CLOSED for the `Err`
+  arm**, which now clears it, so `has_port_mapping()` stops claiming a mapping
+  it just failed to confirm - the contract that field documents for itself.
+  **UNTESTED: it needs a real IGD to exercise; the change rests on the
+  documented contract, not on a green test.** The `Remapped` arm still cannot
+  refresh the address because `RefreshOutcome` does not carry one - left alone.
+- ~~Carried hazard: `finds_inflight` underflow.~~ **CLOSED**, made saturating,
+  so the worst case is one over-parallel round instead of a wedged lookup.
+- ~~12. PUBLIC-REPO privacy (the IP half).~~ **CLOSED.** The captured peer
+  addresses are gone from `fetch.rs`, `kad_live.rs` and `log.md` (redacted there
+  with the `<peer-ip>` convention the wiki already uses). Replacements are
+  SYNTHETIC but keep each test's property: routable, because
+  `is_routable_public_v4` rejects the RFC5737 ranges, and for the byte-order
+  test one that still reverses into reserved space, which is how the original
+  bug announced itself.
+
+**STILL OPEN - verified in code, deliberately NOT fixed.** Ranked. **If you
+close one, strike it here.**
+
+1. **The serve loop answers before checking the source address.** No
+   routable/private check and no ipfilter consultation before replying; only the
+   contact INSERT is gated. So padMule reflects to RFC1918/loopback and answers
+   an IP the user blocklisted. The spec's Security section requires the check,
+   and a test currently PINS the permissive behaviour - read it before changing,
+   and decide deliberately, because the same "is this faithful or is it a gap?"
+   question is what the item-1 correction above turned on.
+2. **`related_search` poisons "Load more"**: it issues a fresh server query
+   without resetting `search_session`, so a later `search_more()` splices the
+   related query's page 2 into the keyword result set.
+3. **The 2-worker FFI runtime writes every received block synchronously.**
+   `part_store` uses `File::write_all` from `Download::add_block` with no
+   `spawn_blocking`, the one uninsulated blocking call in an engine that
+   otherwise wraps hashing and verification carefully - on a `worker_threads(2)`
+   runtime, with ~4 workers per download and NO cap on concurrent downloads.
+   **A live suspect for "concurrency under load" below; measure it before
+   assuming a download cap is the whole story.**
+4. **The stress harness corrupts the two numbers it exists to produce**:
+   `add_download`'s outcome is discarded so rejected hits still inflate the
+   `queued` denominator, and it reuses fixed dirs, so `resume_downloads` puts
+   previous-run part-files into `ever_received` on tick one without a byte
+   arriving. Fix before trusting it for the item above.
+5. **Format fidelity, low severity**: `read_part_met` accepts the eDonkey
+   `0xE1` version but parses it with the `0xE0` layout (aMule switches layouts,
+   PartFile.cpp:432-456) - and its test only flips the version byte on an
+   `0xE0` golden, so it is tautological; `write_tag` can emit `TAGTYPE_BSOB`
+   into a MET file, which aMule's MET reader throws on; `is_expired` uses `>=`
+   where aMule uses strict `>`; nodes.dat v0 is parsed where aMule refuses it.
+6. **`ship.sh` guard 4 does not exist.** The `GUARD 4` label sits on a WDA
+   `/status` ping and the run ends by telling a human to check Settings, so the
+   "closed loop" is open at its last link - though `device-timing.sh` already
+   reads the build off the device. Also: a zsign failure is swallowed by
+   `|| true` (a stale signed ipa could install), the run-picker can lock onto an
+   older FAILED run for the same sha, and the CI wait loop has no timeout while
+   holding the `flock`.
+7. **PUBLIC-REPO privacy, the remaining half, for Anthony to decide:** the Apple
+   Team ID `Q444CHAF2Z` is committed in `ship.sh` and `device-timing.sh`. Left
+   alone on purpose - it is the installed bundle id's suffix, so changing it
+   risks breaking the proven install path for a personal-identifier concern that
+   is real but weaker than the captured-peer one. Parameterising it via an env
+   var would close it without touching the flow.
 
 ## THEN, IN PRIORITY ORDER
 
@@ -193,7 +313,11 @@ and iOS then refuses to load it.
   insert a v1 contact even though the nodes.dat path gates `version > 1`.
   `CSearch::add` rejects `version <= 1` for the FRONTIER only, and
   `absorb_find_answer` feeds the TABLE first - so the gap is real and the rewrite
-  did not close it.
+  did not close it. **The 8cp reanalysis found this is the SAME asymmetry as
+  ledger item 1 above** (the anti-hijack refusal also filters only the frontier)
+  and that it starts one layer lower: `read_nodes_dat` parses a v0 file that
+  aMule refuses outright, and `routing::load_nodes` does not drop `version <= 1`
+  at load the way aMule does. Fix them together - it is one seam, not three.
 - **`KAD_MAINTENANCE_BUDGET` (3s) exactly equals `REFRESH_DEADLINE_QUERIES` x
   `KAD_PER_QUERY`** (4 x 750ms), so for a full-length refresh the outer timeout
   and the lookup's own deadline fire together and cancellation is the NORMAL path.
@@ -201,7 +325,19 @@ and iOS then refuses to load it.
 - **`drive_lookup` dispatches BEFORE it checks `results >= want`**, so the value
   response that satisfies a search triggers one more harvest-and-refill batch
   whose replies are discarded. Wasted datagrams on the success path; not a
-  correctness bug, never measured.
+  correctness bug, never measured. (Re-confirmed by the 8cp reanalysis.)
+- **`finds_inflight` can UNDERFLOW and wedge a lookup** (found 8cp): the
+  JoinSet-error arm decrements unconditionally, including when the failed task
+  was a `ReqKind::Value`, while the normal arm decrements non-saturating. One
+  panicking value task therefore wraps the counter in release, after which
+  `ALPHA_QUERY.saturating_sub(finds_inflight)` is 0 and no FIND_NODE dispatches
+  again until the overall deadline. Latent - it needs a task panic first.
+- **There is NO contact eviction anywhere**: `RoutingTable` exposes no removal
+  API at all, `Zone::add` drops the NEW contact when a bin is full rather than
+  probing the oldest, and `CSearch::on_timeout` never feeds failure back to the
+  table. Dead verified contacts persist as lookup seeds for the node's life.
+  This is the other half of eMule's `OnSmallTimer` named above, stated as the
+  code shape rather than the behaviour.
 - Near-biased nodes.dat sample. No bootstrap retry within a foreground session.
 
 ## Related

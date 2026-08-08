@@ -477,9 +477,16 @@ which looks like the feature silently not working.
 > Indexed.cpp:696, emits only inside `if (m_mapKeyword.Lookup(...))`), and since
 > padMule stores nothing it would otherwise emit a packet no stock client sends
 > on nearly every search reaching it - a padMule fingerprint.
-> **Offline-verified only: no device pass, and the external proof the spec names
+> **[SUPERSEDED 2026-08-08. The paragraph below was true when written on
+> 2026-08-07 and both of its caveats were closed within a day; annotated in
+> place rather than rewritten, per the ledger rule.] The external proof RAN and
+> PASSED (row 8cl): a real amuled EVICTED a silent control padMule and KEPT the
+> answering one in the same sweep ([[kad-verify-oracle]]). The device pass ran
+> too (row 8cm): no regression, `Longest poll gap` 1.1s.**
+>
+> ~~Offline-verified only: no device pass, and the external proof the spec names
 > - does a real amuled KEEP padMule across a ping cycle ([[kad-verify-oracle]]) -
-> has NOT been run.** So "we answer" is true of the code and unproven against
+> has NOT been run.~~ So "we answer" is true of the code and NOW proven against
 > another implementation. The section below stays as the record of what was
 > broken and why it mattered.
 

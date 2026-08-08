@@ -8,7 +8,7 @@ Mac. Confidence high except Rust-on-iOS (medium).
 
 > **TARGET DEVICE CHANGED (2026-08-02, confirmed by Anthony).** The target is now
 > an **iPad Pro 11-inch, M4 generation**: `iPad16,3`, board `J717AP`, arm64e,
-> iPadOS 26.5.2, 512GB with ~476GB free - read directly off the device over USB
+> iPadOS 26.6 (26.5.2 when this was written 2026-08-02), 512GB with ~476GB free - read directly off the device over USB
 > ([[ipad-usb-tooling]]), not assumed. It REPLACES the original target, an iPad
 > Pro 4th gen (2020, A12Z, 6GB RAM).
 >
