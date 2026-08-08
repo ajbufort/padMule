@@ -8,10 +8,12 @@ Full narrative: [[build-progress]] rows 8cf-8ch and the [[log]] entries for
 
 ## THE ONE-LINE SUMMARY
 
-The GUI freeze (8cg) and the operation slowness (8ch) are both fixed and **both
-are now measured on device**: search 10.3s -> 4.6-6.4s, Refresh 7.5-9.3s ->
-2.83s, and a **Longest poll gap of 1.1s** across nine searches, which is the
-first direct evidence the lock-free poll really does keep running.
+**padMule now keeps SHARING after it leaves the screen** (row 8cj, built
+2026-08-07, NOT yet device-verified) - and the agent runs a closed
+build-sign-install loop, because Anthony granted the signing key. Earlier the
+same day: the GUI freeze (8cg) and the operation slowness (8ch) were fixed and
+device-measured - search 10.3s -> 4.6-6.4s, Refresh 7.5-9.3s -> 2.83s, Longest
+poll gap 1.1s.
 
 ## State of the tree
 
@@ -32,7 +34,16 @@ first direct evidence the lock-free poll really does keep running.
   rendered as ". . .   . . .", so the tree cannot witness that fix and only a
   picture can.
 
-## THE INSTALL PATH - read this before touching Sideloadly
+## THE INSTALL PATH - THE AGENT NOW HAS THE KEY
+
+**ANTHONY GRANTED THE SIGNING KEY TO THE AGENT, 2026-08-07**, reversing the
+"Anthony runs zsign himself" rule that [[ipad-usb-tooling]] and
+[[padmule-ipa-delivery]] still describe. `scripts/ship.sh` is the closed loop:
+commit -> CI -> verify sha AND `CFBundleVersion` from a FRESH extraction -> sign
+-> install -> confirm WDA survived. Every guard in it is traceable to a session
+it already cost. Its tail also lists the KB/handoff duties and the
+run-reanalyze-after-a-compact rule, because Anthony asked for those to be part of
+the loop rather than a chore after it.
 
 **zsign + `pymobiledevice3` is the default. Sideloadly is for RENEWALS ONLY.**
 
@@ -107,7 +118,24 @@ on device against 85% on the dev box. **So the barrier IS the remaining cost**,
 and eMule's event-driven `CSearch` - no rounds, value requests interleaved -
 is worth roughly 2-3x on the Kad arm. See [[kad-routing-lifecycle]].
 
-## THE TOP NEXT ACTION - a DECISION is pending, not work
+## THE TOP NEXT ACTION - VERIFY BACKGROUND SEEDING ON DEVICE
+
+Row 8cj ships untested on glass. The build is offline-verified (650 tests,
+mutation-checked) and the memory gate is measured (30.8MB against ~100MB), but
+the thing that actually matters has NOT been observed: **does padMule keep
+serving after the home button, and for how long?**
+
+The check: turn Settings -> "Keep sharing in the background" ON, start an upload
+from the Acer (see the `controlled-swarm-acer` memory - and DO NOT search for
+personal or family video, those are not shared), background padMule, and watch
+whether bytes keep moving. Then leave it overnight and see whether the process
+is still alive in the morning - `pymobiledevice3 developer dvt sysmon process
+single` shows `physFootprint` and whether it is running at all.
+
+Jetsam is what will end it, not suspension. If it dies, the number to look at is
+the footprint at the time, not the elapsed hours.
+
+## THEN - a DECISION is pending, not work
 
 Anthony asked for the **event-driven `CSearch` rewrite, designed together with
 the Kad serve loop** (not after it - they need the same restructure, and doing

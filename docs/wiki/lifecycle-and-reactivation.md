@@ -134,6 +134,14 @@ strongest (verified in the iPadOS research, docs/raw/ipados-constraints-*):
    grade (OS discretion, may not fire): hash-check parts, prune sources, brief
    resume attempts while on power. Complements, never the primary runtime.
 
+**[BUILT 2026-08-07, same day - see [[build-progress]] 8cj. Background SEEDING
+ships: `EngineState::Seeding` + an `audio` keepalive, default OFF. So the
+"permanent foreground-only posture" below is superseded for the SERVE side. What
+is NOT built and is not planned: background DOWNLOADING, which stays off because
+it is the expensive half and seeding is the half that earns standing. The
+paragraphs below are kept because the analysis behind the decision stays
+accurate and is why the build is safe.]**
+
 **[REOPENED 2026-08-07 by Anthony: "we need to come up with a clever way to keep
 Kad, and padMule in general, always running in the background."** The 2026-08-04
 "permanent posture" decision below is therefore back on the table as a FEATURE
