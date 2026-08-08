@@ -99,6 +99,53 @@ whole point of the measurement. Download progress survived (byte counts
 matched exactly) but the process-global fetch counters did not. If the run
 matters, screenshot and read `/source` - do not open a session.
 
+**AND *ENDING* A SESSION KILLS IT TOO (2026-08-08).** `DELETE /session/{id}`
+terminates the app under test - WDA's default teardown. This produced a fifth
+false "DEAD" reading: background seeding was enabled, the session was closed to
+get WDA out of the way, the app was backgrounded with `dvt launch`, and sysmon
+found no padMule at all. It read exactly like the feature failing. It was the
+session teardown. **So the WDA session is fatal at BOTH ends** - creating one
+(for this bundle or another) and closing one. The rule that actually works:
+**do not close the session before the measurement; background with `dvt launch`
+and leave the session open, or relaunch the app after closing it.**
+
+**AND THE APP'S OWN LOG SETTLES IT IN ONE READ.** `enterBackground()` logs which
+branch it took - `keepalive: STARTED` + `lifecycle: entering background SEEDING
+(keepalive held)`, or `the keepalive did not start - pausing instead`, or
+`SKIPPED - sharing is off`. Capture it and the question of "did seeding engage"
+stops being an inference:
+
+```bash
+pymobiledevice3 syslog live -m padMule > cap.log &   # NOT idevicesyslog
+pymobiledevice3 developer dvt launch com.apple.DocumentsApp
+grep -iE "lifecycle|keepalive|seeding" cap.log
+```
+
+**`idevicesyslog` DOES NOT WORK on this device any more** - "No device found".
+It uses the old usbmuxd path, and an iOS 17+ device needs the pymobiledevice3
+tunnel. Use `pymobiledevice3 syslog live -m <proc>`. The older notes in this
+entry that reach for `idevicesyslog` are stale on that point.
+
+**HOW TO TAP A SwiftUI TOGGLE (2026-08-08).** Its accessibility element is the
+whole ROW (a ~540pt-wide rect), so clicking the element, or tapping the rect's
+CENTRE, hits the label and does nothing - the switch reports the same value
+afterwards and it looks like the setting is stuck. Tap near the row's RIGHT
+EDGE (`x = rect.x + rect.width - 30`). Always read the value back: `GET
+/session/{id}/element/{eid}/attribute/value` returns "0"/"1".
+
+**The search field is an `XCUIElementTypeTextField`, NOT a
+`XCUIElementTypeSearchField`** - a class-name lookup for the latter finds
+nothing.
+
+**WDA's `partial link text` matching is CASE-SENSITIVE (2026-08-08).** Polling
+for `ministe` missed both `Minister` (capital M) and the Catalan `ministre`
+(t-r-e), so a search returning 195 results read as returning NOTHING and nearly
+went into the record as a regression. Pick an interior substring that survives
+any capitalisation, and **make it distinctive against the PREVIOUS query** - the
+results list is still not cleared between searches, so a token shared with the
+last one matches stale rows at t=0 and yields ~1.2s, which is probe latency
+wearing a search time's clothes.
+
 
 
 - **ATTACHING TO WSL TAKES THE DEVICE AWAY FROM WINDOWS.** While attached,

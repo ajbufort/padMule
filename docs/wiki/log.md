@@ -916,3 +916,31 @@ Append-only, timestamped record of Ingest / Query / Lint passes.
   **The pattern is now unmistakable: every single device measurement session
   produces at least one probe that is confidently wrong before it is right.**
   Budget for it, and never let a first reading into the record.
+
+- 2026-08-08 **A FIFTH FALSE "DEAD", and the app's own log ended the argument.**
+  Re-running the seeding CPU experiment, sysmon reported padMule absent from all
+  656 processes after backgrounding - which reads exactly like the feature
+  failing, and would have been the second time in two days that a wrong
+  instrument nearly wrote a false verdict about background seeding. Verified
+  first: zero matches across EVERY string field, while `Files` (the app used to
+  background it) sat right there at pid 2075. So the instrument was fine and
+  padMule really had died.
+  **The cause was `DELETE /session/{id}`.** Ending a WDA session terminates the
+  app under test, so closing the session "to get WDA out of the way" killed the
+  thing being measured before it was ever backgrounded. **The WDA session is
+  fatal at BOTH ends** - [[ipad-usb-tooling]] already recorded that CREATING one
+  disturbs or kills the app; closing one does too. Rule: leave the session open,
+  background with `dvt launch`, or relaunch after closing.
+  **The fix for the whole class is to stop inferring.** `enterBackground()`
+  already logs which branch it took, and one capture settled it:
+  `keepalive: STARTED`, `lifecycle: entering background SEEDING (keepalive
+  held)`, `state -> seeding`, still logging 56s later. Seeding engages, on this
+  build, with the state-aware poll in place. **`idevicesyslog` no longer works
+  here** ("No device found" - old usbmuxd path against an iOS 17+ tunnel); use
+  `pymobiledevice3 syslog live -m padMule`. That is a stale instruction in
+  several older entries.
+  Two UI-automation traps banked the same round: a SwiftUI Toggle's
+  accessibility element is the whole ROW, so clicking the element or its rect
+  CENTRE hits the label and silently does nothing (tap the right edge, then READ
+  THE VALUE BACK); and the search field is an `XCUIElementTypeTextField`, not a
+  `SearchField`.
