@@ -96,7 +96,7 @@ UniFFI-generated binding.
 |---|---|
 | `crates/mule-proto` | eD2k wire codec: packet framing, tags, ed2k/MD4 hashing, Kad 128-bit IDs. |
 | `crates/mule-files` | Byte-compatible on-disk formats: `server.met`, `known.met`, `part.met`, `nodes.dat`. |
-| `crates/mule-kad`   | Kademlia routing table and message types. |
+| `crates/mule-kad`   | Kademlia: routing bin-tree, message codecs, UDP obfuscation, the event-driven iterative lookup, and anti-abuse hardening. |
 | `crates/mule-engine`| The live engine: server link, peer transfers, multi-source download, uploads, Kad, UPnP/NAT-PMP, and the `Engine` facade the UI drives. |
 | `crates/mule-ffi`   | UniFFI seam: wraps `Engine` in a synchronous, FFI-friendly facade and generates the Swift bindings. |
 | `crates/mule-cli`   | A command-line harness used to exercise the engine against the real network. |

@@ -38,7 +38,7 @@ current build state is `docs/wiki/build-progress.md`.
 | `crates/mule-files` | On-disk formats, byte-compatible with upstream: server.met, known.met, part.met (+gaps), clients.met, nodes.dat, preferences. |
 | `crates/mule-kad` | Kad2: UDP framing + obfuscation, message codecs, routing bin-tree, iterative lookup, anti-abuse hardening. Offline-testable. |
 | `crates/mule-engine` | The live engine: server link, peer transfer, TCP obfuscation, secure ident, credits, Kad node, fetch/search/catalog, share/upload, UPnP + NAT-PMP, and the `Engine` lifecycle facade. |
-| `crates/mule-cli` | Dev + live-network harness (29 subcommands: login, listen, peer-*, kad-*, upnp-*, *-search, offer-*, link, fetch-complete, aich-*, ...). |
+| `crates/mule-cli` | Dev + live-network harness (30 subcommands: login, listen, peer-*, kad-* incl. `kad-serve`, upnp-*, *-search, offer-*, link, fetch-complete, aich-*, ...). |
 | `crates/mule-ffi` | UniFFI seam: sync facade over the async engine; Swift bindings generated in CI from the compiled library. |
 | `ios/` | SwiftUI app. XcodeGen `project.yml`; the pbxproj is generated in CI, never committed. |
 | `amule-3.0.1/` | Vendored upstream C++ - reference oracle only. `build-oracle/` holds a built amuled for differential tests. |
@@ -109,7 +109,7 @@ Details and what is portable from them: `docs/wiki/ref-ecosystem.md`.
 source "$HOME/.cargo/env"              # cargo is NOT on the default PATH
 
 cargo build --workspace
-cargo test --workspace                 # the unit gate (677 tests, offline)
+cargo test --workspace                 # the unit gate (700 tests, offline)
 cargo clippy --workspace --all-targets # must be warning-free
 cargo fmt --all -- --check
 
