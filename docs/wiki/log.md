@@ -731,3 +731,47 @@ Append-only, timestamped record of Ingest / Query / Lint passes.
   vacuity that made row 8cj's first listener test worthless. The contact is now
   seeded explicitly, which makes the test about the ACK PATH, its actual
   subject. Gate: 677 tests over three consecutive full runs.
+
+- 2026-08-07 **The CI guard that only guarded a third of what it claimed.**
+  `scripts/ship.sh` states guard 1 as "CI must be GREEN for the exact sha", and
+  it dispatched the Rust unit gate without ever reading its conclusion, and
+  never dispatched the Swift simulator tests at all - so a red workspace would
+  reach the device. Since row 8ci that is worse than it sounds: the Swift suite
+  is what RENDERS the views, and rendering is the only instrument that can catch
+  a layout bug the accessibility tree reads as correct. All three workflows are
+  now dispatched and all three required green, each with its own headSha check.
+  Also `--limit 20` rather than `1` when locating the run, because the newest run
+  of a workflow is not necessarily ours and with `--limit 1` a mismatch was
+  indistinguishable from "CI has not started yet". **The general shape: a guard's
+  COMMENT is a claim about the guard, and this one had been true when written and
+  false since the workflows multiplied.**
+  Also closed four doc drifts the morning's reanalysis found: CLAUDE.md's test
+  count (628 -> 677) and its now-superseded foreground-only claim,
+  [[security-model]]'s "Release blockers" paragraph contradicting its own 24/0/2
+  scorecard (annotated in place, not deleted), `MARKETING_VERSION` never reaching
+  the bundle so the device reported 1.0 for a pre-1.0 app, and
+  `MuleEngine::heartbeat` counting seven duties where there are eight
+  (`maintain_kad` was added to the body, not to the sentence enumerating them -
+  the same shape as a test that pins "these callers" and names all but one).
+
+- 2026-08-07 **The seeding poll is state-aware, as an EXPERIMENT not a tuning
+  knob.** `EngineModel.shouldRunFastPoll` throttles the full UI snapshot to one
+  tick in five while `state == .seeding`, because there is no UI on screen and
+  `refreshFast()` marshals the whole downloads list and shared library across the
+  FFI every second. **This is not a fix, and the doc comment says so:** the soak
+  settled SURVIVAL (60 samples, ~70 min, footprint flat) and left CPU
+  unexplained, with samples split almost exactly evenly above and below 5%
+  against 0.1% foreground-idle - and the obvious "it is our poll" hypothesis has
+  a hole in it, since a 1 Hz signal would be caught by nearly any sampling window
+  rather than half of them. Throttling the snapshot SEPARATES the two candidates:
+  if the split survives, the audio keepalive owns the cost and the poll is
+  exonerated. The heartbeat cadence is deliberately unchanged, because an
+  experiment with two variables answers neither. Awaiting a device re-soak.
+
+- 2026-08-07 **Method note: backticks in a `git commit -m "..."` are command
+  substitution.** One commit message shipped with a word silently deleted - bash
+  ran the backticked identifier as a command, it failed, and the empty result was
+  interpolated. Caught by scanning my own commits for the double-space it leaves
+  behind; amended via `-F` with a quoted heredoc. **Use a file or a quoted
+  heredoc for any message containing backticks, which in this repo is most of
+  them.**
