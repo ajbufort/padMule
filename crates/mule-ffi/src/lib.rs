@@ -794,9 +794,13 @@ impl MuleEngine {
     /// It drains pending share re-announces, finalizes downloads that completed
     /// outside a fetch task, detects a server drop/kick, runs the periodic
     /// checkpoint, unshares files deleted in the Files app, re-drives idle
-    /// downloads, and merges gossip-harvested servers into server.met.
+    /// downloads, merges gossip-harvested servers into server.met, and refreshes
+    /// the Kad routing table. That is EIGHT: the sentence said seven for as long
+    /// as `maintain_kad` had existed, because it was added to the BODY without
+    /// being added to the list that enumerates it - the same shape as a test
+    /// that pins "these callers" and names all but one.
     ///
-    /// IF THIS STOPS BEING CALLED, all seven stop SILENTLY - nothing errors and
+    /// IF THIS STOPS BEING CALLED, all EIGHT stop SILENTLY - nothing errors and
     /// nothing on screen changes; downloads simply stall, finished files are
     /// never shared, and a kick goes unnoticed. It used to be a side effect of
     /// `downloads()`, which made it impossible to forget but also forced every

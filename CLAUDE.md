@@ -82,9 +82,14 @@ Details: `docs/wiki/decisions-and-lessons.md`, `docs/wiki/ref-source-trees.md`,
   UNSIGNED `.ipa`; **Sideloadly** on the Windows host installs it with a free
   Apple ID (7-day re-sign). AltStore/AltServer failed here (-22411); do not
   retry it without new evidence.
-- iPadOS suspends backgrounded apps and reclaims sockets: v1 is
-  foreground-only with clean, honest pause/resume (a HARD requirement - see
-  `docs/wiki/lifecycle-and-reactivation.md`).
+- iPadOS suspends backgrounded apps and reclaims sockets, so clean, honest
+  pause/resume is a HARD requirement (see `docs/wiki/lifecycle-and-reactivation.md`).
+  SUPERSEDED IN PART 2026-08-07 (build-progress 8cj): background SEEDING ships -
+  an `audio` keepalive plus `EngineState::Seeding` keeps the listener and server
+  login up so peers keep downloading from us, default OFF, device-verified over a
+  70-minute soak at a flat ~32MB. Background DOWNLOADING stays unbuilt on purpose,
+  and Kad is dropped on the way in. Clean pause/resume is still required, because
+  jetsam can end a seed at any moment.
 - The engine/UI seam is in-process FFI (`crates/mule-ffi`); the EC protocol is
   deferred entirely.
 
@@ -104,7 +109,7 @@ Details and what is portable from them: `docs/wiki/ref-ecosystem.md`.
 source "$HOME/.cargo/env"              # cargo is NOT on the default PATH
 
 cargo build --workspace
-cargo test --workspace                 # the unit gate (628 tests, offline)
+cargo test --workspace                 # the unit gate (677 tests, offline)
 cargo clippy --workspace --all-targets # must be warning-free
 cargo fmt --all -- --check
 

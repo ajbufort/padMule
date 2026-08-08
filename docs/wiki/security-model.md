@@ -100,6 +100,11 @@ send-side receiver keys terminal-proven ([[kad-verify-oracle]]), key capture clo
 left is AICH block recovery
 [OPTIMIZATION - integrity already holds via per-part MD4 + the poisoning ban, and
 the advertised AICH bit is non-breaking, so this is not release-blocking].
+[SUPERSEDED 2026-08-03, annotated 2026-08-07: AICH block recovery SHIPPED as
+wave 11 (build-progress 8bj) and its row reads OPERATIONAL, so the scorecard is
+24/0/2 with NO remaining protocol gap. This paragraph is 2026-08-02 text that
+outlived its subject by a day and was left contradicting the tally above it -
+kept in place rather than deleted, per the annotate-do-not-rewrite rule.]
 
 NOT blockers (documented decisions): server TCP/UDP obfuscation - a deliberate,
 interop-safe v1 opt-out, [[obfuscation-posture]].
