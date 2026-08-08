@@ -21,14 +21,19 @@ use mule_kad::{
     build_search_key_req_restrictive, build_search_source_req, is_acceptable_contact,
     kad_deobfuscate, kad_keyword_target, kad_obfuscate_request, kad_obfuscate_response, pack_kad,
     parse_bootstrap_res, parse_hello, parse_kad2_res, parse_search_res, unpack_kad, BootstrapRes,
-    FileResult, Hello, Lookup, RoutingTable, Source, WireContact, ALPHA_QUERY, K, KAD_FIND_NODE,
-    OP_BOOTSTRAP_RES, OP_HELLO_RES, OP_KAD2_RES, OP_SEARCH_RES,
+    FileResult, FloodTracker, FloodVerdict, Hello, Lookup, RoutingTable, Source, WireContact,
+    ALPHA_QUERY, K, KAD_FIND_NODE, OP_BOOTSTRAP_RES, OP_HELLO_RES, OP_KAD2_RES, OP_SEARCH_RES,
 };
 use mule_proto::Kad128;
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+/// `kad_live`'s bare `Instant` is tokio's (it drives timeouts); the flood
+/// tracker and the out-track list are plain wall-clock bookkeeping, so they use
+/// std's. Aliased rather than imported bare so the two can never be confused.
+use std::time::Instant as StdInstant;
 use tokio::net::UdpSocket;
 use tokio::time::{timeout, Instant};
 
@@ -296,6 +301,98 @@ struct ReadLoop {
     routing: Arc<Mutex<RoutingTable>>,
     ip_filter: Arc<Mutex<Option<Arc<IpFilter>>>>,
     pending: Arc<Mutex<Vec<PendingSlot>>>,
+    /// One flood tracker PER SERVED REQUEST OPCODE, keyed inside by source IP.
+    /// `FloodTracker` was written for this and had no call site until now.
+    flood: Arc<Mutex<HashMap<u8, FloodTracker>>>,
+    /// IPs we have sent a HELLO_RES to, and when - eMule's out-track list, the
+    /// gate that makes an inbound HELLO_RES_ACK *solicited*. See
+    /// [`ACK_SOLICITED_WINDOW`].
+    hello_res_sent: Arc<Mutex<HashMap<u32, StdInstant>>>,
+}
+
+/// How long a sent HELLO_RES makes an ACK from that IP acceptable.
+///
+/// eMule's `IsOnOutTrackList` (PacketTracking.cpp:84-97) matches entries newer
+/// than 180 s and REMOVES the entry on a match, so one HELLO_RES buys exactly
+/// one ACK. Both properties matter: the window bounds how long a spoofer has,
+/// and the consumption stops one solicitation being replayed.
+const ACK_SOLICITED_WINDOW: Duration = Duration::from_secs(180);
+
+/// Cap on tracked IPs, for the out-track list and each flood tracker alike.
+///
+/// NOT in either authority, and it is a padMule-specific necessity rather than
+/// an improvement: these maps are keyed by an ATTACKER-CONTROLLED value (a UDP
+/// source address, trivially spoofed), so an unbounded map is a memory-exhaustion
+/// vector on a device with a jetsam budget around 100 MB. eMule runs on a desktop
+/// and prunes on a timer; padMule prunes on insert and then refuses to grow.
+/// Refusing to GROW is deliberately fail-open for a NEW ip - dropping every
+/// unknown source under a spray would be a self-inflicted outage, and the
+/// entries already held keep protecting against the floods that actually cost
+/// us (a real peer sends from one address).
+const MAX_TRACKED_IPS: usize = 4096;
+
+/// The inbound request budget for one IP, per minute, per opcode - eMule's
+/// exact numbers from `InTrackListIsAllowedPacket` (PacketTracking.cpp:161-176):
+/// BOOTSTRAP_REQ 2, HELLO_REQ 3, KADEMLIA2_REQ 10, PING 2. Over the budget the
+/// request is IGNORED; over five times it the IP is BANNED, which is that
+/// function's own two-tier shape (:196-205).
+///
+/// `None` means "not a request we serve" - no tracking, because we drop it
+/// anyway. eMule returns true for anything outside its switch, and notably
+/// KADEMLIA2_HELLO_RES_ACK is NOT in it: an ACK is a peer's reaction to our own
+/// answer, and rate-limiting it would throttle a handshake WE asked for.
+fn flood_budget(op: u8) -> Option<u32> {
+    match op {
+        mule_kad::OP_BOOTSTRAP_REQ => Some(2),
+        mule_kad::OP_HELLO_REQ => Some(3),
+        mule_kad::OP_KAD2_REQ => Some(10),
+        mule_kad::OP_PING => Some(2),
+        _ => None,
+    }
+}
+
+/// Apply the per-opcode flood budget to one inbound request. `true` = serve it.
+fn flood_allows(
+    flood: &Mutex<HashMap<u8, FloodTracker>>,
+    op: u8,
+    from_ip: u32,
+    now: StdInstant,
+) -> bool {
+    let Some(budget) = flood_budget(op) else {
+        return true; // not a served request; the caller drops it regardless
+    };
+    let mut map = flood.lock().expect(LOCK_POISONED);
+    let tracker = map.entry(op).or_insert_with(|| {
+        FloodTracker::new(
+            Duration::from_secs(60),
+            budget,
+            // eMule bans at 5x the per-minute allowance.
+            budget * 5,
+            // CLIENTBANTIME, opcodes.h:122 - HR2MS(2).
+            Duration::from_secs(2 * 60 * 60),
+        )
+    });
+    matches!(tracker.record(from_ip, now), FloodVerdict::Allow)
+}
+
+/// Note that we answered `ip` with a HELLO_RES, so its ACK is solicited.
+/// Prunes expired entries first, then refuses to grow past [`MAX_TRACKED_IPS`].
+fn note_hello_res_sent(sent: &Mutex<HashMap<u32, StdInstant>>, ip: u32, now: StdInstant) {
+    let mut m = sent.lock().expect(LOCK_POISONED);
+    m.retain(|_, t| now.duration_since(*t) < ACK_SOLICITED_WINDOW);
+    if m.len() < MAX_TRACKED_IPS || m.contains_key(&ip) {
+        m.insert(ip, now);
+    }
+}
+
+/// Did we send `ip` a HELLO_RES within the window? CONSUMES the entry on a
+/// match, so one solicitation admits exactly one ACK (eMule removes it too).
+fn take_hello_res_sent(sent: &Mutex<HashMap<u32, StdInstant>>, ip: u32, now: StdInstant) -> bool {
+    let mut m = sent.lock().expect(LOCK_POISONED);
+    match m.remove(&ip) {
+        Some(t) => now.duration_since(t) < ACK_SOLICITED_WINDOW,
+        None => false,
+    }
 }
 
 /// The single reader of the Kad socket, for the node's life.
@@ -361,6 +458,36 @@ async fn run_read_loop(ctx: ReadLoop) {
         // above, computed for the SENDER: it echoed the key we issue for its
         // address, proving it receives there.
         let valid_receiver_key = dec.receiver_vk == mule_kad::udp_verify_key(ctx.udp_key, from_ip);
+        let now = StdInstant::now();
+
+        // An inbound HELLO_RES_ACK completes the three-way handshake OUR
+        // HELLO_RES asked for, so it is handled BEFORE the flood gate and never
+        // subject to it: eMule leaves it out of `InTrackListIsAllowedPacket`'s
+        // switch for the same reason - throttling it would throttle a handshake
+        // we solicited. It is a response, so it produces no answer.
+        if op == mule_kad::OP_HELLO_RES_ACK {
+            let solicited = take_hello_res_sent(&ctx.hello_res_sent, from_ip, now);
+            match crate::kad_serve::accept_hello_res_ack(&payload, solicited, valid_receiver_key) {
+                crate::kad_serve::AckVerdict::MarkSenderVerified { sender_id } => {
+                    // The other half of eMule's VerifyContact: the bit is set
+                    // only if the address we STORED for that id matches the one
+                    // this datagram came from (RoutingZone.cpp:985-986).
+                    ctx.routing
+                        .lock()
+                        .expect(LOCK_POISONED)
+                        .verify_contact(&sender_id, from_ip);
+                }
+                crate::kad_serve::AckVerdict::Drop => {}
+            }
+            continue;
+        }
+
+        // THE FLOOD GATE, placed where eMule places it: before dispatch, so a
+        // flooded request is not merely unanswered but never processed - it does
+        // not get to add a contact or cost us a table walk either.
+        if !flood_allows(&ctx.flood, op, from_ip, now) {
+            continue;
+        }
         // An inbound HELLO carries enough to be RECORDED (the other served
         // requests name no sender id). Through the gated path only: an inbound
         // requester faces the ipfilter, the port-53 guard and the anti-sybil
@@ -384,10 +511,6 @@ async fn run_read_loop(ctx: ReadLoop) {
                 );
             }
         }
-        // NOTE: an inbound OP_HELLO_RES_ACK (mark the sender IP-verified;
-        // eMule hard-drops it on an invalid receiver key) routes from here
-        // when its handler lands - it is a peer's reaction to OUR answer, not
-        // a request, so `answer_request` stays silent on it by design.
         // Read at ANSWER time through the shared handle, never captured at
         // spawn: `start_kad` sets this after binding (AMENDMENT 2).
         let advertised = match ctx.advertised_udp_port.load(Ordering::Relaxed) {
@@ -413,6 +536,12 @@ async fn run_read_loop(ctx: ReadLoop) {
         // tests already answers: RC4 on the key the sender asked us to echo
         // (dec.sender_vk), our own verify key for its address riding along so
         // it can verify US on its next packet.
+        // Note the solicitation BEFORE the send, not after: the peer's ACK can
+        // be on the wire before our own `send_to` future resolves, and an ACK
+        // that beats its own bookkeeping would be dropped as unsolicited.
+        if answer.request_ack {
+            note_hello_res_sent(&ctx.hello_res_sent, from_ip, now);
+        }
         let datagram = kad_obfuscate_response(
             &pack_kad(answer.opcode, answer.payload),
             rand::random(),
@@ -459,7 +588,11 @@ impl KadNode {
         // HANDLES above rather than capturing values, so configuration applied
         // after this point (`set_ip_filter`, `set_advertised_udp_port`) is
         // visible to it - see AMENDMENT 2 in the kad-serve-loop plan.
+        let flood = Arc::new(Mutex::new(HashMap::new()));
+        let hello_res_sent = Arc::new(Mutex::new(HashMap::new()));
         let read_loop = tokio::spawn(run_read_loop(ReadLoop {
+            flood: Arc::clone(&flood),
+            hello_res_sent: Arc::clone(&hello_res_sent),
             socket: Arc::clone(&socket),
             kad_id,
             udp_key,
@@ -2012,10 +2145,6 @@ mod tests {
         parse_hello(&rpayload).unwrap()
     }
 
-    /// THE REGRESSION ONE SHARED SOCKET MAKES POSSIBLE: an inbound request
-    /// arriving while an outbound request is waiting for its reply. Before the
-    /// owning loop, the only reader was the reply collector and it DISCARDED
-    /// anything it was not waiting for - so a peer's PING was dropped on the
     /// DROPPING THE NODE MUST STOP ITS READ LOOP, or `pause()` never releases
     /// the Kad port.
     ///
@@ -2059,6 +2188,168 @@ mod tests {
             "the read loop outlived its node and still holds the socket - the \
              Kad port would never be released on pause(), and a resumed node \
              would race the stale loop for datagrams"
+        );
+    }
+
+    /// THE THREE-WAY HANDSHAKE, END TO END, THROUGH THE LOOP: a peer HELLOs,
+    /// padMule asks for an ACK, the peer sends one, and the contact is MARKED
+    /// VERIFIED. Without the last step the whole exchange is theatre - and it
+    /// would be silent theatre, because `closest_to` hands out only verified
+    /// contacts (row 8ao), so an unrecorded verification means that peer can
+    /// never appear in any answer we give.
+    #[tokio::test]
+    async fn a_solicited_ack_marks_the_sender_verified_in_the_table() {
+        let node_id = Kad128::from_words([0xA, 0xB, 0xC, 0xD]);
+        let node =
+            KadNode::bind_with_identity("127.0.0.1:0".parse().unwrap(), 4662, node_id, 0x9182)
+                .await
+                .unwrap();
+        let ours = node.local_addr();
+        let peer_id = Kad128::from_hash(&[0x77; 16]);
+        let peer_key = 0x5A5Au32;
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let my_vk = udp_verify_key(peer_key, ip_u32(&ours));
+        // SEED THE CONTACT EXPLICITLY. On loopback the HELLO's own contact-add
+        // is refused by the routable-public gate (`is_acceptable_contact`), so
+        // without this the table holds nothing for `verify_contact` to find and
+        // the test would assert about a contact that never existed - the same
+        // vacuity that made row 8cj's first listener test worthless. Seeding it
+        // makes this test about the ACK PATH, which is its subject.
+        node.with_routing(|t| t.add(peer_id, ip_u32(&ours), 4672, 4662, 8, false));
+
+        // Leg 1: HELLO_REQ from an UNPROVEN sender (echo_vk 0), so the answer
+        // must carry the ack request.
+        let (op, payload) = build_hello_req(
+            &peer_id,
+            4662,
+            Some(peer.local_addr().unwrap().port()),
+            None,
+        );
+        let dg = kad_obfuscate_request(&pack_kad(op, payload), &node_id, 0x3333, 0, my_vk, 0x40);
+        peer.send_to(&dg, ours).await.unwrap();
+
+        // Leg 2: read the HELLO_RES and take the key it wants echoed back.
+        let mut buf = vec![0u8; 8192];
+        let (n, from) = timeout(Duration::from_secs(3), peer.recv_from(&mut buf))
+            .await
+            .expect("the HELLO must be answered")
+            .unwrap();
+        let dec = kad_deobfuscate(&buf[..n], &peer_id, peer_key, ip_u32(&from)).unwrap();
+        let (rop, rpayload) = unpack_kad(&dec.payload).unwrap();
+        assert_eq!(rop, OP_HELLO_RES);
+        let hello = parse_hello(&rpayload).unwrap();
+        assert!(
+            hello.misc_options.is_some_and(|m| m & 0x04 != 0),
+            "precondition: an unproven sender must be ASKED for an ack, or this \
+             test proves nothing about what happens when it answers"
+        );
+        assert!(
+            !node.with_routing(|t| t.contacts().iter().any(|c| c.id == peer_id && c.verified)),
+            "precondition: not verified until the ack lands"
+        );
+
+        // Leg 3: the ACK, echoing the node's sender key so its bValidReceiverKey holds.
+        let (ao, ap) = mule_kad::build_hello_res_ack(&peer_id);
+        let ack = kad_obfuscate_request(
+            &pack_kad(ao, ap),
+            &node_id,
+            0x4444,
+            dec.sender_vk, // echo what the node asked us to echo
+            my_vk,
+            0x40,
+        );
+        peer.send_to(&ack, ours).await.unwrap();
+
+        for _ in 0..200 {
+            if node.with_routing(|t| t.contacts().iter().any(|c| c.id == peer_id && c.verified)) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the ack was accepted but the contact was never marked verified");
+    }
+
+    /// AN UNSOLICITED ACK CHANGES NOTHING. eMule drops an ACK from an IP it did
+    /// not send a HELLO_RES to inside 180s (`IsOnOutTrackList`,
+    /// PacketTracking.cpp:84-97) - the spec omitted this gate entirely. Without
+    /// it anyone can name any KadID from any address and try to have that
+    /// contact marked verified, which is exactly the spoof the handshake exists
+    /// to prevent.
+    #[tokio::test]
+    async fn an_unsolicited_ack_verifies_nothing() {
+        let node_id = Kad128::from_words([0xE, 0xE, 0xE, 0xE]);
+        let node =
+            KadNode::bind_with_identity("127.0.0.1:0".parse().unwrap(), 4662, node_id, 0x2718)
+                .await
+                .unwrap();
+        let ours = node.local_addr();
+        // A contact already in the table, unverified, at the address the ACK
+        // will come from - so ONLY the solicitation gate can stop this.
+        let peer_id = Kad128::from_hash(&[0x66; 16]);
+        node.with_routing(|t| t.add(peer_id, ip_u32(&ours), 4672, 4662, 8, false));
+
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_key = 0x1234u32;
+        let (ao, ap) = mule_kad::build_hello_res_ack(&peer_id);
+        let ack = kad_obfuscate_request(
+            &pack_kad(ao, ap),
+            &node_id,
+            0x4444,
+            udp_verify_key(0x2718, ip_u32(&peer.local_addr().unwrap())),
+            udp_verify_key(peer_key, ip_u32(&ours)),
+            0x40,
+        );
+        peer.send_to(&ack, ours).await.unwrap();
+
+        // No HELLO_RES was ever sent to this address, so it must stay unverified.
+        for _ in 0..30 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !node.with_routing(|t| t.contacts().iter().any(|c| c.id == peer_id && c.verified)),
+            "an ack nobody asked for verified a contact - any address could then \
+             claim any KadID"
+        );
+    }
+
+    /// THE FLOOD LIMITER'S FIRST PRODUCTION CALL SITE. eMule allows 2 PINGs per
+    /// minute per IP (`InTrackListIsAllowedPacket`, PacketTracking.cpp:161-176)
+    /// and IGNORES the rest. A serve loop without this answers every packet a
+    /// stranger sends, which is both a CPU drain and, for BOOTSTRAP, an
+    /// amplification arm.
+    #[tokio::test]
+    async fn a_flood_of_pings_from_one_ip_stops_being_answered() {
+        let node_id = Kad128::from_words([0xF, 0xF, 0xF, 0xF]);
+        let node =
+            KadNode::bind_with_identity("127.0.0.1:0".parse().unwrap(), 4662, node_id, 0x3141)
+                .await
+                .unwrap();
+        let ours = node.local_addr();
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_key = 0x8888u32;
+        let my_vk = udp_verify_key(peer_key, ip_u32(&ours));
+
+        let mut answered = 0;
+        let mut buf = vec![0u8; 8192];
+        for i in 0..6u16 {
+            let (op, payload) = mule_kad::build_ping();
+            let dg =
+                kad_obfuscate_request(&pack_kad(op, payload), &node_id, 0x1000 + i, 0, my_vk, 0x40);
+            peer.send_to(&dg, ours).await.unwrap();
+            if timeout(Duration::from_millis(300), peer.recv_from(&mut buf))
+                .await
+                .is_ok()
+            {
+                answered += 1;
+            }
+        }
+        // eMule's budget is 2/min; the exact tail is not the point, being
+        // BOUNDED is. Asserting a literal rather than the constant, so raising
+        // the budget cannot make this pass by definition.
+        assert!(
+            (1..=2).contains(&answered),
+            "6 pings drew {answered} answers; eMule allows 2 per minute and \
+             ignores the rest"
         );
     }
 
