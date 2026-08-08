@@ -1151,3 +1151,35 @@ Append-only, timestamped record of Ingest / Query / Lint passes.
   `ideviceinfo` and that was the DOCUMENTED trap, not a missing device - the
   libimobiledevice CLI set fails while the iPad is "Not shared" to WSL, which is
   the normal state. Verify a FAILURE the way you verify a success.
+
+- 2026-08-08 **MERGED to `main`, and the branch list is finally clean - with the
+  `fetch-funnel` worry RESOLVED rather than abandoned.** `kad-csearch`
+  fast-forwarded into `main` (8 commits, `--ff-only`, so history stays LINEAR at 0
+  merge commits), gate re-run on the merged `main` ITSELF at 700 tests, pushed,
+  and all three workflows went green for the merged tip - the FIRST automatic CI
+  coverage this work has had, because branch tips are never built.
+  **THE `fetch-funnel` NOTE, written because the branch is now gone and the
+  warnings about it are not.** For weeks the handoffs carried "83 commits on
+  `fetch-funnel` unmerged and never PR'd", latterly 89, as an open risk. **That
+  work was never lost and was never abandoned: it reached `main` by REBASE**, so
+  every commit is present with a different SHA. `git cherry main fetch-funnel`
+  found an equivalent in `main` for all 89 of 89. The branch was a DUPLICATE, not
+  a backlog. A future reader who finds those old warnings and no branch should
+  read this line and stop looking: nothing is missing.
+  **The deletions were cleared by PATCH-ID, never ancestry** - the distinction is
+  the whole point, since ancestry called all 89 commits unmerged and would have
+  made deleting look like data loss. Tips recorded in
+  `/home/ajbufort/padmule-deleted-branches-2026-08-08.txt` (outside the repo, so a
+  PUBLIC-repo reader never sees dead shas), recoverable with
+  `git push origin <sha>:refs/heads/<name>`.
+  **`worktree-wave11-aich` was left alone on purpose** - remote already deleted,
+  tip already recorded, 10 commits all in `main` by patch-id, but the local branch
+  is held by a LOCKED worktree and a lock is a deliberate signal. Nothing is at
+  risk by leaving it.
+  One small prediction of mine was wrong and is recorded as such: I expected
+  `git branch -d fetch-funnel` to REFUSE because ancestry disagrees. It warned
+  ("merged to refs/remotes/origin/fetch-funnel, but not yet merged to HEAD") and
+  proceeded. `-D` was never needed - git checks the remote-tracking ref too.
+  Also true and worth not re-deriving: nothing under `crates/`, `ios/` or the
+  manifests changed after `c656555`, so the build on the DEVICE is `main`'s
+  current shipped code. A doc-only tip needs no reship.

@@ -124,10 +124,19 @@ OPEN.** Item 1 below.
 4. **Move the 1s heartbeat clock out of the UI runloop** into Rust as a tokio
    interval keyed off `EngineState`. Eight duties fail SILENTLY if it stops.
    **This buys NO CPU** - refuted 2026-08-08. Do it for robustness and say so.
-5. **Housekeeping, now that the Kad work is verified:** `kad-csearch` is ahead of
-   `main` with device-verified work and should be merged. `fetch-funnel` is a
-   deletable duplicate (89/89 diverged; its content reached `main` by rebase -
-   check merged-ness by **patch-id (`git cherry`), not ancestry**).
+5. **Housekeeping: DONE 2026-08-08.** `kad-csearch` was fast-forwarded into
+   `main` (`--ff-only`, history still LINEAR at 0 merge commits), the gate was
+   re-run on the merged `main` itself, all three workflows went green for the
+   merged tip, and both `kad-csearch` and `fetch-funnel` are DELETED, local and
+   remote. Tips recorded in `/home/ajbufort/padmule-deleted-branches-2026-08-08.txt`
+   (outside the repo), recoverable with
+   `git push origin <sha>:refs/heads/<name>`. **`worktree-wave11-aich` was left
+   alone deliberately** - its remote is already gone and its tip already recorded,
+   but the local branch is held by a LOCKED worktree, and a lock is a deliberate
+   signal. Its content is in `main` either way.
+   **THE RULE THAT MADE THIS SAFE, keep it:** check merged-ness by **patch-id
+   (`git cherry`), not ancestry.** For `fetch-funnel` ancestry claimed 89 commits
+   would be lost; patch-id found an equivalent in `main` for all 89.
 
 ## MEASURING ON THE DEVICE - read before you touch it
 

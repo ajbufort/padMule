@@ -26,7 +26,7 @@ FIND_NODE answer rate was the same in both arms, so the win is structural.
 - **MERGED TO `main` 2026-08-08.** `kad-csearch` was fast-forwarded into `main`
   (8 commits, `--ff-only`, so history stays LINEAR - still 0 merge commits), the
   gate was re-run on the merged `main` ITSELF at 700 tests, and `main` is pushed.
-  `kad-csearch` is now IDENTICAL to `main` and is a deletable duplicate.
+  `kad-csearch` has since been DELETED (local and remote), as has `fetch-funnel`.
 - **The last CODE commit is `9b3402b`** (the CSearch rewrite). Nothing under
   `crates/`, `ios/` or the manifests has changed since `c656555`, so **the build
   installed on the device IS `main`'s current shipped code** - a doc-only tip does
@@ -38,12 +38,17 @@ FIND_NODE answer rate was the same in both arms, so the win is structural.
   `ship.sh`, artifact verified, signed and installed). The branch-only CI hole
   below is therefore closed for THIS sha specifically - it is not closed in
   general.
-- **`fetch-funnel` is a DELETABLE DUPLICATE**: 89/89 diverged from `main`,
-  because its content reached `main` by rebase. Merged-ness there must be checked
-  by **patch-id (`git cherry`), not ancestry** - a rebase changes every SHA and
-  ancestry calls it unmerged. Recorded in [[log]] 2026-08-08.
-- `worktree-wave11-aich` is a LOCKED worktree (10 ahead / 122 behind). A lock is
-  a deliberate signal; do not override it.
+- **`fetch-funnel` and `kad-csearch` are DELETED (2026-08-08), local and
+  remote.** Tips are in `/home/ajbufort/padmule-deleted-branches-2026-08-08.txt`
+  outside the repo, recoverable with `git push origin <sha>:refs/heads/<name>`.
+  **Both were cleared by PATCH-ID (`git cherry`), never ancestry** - for
+  `fetch-funnel` ancestry claimed 89 commits would be lost and patch-id found an
+  equivalent in `main` for all 89, because a rebase changes every SHA. Keep that
+  rule; it is the only thing standing between a tidy branch list and lost work.
+- `worktree-wave11-aich` is a LOCKED worktree (10 ahead / 131 behind), and its
+  remote is already gone with its tip already recorded. Its 10 commits are all in
+  `main` by patch-id, so nothing is at risk by leaving it. A lock is a deliberate
+  signal; do not override it.
 - CI: `c656555` was dispatched explicitly by `ship.sh` and went green on all
   three. The push to `main` then fired all three AGAIN for the merged tip, which
   is the first time this work has had automatic CI coverage - branch tips never
