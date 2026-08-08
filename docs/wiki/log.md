@@ -521,3 +521,15 @@ Append-only, timestamped record of Ingest / Query / Lint passes.
   so by failing. Default OFF; footer blunt about jetsam, because the failure mode
   is a user who believes it is a guarantee. Not yet device-verified: longevity
   overnight is the open question.
+
+- 2026-08-07 **Two ships raced and BOTH lost their install.** Running
+  `scripts/ship.sh` twice with an overlap - my error - had both runs reach the
+  install stage, and iOS answers a second concurrent installation with
+  "Coordinator superseded": the first dies, and the second died too. The device
+  reported `CFBundleVersion 48b5128` afterwards, i.e. NEITHER new build landed,
+  which is exactly the failure a "signed OK" line would have hidden if the loop
+  had not read the installed version back. The script now takes an flock and
+  refuses to start while another ship holds it - the device is a single resource
+  and the lock says so. Also worth remembering: a hanging `apps install` after
+  such a collision is not a broken build; `pymobiledevice3 apps list` gives the
+  installed CFBundleVersion in one call and settles what is actually on there.
