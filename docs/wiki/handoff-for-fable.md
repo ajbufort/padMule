@@ -41,10 +41,21 @@ entry says what to do and how this project judges it.
   binds; use ephemeral ports (0) in tests.
 - Do NOT commit unless asked. Leave work in the tree and report its state.
 
-## THE IMMEDIATE NEXT ACTION
+## THE IMMEDIATE NEXT ACTION - DONE 2026-08-08. Read this, then pick from the list below.
 
-**Device-verify the CSearch rewrite** (branch `kad-csearch`, commit `9b3402b`).
-It is offline-green and has never run on hardware.
+**The CSearch rewrite is DEVICE-VERIFIED.** Build `c656555` is on the iPad.
+Search submit-to-first-results went **6.79s -> 3.32s (-51%)**, `Longest poll gap`
+stayed at **1.1s** (the no-regression bar), and the new panel reports **TTFR
+1939ms** on 5 of 5 value lookups. **The FIND_NODE answer rate was 51% before and
+52% after**, which is the control that makes the attribution structural rather
+than a lucky hour - it is doing real work, because the device arms were
+SEQUENTIAL rather than alternating. Full account: [[build-progress]] row 8co,
+detail in [[kad-routing-lifecycle]]. **-51% is the JOINED server+Kad number; the
+Kad arm's own figure is the TTFR.** Nothing in the priority list below has been
+started.
+
+The original statement of this action is kept below, because the A/B design it
+describes is the one that was used and is worth reusing.
 
 The A/B is already set up for you. The BEFORE figures, taken on device
 2026-08-08 with the old round-based lookup (build-progress row 8cm), are

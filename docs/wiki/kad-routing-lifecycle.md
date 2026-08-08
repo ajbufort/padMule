@@ -298,6 +298,37 @@ are not comparable BETWEEN pairs; the pairing is what controls for it.
 
 Raw logs: `$CLAUDE_JOB_DIR/tmp/ab-ypm.log`, `ab-hh.log`, driver `ab.py`.
 
+### And on the DEVICE - measured 2026-08-08 (row 8co)
+
+The dev-box A/B deliberately predicted nothing about the device. Here is the
+device, build `cadace2` (round-based) vs `c656555` (CSearch), both arms
+warm-disk / fresh-counters / foreground / HighID to the same eMule Sunrise over
+AirVPN:
+
+| | before (rounds) | after (CSearch) |
+|---|---|---|
+| search submit-to-first-results (n=5) | 6.84 / 6.89 / 6.78 / 6.13 / 6.79, median **6.79s** | 3.32 / 2.68 / 4.48 / 3.35 / 2.70, median **3.32s** |
+| | | **-51%** |
+| `Longest poll gap` | 1.0s | **1.1s** - no regression, matches 8cm |
+| FIND_NODE answered | 71/138 = **51%** | 40/77 = **52%** |
+| Kad time-to-first-result | the old panel had no such field | **1939 ms** avg, 5 of 5 lookups |
+| Kad lookup completion | avg ROUND 673ms x 50-54 rounds | **1992 ms** avg per value lookup |
+
+**THE ANSWER RATE IS THE CONTROL, and it is why this attribution holds.** 51%
+before, 52% after: the swarm behaved identically in both arms, so a halved
+search cannot be a lucky hour. That control is doing real work here, because the
+device arms were **SEQUENTIAL, not alternating** - you cannot cheaply reinstall
+back and forth - so drift is otherwise uncontrolled. Note also how much worse
+the device is than the dev box (51% answered against 85%), which is exactly the
+condition the round barrier punished hardest.
+
+**-51% IS THE JOINED NUMBER.** The device search runs the server and Kad arms in
+one `tokio::join!`, so the server arm sets a floor and this understates the Kad
+change. The Kad arm's own figure is the 1939ms TTFR. Do not quote -51% as the
+Kad speedup.
+
+Caveats: n=5 per arm, one query, one server, one session.
+
 Consequences that were being read as other problems:
 
 - **The search cap WAS the search cost.** `KAD_SEARCH_WAIT` looked like a safety

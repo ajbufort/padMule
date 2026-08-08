@@ -13,9 +13,10 @@ Full narrative: [[build-progress]] rows 8ck-8cn and the [[log]] entries for
 
 ## THE ONE-LINE SUMMARY
 
-**padMule ANSWERS on Kad (proven against a real amuled, and on the device), and
-its lookup is now event-driven (offline-green, never run on hardware).** Steps 1
-and 2 of the owning-read-loop spec are both built; only step 1 is verified.
+**padMule ANSWERS on Kad and its lookup is event-driven - BOTH steps of the
+owning-read-loop spec are now built AND device-verified.** Search time on the
+iPad halved (6.79s -> 3.32s) with the poll gap unchanged at 1.1s, and the
+FIND_NODE answer rate was the same in both arms, so the win is structural.
 
 ## State of the tree - VERIFIED 2026-08-08, not remembered
 
@@ -29,22 +30,29 @@ and 2 of the owning-read-loop spec are both built; only step 1 is verified.
   trusting a sha written here** - a "state of the tree" line that names its own
   HEAD is stale the moment it is committed, which is exactly how row 8cn came to
   say "NOT committed" in the commit that committed it.
-- **UNPUSHED as of this writing.** `ship.sh` guard 5 aborts unless
-  `origin/<branch>` is already at HEAD, because `gh workflow run --ref` builds
-  the REMOTE ref. Push before shipping.
+- **PUSHED, and all three CI workflows are GREEN for `c656555`** (dispatched by
+  `ship.sh`, artifact verified, signed and installed). The branch-only CI hole
+  below is therefore closed for THIS sha specifically - it is not closed in
+  general.
 - **`fetch-funnel` is a DELETABLE DUPLICATE**: 89/89 diverged from `main`,
   because its content reached `main` by rebase. Merged-ness there must be checked
   by **patch-id (`git cherry`), not ancestry** - a rebase changes every SHA and
   ancestry calls it unmerged. Recorded in [[log]] 2026-08-08.
 - `worktree-wave11-aich` is a LOCKED worktree (10 ahead / 122 behind). A lock is
   a deliberate signal; do not override it.
-- **NO CI HAS RUN FOR `eb7ee3c`.** See the CI hole below.
-- **Installed on device: `cadace2`** (the row-8cm device pass). **The CSearch
-  work has never been on the device.**
-- **THE DEVICE IS A FRESH INSTALL** (the app was deleted mid-session on
-  2026-08-08): no nodes.dat, no server.met, regenerated identity, EMPTY share
-  library, no downloads. Any measurement assuming warm state is not comparable to
-  2026-08-07's.
+- No CI ever ran for `eb7ee3c` itself (branch tips are not built automatically);
+  `c656555` was dispatched explicitly by `ship.sh`. See the CI hole below.
+- **Installed on device: `c656555`** - confirmed by `CFBundleVersion` read back
+  off the device AND, more decisively, by the Stats panel's own text ("Every
+  request races its own deadline now - no rounds"), which exists only in this
+  build. A version string proves what was INSTALLED; a panel proves what is
+  EXECUTING.
+- **THE DEVICE IS WARM AGAIN, and this line used to say the opposite.** It was
+  a fresh install for row 8cm (Anthony deleted the app mid-session), but it has
+  since run: server.met carries 10 servers and nodes.dat is populated, verified
+  on glass 2026-08-08 in both arms of the 8co pass. **An install over the top
+  PRESERVES the data container**, so shipping a build does not reset it - only
+  deleting the app does. Share library and downloads are still empty.
 
 ## THE CI HOLE, stated correctly
 
@@ -98,11 +106,20 @@ keeps working past it. Only Anthony can renew. Runbook in [[ipad-usb-tooling]].
 Budget for it. Never let a first reading into the record. Full runbook in
 [[ipad-usb-tooling]]; the ones that have actually bitten:
 
-- **The WDA session is fatal at BOTH ends.** Creating one (any bundle) disturbs
-  or kills the app; `DELETE /session` TERMINATES the app under test. That
-  produced a fifth false "DEAD" for background seeding on 2026-08-08. Background
-  with `pymobiledevice3 developer dvt launch <other.bundle>` and leave the
-  session open, or relaunch after closing.
+- **The WDA session is fatal at BOTH ends, and the mechanism is now MEASURED:
+  creating one RELAUNCHES the app** (padMule pid 2092 -> 2132 across a
+  `POST /session`), so every in-app counter resets while nodes.dat and server.met
+  survive; `DELETE /session` TERMINATES the app under test. Anything you want off
+  a long-running session must be read before you open one, and opening one is the
+  only way to read it - know you are making that trade. Background with
+  `pymobiledevice3 developer dvt launch <other.bundle>` and leave the session
+  open, or relaunch after closing.
+- **An active XCUITest session BLOCKS `apps install` INDEFINITELY.** Ten minutes
+  at ZERO CPU in `do_epoll_wait`, released instantly by `DELETE /session`. Close
+  the session BEFORE installing, and never trust the install's exit - read
+  `CFBundleVersion` back off the device.
+- **A `pgrep -f "<string>"` waiter matches its own command line** and so never
+  terminates. Poll the OBSERVABLE (the installed version), not the process.
 - **Stop inferring - the app logs which branch it took.** `keepalive: STARTED` /
   `entering background SEEDING` / `the keepalive did not start - pausing
   instead`. One capture ends the argument.
@@ -138,6 +155,23 @@ Every Kad figure is modestly better than 2026-08-07's, **and none of it is
 attributed to the serve loop** - different hour, different contact mix, fresh
 table. These figures are preserved verbatim in `stats.rs`, the FFI doc and
 [[build-progress]], because the panel that produced them no longer exists.
+
+**THE CSEARCH DEVICE PASS, 2026-08-08 (row 8co) - build `c656555` IS ON THE
+iPAD.** Both arms warm-disk / fresh-counters / foreground / HighID to the same
+eMule Sunrise over AirVPN.
+
+| Reading | before (`cadace2`, rounds) | after (`c656555`, CSearch) |
+|---|---|---|
+| search submit-to-first-results (n=5) | median **6.79s** | median **3.32s** (**-51%**) |
+| `Longest poll gap` | 1.0s | **1.1s** - bar met |
+| FIND_NODE answered | 71/138 = **51%** | 40/77 = **52%** |
+| Kad time-to-first-result | no such field | **1939 ms**, 5 of 5 lookups |
+
+**The equal answer rate is the control** - the swarm behaved the same in both
+arms, so the halved search is structural, not a good hour. It matters because the
+device arms were SEQUENTIAL, not alternating. **-51% is the JOINED server+Kad
+number** (one `tokio::join!`, so the server arm floors it); the Kad arm's own
+figure is the TTFR. n=5 per arm, one query, one server, one session.
 
 **THE CSEARCH A/B, off-device, 2026-08-08.** Old (`main` @ `54384f2`) vs new
 (`kad-csearch` @ `eb7ee3c`), alternating against the live network, same seed

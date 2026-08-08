@@ -1092,3 +1092,62 @@ Append-only, timestamped record of Ingest / Query / Lint passes.
   times are not comparable BETWEEN pairs - the pairing is what controls it.
   Nothing committed: the tree carries the doc changes and `stats.rs`'s one-word
   date fix, per the handoff's "do not commit unless asked".
+
+- 2026-08-08 **DEVICE PASS: the event-driven CSearch halves search time on the
+  iPad, and the answer rate is what proves it.** Pushed `c656555`, shipped it
+  through `ship.sh` (all three workflows green, artifact verified, zsign,
+  install), and ran a before/after on glass. Full account: [[build-progress]]
+  row 8co; numbers also in [[kad-routing-lifecycle]].
+  **DESIGN.** Both arms warm-disk / fresh-counters / foreground / HighID to the
+  SAME server (eMule Sunrise, real Lugdunum 17.15) over AirVPN. That state is
+  reproducible because creating a WDA session RELAUNCHES padMule - measured, pid
+  2092 -> 2132 - which resets every in-app counter while nodes.dat and server.met
+  survive, and an install over the top preserves the data container too. The
+  hazard used to read "disturbs or kills the app"; naming the mechanism turned it
+  from a nuisance into the experiment's control.
+  **RESULT.** Search submit-to-first-results, same query, n=5 each: **6.84 /
+  6.89 / 6.78 / 6.13 / 6.79 (median 6.79s) -> 3.32 / 2.68 / 4.48 / 3.35 / 2.70
+  (median 3.32s) = -51%.** `Longest poll gap` **1.1s**, matching 8cm, so the
+  no-regression bar holds. New panel on glass: 5 of 5 value lookups completed at
+  avg 1992ms, all 5 reached a first result at avg **1939ms** - a quantity the old
+  panel could not express at all.
+  **THE CONTROL IS THE POINT.** FIND_NODE answered **51% before (71/138) and 52%
+  after (40/77)**: the swarm behaved the same in both arms, so a halved search is
+  STRUCTURAL, not a good hour. That control is load-bearing here, because unlike
+  the off-device A/B the device arms were **SEQUENTIAL rather than alternating** -
+  you cannot cheaply reinstall back and forth - so drift is otherwise
+  uncontrolled. Also worth keeping: the device answers 51% where the dev box
+  answers 85%, which is exactly the condition the round barrier punished hardest.
+  **-51% IS THE JOINED NUMBER** (server + Kad in one `tokio::join!`, so the
+  server arm floors it). The Kad arm's own figure is the 1939ms TTFR. Quoting
+  -51% as the Kad speedup would overstate it. n=5 per arm, one query, one server,
+  one session.
+  **PROOF THE NEW BINARY WAS THE ONE RUNNING** is better than the version string:
+  the panel's own text changed from "A lookup round ends when its last peer
+  answers" to "Every request races its own deadline now - no rounds", and that
+  text exists only in `c656555`. A version string proves what was INSTALLED; a
+  panel proves what is EXECUTING. I did NOT reach Settings > This device > Build
+  and said so rather than implying I had.
+- 2026-08-08 **FOUR TOOLING DEFECTS, all found by USING the tools, all fixed**
+  (recorded in [[ipad-usb-tooling]], script fixed in `scripts/device-timing.sh`).
+  **`device-timing.sh` could not have produced a number**: it located the search
+  field by `label=Search`, which now matches the Search TAB BUTTON ("Search the
+  eD2k network" is the PLACEHOLDER); it submitted through
+  `POST /wda/keyboard/return`, which WDA 16.1.1 does not implement - and `curl`
+  exits 0 on an error BODY, so the failure was SILENT and the loop timed a search
+  that was never submitted; it cleared the FIELD but never the RESULTS, walking
+  into the very trap it was written to encode; and it polled `/source` (1.70s) at
+  a resolution worse than the effect. **A harness that encodes the rules still
+  has to be RUN to be believed** - this one had been correct for a UI that changed
+  underneath it.
+  Two more, both about diagnosing rather than measuring: **an active XCUITest
+  session BLOCKS `apps install` indefinitely** (ten minutes at ZERO CPU parked in
+  `do_epoll_wait`; `DELETE /session` released it in seconds - and the tell that it
+  was stuck rather than slow was sampling CPU time twice, which took 20 seconds
+  and replaced a guess), and **a `pgrep -f "<string>"` waiter matches its own
+  command line**, so `until ! pgrep -f "apps install"` can never terminate and
+  looks exactly like "still installing".
+  Also: my own first probe this session read "No device found" from
+  `ideviceinfo` and that was the DOCUMENTED trap, not a missing device - the
+  libimobiledevice CLI set fails while the iPad is "Not shared" to WSL, which is
+  the normal state. Verify a FAILURE the way you verify a success.

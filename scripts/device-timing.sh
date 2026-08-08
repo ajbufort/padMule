@@ -1,30 +1,49 @@
 #!/usr/bin/env bash
-# Time the operations row 8ch was meant to speed up, on the real device, over
-# WebDriverAgent. Prints one line per reading; nothing else.
+# Time search submit-to-first-results on the real device, over WebDriverAgent.
+# Prints one line per reading; nothing else.
 #
 # WHY THIS IS A SCRIPT AND NOT A SEQUENCE OF CURLS: every rule below was learned
 # by getting a wrong number out of the device, and each one is a line of code
 # here rather than a thing to remember.
 #
 #   1. `GET /source` walks the whole view hierarchy on the MAIN THREAD at
-#      1.4-2.4s per call. Polling it once a second STARVES the work being
-#      measured and manufactures the freeze. So the poll interval is 2.5s and
-#      the readings that matter are taken AFTER the operation, never during.
-#   2. The WDA search field CONCATENATES. Setting it twice searches
+#      1.4-2.4s per call, so it is NEVER the polling probe - only a one-shot
+#      read at the end. One `elements` query is ~0.18s; the poll uses those.
+#   2. The search field CONCATENATES. Setting it twice searches
 #      "ministerminister", which returns nothing fast and therefore looks like a
 #      clean, fast result. Every set is cleared first and READ BACK, and a
 #      mismatch aborts rather than producing a number.
-#   3. A single pair of runs cannot attribute a difference: search populations
+#   3. THE RESULTS LIST IS NOT CLEARED BETWEEN SEARCHES. A probe polling for
+#      rows finds the PREVIOUS run's at t=0 and reports probe latency as a
+#      search time. Tap "Clear search" and ASSERT ZERO ROWS before any clock
+#      starts.
+#   4. A single pair of runs cannot attribute a difference: search populations
 #      and probe rounds vary. Each reading is repeated and all values printed -
 #      read the spread, not the first number.
 #
-# Usage: scripts/device-timing.sh [query]
+# FIXED 2026-08-08 after this script was found unable to produce a number at
+# all. It had been correct for a UI that changed underneath it:
+#   - it located the field with label="Search", which now matches the Search TAB
+#     BUTTON ("Search the eD2k network" is the PLACEHOLDER, not the label);
+#   - it submitted with POST /wda/keyboard/return, which WDA 16.1.1 does not
+#     implement, and curl exits 0 on an error BODY - so the failure was SILENT
+#     and the loop timed a search that was never submitted;
+#   - it cleared the FIELD but never the RESULTS, walking into rule 3 above -
+#     which this very script exists to encode;
+#   - it polled /source every 2.5s, a resolution worse than the effect.
+# A harness that encodes the rules still has to be RUN to be believed.
+#
+# NOTE creating the session RELAUNCHES padMule (pid changes), so every
+# cumulative in-app counter resets. On-disk state survives, so the app stays
+# WARM - see docs/wiki/ipad-usb-tooling.md.
+#
+# Usage: scripts/device-timing.sh [query] [repeats]
 set -uo pipefail
 
 WDA=localhost:8100
 BUNDLE=us.ajbconsulting.padMule.Q444CHAF2Z
 QUERY="${1:-yes prime minister}"
-REPEATS=2
+REPEATS="${2:-5}"
 
 api() { curl -s --max-time 30 "$@"; }
 
@@ -35,8 +54,14 @@ need() {
   }
 }
 
-# The accessibility tree as one flat text blob: every label, one per line. Cheap
-# enough to grep, expensive enough that callers must not loop on it tightly.
+session() {
+  api -X POST "$WDA/session" -H 'Content-Type: application/json' \
+    -d "{\"capabilities\":{\"alwaysMatch\":{\"bundleId\":\"$BUNDLE\"}}}" |
+    python3 -c 'import json,sys; print(json.load(sys.stdin)["value"]["sessionId"])'
+}
+
+# The accessibility tree as one flat text blob. EXPENSIVE (rule 1) - one-shot
+# reads only, never in a poll.
 source_text() {
   api "$WDA/source?format=json" |
     python3 -c '
@@ -55,57 +80,20 @@ print("\n".join(out))
 '
 }
 
-session() {
-  api -X POST "$WDA/session" -H 'Content-Type: application/json' \
-    -d "{\"capabilities\":{\"alwaysMatch\":{\"bundleId\":\"$BUNDLE\"}}}" |
-    python3 -c 'import json,sys; print(json.load(sys.stdin)["value"]["sessionId"])'
-}
-
-# First element whose name/label matches $2 exactly, as an element id.
-find_element() {
-  api -X POST "$WDA/session/$1/elements" -H 'Content-Type: application/json' \
-    -d "{\"using\":\"link text\",\"value\":\"label=$2\"}" |
+# Element ids for a locator, space separated.
+els() {
+  api -X POST "$WDA/session/$SID/elements" -H 'Content-Type: application/json' -d "$1" |
     python3 -c 'import json,sys
 v=json.load(sys.stdin).get("value") or []
-print(v[0]["ELEMENT"] if v else "")'
+print(" ".join(e["ELEMENT"] for e in v))'
 }
+first_by_label() { els "{\"using\":\"link text\",\"value\":\"label=$1\"}" | awk '{print $1}'; }
+tap() { api -X POST "$WDA/session/$SID/element/$1/click" -d '{}' >/dev/null; }
 
-tap() { api -X POST "$WDA/session/$1/element/$2/click" -d '{}' >/dev/null; }
-
-# Clear, set, and READ BACK. Rule 2 above: the field concatenates, and a silent
-# concatenation produces a fast meaningless result that looks like a good one.
-set_field() {
-  local sid=$1 eid=$2 text=$3
-  api -X POST "$WDA/session/$sid/element/$eid/clear" -d '{}' >/dev/null
-  api -X POST "$WDA/session/$sid/element/$eid/value" -H 'Content-Type: application/json' \
-    -d "$(python3 -c 'import json,sys; print(json.dumps({"value":list(sys.argv[1])}))' "$text")" >/dev/null
-  local got
-  got=$(api "$WDA/session/$sid/element/$eid/attribute/value" |
-    python3 -c 'import json,sys; print(json.load(sys.stdin).get("value") or "")')
-  if [ "$got" != "$text" ]; then
-    echo "ABORT: the search field reads '$got', not '$text' - it concatenated." >&2
-    return 1
-  fi
-}
-
-# Wait until the tree contains $2, polling no faster than rule 1 allows.
-# Prints the elapsed seconds, or "timeout".
-wait_for() {
-  local pattern=$1 limit=$2 t0 now
-  t0=$(date +%s.%N)
-  while :; do
-    now=$(date +%s.%N)
-    if (($(echo "$now - $t0 > $limit" | bc -l))); then
-      echo "timeout"
-      return 1
-    fi
-    if source_text | grep -qE "$pattern"; then
-      echo "$(echo "$now - $t0" | bc -l)"
-      return 0
-    fi
-    sleep 2.5
-  done
-}
+# Result rows. Marker is `Get` - ONE BUTTON PER ROW - never `srcs`: a
+# single-source row reads "1 src", so an `srcs` matcher cannot fire on a thin
+# result set, which is exactly what an unpopular query returns.
+count_rows() { els '{"using":"partial link text","value":"label=Get"}' | wc -w; }
 
 need
 SID=$(session)
@@ -113,21 +101,45 @@ echo "session $SID"
 sleep 8 # let the activation settle before timing anything
 
 echo "--- build on device ---"
-source_text | grep -iE "build|version" | head -5
+source_text | grep -iE "^Build|version" | head -3
 
-echo "--- search submit-to-results (was 10.3s) ---"
-for i in $(seq 1 $REPEATS); do
-  FIELD=$(find_element "$SID" "Search")
-  [ -z "$FIELD" ] && { echo "run $i: no search field found"; break; }
-  set_field "$SID" "$FIELD" "$QUERY" || break
-  T0=$(date +%s.%N)
-  api -X POST "$WDA/session/$SID/wda/keyboard/return" -d '{}' >/dev/null 2>&1 ||
-    api -X POST "$WDA/session/$SID/element/$FIELD/value" \
-      -H 'Content-Type: application/json' -d '{"value":["\n"]}' >/dev/null
-  echo "run $i: $(wait_for 'srcs|sources|server \+ kad|No results' 40)s"
-  sleep 5 # the engine's 2s server-search flood guard, with room
+echo "--- search submit-to-first-results ---"
+for i in $(seq 1 "$REPEATS"); do
+  # RULE 3: clear the RESULTS, and prove it.
+  C=$(first_by_label "Clear search")
+  [ -n "$C" ] && tap "$C"
+  sleep 1.5
+  N=$(count_rows)
+  if [ "$N" -ne 0 ]; then echo "run $i: ABORT - $N stale rows survived Clear search"; continue; fi
+
+  # RULE 2: set, then READ BACK.
+  F=$(els '{"using":"class name","value":"XCUIElementTypeTextField"}' | awk '{print $1}')
+  [ -z "$F" ] && { echo "run $i: ABORT - no search field"; continue; }
+  api -X POST "$WDA/session/$SID/element/$F/clear" -d '{}' >/dev/null
+  api -X POST "$WDA/session/$SID/element/$F/value" -H 'Content-Type: application/json' \
+     -d "$(python3 -c 'import json,sys;print(json.dumps({"value":list(sys.argv[1])}))' "$QUERY")" >/dev/null
+  GOT=$(api "$WDA/session/$SID/element/$F/attribute/value" |
+        python3 -c 'import json,sys;print(json.load(sys.stdin).get("value") or "")')
+  [ "$GOT" = "$QUERY" ] || { echo "run $i: ABORT - field reads '$GOT', not '$QUERY'"; continue; }
+
+  # Submit by TAPPING the keyboard's return key. /wda/keyboard/return does not
+  # exist in WDA 16.1.1 and fails silently through curl.
+  SK=$(first_by_label "search")
+  [ -z "$SK" ] && { echo "run $i: ABORT - no keyboard search key (is the keyboard up?)"; continue; }
+  T0=$(date +%s.%N); tap "$SK"
+  DL=$(echo "$T0 + 45" | bc -l); HIT=""
+  while (( $(echo "$(date +%s.%N) < $DL" | bc -l) )); do
+    if [ "$(count_rows)" -gt 0 ]; then HIT=1; break; fi
+    sleep 0.4
+  done
+  EL=$(echo "$(date +%s.%N) - $T0" | bc -l)
+  if [ -n "$HIT" ]; then printf "run %d: %.2fs  (%s rows)\n" "$i" "$EL" "$(count_rows)"
+  else printf "run %d: TIMEOUT >45s\n" "$i"; fi
+  sleep 5 # the engine's server-search flood guard, with room
 done
 
-echo "--- READ ONCE, AT THE END: Stats -> Longest poll gap ---"
-echo "(near 1s = the lock-free poll really did keep running)"
-source_text | grep -iE "poll gap|Status polls|Heartbeats" | head -6
+echo "--- READ ONCE, AT THE END: Stats -> Longest poll gap + the Kad panel ---"
+echo "(poll gap near 1s = the lock-free poll really did keep running)"
+S=$(first_by_label "Statistics"); [ -n "$S" ] && tap "$S"
+sleep 4
+source_text | grep -iE "poll gap|lookups run|first result|completed|TIMEOUT|FIND_NODE|value ask|high-water|rounds|silent" | head -20

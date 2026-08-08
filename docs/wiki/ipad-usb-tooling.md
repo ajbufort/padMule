@@ -221,6 +221,72 @@ state in text), `POST /session/{id}/actions` (W3C tap), `POST
 Kept HERE rather than only in [[handoff-next-session]], which is replaced
 wholesale every session. `scripts/device-timing.sh` encodes all of it.
 
+> **[2026-08-08: `scripts/device-timing.sh` was BROKEN and could not have
+> produced a number. Four defects, found by using it.]** It is fixed; the
+> failures are recorded because three of them are shapes, not typos.
+>
+> 1. **It located the search field with `label=Search`, which now matches the
+>    Search TAB BUTTON.** "Search the eD2k network" is the field's PLACEHOLDER,
+>    not its label. Find the field by CLASS
+>    (`XCUIElementTypeTextField`) - there is exactly one on that screen.
+> 2. **It submitted with `POST /wda/keyboard/return`, which WDA 16.1.1 does not
+>    implement - and `curl` exits 0 on an error BODY, so the failure was
+>    SILENT.** The timing loop then measured a search that was never submitted.
+>    The keyboard's return key is a real element labelled `search`; TAP IT.
+>    **This is "a silent path must still speak" in a probe** - the same shape the
+>    engine keeps being audited for.
+> 3. **It never cleared the RESULTS between repeats, only the FIELD.** So repeat
+>    2+ matched the previous run's rows at t=0 - the exact trap rule 1 below
+>    documents, walked into by the script written to encode rule 1. Tap
+>    **Clear search** and ASSERT ZERO rows before starting any clock.
+> 4. **Its poll was `GET /source` (1.70s) every 2.5s**, so its RESOLUTION was
+>    worse than the effect being measured. One `elements` query is ~0.18s here;
+>    polling those at 0.4s gives ~0.6s resolution and costs the app far less.
+>
+> **A harness that encodes the rules still has to be RUN to be believed.** This
+> one had been correct for a UI that has since changed underneath it.
+
+**CREATING A WDA SESSION RELAUNCHES THE APP - measured, not inferred (2026-08-08).**
+The hazard used to read "creating one (any bundle) disturbs or kills the app",
+which is vague enough to plan around badly. The mechanism: padMule was pid 2092
+before `POST /session` and **pid 2132 after**. So:
+
+- **In-memory state is GONE** - the Kad panel, the fetch funnel and every
+  cumulative counter reset. Anything you wanted off a long-running session must
+  be read BEFORE you open a session, and the only way to read it is to open a
+  session. That trade is unavoidable; know you are making it.
+- **On-disk state SURVIVES** (nodes.dat, server.met, downloads), so the app is
+  still WARM. An install over the top preserves the data container too.
+- Therefore the clean A/B design is: **warm disk, fresh counters, foreground,
+  relaunched by the session create** - identical and reproducible on both arms.
+  That is how the 2026-08-08 before/after pair was taken.
+
+**AN ACTIVE XCUITEST SESSION BLOCKS `apps install` INDEFINITELY (2026-08-08).**
+`pymobiledevice3 apps install` sat for over ten minutes against a documented
+~30s, and the read-back still said the OLD build. The tell that it was stuck
+rather than slow: **zero CPU time accumulated** and the process parked in
+`do_epoll_wait` - it was blocked on the device, not working. `DELETE /session`
+(which terminates the app under test) released it and the install completed in
+seconds.
+
+So the order matters: **close the WDA session BEFORE installing**, or the
+install hangs with no error. Two corollaries:
+
+- A `--max-time`/`timeout` around the install turns this into a SILENT partial:
+  the command is killed, prints nothing useful, and the app is unchanged. Always
+  read the build back (`pymobiledevice3 apps list` -> `CFBundleVersion`) rather
+  than trusting the install's exit.
+- **Do not diagnose "stalled" from elapsed time alone.** Sample CPU time twice;
+  a process burning CPU is working, a process at 00:00:00 in an epoll wait is
+  blocked. That check took 20 seconds and replaced a guess.
+
+**A `pgrep -f "<string>"` waiter matches ITS OWN command line.** A loop written
+as `until ! pgrep -f "apps install"; do sleep 15; done` never terminates,
+because the shell running it contains that string. It looked exactly like "the
+install is still going" for several minutes. Match the interpreter path
+(`pgrep -af "pymobiledevice3 apps install"` filtered for the venv python), or
+poll the OBSERVABLE (the installed version) instead of the process.
+
 **Probe costs, timed on device 2026-08-07** (this is the whole reason the rules
 below exist - every probe spends MAIN-THREAD time in the app you are measuring):
 
