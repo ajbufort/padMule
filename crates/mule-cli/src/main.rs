@@ -3,8 +3,8 @@
 //! login-any, listen), server search + offers (global-search, server-search,
 //! related-search, offer-search, offer-hold), hashing + serving (hash-file,
 //! serve-file), peer transfer + diagnostics (peer-download, peer-probe,
-//! sec-ident), the full Kad surface (kad-bootstrap, kad-search, kad-fetch,
-//! kad-keyword), links + filters (link, ipfilter), port mapping (upnp,
+//! sec-ident), the full Kad surface (kad-bootstrap, kad-serve, kad-search,
+//! kad-fetch, kad-keyword), links + filters (link, ipfilter), port mapping (upnp,
 //! upnp-unicast, upnp-query, upnp-unmap, natpmp), and the completion-optimized
 //! fetchers (search-download, fetch-complete). Run with no arguments for
 //! usage; the match in `main` is the authoritative list.
@@ -1437,6 +1437,116 @@ async fn cmd_kad_bootstrap(nodes_path: &str, bind_ip: Option<&str>) {
     }
 }
 
+/// Stand up a Kad node that KEEPS ANSWERING - the serve-loop oracle path.
+///
+/// `kad-bootstrap` is a one-shot: it handshakes and exits, which is exactly the
+/// behaviour that used to age padMule out of every routing table that learned
+/// it (eMule's OnSmallTimer probes the oldest contact and evicts what stays
+/// silent). This command drives the REAL serve path instead: binding a KadNode
+/// spawns the owning read loop (kad_live::run_read_loop), which answers PING,
+/// HELLO, FIND_NODE and BOOTSTRAP for the node's whole life. We bootstrap +
+/// HELLO like kad-bootstrap so the far side learns us, then idle while the
+/// read loop serves.
+async fn cmd_kad_serve(nodes_path: &str, bind_ip: Option<&str>, secs: u64) {
+    let bytes = match std::fs::read(nodes_path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("cannot read {nodes_path}: {e}");
+            return;
+        }
+    };
+    let parsed = match read_nodes_dat(&bytes) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("bad nodes.dat: {e:?}");
+            return;
+        }
+    };
+    let contacts: Vec<_> = parsed
+        .contacts
+        .into_iter()
+        .filter(|c| c.version >= 2)
+        .collect();
+    let bind_addr: IpAddr = match bind_ip {
+        Some(s) => match s.parse() {
+            Ok(ip) => ip,
+            Err(e) => {
+                eprintln!("bad bind IP {s}: {e}");
+                return;
+            }
+        },
+        None => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+    };
+    let bind: SocketAddr = SocketAddr::new(bind_addr, 4672);
+    let mut node = match KadNode::bind(bind, 4662).await {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("bind failed: {e}");
+            return;
+        }
+    };
+    println!(
+        "bound Kad UDP on {bind}; our KadID {:08x?}",
+        node.kad_id().words()
+    );
+    let seeded = node.seed_routing(&contacts);
+    println!(
+        "seeded routing with {seeded} of {} contacts",
+        contacts.len()
+    );
+
+    // Handshake so the far side LEARNS us (bootstrap, then the v8 HELLO +
+    // HELLO_RES_ACK that earns the verified bit). Retried a little because a
+    // just-started peer may not be listening yet; a persistent failure is
+    // reported but does NOT stop the serve - answering needs no handshake.
+    let mut introduced = false;
+    for attempt in 1..=5u32 {
+        match node
+            .bootstrap_any(&contacts, Duration::from_millis(1200), 40)
+            .await
+        {
+            Ok((i, res)) => {
+                println!(
+                    "BOOTSTRAP_RES from contact #{i}: version {}, tcp {}, {} contacts",
+                    res.version,
+                    res.tcp_port,
+                    res.contacts.len()
+                );
+                match node.hello(&contacts[i], Duration::from_millis(1500)).await {
+                    Ok(h) => println!(
+                        "HELLO_RES: id {:08x?}, tcp {}, version {}",
+                        h.id.words(),
+                        h.tcp_port,
+                        h.version
+                    ),
+                    Err(e) => println!("HELLO after bootstrap: {e}"),
+                }
+                introduced = true;
+                break;
+            }
+            Err(e) => {
+                println!("bootstrap attempt {attempt}: {e}");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+    if !introduced {
+        println!("no contact answered; serving anyway (inbound requests still work)");
+    }
+
+    println!("serving for {secs}s (the read loop answers PING/HELLO/FIND_NODE/BOOTSTRAP)...");
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(secs) {
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        println!(
+            "kad-serve alive {}s, routing table {} contacts",
+            start.elapsed().as_secs(),
+            node.contacts_known()
+        );
+    }
+    println!("kad-serve done after {secs}s");
+}
+
 /// Wave-6 GOAL: bootstrap into Kad, then resolve an ed2k file hash to sources
 /// (iterative FIND_NODE lookup toward the hash, then SEARCH_SOURCE_REQ).
 async fn cmd_kad_search(nodes_path: &str, hash: [u8; 16], size: u64) {
@@ -2711,6 +2821,13 @@ async fn main() {
         Some("kad-bootstrap") if args.len() == 4 => {
             cmd_kad_bootstrap(&args[2], Some(&args[3])).await
         }
+        Some("kad-serve") if (3..=5).contains(&args.len()) => {
+            let secs = args
+                .get(4)
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(600);
+            cmd_kad_serve(&args[2], args.get(3).map(String::as_str), secs).await
+        }
         Some("kad-search") if args.len() == 5 => {
             match (parse_hex16(&args[3]), args[4].parse::<u64>()) {
                 (Some(hash), Ok(size)) => cmd_kad_search(&args[2], hash, size).await,
@@ -2804,6 +2921,9 @@ async fn main() {
             eprintln!("  mule-cli offer-search <host> <port> <name>");
             eprintln!("  mule-cli offer-hold <host> <port> <name[|name2|...]> [secs]");
             eprintln!("  mule-cli kad-bootstrap <nodes.dat> [bind-ip]");
+            eprintln!(
+                "  mule-cli kad-serve <nodes.dat> [bind-ip] [secs]   (stay up and ANSWER Kad)"
+            );
             eprintln!("  mule-cli kad-search <nodes.dat> <ed2k-hash-hex> <size>");
             eprintln!("  mule-cli kad-fetch <nodes.dat> <ed2k-hash-hex> <size> <out>");
             eprintln!("  mule-cli kad-keyword <nodes.dat> <keyword>");

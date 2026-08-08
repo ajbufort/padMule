@@ -1,18 +1,42 @@
 #!/usr/bin/env bash
-# REVERSE-KAD ORACLE: prove a REAL amuled 3.0.1 flips padMule's Kad IP-verified
-# bit via padMule's v8 HELLO_RES_ACK three-way handshake. This is the terminal
-# proof for the Kad hard-verify send-side work (docs/wiki/build-progress wave 10):
-# the receive side was live-proven, but "a real node verifies US" could not be,
-# because a stock node logs nothing when it flips the bit. So we run a LOGGING-
-# INSTRUMENTED amuled (scripts/build-amuled-kad-oracle.sh - a committed, auditable,
-# logging-only patch; the pristine amule-3.0.1/ is untouched) and watch for its
-# PADMULE-ORACLE-VERIFIED line naming padMule's IP.
+# REVERSE-KAD ORACLE: prove against a REAL amuled 3.0.1 that padMule (a) earns
+# the Kad IP-verified bit via its v8 HELLO_RES_ACK three-way handshake, and
+# (b) - the 2026-08-07 serve-loop extension - STAYS in amuled's routing table
+# because it now ANSWERS the OnSmallTimer liveness probe that used to evict it.
 #
-# Topology (all inside one `unshare -rn` namespace, zero egress):
-#   padMule (mule-cli kad-bootstrap) at PAD_IP  --HELLO_REQ/RES/RES_ACK-->  amuled at AM_IP
-# We pre-seed amuled's Kad ID (preferencesKad.dat) so we can build a one-contact
-# nodes.dat pointing padMule straight at it, and a src-route so padMule's socket
-# sources from PAD_IP (distinct from amuled's, or amuled would self-reject).
+# The run is an A/B experiment inside one amuled routing table:
+#   CONTROL  (CTRL_IP): `mule-cli kad-bootstrap` - the OLD one-shot behaviour.
+#            It handshakes, exits, and goes silent - exactly what padMule did
+#            before the owning read loop. amuled must EVICT it.
+#   SERVE    (PAD_IP):  `mule-cli kad-serve` - the read loop stays up and
+#            answers. amuled must probe it, get a HELLO_RES back, REFRESH the
+#            contact, and never evict it.
+# Same amuled, same table, same OnSmallTimer sweeps: the asymmetry is the proof.
+#
+# Evidence comes from a LOGGING-INSTRUMENTED amuled (scripts/
+# build-amuled-kad-oracle.sh applies scripts/amule-oracle-kad-verify.patch - a
+# committed, auditable, logging-only patch; the pristine amule-3.0.1/ is never
+# touched). The oracle lines it emits:
+#   PADMULE-ORACLE-VERIFIED   - amuled flipped a contact's IP-verified bit
+#   PADMULE-ORACLE-SMALLTIMER - OnSmallTimer probed its oldest contact (HELLO_REQ)
+#   PADMULE-ORACLE-HELLO-RES  - a HELLO_RES answered a HELLO_REQ amuled sent
+#   PADMULE-ORACLE-PONG       - a PONG answered a KADEMLIA2_PING amuled sent
+#   PADMULE-ORACLE-REFRESH    - the probed contact was KEPT (SetAlive/UpdateType)
+#   PADMULE-ORACLE-EVICTED    - a probed contact stayed silent and was removed
+#
+# TIMING (all read out of amule-3.0.1 sources, not guessed):
+#   Kademlia.cpp:254-257  - OnSmallTimer per zone every MIN2S(1) = 60 s
+#   Contact.cpp:90        - a probed contact gets type=4, expiry now+2 min
+#   RoutingZone.cpp:770-777 - expired type-4 contacts are removed next sweep
+# So a silent contact dies ~3-4 sweeps after being learned; the whole A/B run
+# fits in ~8 minutes. This script is therefore SLOW BY NATURE - it must sit
+# through real eviction cycles.
+#
+# Topology (one `unshare -rn` namespace, zero egress):
+#   kad-serve at PAD_IP, kad-bootstrap at CTRL_IP  <-UDP->  amuled at AM_IP
+# amuled's Kad ID is pre-seeded (preferencesKad.dat) so a one-contact nodes.dat
+# can point both padMule instances straight at it; a src-route keeps an
+# UNSPECIFIED-bound socket sourcing from the right address.
 #
 # Prereqs: scripts/build-amuled-kad-oracle.sh once + `cargo build --release -p mule-cli`.
 set -uo pipefail
@@ -21,14 +45,22 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CLI="$REPO/target/release/mule-cli"
 AMULED="$REPO/build-oracle/kad-build/src/amuled"
 
-PAD_IP=77.77.0.9        # padMule (mule-cli) source IP
+PAD_IP=77.77.0.9        # padMule SERVE node (mule-cli kad-serve) - must survive
+CTRL_IP=77.77.0.8       # CONTROL (one-shot kad-bootstrap) - must be evicted
 AM_IP=88.88.0.3         # amuled Kad node IP
 # Kad rides the CLIENT UDP socket, which binds to UDPPort. The SERVER UDP socket
 # binds to TCP+3, so UDPPort must NOT equal TCP+3 or the client socket collides
 # and falls back to an ephemeral port. TCP 4662 -> server UDP 4665; Kad UDP 4672.
 AM_UDP=4672             # amuled client/Kad UDP port (= UDPPort)
 AM_TCP=4662             # amuled ed2k TCP port (server UDP = 4665)
-# padMule's mule-cli kad-bootstrap binds UDP 4672 (hardcoded); nothing to set.
+# Both padMule instances bind UDP 4672 (hardcoded) on their own IPs.
+
+# How long the serve node stays up. Must outlast: learn (~60s) + probe (~120s)
+# + control eviction (~240s) + margin.
+SERVE_SECS=560
+# Give up watching after this long (the sweeps are 60s apart; 9 min is 3+ full
+# probe-and-evict cycles past the handshakes).
+WATCH_SECS=540
 
 # A fixed, non-zero 16-byte Kad ID we assign to amuled (byte-identical in its
 # preferencesKad.dat and in padMule's nodes.dat -> the NodeID obfuscation keys match).
@@ -50,11 +82,12 @@ trap cleanup EXIT
 ip link set lo up
 ip link add name d0 type dummy 2>/dev/null
 ip addr add "$PAD_IP/24" dev d0        # padMule IP first (interface primary)
+ip addr add "$CTRL_IP/24" dev d0
 ip addr add "$AM_IP/24"  dev d0
 ip link set d0 up
-# Force padMule's UNSPECIFIED-bound socket to source from PAD_IP when it dials
-# amuled (else the kernel would pick AM_IP - amuled's own subnet address - and
-# amuled would reject a contact at its own IP).
+# Force an UNSPECIFIED-bound socket to source from PAD_IP when it dials amuled
+# (both mule-cli invocations pass an explicit bind IP, which pins the source
+# anyway; this keeps the old belt-and-braces behaviour).
 ip route add "$AM_IP/32" dev d0 src "$PAD_IP"
 
 # 1) amuled: generate a default config, then tune it for an isolated Kad-only run.
@@ -131,26 +164,78 @@ case "$CUDP" in
   *) echo "WARN: client/Kad UDP is NOT on $AM_UDP - padMule cannot reach it"; ;;
 esac
 
-# 5) drive padMule against it, retrying a few times for Kad warmup.
-VERIFIED=0
-for attempt in $(seq 1 8); do
-  kill -0 "$AM" 2>/dev/null || { echo "amuled exited early"; break; }
-  "$CLI" kad-bootstrap "$NODES" "$PAD_IP" > "$WORK/cli.$attempt.log" 2>&1
-  if LOGS | grep -q "PADMULE-ORACLE-VERIFIED"; then VERIFIED=1; break; fi
-  sleep 2
+# 5) SERVE node: kad-serve stays up for the whole run, its read loop answering.
+"$CLI" kad-serve "$NODES" "$PAD_IP" "$SERVE_SECS" > "$WORK/serve.log" 2>&1 &
+SERVE=$!
+echo "== kad-serve up at $PAD_IP (pid $SERVE, ${SERVE_SECS}s)"
+
+# 6) CONTROL: the OLD one-shot behaviour - handshake, exit, go silent.
+"$CLI" kad-bootstrap "$NODES" "$CTRL_IP" > "$WORK/ctrl.log" 2>&1
+echo "== control kad-bootstrap at $CTRL_IP done (process exited - now silent)"
+
+# 7) Watch amuled's oracle lines for the A/B outcome.
+#    PASS needs, in one run:
+#      VERIFIED  for $PAD_IP        (proof 1: the v8 handshake earns the bit)
+#      SMALLTIMER probe -> $PAD_IP  (proof 2: amuled probed padMule...)
+#      HELLO-RES from $PAD_IP       (...and padMule ANSWERED)
+#      REFRESH   for $PAD_IP        (proof 3a: the answer KEPT the contact)
+#      EVICTED   for $CTRL_IP       (proof 3b: the same sweeps evicted the
+#                                    silent one-shot - the old behaviour)
+#      no EVICTED for $PAD_IP       (proof 3c: ...and never the serve node)
+seen() { LOGS | grep -q "$1"; }
+START=$(date +%s)
+echo "== watching (up to ${WATCH_SECS}s; sweeps are 60s apart, eviction needs ~4-6 of them)"
+VERDICT=incomplete
+while :; do
+  NOW=$(( $(date +%s) - START ))
+  if ! kill -0 "$AM" 2>/dev/null; then echo "amuled exited early"; break; fi
+  if seen "PADMULE-ORACLE-EVICTED contact ($PAD_IP)"; then
+    VERDICT=serve-evicted; break
+  fi
+  if seen "PADMULE-ORACLE-VERIFIED contact (sender: $PAD_IP)" \
+     && seen "PADMULE-ORACLE-SMALLTIMER probe -> $PAD_IP" \
+     && seen "PADMULE-ORACLE-HELLO-RES from $PAD_IP" \
+     && seen "PADMULE-ORACLE-REFRESH contact ($PAD_IP)" \
+     && seen "PADMULE-ORACLE-EVICTED contact ($CTRL_IP)"; then
+    VERDICT=pass; break
+  fi
+  if [ "$NOW" -ge "$WATCH_SECS" ]; then break; fi
+  # progress line every ~30s so a long run is visibly alive
+  if [ $(( NOW % 30 )) -lt 5 ]; then
+    echo "   t=${NOW}s: $(LOGS | grep -c 'PADMULE-ORACLE-SMALLTIMER') probes, \
+$(LOGS | grep -c 'PADMULE-ORACLE-REFRESH') refreshes, \
+$(LOGS | grep -c 'PADMULE-ORACLE-EVICTED') evictions"
+  fi
+  sleep 5
 done
 
 echo; echo "===== RESULT ====="
-if [ "$VERIFIED" = 1 ]; then
-  echo "PASS: a REAL amuled 3.0.1 marked padMule IP-verified via the v8 handshake."
-  echo "--- amuled verify line(s) ---"
-  LOGS | grep "PADMULE-ORACLE-VERIFIED"
-  echo "--- padMule side (last attempt) ---"
-  grep -E "BOOTSTRAP_RES|HELLO_RES|HELLO after" "$WORK"/cli.*.log 2>/dev/null | tail -4
-else
-  echo "FAIL/INCOMPLETE: no PADMULE-ORACLE-VERIFIED line from amuled."
-  echo "--- padMule last attempt ---"; tail -8 "$WORK"/cli.*.log 2>/dev/null | tail -12
-  echo "--- amuled log (Kad lines) ---"; LOGS | grep -iE "kad|verif|bootstrap|hello" | tail -20
-  echo "--- amuled log tail ---"; LOGS | tail -15
-fi
-[ "$VERIFIED" = 1 ]
+echo "--- all oracle lines, in order ---"
+LOGS | grep "PADMULE-ORACLE" | sed 's/^/    /'
+echo "--- serve node last heartbeats ---"
+tail -4 "$WORK/serve.log" | sed 's/^/    /'
+echo
+case "$VERDICT" in
+  pass)
+    echo "PASS: a REAL amuled 3.0.1 (1) marked padMule IP-verified, (2) probed it"
+    echo "on the OnSmallTimer sweep and got a HELLO_RES back, and (3) KEPT it in"
+    echo "the routing table - while the SAME sweeps evicted the silent one-shot"
+    echo "control at $CTRL_IP, which is exactly what padMule used to be."
+    ;;
+  serve-evicted)
+    echo "FAIL: amuled EVICTED the serve node at $PAD_IP - the read loop did not"
+    echo "keep it alive. Check $WORK/serve.log and the flood budgets."
+    ;;
+  *)
+    echo "FAIL/INCOMPLETE after ${WATCH_SECS}s. Missing evidence:"
+    seen "PADMULE-ORACLE-VERIFIED contact (sender: $PAD_IP)" || echo "  - VERIFIED for $PAD_IP"
+    seen "PADMULE-ORACLE-SMALLTIMER probe -> $PAD_IP"        || echo "  - SMALLTIMER probe -> $PAD_IP"
+    seen "PADMULE-ORACLE-HELLO-RES from $PAD_IP"             || echo "  - HELLO-RES from $PAD_IP"
+    seen "PADMULE-ORACLE-REFRESH contact ($PAD_IP)"          || echo "  - REFRESH for $PAD_IP"
+    seen "PADMULE-ORACLE-EVICTED contact ($CTRL_IP)"         || echo "  - EVICTED for control $CTRL_IP"
+    echo "--- padMule serve log tail ---"; tail -12 "$WORK/serve.log"
+    echo "--- control log tail ---"; tail -6 "$WORK/ctrl.log"
+    echo "--- amuled log (Kad lines) ---"; LOGS | grep -iE "kad|verif|bootstrap|hello" | tail -20
+    ;;
+esac
+[ "$VERDICT" = pass ]
