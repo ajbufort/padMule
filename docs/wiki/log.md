@@ -500,3 +500,24 @@ Append-only, timestamped record of Ingest / Query / Lint passes.
   bundle was gone while WebDriverAgent remained. Reinstalled from the signed IPA
   on disk. Worth knowing that a launch failure can mean "not installed" rather
   than "broken build", and that the apps list settles it in one call.
+
+- 2026-08-07 **BACKGROUND SEEDING BUILT (row 8cj)**, the same day the decision was
+  reopened. Anthony's ask was specific and better-shaped than "always on": keep
+  SHARING what has been downloaded, to be a good neighbour and earn standing.
+  Measured before building - `physFootprint` 30.8 MB against the ~100MB jetsam
+  budget - which is what turned this from risky to obviously worth doing. The
+  mechanism is the ordinary `audio` `UIBackgroundModes` key; sideloading is what
+  makes it available (review 2.5.4 is the only thing that normally forbids it),
+  so there is no backdoor and no private API. `EngineState::Seeding` keeps the
+  listener and server login up and drops Kad; the maintainers that should keep
+  running have no `Running` guard and continue for free, the ones that should
+  stop already gate on it. A separate STATE rather than a flag, because
+  "Running" while backgrounded is the dishonest status this entry calls a hard
+  requirement to avoid. **The keepalive decides the path, not the setting** - it
+  is started first and a failure falls back to a plain pause, because claiming a
+  seed we are not performing is the same dishonesty in a different place.
+  Mutation-checked, and the first listener test was VACUOUS (offline `start()`
+  never binds a listener, so it asserted about one that never existed) and said
+  so by failing. Default OFF; footer blunt about jetsam, because the failure mode
+  is a user who believes it is a guarantee. Not yet device-verified: longevity
+  overnight is the open question.
