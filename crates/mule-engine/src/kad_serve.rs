@@ -1,0 +1,387 @@
+//! Answering inbound Kad requests - the RULES, with no I/O.
+//!
+//! padMule answers ROUTING queries only: PING, HELLO, FIND_NODE and BOOTSTRAP.
+//! It stores nothing and publishes nothing, so a search or a publish gets no
+//! answer at all - see `answer_request` for why silence is the faithful choice
+//! there rather than the lazy one.
+//!
+//! Pure on purpose. The socket loop lives in `kad_live`; everything decided
+//! here (who gets a reply, what it contains, when the ACK bit is set) is a rule
+//! a remote peer's behaviour depends on, so it must be testable without a
+//! socket.
+
+use mule_kad::{
+    build_bootstrap_res, build_hello_res, build_kad2_res, build_pong, parse_hello, parse_kad2_req,
+    WireContact, KADEMLIA_VERSION, OP_BOOTSTRAP_REQ, OP_HELLO_REQ, OP_KAD2_REQ, OP_PING,
+};
+use mule_proto::Kad128;
+
+/// What we tell a peer about ourselves when answering.
+pub struct ServeIdentity {
+    pub kad_id: Kad128,
+    pub tcp_port: u16,
+    /// The port peers should DIAL - the advertised one, which differs from the
+    /// bound port behind a VPN remote-to-local forward. Answering with the bound
+    /// port there would put us in the peer's table at an address nobody
+    /// forwards, which is worse than not answering at all.
+    pub advertised_udp_port: u16,
+}
+
+/// One outbound answer.
+pub struct ServeAnswer {
+    pub opcode: u8,
+    pub payload: Vec<u8>,
+    /// True when we asked the peer for a verification ACK, so the caller knows
+    /// an inbound `HELLO_RES_ACK` from it is expected. Set only where eMule sets
+    /// it - see [`answer_hello`].
+    pub request_ack: bool,
+}
+
+impl ServeAnswer {
+    fn plain(op: u8, payload: Vec<u8>) -> Option<Self> {
+        Some(ServeAnswer {
+            opcode: op,
+            payload,
+            request_ack: false,
+        })
+    }
+}
+
+/// Decide the answer to one inbound request, or `None` to stay silent.
+///
+/// `valid_receiver_key` is eMule's `bValidReceiverKey`: whether the request
+/// echoed back the verify key we issue for this sender's address, which PROVES
+/// the sender receives at that IP.
+///
+/// `closest` yields our routing table's closest VERIFIED contacts to a target,
+/// passed as a closure so this stays free of the table's lock.
+///
+/// WHAT IS DELIBERATELY NOT ANSWERED, and why silence is faithful rather than
+/// lazy: padMule stores nothing, so it has no results for a
+/// `SEARCH_KEY_REQ`/`SEARCH_SOURCE_REQ` and nothing to acknowledge for a
+/// `PUBLISH_*`. eMule STAYS SILENT in exactly that position -
+/// `CIndexed::SendValidKeywordResult` (Indexed.cpp:696) builds and sends a
+/// packet only inside `if (m_mapKeyword.Lookup(...))`, so no entry means no
+/// packet, and there is no empty-`SEARCH_RES` path in stock eMule anywhere.
+/// An earlier draft of this design had us answer empty as a courtesy; since no
+/// stock client emits that packet and we would emit one for nearly every search
+/// reaching us, it would have been a padMule fingerprint broadcast to the
+/// network. Reversed 2026-08-07 on that evidence. A bonus: we never parse an
+/// attacker-supplied search payload or expression tree at all.
+pub fn answer_request(
+    op: u8,
+    payload: &[u8],
+    from_udp_port: u16,
+    me: &ServeIdentity,
+    valid_receiver_key: bool,
+    closest: impl FnOnce(&Kad128, usize) -> Vec<WireContact>,
+) -> Option<ServeAnswer> {
+    match op {
+        OP_PING => {
+            let (o, p) = build_pong(from_udp_port);
+            ServeAnswer::plain(o, p)
+        }
+        OP_HELLO_REQ => answer_hello(payload, me, valid_receiver_key),
+        OP_KAD2_REQ => {
+            let req = parse_kad2_req(payload).ok()?;
+            // The receiver field is the sender's own check that it reached the
+            // node it meant to; eMule silently drops a request naming someone
+            // else, and so do we.
+            if req.receiver != me.kad_id {
+                return None;
+            }
+            let mut contacts = closest(&req.target, KAD_FIND_NODE_ANSWER_CAP);
+            // TRUNCATE HERE, do not merely ASK for the cap. Passing the limit to
+            // the closure and trusting it is the "moved the check == removed the
+            // check" shape: the rule is ours, the wire consequence is ours, so
+            // the enforcement belongs here rather than in whatever happens to
+            // supply the contacts.
+            contacts.truncate(KAD_FIND_NODE_ANSWER_CAP);
+            let (o, p) = build_kad2_res(&req.target, &contacts);
+            ServeAnswer::plain(o, p)
+        }
+        OP_BOOTSTRAP_REQ => {
+            let mut contacts = closest(&me.kad_id, KAD_BOOTSTRAP_ANSWER_CAP);
+            contacts.truncate(KAD_BOOTSTRAP_ANSWER_CAP);
+            let (o, p) = build_bootstrap_res(&me.kad_id, me.tcp_port, KADEMLIA_VERSION, &contacts);
+            ServeAnswer::plain(o, p)
+        }
+        _ => None,
+    }
+}
+
+/// The most contacts we put in a KADEMLIA2_RES.
+///
+/// eMule requests 11 (`KAD_FIND_NODE`) and REJECTS an answer longer than it
+/// asked for (Search.cpp:377), so an over-long answer is not generosity - it
+/// gets the whole response discarded by the node we are trying to stay known to.
+pub const KAD_FIND_NODE_ANSWER_CAP: usize = 11;
+
+/// Contacts in a BOOTSTRAP_RES.
+///
+/// AMPLIFICATION, capped deliberately: this is the largest response padMule
+/// emits for the smallest request (a bodiless BOOTSTRAP_REQ), and UDP source
+/// addresses are spoofable, so answering at all makes padMule a reflector. eMule
+/// carries the same exposure; that is not a sufficient reason to match it
+/// without a limit. 20 contacts is ~500 bytes against a ~30-byte request. The
+/// per-IP flood limit on this opcode is the other half of the mitigation.
+pub const KAD_BOOTSTRAP_ANSWER_CAP: usize = 20;
+
+/// The misc-options bit that asks the peer for a HELLO_RES_ACK (eMule
+/// `SendMyDetails`, KademliaUDPListener.cpp:106-140).
+const MISC_REQUEST_ACK: u8 = 0x04;
+
+/// Answer a KADEMLIA2_HELLO_REQ.
+///
+/// The ACK is requested only when the sender's IP is NOT already proven - eMule
+/// sets `bRequestAckPackage` as `bAddedOrUpdated && !bValidReceiverKey`
+/// (KademliaUDPListener.cpp:601). Asking a peer that already verified us is
+/// pointless traffic; the first draft of the design said "always".
+pub fn answer_hello(
+    payload: &[u8],
+    me: &ServeIdentity,
+    valid_receiver_key: bool,
+) -> Option<ServeAnswer> {
+    // Parsed for validity even though we take nothing from it: a malformed
+    // HELLO must be dropped rather than answered.
+    parse_hello(payload).ok()?;
+    let request_ack = !valid_receiver_key;
+    let (o, p) = build_hello_res(
+        &me.kad_id,
+        me.tcp_port,
+        Some(me.advertised_udp_port),
+        request_ack.then_some(MISC_REQUEST_ACK),
+    );
+    Some(ServeAnswer {
+        opcode: o,
+        payload: p,
+        request_ack,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn me() -> ServeIdentity {
+        ServeIdentity {
+            kad_id: Kad128::from_hash(&[0x01; 16]),
+            tcp_port: 4662,
+            advertised_udp_port: 4672,
+        }
+    }
+
+    fn no_contacts(_: &Kad128, _: usize) -> Vec<WireContact> {
+        Vec::new()
+    }
+
+    /// A PING is answered with the REQUESTER's port, which is how the peer
+    /// learns its own external port - and answering at all is what stops eMule
+    /// evicting us on its OnSmallTimer sweep, which is the whole point of the
+    /// serve loop.
+    #[test]
+    fn a_ping_is_answered_with_the_requesters_port() {
+        let a = answer_request(OP_PING, &[], 5000, &me(), false, no_contacts)
+            .expect("a ping must be answered");
+        assert_eq!(a.opcode, mule_kad::OP_PONG);
+        assert_eq!(a.payload, vec![0x88, 0x13]); // 5000 LE
+    }
+
+    /// An opcode we do not serve produces NO answer - and must not panic. This
+    /// is most of the protocol (publish, notes, buddies, firewall checks).
+    #[test]
+    fn an_unserved_opcode_is_silently_ignored() {
+        assert!(answer_request(0x43, &[], 5000, &me(), false, no_contacts).is_none());
+    }
+
+    fn contact(seed: u8, ip: u32) -> WireContact {
+        WireContact {
+            id: Kad128::from_hash(&[seed; 16]),
+            ip,
+            udp_port: 4672,
+            tcp_port: 4662,
+            version: 8,
+        }
+    }
+
+    fn hello_req() -> Vec<u8> {
+        let peer = Kad128::from_hash(&[0x55; 16]);
+        mule_kad::build_hello_req(&peer, 4662, Some(4672), None).1
+    }
+
+    /// eMule asks for a verification ACK only when it has NOT already proved the
+    /// sender's IP: `bAddedOrUpdated && !bValidReceiverKey`
+    /// (KademliaUDPListener.cpp:601). Asking a peer that already verified us is
+    /// pointless traffic, and the first draft of the design said "always".
+    #[test]
+    fn the_ack_is_requested_only_when_the_senders_ip_is_not_yet_proven() {
+        let unproven = answer_hello(&hello_req(), &me(), false).unwrap();
+        assert!(unproven.request_ack, "an unverified sender must be asked");
+        assert_eq!(
+            parse_hello(&unproven.payload).unwrap().misc_options,
+            Some(MISC_REQUEST_ACK),
+            "the ask must be ON THE WIRE, not just on the struct"
+        );
+
+        let proven = answer_hello(&hello_req(), &me(), true).unwrap();
+        assert!(
+            !proven.request_ack,
+            "a sender that already proved its IP must not be asked again"
+        );
+        assert_ne!(
+            parse_hello(&proven.payload).unwrap().misc_options,
+            Some(MISC_REQUEST_ACK)
+        );
+    }
+
+    /// The udp port in our HELLO_RES must be the ADVERTISED one. Behind a VPN
+    /// remote-to-local forward the bound port is not the port peers can reach,
+    /// and answering with it puts us in their table at a dead address - worse
+    /// than not answering.
+    #[test]
+    fn the_hello_response_advertises_our_reachable_port() {
+        let mut id = me();
+        id.advertised_udp_port = 5999; // the forwarded port, not the bound one
+        let a = answer_hello(&hello_req(), &id, false).unwrap();
+        assert_eq!(a.opcode, mule_kad::OP_HELLO_RES);
+        let parsed = parse_hello(&a.payload).unwrap();
+        assert_eq!(parsed.id, id.kad_id);
+        assert_eq!(parsed.source_udp_port, Some(5999));
+    }
+
+    #[test]
+    fn a_malformed_hello_is_not_answered() {
+        assert!(answer_hello(&[0u8; 4], &me(), false).is_none());
+    }
+
+    /// A FIND_NODE is answered from our table, capped at what the requester
+    /// asked for - eMule REJECTS an over-long answer (Search.cpp:377), so
+    /// sending one gets the whole response discarded by the node we are trying
+    /// to stay known to.
+    #[test]
+    fn find_node_is_answered_and_capped_at_the_requested_count() {
+        let target = Kad128::from_hash(&[0x33; 16]);
+        let (_, req) = mule_kad::build_kad2_req(mule_kad::KAD_FIND_NODE, &target, &me().kad_id);
+        let pool: Vec<WireContact> = (1..=20)
+            .map(|i| contact(i, 0x0A00_0000 + i as u32))
+            .collect();
+
+        // The closure DELIBERATELY IGNORES `want` and hands back all 20. If it
+        // honoured the cap the assertion below would compare the cap against
+        // itself and could never fail - which is exactly what the first version
+        // of this test did, and a mutation raising the cap to 100 sailed
+        // straight through it.
+        let a = answer_request(OP_KAD2_REQ, &req, 5000, &me(), false, |t, _want| {
+            assert_eq!(
+                *t, target,
+                "the table must be asked for the REQUESTED target"
+            );
+            pool.clone()
+        })
+        .expect("a find_node must be answered");
+
+        assert_eq!(a.opcode, mule_kad::OP_KAD2_RES);
+        let res = mule_kad::parse_kad2_res(&a.payload).unwrap();
+        assert_eq!(res.target, target);
+        // A LITERAL, not the constant: asserting against the same symbol the
+        // production code uses cannot catch that symbol changing.
+        assert_eq!(
+            res.contacts.len(),
+            11,
+            "20 contacts offered, 11 is eMule's requested count, got {}",
+            res.contacts.len()
+        );
+    }
+
+    /// A request addressed to a DIFFERENT node's id is not ours to answer. That
+    /// field exists precisely so a contact can tell it reached the right node.
+    #[test]
+    fn a_request_addressed_to_another_node_is_ignored() {
+        let target = Kad128::from_hash(&[0x33; 16]);
+        let someone_else = Kad128::from_hash(&[0xEE; 16]);
+        let (_, req) = mule_kad::build_kad2_req(mule_kad::KAD_FIND_NODE, &target, &someone_else);
+        assert!(
+            answer_request(OP_KAD2_REQ, &req, 5000, &me(), false, |_, _| vec![contact(
+                1, 1
+            )])
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn a_malformed_find_node_is_not_answered() {
+        assert!(answer_request(OP_KAD2_REQ, &[0u8; 5], 5000, &me(), false, no_contacts).is_none());
+    }
+
+    /// A bootstrap answer carries our details plus contacts - it is how a cold
+    /// node enters the network - and it is CAPPED, because it is the largest
+    /// thing we emit for the smallest request on a protocol with spoofable
+    /// source addresses.
+    #[test]
+    fn bootstrap_is_answered_with_our_details_and_a_capped_contact_list() {
+        let pool: Vec<WireContact> = (1..=30)
+            .map(|i| contact(i, 0x0A00_0000 + i as u32))
+            .collect();
+        // Ignores `want` for the same reason as the find_node test: a closure
+        // that self-limits makes the cap assertion tautological.
+        let a = answer_request(OP_BOOTSTRAP_REQ, &[], 5000, &me(), false, |_, _want| {
+            pool.clone()
+        })
+        .expect("bootstrap must be answered");
+        assert_eq!(a.opcode, mule_kad::OP_BOOTSTRAP_RES);
+        let res = mule_kad::parse_bootstrap_res(&a.payload).unwrap();
+        assert_eq!(res.id, me().kad_id);
+        assert_eq!(res.tcp_port, 4662);
+        assert_eq!(
+            res.contacts.len(),
+            20,
+            "30 contacts offered; the amplification cap is 20, got {}",
+            res.contacts.len()
+        );
+    }
+
+    /// padMule stores nothing, so a search gets SILENCE - which is exactly what
+    /// eMule does in the same position: `CIndexed::SendValidKeywordResult`
+    /// (Indexed.cpp:696) sends a packet only inside
+    /// `if (m_mapKeyword.Lookup(...))`, and stock eMule has no empty-SEARCH_RES
+    /// path anywhere. An earlier draft answered empty as a courtesy; since no
+    /// stock client emits that packet, every one would have fingerprinted
+    /// padMule to anyone searching a keyword we lack.
+    #[test]
+    fn a_search_gets_silence_because_that_is_what_emule_gives() {
+        let kw = mule_kad::kad_keyword_target("minister");
+        let (_, key_req) = mule_kad::build_search_key_req(&kw, 0);
+        assert!(
+            answer_request(
+                mule_kad::OP_SEARCH_KEY_REQ,
+                &key_req,
+                5000,
+                &me(),
+                false,
+                no_contacts
+            )
+            .is_none(),
+            "answering a keyword search would fingerprint padMule"
+        );
+
+        let file = Kad128::from_hash(&[0x77; 16]);
+        let (_, src_req) = mule_kad::build_search_source_req(&file, 0, 9_728_000);
+        assert!(answer_request(
+            mule_kad::OP_SEARCH_SOURCE_REQ,
+            &src_req,
+            5000,
+            &me(),
+            false,
+            no_contacts
+        )
+        .is_none());
+    }
+
+    /// We store nothing, so acknowledging a publish would be a lie.
+    #[test]
+    fn a_publish_is_ignored_rather_than_falsely_acknowledged() {
+        for op in [0x43u8, 0x44, 0x45] {
+            assert!(answer_request(op, &[0u8; 40], 5000, &me(), false, no_contacts).is_none());
+        }
+    }
+}

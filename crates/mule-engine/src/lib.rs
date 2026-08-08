@@ -15,6 +15,7 @@ pub mod fetch;
 pub mod framed;
 pub mod identity;
 pub mod kad_live;
+pub mod kad_serve;
 pub mod known2_store;
 pub mod link;
 pub mod multi_source;
