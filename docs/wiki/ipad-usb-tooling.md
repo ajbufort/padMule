@@ -299,6 +299,61 @@ pymobiledevice3's own `developer dvt xcuitest` launches the runner directly, so
 go-ios is not part of the path at all. The three go-ios recovery ideas queued
 here are retained only as history.]
 
+## DEADLINE: THE WDA PROFILE EXPIRES 2026-08-10 02:29 UTC
+
+Read off the profile itself, not remembered: `wda.mobileprovision` has
+`ExpirationDate` **2026-08-10 02:29:05 UTC**, `TimeToLive 7`,
+created 2026-08-03. padMule's own profile runs to **2026-08-14 05:49 UTC**.
+
+iOS refuses to launch an app whose profile has expired, so **when the WDA
+profile lapses, agent-driven device testing stops dead** - no taps, no element
+queries, no screenshots through WDA. `pymobiledevice3` itself keeps working
+(install, syslog, `dvt sysmon`, `dvt launch`, `dvt screenshot`), so measurement
+that does not need UI DRIVING survives.
+
+**ONLY ANTHONY CAN RENEW IT.** zsign can only USE an existing cert + profile; it
+cannot ask Apple for a new one. A fresh 7-day profile comes from Sideloadly
+talking to Apple with the Apple ID. The renewal, in order:
+
+```bash
+# 1. ANTHONY: Sideloadly-install the WDA ipa (this is what mints a new profile).
+#    It will ALSO break the nested .xctest signature - that is expected.
+#    /home/ajbufort/wda-resign/wda-unsigned.ipa
+
+# 2. Pull the fresh profile back off the device:
+ideviceprovision copy /home/ajbufort/wda-resign/    # -> wda.mobileprovision
+
+# 3. AGENT: re-sign with zsign, which DOES cover the nested .xctest.
+#    Without -b the bundle id will not match and install fails 0xe8008016.
+cd /home/ajbufort/wda-resign
+./zsign -k /mnt/c/Users/ajbuf/AppData/Roaming/Sideloadly/key.pem \
+  -c cert.pem -m wda.mobileprovision \
+  -b com.facebook.WebDriverAgentRunner.xctrunner.Q444CHAF2Z \
+  -o wda-signed.ipa wda-unsigned.ipa
+
+# 4. Install and relaunch the runner:
+pymobiledevice3 apps install wda-signed.ipa
+pymobiledevice3 developer dvt xcuitest com.facebook.WebDriverAgentRunner.xctrunner.Q444CHAF2Z &
+pymobiledevice3 usbmux forward 8100 8100 &
+curl -s localhost:8100/status   # must report ready: true
+```
+
+**WHY STEP 3 IS NOT OPTIONAL:** Sideloadly signs the outer app and Frameworks
+but NOT the nested `.xctest`, which iOS then refuses to load into a signed
+process - XCTest error 103. That has cost this project a session already.
+
+**Check the real expiry rather than trusting any doc, including this one:**
+
+```bash
+python3 - /home/ajbufort/wda-resign/wda.mobileprovision <<'EOF'
+import sys,plistlib,datetime
+raw=open(sys.argv[1],'rb').read(); a=raw.find(b'<?xml'); b=raw.find(b'</plist>')
+d=plistlib.loads(raw[a:b+8]); e=d['ExpirationDate']
+if e.tzinfo is None: e=e.replace(tzinfo=datetime.timezone.utc)
+print(e, (e-datetime.datetime.now(datetime.timezone.utc)).total_seconds()/86400, "days")
+EOF
+```
+
 ## THE INSTALL PATH: zsign + pymobiledevice3. Sideloadly is for RENEWALS ONLY.
 
 **This is the default. Do not reach for Sideloadly to install a build.**
