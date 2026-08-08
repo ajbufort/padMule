@@ -150,9 +150,11 @@ except where noted; the Swift one is CI-verified only, see below):
   `nil` ("push nothing") when an ON decision would clear a pause the user did
   not lift; only `setSharing` passes `userInitiated: true`. The OFF direction is
   never gated. `SettingsTests` now calls the REAL rule instead of re-stating it,
-  which is what let this hide. **NOT LOCALLY VERIFIED - there is no Apple
-  toolchain on this box, so the Swift half compiles and runs in CI only
-  (`ios-test.yml`). Treat it as unproven until that goes green.**
+  which is what let this hide. **VERIFIED IN CI 2026-08-08** - `ios-test.yml`
+  green for `3ba50e5`, with the log showing
+  `testAnIncidentalRecomputeCannotCancelThePublicAddressPause` PASSED inside 32
+  executed tests. There is no Apple toolchain on this box, so CI is the only
+  place it can run; read the EXECUTED-test line, not the workflow badge.
 - ~~6. A failed UPnP refresh leaves `public_ip` stale.~~ **CLOSED for the `Err`
   arm**, which now clears it, so `has_port_mapping()` stops claiming a mapping
   it just failed to confirm - the contract that field documents for itself.

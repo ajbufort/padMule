@@ -1435,3 +1435,24 @@ Append-only, timestamped record of Ingest / Query / Lint passes.
   anywhere - not locally, not in CI. A compile is not a run. The `3ba50e5` run
   is the next chance to execute them; read its conclusion before calling that
   fix verified. The Rust gate and the iOS BUILD were green for every pushed sha.
+
+- 2026-08-08 **AND THE RED WAS THE RUNNER: the iOS fix is now VERIFIED, with the
+  executed test quoted rather than the badge.** The next push (`3ba50e5`, same
+  Swift code as the `5d83d01` that "failed") went green on all three workflows,
+  and the log shows the tests actually RUNNING:
+  `Test Case '-[padMuleTests.SettingsTests
+  testAnIncidentalRecomputeCannotCancelThePublicAddressPause]' passed` inside
+  `Executed 32 tests, with 0 failures (0 unexpected)`.
+  The identical bundle failing at one sha and running clean at the next confirms
+  the earlier FAILURE was a simulator runner timeout, exactly as the log said,
+  and NOT the sharing-decision change. **So `EngineModel.sharingDecision` and the
+  rewritten `SettingsTests` have now EXECUTED and PASSED - verified rather than
+  assumed, and the three entries that said "unproven until CI is green" were
+  corrected the moment it was, instead of being left to rot into the next
+  session's briefing.**
+  **The transferable bit is HOW it was checked.** A green workflow conclusion
+  proves a job exited 0; it does not prove a single test ran - that is the whole
+  e3ed990 lesson, where a suite failed to COMPILE for three builds while
+  everything looked fine. So the evidence quoted here is the per-test line and
+  the executed count, pulled from `gh run view --log`, not `conclusion: success`.
+  Ask for the executed count whenever a green iOS badge is load-bearing.

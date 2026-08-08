@@ -103,11 +103,20 @@ infrastructure flake on the macOS runner, in the same family as the local
 2s-deadline loopback flake below: **a failure has to be verified the way a
 success does, and a red badge is a claim like any other.**
 
-**WHAT IS THEREFORE STILL UNPROVEN:** `EngineModel.sharingDecision` and the
-rewritten `SettingsTests` have COMPILED but have never been EXECUTED anywhere.
-There is no Apple toolchain on this box, so CI is the only thing that can run
-them. Re-run `ios-test.yml` (or check `3ba50e5`'s run) and read the result before
-treating the sharing-decision fix as verified.
+**RESOLVED THE SAME DAY, AND THE FIX IS NOW GENUINELY VERIFIED.** The next push
+(`3ba50e5`, which contains the same Swift code) went GREEN on all three
+workflows, and the run log shows the tests EXECUTING rather than merely a green
+badge:
+
+    Test Case '-[padMuleTests.SettingsTests
+      testAnIncidentalRecomputeCannotCancelThePublicAddressPause]' passed
+    Executed 32 tests, with 0 failures (0 unexpected)
+
+So the identical bundle that "failed" at `5d83d01` ran clean at `3ba50e5` -
+which confirms the earlier red was the runner, not the code - and the named test
+that pins the public-address-pause rule has now RUN and PASSED. `sharingDecision`
+is verified, not assumed. **Quoting the executed test line, not the workflow
+conclusion, is the point:** a green workflow can mean a suite that never ran.
 
 ## THE CI HOLE, stated correctly
 
