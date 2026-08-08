@@ -15,14 +15,16 @@
 //! we recompute on receive (same peer, same convention both directions).
 
 use crate::kad_serve::{answer_request, ServeIdentity};
+use crate::stats::KadReqKind;
 use mule_files::{IpFilter, KadContact};
 use mule_kad::{
     build_bootstrap_req, build_hello_req, build_hello_res_ack, build_kad2_req,
     build_search_key_req_restrictive, build_search_source_req, is_acceptable_contact,
-    kad_deobfuscate, kad_keyword_target, kad_obfuscate_request, kad_obfuscate_response, pack_kad,
-    parse_bootstrap_res, parse_hello, parse_kad2_res, parse_search_res, unpack_kad, BootstrapRes,
-    FileResult, FloodTracker, FloodVerdict, Hello, Lookup, RoutingTable, Source, WireContact,
-    ALPHA_QUERY, K, KAD_FIND_NODE, OP_BOOTSTRAP_RES, OP_HELLO_RES, OP_KAD2_RES, OP_SEARCH_RES,
+    is_acceptable_contact_ip, kad_deobfuscate, kad_keyword_target, kad_obfuscate_request,
+    kad_obfuscate_response, pack_kad, parse_bootstrap_res, parse_hello, parse_kad2_res,
+    parse_search_res, unpack_kad, BootstrapRes, CSearch, FileResult, FloodTracker, FloodVerdict,
+    Hello, RoutingTable, Source, WireContact, ALPHA_QUERY, K, KAD_FIND_NODE, OP_BOOTSTRAP_RES,
+    OP_HELLO_RES, OP_KAD2_RES, OP_SEARCH_RES,
 };
 use mule_proto::Kad128;
 use std::collections::HashMap;
@@ -46,14 +48,43 @@ const LOCK_POISONED: &str = "kad lock poisoned";
 /// dropped (eMule caps the response at the requested count, Search.cpp:377).
 const KAD_REQUESTED_CONTACTS: usize = 11;
 
-/// Iteration rounds for a maintenance refresh. Deliberately shallower than the
-/// 12 a real lookup runs: this fires on the heartbeat under the engine lock, so
-/// its worst case is a user's search waiting behind it. Breadth comes from
-/// repeating it against fresh random targets, not from one deep dive.
-/// `pub(crate)` so `KAD_MAINTENANCE_BUDGET` can be pinned against the structural
-/// worst case this implies, rather than against a number someone remembered.
-/// A round is ONE wait, not `ALPHA_QUERY` of them - see [`KadNode::request_batch`].
-pub(crate) const REFRESH_ROUNDS: usize = 4;
+/// A maintenance refresh's overall deadline and spend, in `per_query` units:
+/// the lookup ends after `REFRESH_DEADLINE_QUERIES * per_query` and may send at
+/// most `REFRESH_DEADLINE_QUERIES * ALPHA_QUERY` FIND_NODEs - the same worst
+/// case the old 4-round refresh had, kept as an envelope. Deliberately smaller
+/// than a real lookup's [`LOOKUP_DEADLINE_QUERIES`]: this fires on the
+/// heartbeat under the engine lock, so its worst case is a user's search
+/// waiting behind it. Breadth comes from repeating it against fresh random
+/// targets, not from one deep dive. `pub(crate)` so `KAD_MAINTENANCE_BUDGET`
+/// can be pinned against the worst case this implies, rather than against a
+/// number someone remembered.
+pub(crate) const REFRESH_DEADLINE_QUERIES: u32 = 4;
+
+/// A value lookup's overall deadline, in `per_query` units. 16 is the
+/// pre-rewrite worst case kept as an envelope: 12 FIND_NODE round windows plus
+/// ceil(K/ALPHA_QUERY) = 4 value windows. The event-driven lookup normally
+/// finishes far inside it; this is the "overall deadline" leg of its
+/// termination (the others: enough results, candidates exhausted).
+const LOOKUP_DEADLINE_QUERIES: u32 = 16;
+
+/// FIND_NODE spend cap per value lookup - the pre-rewrite structural maximum
+/// (12 rounds x ALPHA_QUERY). The rewrite changes WHEN requests go out, not
+/// how many a lookup may spend.
+const LOOKUP_FIND_BUDGET: usize = 36;
+
+/// Value-request spend cap per lookup - the pre-rewrite maximum (the value
+/// phase asked at most the in-tolerance subset of the closest-K frontier).
+const LOOKUP_VALUE_BUDGET: usize = K;
+
+/// The stall-recovery cadence and gate, both eMule's: JumpStart runs on a 1s
+/// timer (SEARCH_JUMPSTART, Defines.h:48) and returns at once if any response
+/// arrived within the last 3 seconds (Search.cpp:281). With per-request
+/// deadlines every in-flight request already produces an event, so this tick
+/// should never be the thing making progress - it is defense in depth against
+/// a lost event, which would otherwise stall the lookup silently until the
+/// overall deadline.
+const STALL_TICK: Duration = Duration::from_secs(1);
+const STALL_AFTER: Duration = Duration::from_secs(3);
 
 /// Bind the Kad UDP socket with SO_REUSEADDR set.
 ///
@@ -287,6 +318,130 @@ fn closest_wire_contacts_in(
             version: c.version,
         })
         .collect()
+}
+
+/// A private LAN address in eMule's `IsLANIP` sense: acceptable only when
+/// private ranges are allowed (10/8, 172.16/12, 192.168/16). Loopback and
+/// other unroutables are NOT "LAN" - they fail both ways.
+fn is_lan_ip(ip: u32) -> bool {
+    is_acceptable_contact_ip(ip, /*allow_private=*/ true)
+        && !is_acceptable_contact_ip(ip, /*allow_private=*/ false)
+}
+
+/// Per-ANSWER rules for the SEARCH FRONTIER, from eMule ProcessResponse
+/// (Search.cpp:423-473): a node may not answer with itself, may list each IP
+/// only once, and may name AT MOST 2 CONTACTS PER PUBLIC /24. The responder's
+/// own IP and subnet are pre-seeded (Search.cpp:423-424), so its /24 admits
+/// only one more contact.
+///
+/// NOTE eMule's comment at :457 says "/28 subnet" but the mask is 0xFFFFFF00,
+/// which is a /24 - the code is right, the comment is wrong; we follow the
+/// code. LAN addresses are exempt from the subnet cap (:458), not from the
+/// unique-IP rule; eMule's exempt branch also accidentally RESETS the subnet
+/// count, which we skip - a public and a private address can never share a
+/// /24, so the difference is unobservable.
+///
+/// THE FRONTIER ONLY. The routing table takes the same answer through its own
+/// gates instead (`gated_add_contact`), because that is eMule's structure too:
+/// Process_KADEMLIA2_RES (KademliaUDPListener.cpp:846) hands every basically-
+/// acceptable contact to RoutingZone::AddUnfiltered, and only the list passed
+/// on to CSearch faces these per-answer rules. Applying them to the table
+/// would starve it - see `KadNode::absorb_find_answer`, which keeps the two
+/// paths apart.
+fn frontier_filter(responder_ip: u32, mut contacts: Vec<WireContact>) -> Vec<WireContact> {
+    let mut seen_ips = std::collections::HashSet::new();
+    seen_ips.insert(responder_ip);
+    let mut subnets: HashMap<u32, u32> = HashMap::new();
+    subnets.insert(responder_ip & 0xFFFF_FF00, 1);
+    contacts.retain(|c| {
+        if !seen_ips.insert(c.ip) {
+            return false;
+        }
+        if !is_lan_ip(c.ip) {
+            let n = subnets.entry(c.ip & 0xFFFF_FF00).or_insert(0);
+            if *n >= 2 {
+                return false;
+            }
+            *n += 1;
+        }
+        true
+    });
+    contacts
+}
+
+/// Withdraws whatever pending slots a lookup still owns when it is dropped.
+///
+/// The lookup's callers CANCEL it - `KAD_SEARCH_WAIT` wraps `resolve_keyword`,
+/// `KAD_MAINTENANCE_BUDGET` wraps `refresh_routing` - and a cancelled future
+/// never reaches its own cleanup line. A stale slot is not a leak but a
+/// misdirection: the read loop would feed the NEXT request's reply from that
+/// peer to a receiver nobody holds. Slots answered or withdrawn earlier are
+/// simply absent by the time this runs; removing them again is a no-op.
+struct SlotGuard {
+    pending: Arc<Mutex<Vec<PendingSlot>>>,
+    seqs: Vec<u64>,
+}
+
+impl SlotGuard {
+    fn new(pending: Arc<Mutex<Vec<PendingSlot>>>) -> Self {
+        SlotGuard {
+            pending,
+            seqs: Vec::new(),
+        }
+    }
+    fn track(&mut self, seq: u64) {
+        self.seqs.push(seq);
+    }
+}
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        self.pending
+            .lock()
+            .expect(LOCK_POISONED)
+            .retain(|p| !self.seqs.contains(&p.seq));
+    }
+}
+
+/// Which lookup request an in-flight future belongs to.
+#[derive(Clone, Copy, PartialEq)]
+enum ReqKind {
+    Find,
+    Value,
+}
+
+impl ReqKind {
+    fn stats(self) -> KadReqKind {
+        match self {
+            ReqKind::Find => KadReqKind::FindNode,
+            ReqKind::Value => KadReqKind::Value,
+        }
+    }
+}
+
+/// One resolved in-flight lookup request: who it went to, how long it took,
+/// and the reply if one came inside the per-request deadline.
+struct ReqEvent {
+    kind: ReqKind,
+    contact: WireContact,
+    seq: u64,
+    rtt: Duration,
+    outcome: Option<ReplyAnswer>,
+}
+
+/// What kind of value a lookup harvests, if any.
+enum ValueAsk<'a> {
+    /// Pure node lookup (routing refresh): resolved candidates are consumed
+    /// without a value request.
+    None,
+    /// KADEMLIA2_SEARCH_SOURCE_REQ for the target file hash.
+    Sources { file_size: u64 },
+    /// KADEMLIA2_SEARCH_KEY_REQ: `words` ride along as the remote filter tree,
+    /// `keyword` filters each result locally (eMule Search.cpp:1379-1395).
+    Keyword {
+        keyword: &'a str,
+        words: &'a [String],
+    },
 }
 
 /// What the owning read loop needs. Copies of the immutable identity, and the
@@ -830,25 +985,83 @@ impl KadNode {
         answers.pop().expect("one request in, one answer out")
     }
 
+    /// Obfuscate, register and send ONE outbound request; the returned oneshot
+    /// resolves when the read loop matches its reply. The ONLY way a request
+    /// enters `pending`, shared by `request_batch` (bootstrap / hello) and the
+    /// event-driven lookup, so the two paths cannot drift apart.
+    ///
+    /// Registration happens BEFORE the send, so a reply (loopback is this
+    /// fast) cannot arrive while its slot does not exist yet. A failed send
+    /// withdraws the slot at once: no reply is coming, and a dead slot must
+    /// not swallow another request's IP-fallback match.
+    async fn begin_request(
+        &self,
+        target_id: &Kad128,
+        dest: SocketAddr,
+        frame: &[u8],
+        expect: u8,
+    ) -> Result<(u64, tokio::sync::oneshot::Receiver<ReplyAnswer>), KadError> {
+        let dest_ip = ip_u32(&dest);
+        let sender_vk = mule_kad::udp_verify_key(self.udp_key, dest_ip);
+        // ECHO the verify key this contact previously handed us (send-side), so
+        // it verifies US - but only while it was minted against our current
+        // public IP. 0 for a genuine first contact / unknown / IP-mismatch,
+        // which is byte-identical to the pre-hard-verify wire. This is a FIELD
+        // flip only; the RC4 obfuscation stays NodeID-keyed, byte-faithful to
+        // eMule (EncryptedDatagramSocket.cpp: NodeID always wins when present).
+        let our_ip = self.current_public_ip.load(Ordering::Relaxed);
+        let echo_vk = self.with_routing(|t| t.verify_key_for(target_id, dest_ip, our_ip));
+        let datagram = kad_obfuscate_request(
+            frame,
+            target_id,
+            rand::random(), // random key seed
+            echo_vk,        // the peer's key we echo so IT can verify US
+            sender_vk,      // our key, want this echoed so WE can verify IT
+            rand::random(), // marker randomness
+        );
+        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.pending.lock().expect(LOCK_POISONED).push(PendingSlot {
+            seq,
+            dest,
+            dest_ip,
+            sender_vk,
+            expect,
+            tx,
+        });
+        match self.socket.send_to(&datagram, dest).await {
+            Ok(_) => Ok((seq, rx)),
+            Err(e) => {
+                self.pending
+                    .lock()
+                    .expect(LOCK_POISONED)
+                    .retain(|p| p.seq != seq);
+                Err(KadError::Io(e))
+            }
+        }
+    }
+
     /// Send SEVERAL Kad requests and collect their replies within ONE window,
-    /// demultiplexing the shared socket by source address.
+    /// demultiplexing the shared socket by source address. The one-shot
+    /// handshake paths (bootstrap, hello) live here; the LOOKUPS moved on to
+    /// [`KadNode::drive_lookup`], whose per-request deadlines share
+    /// `begin_request` with this, so the two waiting styles cannot drift in
+    /// how they register and match replies.
     ///
-    /// WHY THIS EXISTS. Kademlia's ALPHA is a CONCURRENCY parameter - eMule's
-    /// `CSearch` keeps alpha requests IN FLIGHT and reacts to whichever answers
-    /// first. padMule used it as a batch SIZE and then awaited each member in
-    /// turn, so a lookup round cost `alpha * per_query` instead of `per_query`:
-    /// `resolve_keyword` structurally 12 rounds x 3 queries x 750ms = 27s of
-    /// lookup before the keyword phase even started, which is the ~10s search
-    /// measured on device 2026-08-07 and the reason `refresh_routing` (4 x 3 x
-    /// 750ms = 9s against a 3s deadline) was always cut off mid-round.
+    /// HISTORY (it explains the shape). Kademlia's ALPHA is a CONCURRENCY
+    /// parameter, but padMule first used it as a batch SIZE and awaited each
+    /// member in turn - a lookup round cost `alpha * per_query`, the ~10s
+    /// search measured on device 2026-08-07. This batch (one window, requests
+    /// concurrent) was the first fix; the round barrier it kept - the window
+    /// ends at the SLOWEST member - was measured at 57% of rounds held open by
+    /// a silent peer (row 8cm), and the event-driven lookup removed the rounds
+    /// entirely.
     ///
-    /// THE SINGLE SOCKET IS WHY IT WAS WRITTEN SERIALLY, and it is the whole
-    /// difficulty: `recv_from` hands each datagram to exactly one waiter, and the
-    /// old loop DISCARDED anything not from its own destination - so two
-    /// concurrent requests would silently eat each other's replies. One loop
-    /// owning the whole batch is what makes concurrency safe here: a datagram
-    /// that used to be dropped as "not mine" is now matched to the peer in this
-    /// batch that is waiting for it.
+    /// THE SINGLE SOCKET is why waiting is delicate at all: `recv_from` hands
+    /// each datagram to exactly one waiter, and the pre-loop code DISCARDED
+    /// anything not from its own destination - so two concurrent requests
+    /// would silently eat each other's replies. The owning read loop matching
+    /// datagrams to registered slots is what makes any concurrency safe here.
     ///
     /// Wire-identical. The same datagrams are sent to the same peers with the
     /// same keys; only the order of our own waiting changes.
@@ -865,51 +1078,9 @@ impl KadNode {
         let mut slots: Vec<Result<(u64, tokio::sync::oneshot::Receiver<ReplyAnswer>), KadError>> =
             Vec::with_capacity(reqs.len());
         for (target_id, dest, frame) in reqs {
-            let dest_ip = ip_u32(dest);
-            let sender_vk = mule_kad::udp_verify_key(self.udp_key, dest_ip);
-            // ECHO the verify key this contact previously handed us (send-side), so
-            // it verifies US - but only while it was minted against our current
-            // public IP. 0 for a genuine first contact / unknown / IP-mismatch,
-            // which is byte-identical to the pre-hard-verify wire. This is a FIELD
-            // flip only; the RC4 obfuscation stays NodeID-keyed, byte-faithful to
-            // eMule (EncryptedDatagramSocket.cpp: NodeID always wins when present).
-            let our_ip = self.current_public_ip.load(Ordering::Relaxed);
-            let echo_vk = self.with_routing(|t| t.verify_key_for(target_id, dest_ip, our_ip));
-            let datagram = kad_obfuscate_request(
-                frame,
-                target_id,
-                rand::random(), // random key seed
-                echo_vk,        // the peer's key we echo so IT can verify US
-                sender_vk,      // our key, want this echoed so WE can verify IT
-                rand::random(), // marker randomness
-            );
-            let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            // Register BEFORE sending, so a reply (loopback is this fast)
-            // cannot arrive while its slot does not exist yet.
-            self.pending.lock().expect(LOCK_POISONED).push(PendingSlot {
-                seq,
-                dest: *dest,
-                dest_ip,
-                sender_vk,
-                expect,
-                tx,
-            });
             // A send that fails is THIS request's failure, not the batch's - the
             // others are already on the wire and their answers are still coming.
-            // Its slot is withdrawn at once: no reply is coming, and a dead slot
-            // must not swallow another request's IP-fallback match (the old
-            // loop's `waiting()` check excluded exactly these).
-            match self.socket.send_to(&datagram, *dest).await {
-                Ok(_) => slots.push(Ok((seq, rx))),
-                Err(e) => {
-                    self.pending
-                        .lock()
-                        .expect(LOCK_POISONED)
-                        .retain(|p| p.seq != seq);
-                    slots.push(Err(KadError::Io(e)));
-                }
-            }
+            slots.push(self.begin_request(target_id, *dest, frame, expect).await);
         }
 
         // ONE deadline for the whole batch: each slot awaits only what remains
@@ -1068,99 +1239,337 @@ impl KadNode {
         Ok(())
     }
 
-    /// Ask SEVERAL nodes (KADEMLIA2_REQ, FIND_NODE) for the contacts they know
-    /// closest to `target`, concurrently, returning one slot per node in the
-    /// order given. A slot is `None` when that node did not answer in time or
-    /// answered unusably.
+    /// Absorb one FIND_NODE answer along BOTH of eMule's paths, kept apart:
     ///
-    /// Alpha means concurrent, not batched-then-awaited - see [`request_batch`].
-    /// The answer filtering below is unchanged; only the waiting is.
-    ///
-    /// [`request_batch`]: Self::request_batch
-    async fn find_node_batch(
-        &self,
-        nodes: &[WireContact],
-        target: &Kad128,
-        wait: Duration,
-    ) -> Vec<Option<(Vec<WireContact>, bool, u32)>> {
-        let reqs: Vec<(Kad128, SocketAddr, Vec<u8>)> = nodes
-            .iter()
-            .map(|n| {
-                let (op, payload) = build_kad2_req(KAD_FIND_NODE, target, &n.id);
-                (n.id, contact_addr(n.ip, n.udp_port), pack_kad(op, payload))
-            })
-            .collect();
-        // PROFILE THE ROUND HERE, where the batch size and the window are both
-        // known, so nothing has to be threaded through three call sites. What
-        // matters is whether the window was ended by the last ANSWER or by the
-        // deadline - see `stats::note_kad_round`.
-        let t0 = Instant::now();
-        let raw = self.request_batch(&reqs, OP_KAD2_RES, wait).await;
-        let answered = raw.iter().filter(|r| r.is_ok()).count();
-        crate::stats::note_kad_round(reqs.len(), answered, t0.elapsed().as_millis() as u64);
-        raw.into_iter()
-            .zip(nodes)
-            .map(|(answer, node)| {
-                let (res_payload, verified, sender_vk) = answer.ok()?;
-                let mut contacts = parse_kad2_res(&res_payload).ok()?.contacts;
-                // Drop a malicious over-long answer: padMule requests
-                // KAD_FIND_NODE, whose count field caps at what we asked for (11);
-                // a compliant node never exceeds it, a hostile one may pad up to
-                // 255 fabricated contacts (eMule Search.cpp:377 rejects the same
-                // way).
-                if contacts.len() > KAD_REQUESTED_CONTACTS {
-                    return None;
-                }
-                // A node may not answer with itself, and may not list many IDs on
-                // one IP: keep at most one contact per source IP within a single
-                // answer (eMule Search.cpp:423/449 - honest nodes never do either).
-                let responder_ip = node.ip;
-                let mut seen_ips = std::collections::HashSet::new();
-                contacts.retain(|c| c.ip != responder_ip && seen_ips.insert(c.ip));
-                // ...and it may not re-point a contact we have already VERIFIED to
-                // some other address: a KadID is semi-public, so that is precisely
-                // how an attacker takes over a known node's identity (eMule
-                // CRoutingZone::IsAcceptableContact, RoutingZone.cpp:1014-1020).
-                self.with_routing(|t| {
-                    contacts.retain(|c| t.is_acceptable_answer(&c.id, c.ip, c.udp_port))
-                });
-                Some((contacts, verified, sender_vk))
-            })
-            .collect()
+    /// - the RESPONDER is recorded (`note_responder`) with its receiver-key
+    ///   verdict, and its sender key stored for the send-side echo;
+    /// - every listed contact is offered to the ROUTING TABLE through the
+    ///   gated insert path - eMule Process_KADEMLIA2_RES hands each basically-
+    ///   acceptable contact to AddUnfiltered (KademliaUDPListener.cpp:846)
+    ///   BEFORE the search ever sees the list, so the table is fed by every
+    ///   answer, never starved by the search's stricter per-answer rules;
+    /// - what returns is the SEARCH FRONTIER's view: `frontier_filter` (self,
+    ///   unique IPs, 2 per public /24), plus the verified-repoint refusal - a
+    ///   KadID is semi-public, so re-pointing a VERIFIED contact to some other
+    ///   address is precisely how an attacker takes over a known node's
+    ///   identity (eMule CRoutingZone::IsAcceptableContact, RoutingZone.cpp:
+    ///   1014-1020; the listener gates pResults on bWasAdded ||
+    ///   IsAcceptableContact the same way).
+    fn absorb_find_answer(
+        &mut self,
+        responder: &WireContact,
+        verified: bool,
+        sender_vk: u32,
+        contacts: Vec<WireContact>,
+    ) -> Vec<WireContact> {
+        self.note_responder(responder, verified, sender_vk);
+        for c in &contacts {
+            self.add_contact(c.id, c.ip, c.udp_port, c.tcp_port, c.version, false);
+        }
+        let mut frontier = frontier_filter(responder.ip, contacts);
+        self.with_routing(|t| frontier.retain(|c| t.is_acceptable_answer(&c.id, c.ip, c.udp_port)));
+        frontier
     }
 
-    /// Ask SEVERAL nodes (KADEMLIA2_SEARCH_SOURCE_REQ) for sources of
-    /// `file_hash`, concurrently. One slot per node, in the order given.
-    ///
-    /// Takes `&self`: the caller applies `note_responder` for each answered slot
-    /// afterwards, because the send and the collect must not hold `&mut self`
-    /// while several requests are in flight.
-    async fn search_source_batch(
+    /// Send one lookup request and park its reply-or-deadline future in
+    /// `inflight`. Returns whether the datagram went out; a send failure is
+    /// the caller's cue to mark the contact failed so the frontier is not
+    /// stranded waiting on it.
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_lookup_request(
         &self,
-        nodes: &[WireContact],
-        file_hash: &Kad128,
-        file_size: u64,
-        wait: Duration,
-    ) -> Vec<Option<(Vec<Source>, bool, u32)>> {
-        let reqs: Vec<(Kad128, SocketAddr, Vec<u8>)> = nodes
-            .iter()
-            .map(|n| {
-                let (op, payload) = build_search_source_req(file_hash, 0, file_size);
-                (n.id, contact_addr(n.ip, n.udp_port), pack_kad(op, payload))
-            })
-            .collect();
+        inflight: &mut tokio::task::JoinSet<ReqEvent>,
+        guard: &mut SlotGuard,
+        kind: ReqKind,
+        contact: WireContact,
+        frame: Vec<u8>,
+        expect: u8,
+        per_query: Duration,
+    ) -> bool {
+        let dest = contact_addr(contact.ip, contact.udp_port);
+        match self.begin_request(&contact.id, dest, &frame, expect).await {
+            Ok((seq, rx)) => {
+                guard.track(seq);
+                crate::stats::note_kad_request(kind.stats());
+                let started = Instant::now();
+                inflight.spawn(async move {
+                    // THE PER-REQUEST DEADLINE: this future resolves with the
+                    // reply or at its own deadline, whichever is first - there
+                    // is no round barrier for a silent peer to hold open.
+                    let outcome = match timeout(per_query, rx).await {
+                        Ok(Ok(answer)) => Some(answer),
+                        _ => None,
+                    };
+                    ReqEvent {
+                        kind,
+                        contact,
+                        seq,
+                        rtt: started.elapsed(),
+                        outcome,
+                    }
+                });
+                crate::stats::note_kad_inflight(inflight.len() as u64);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// THE EVENT-DRIVEN LOOKUP (eMule `CSearch`). The round-based lookup this
+    /// replaces charged every round its slowest member: the final old-panel
+    /// device reading (build-progress 8cm) had 57% of FIND_NODE rounds held
+    /// open by a peer that never answered, at an average 601ms against the
+    /// 750ms cap.
+    ///
+    /// The shape, per the step-2 design:
+    /// - an in-flight set capped at [`ALPHA_QUERY`] FIND_NODEs, each with a
+    ///   PER-REQUEST deadline instead of a per-round window;
+    /// - a response feeds frontier + routing table (`absorb_find_answer`) and
+    ///   can dispatch closer top-alpha contacts IMMEDIATELY, inside the
+    ///   response handling (eMule Search.cpp:508);
+    /// - value asks INTERLEAVE with the iteration: the closest responded
+    ///   in-tolerance node is asked while other FIND_NODEs are still
+    ///   outstanding - there is no separate value phase. eMule reaches
+    ///   StorePacket the same way but only from its 3s-gated JumpStart tick;
+    ///   padMule runs the walk after every state change, because a value ask
+    ///   gated behind three seconds of silence would put a 3s floor under
+    ///   time-to-first-result. The 3s-gated tick remains as stall recovery.
+    /// - termination: enough results, candidates exhausted (nothing in flight
+    ///   and nothing left to dispatch), or the overall deadline.
+    async fn drive_lookup(
+        &mut self,
+        target: Kad128,
+        value: ValueAsk<'_>,
+        want: usize,
+        per_query: Duration,
+        deadline_queries: u32,
+        find_budget: usize,
+    ) -> Result<(ResolveOutcome, Vec<FileResult>), KadError> {
+        let seeds = self.closest_wire_contacts(&target, 50);
+        if seeds.is_empty() {
+            return Err(KadError::NotReady); // no routing table - bootstrap first
+        }
+        // A refresh harvests nobody: a zero value budget makes `harvest`
+        // consume resolved entries without ever emitting an ask.
+        let value_budget = match &value {
+            ValueAsk::None => 0,
+            _ => LOOKUP_VALUE_BUDGET,
+        };
+        let mut cs = CSearch::new(target, seeds, find_budget, value_budget, K);
+        let mut out = ResolveOutcome::default();
+        let mut files: Vec<FileResult> = Vec::new();
+        let mut inflight: tokio::task::JoinSet<ReqEvent> = tokio::task::JoinSet::new();
+        let mut finds_inflight = 0usize;
+        let mut guard = SlotGuard::new(Arc::clone(&self.pending));
         let t0 = Instant::now();
-        let raw = self.request_batch(&reqs, OP_SEARCH_RES, wait).await;
-        let answered = raw.iter().filter(|r| r.is_ok()).count();
-        crate::stats::note_kad_value_window(reqs.len(), answered, t0.elapsed().as_millis() as u64);
-        raw.into_iter()
-            .map(|answer| {
-                let (res_payload, verified, sender_vk) = answer.ok()?;
-                let res = parse_search_res(&res_payload).ok()?;
-                let sources = res.results.iter().filter_map(|r| r.as_source()).collect();
-                Some((sources, verified, sender_vk))
-            })
-            .collect()
+        let overall = t0 + per_query * deadline_queries;
+        // eMule initialises m_uLastResponse to construction time (Search.cpp:84).
+        let mut last_response = Instant::now();
+        let mut tick = tokio::time::interval(STALL_TICK);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut need_progress = true;
+
+        loop {
+            if need_progress {
+                need_progress = false;
+                // Value asks first - the JumpStart walk's consumption order.
+                for c in cs.harvest() {
+                    let frame = match &value {
+                        ValueAsk::Sources { file_size } => {
+                            let (op, p) = build_search_source_req(&target, 0, *file_size);
+                            pack_kad(op, p)
+                        }
+                        ValueAsk::Keyword { words, .. } => {
+                            let (op, p) = build_search_key_req_restrictive(&target, 0, words);
+                            pack_kad(op, p)
+                        }
+                        ValueAsk::None => unreachable!("no value asks with a zero budget"),
+                    };
+                    if self
+                        .spawn_lookup_request(
+                            &mut inflight,
+                            &mut guard,
+                            ReqKind::Value,
+                            c,
+                            frame,
+                            OP_SEARCH_RES,
+                            per_query,
+                        )
+                        .await
+                    {
+                        out.nodes_searched += 1;
+                    }
+                }
+                // Keep ALPHA_QUERY FIND_NODEs in flight.
+                for c in cs.refill(ALPHA_QUERY.saturating_sub(finds_inflight)) {
+                    let (op, p) = build_kad2_req(KAD_FIND_NODE, &target, &c.id);
+                    if self
+                        .spawn_lookup_request(
+                            &mut inflight,
+                            &mut guard,
+                            ReqKind::Find,
+                            c.clone(),
+                            pack_kad(op, p),
+                            OP_KAD2_RES,
+                            per_query,
+                        )
+                        .await
+                    {
+                        finds_inflight += 1;
+                        out.nodes_queried += 1;
+                    } else {
+                        cs.on_timeout(&c);
+                    }
+                }
+            }
+            let results = match &value {
+                ValueAsk::Sources { .. } => out.sources.len(),
+                ValueAsk::Keyword { .. } => files.len(),
+                ValueAsk::None => 0,
+            };
+            if !matches!(value, ValueAsk::None) && results >= want {
+                break; // enough results
+            }
+            if inflight.is_empty() {
+                break; // candidates exhausted: nothing in flight, nothing to send
+            }
+            tokio::select! {
+                () = tokio::time::sleep_until(overall) => break, // overall deadline
+                Some(joined) = inflight.join_next() => {
+                    need_progress = true;
+                    let Ok(ev) = joined else {
+                        // Only a panicking request task lands here; free the
+                        // slot estimate so the lookup cannot wedge (the stall
+                        // tick and the overall deadline back this up).
+                        finds_inflight = finds_inflight.saturating_sub(1);
+                        continue;
+                    };
+                    if ev.kind == ReqKind::Find {
+                        finds_inflight -= 1;
+                    }
+                    match ev.outcome {
+                        Some((payload, verified, sender_vk)) => {
+                            last_response = Instant::now();
+                            crate::stats::note_kad_reply(ev.kind.stats(), ev.rtt.as_millis() as u64);
+                            match ev.kind {
+                                ReqKind::Find => match parse_kad2_res(&payload).ok() {
+                                    // Drop a malicious over-long answer whole: padMule requests
+                                    // KAD_FIND_NODE (11) contacts; a compliant node never exceeds
+                                    // that, a hostile one may pad up to 255 fabricated contacts.
+                                    // eMule's search rejects the same way (Search.cpp:377), though
+                                    // its routing table keeps them; ours drops them everywhere -
+                                    // the stricter stance this code already took.
+                                    Some(res) if res.contacts.len() <= KAD_REQUESTED_CONTACTS => {
+                                        out.find_node_responses += 1;
+                                        let frontier = self.absorb_find_answer(
+                                            &ev.contact, verified, sender_vk, res.contacts,
+                                        );
+                                        // eMule's IMMEDIATE dispatch (Search.cpp:508), capped by
+                                        // our in-flight bound.
+                                        let cap = ALPHA_QUERY.saturating_sub(finds_inflight);
+                                        for c in cs.on_response(&ev.contact, frontier, cap) {
+                                            let (op, p) = build_kad2_req(KAD_FIND_NODE, &target, &c.id);
+                                            if self
+                                                .spawn_lookup_request(
+                                                    &mut inflight,
+                                                    &mut guard,
+                                                    ReqKind::Find,
+                                                    c.clone(),
+                                                    pack_kad(op, p),
+                                                    OP_KAD2_RES,
+                                                    per_query,
+                                                )
+                                                .await
+                                            {
+                                                finds_inflight += 1;
+                                                out.nodes_queried += 1;
+                                            } else {
+                                                cs.on_timeout(&c);
+                                            }
+                                        }
+                                    }
+                                    // Over-long or undecodable: no usable answer came, which
+                                    // for the frontier is the same as silence.
+                                    _ => cs.on_timeout(&ev.contact),
+                                },
+                                ReqKind::Value => {
+                                    if let Ok(res) = parse_search_res(&payload) {
+                                        out.search_responses += 1;
+                                        self.note_responder(&ev.contact, verified, sender_vk);
+                                        let had = results;
+                                        match &value {
+                                            ValueAsk::Sources { .. } => {
+                                                for s in res.results.iter().filter_map(|r| r.as_source()) {
+                                                    if !out.sources.iter().any(|e| e.client_hash == s.client_hash) {
+                                                        out.sources.push(s);
+                                                    }
+                                                }
+                                            }
+                                            ValueAsk::Keyword { keyword, .. } => {
+                                                for f in res.results.iter().filter_map(|r| r.as_file()) {
+                                                    // The wire matched ONE word. Apply the rest
+                                                    // locally, exactly as eMule does per result
+                                                    // (Search.cpp:1379-1395) - without this, a
+                                                    // search for "yes prime minister" hands back
+                                                    // everything indexed under "yes".
+                                                    if !mule_kad::kad_filename_matches(&f.name, keyword) {
+                                                        continue;
+                                                    }
+                                                    if !files.iter().any(|e| e.hash == f.hash) {
+                                                        files.push(f);
+                                                    }
+                                                }
+                                            }
+                                            ValueAsk::None => {}
+                                        }
+                                        let have = match &value {
+                                            ValueAsk::Sources { .. } => out.sources.len(),
+                                            _ => files.len(),
+                                        };
+                                        if had == 0 && have > 0 {
+                                            crate::stats::note_kad_first_result(
+                                                t0.elapsed().as_millis() as u64,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        None => {
+                            crate::stats::note_kad_timeout(ev.kind.stats());
+                            // Withdraw the dead slot now rather than at guard
+                            // drop, so it cannot swallow an IP-fallback match
+                            // meant for a later request to the same peer.
+                            self.pending
+                                .lock()
+                                .expect(LOCK_POISONED)
+                                .retain(|p| p.seq != ev.seq);
+                            if ev.kind == ReqKind::Find {
+                                cs.on_timeout(&ev.contact);
+                            }
+                        }
+                    }
+                }
+                _ = tick.tick() => {
+                    // eMule's stall recovery: JumpStart bails if any response
+                    // arrived within the last 3s (Search.cpp:281); past that
+                    // it walks and redispatches - our progress pass.
+                    if last_response.elapsed() >= STALL_AFTER {
+                        need_progress = true;
+                    }
+                }
+            }
+        }
+        // How close did we get? Leading zero bits of the closest node's
+        // distance to the target (higher = closer; a real converged lookup
+        // reaches deep).
+        if let Some(closest) = cs.closest(1).first() {
+            out.closest_prefix_bits = leading_zero_bits(&target.distance(&closest.id));
+        }
+        if !matches!(value, ValueAsk::None) {
+            crate::stats::note_kad_value_lookup_done(t0.elapsed().as_millis() as u64);
+        }
+        Ok((out, files))
     }
 
     /// Grow and refresh the routing table with an iterative lookup toward
@@ -1179,47 +1588,34 @@ impl KadNode {
     /// sat at 138 contacts and keyword searches returned very few Kad hits.
     /// Anthony flagged both as suspicious; they were the same defect.
     ///
-    /// Bounded harder than a real lookup (`REFRESH_ROUNDS`, not 12) because this
-    /// runs on the heartbeat under the engine lock: maintenance must never cost
-    /// the user a slow search. It converges over repeated rounds instead of one
-    /// deep dive, which also spreads the traffic out - the point is a table that
-    /// keeps improving, not one perfect lookup.
+    /// Bounded harder than a real lookup (`REFRESH_DEADLINE_QUERIES`, not 16)
+    /// because this runs on the heartbeat under the engine lock: maintenance
+    /// must never cost the user a slow search. It converges over repeated
+    /// small lookups instead of one deep dive, which also spreads the traffic
+    /// out - the point is a table that keeps improving, not one perfect
+    /// lookup.
     pub async fn refresh_routing(&mut self, target: &Kad128, per_query: Duration) -> usize {
         crate::stats::note_kad_lookup();
         let before = self.contacts_known();
-        let seeds = self.closest_wire_contacts(target, 50);
-        if seeds.is_empty() {
-            return 0; // nothing to ask - bootstrap first
-        }
-        let mut lookup = Lookup::new(*target, seeds);
-        for _round in 0..REFRESH_ROUNDS {
-            let batch = lookup.next_queries(ALPHA_QUERY, K);
-            if batch.is_empty() {
-                break;
-            }
-            let answers = self.find_node_batch(&batch, target, per_query).await;
-            for (node, answer) in batch.iter().zip(answers) {
-                let Some((contacts, verified, sender_vk)) = answer else {
-                    continue;
-                };
-                // Same bookkeeping a real lookup does: the responder proved its IP
-                // iff the receiver key was valid, and every contact it named joins
-                // the table unverified until it answers for itself. That second
-                // part is where the growth comes from.
-                self.note_responder(node, verified, sender_vk);
-                for c in &contacts {
-                    self.add_contact(c.id, c.ip, c.udp_port, c.tcp_port, c.version, false);
-                }
-                lookup.on_response(contacts);
-            }
-        }
+        // NotReady (no seeds) and every other early exit alike gain 0 contacts.
+        let _ = self
+            .drive_lookup(
+                *target,
+                ValueAsk::None,
+                0,
+                per_query,
+                REFRESH_DEADLINE_QUERIES,
+                REFRESH_DEADLINE_QUERIES as usize * ALPHA_QUERY,
+            )
+            .await;
         self.contacts_known().saturating_sub(before)
     }
 
-    /// The Wave-6 goal: resolve an ed2k `file_hash` to sources. Runs an iterative
-    /// FIND_NODE lookup toward the hash over the current routing table, then sends
-    /// SEARCH_SOURCE_REQ to the closest nodes within tolerance, collecting sources
-    /// until at least `want` are found or the candidates are exhausted.
+    /// The Wave-6 goal: resolve an ed2k `file_hash` to sources. An
+    /// event-driven FIND_NODE lookup toward the hash over the current routing
+    /// table, with SEARCH_SOURCE_REQ interleaved to the closest responded
+    /// in-tolerance nodes, collecting sources until at least `want` are found,
+    /// the candidates are exhausted, or the overall deadline lands.
     pub async fn resolve_sources(
         &mut self,
         file_hash: &Kad128,
@@ -1228,119 +1624,24 @@ impl KadNode {
         per_query: Duration,
     ) -> Result<ResolveOutcome, KadError> {
         crate::stats::note_kad_lookup();
-        // Seed the lookup from the routing table's closest-to-hash contacts.
-        let seeds = self.closest_wire_contacts(file_hash, 50);
-        if seeds.is_empty() {
-            return Err(KadError::NotReady); // no routing table - bootstrap first
-        }
-        let mut lookup = Lookup::new(*file_hash, seeds);
-        let mut out = ResolveOutcome::default();
-
-        // Iteratively converge on the nodes closest to the hash.
-        for _round in 0..12 {
-            let batch = lookup.next_queries(ALPHA_QUERY, K);
-            if batch.is_empty() {
-                break;
-            }
-            out.nodes_queried += batch.len();
-            let answers = self.find_node_batch(&batch, file_hash, per_query).await;
-            for (node, answer) in batch.iter().zip(answers) {
-                let Some((contacts, verified, sender_vk)) = answer else {
-                    continue;
-                };
-                out.find_node_responses += 1;
-                // The node that answered proved its IP iff the receiver key was
-                // valid; the contacts it named are unverified until they answer.
-                self.note_responder(node, verified, sender_vk);
-                for c in &contacts {
-                    self.add_contact(c.id, c.ip, c.udp_port, c.tcp_port, c.version, false);
-                }
-                lookup.on_response(contacts);
-            }
-        }
-
-        // How close did we get? Leading zero bits of the closest node's distance
-        // to the hash (higher = closer; a real converged lookup reaches deep).
-        if let Some(closest) = lookup.closest(1).first() {
-            out.closest_prefix_bits = leading_zero_bits(&file_hash.distance(&closest.id));
-        }
-
-        // Query the closest nodes within the storage tolerance for sources,
-        // ALPHA at a time - the same concurrency the lookup rounds now use, so
-        // ten in-tolerance nodes cost four windows instead of ten.
-        let in_tolerance: Vec<WireContact> = lookup
-            .closest(K)
-            .into_iter()
-            .filter(|n| file_hash.distance(&n.id).within_tolerance())
-            .collect();
-        for group in in_tolerance.chunks(ALPHA_QUERY) {
-            out.nodes_searched += group.len();
-            let answers = self
-                .search_source_batch(group, file_hash, file_size, per_query)
-                .await;
-            for (node, answer) in group.iter().zip(answers) {
-                let Some((found, verified, sender_vk)) = answer else {
-                    continue;
-                };
-                out.search_responses += 1;
-                self.note_responder(node, verified, sender_vk);
-                for s in found {
-                    if !out.sources.iter().any(|e| e.client_hash == s.client_hash) {
-                        out.sources.push(s);
-                    }
-                }
-            }
-            if out.sources.len() >= want {
-                break;
-            }
-        }
+        let (out, _) = self
+            .drive_lookup(
+                *file_hash,
+                ValueAsk::Sources { file_size },
+                want,
+                per_query,
+                LOOKUP_DEADLINE_QUERIES,
+                LOOKUP_FIND_BUDGET,
+            )
+            .await?;
         Ok(out)
     }
 
-    /// Ask SEVERAL nodes for keyword matches (KADEMLIA2_SEARCH_KEY_REQ),
-    /// concurrently, and distil the file results from each KADEMLIA2_SEARCH_RES.
-    /// One slot per node, in the order given.
-    ///
-    /// `words` are the query's tokens. When there is more than one, they ride
-    /// along as a search-expression tree so THAT NODE filters before choosing
-    /// what to send back - without that, a common primary keyword returns a
-    /// bounded sample of an enormous pool and the wanted file is simply not in
-    /// it. Local filtering cannot recover what was never sampled.
-    ///
-    /// Takes `&self` for the same reason as `search_source_batch`: the caller
-    /// applies `note_responder` once the batch is collected.
-    async fn search_keyword_batch(
-        &self,
-        nodes: &[WireContact],
-        target: &Kad128,
-        words: &[String],
-        wait: Duration,
-    ) -> Vec<Option<(Vec<FileResult>, bool, u32)>> {
-        let reqs: Vec<(Kad128, SocketAddr, Vec<u8>)> = nodes
-            .iter()
-            .map(|n| {
-                let (op, payload) = build_search_key_req_restrictive(target, 0, words);
-                (n.id, contact_addr(n.ip, n.udp_port), pack_kad(op, payload))
-            })
-            .collect();
-        let t0 = Instant::now();
-        let raw = self.request_batch(&reqs, OP_SEARCH_RES, wait).await;
-        let answered = raw.iter().filter(|r| r.is_ok()).count();
-        crate::stats::note_kad_value_window(reqs.len(), answered, t0.elapsed().as_millis() as u64);
-        raw.into_iter()
-            .map(|answer| {
-                let (res_payload, verified, sender_vk) = answer.ok()?;
-                let res = parse_search_res(&res_payload).ok()?;
-                let files = res.results.iter().filter_map(|r| r.as_file()).collect();
-                Some((files, verified, sender_vk))
-            })
-            .collect()
-    }
-
-    /// Resolve a `keyword` to files over the live Kad network: an iterative
-    /// FIND_NODE lookup toward the keyword hash, then KADEMLIA2_SEARCH_KEY_REQ to
-    /// the closest in-tolerance nodes. Results are de-duped by file hash. This is
-    /// a SERVERLESS search - no eD2k server needed.
+    /// Resolve a `keyword` to files over the live Kad network: an event-driven
+    /// FIND_NODE lookup toward the keyword hash with KADEMLIA2_SEARCH_KEY_REQ
+    /// interleaved to the closest responded in-tolerance nodes. Results are
+    /// de-duped by file hash. This is a SERVERLESS search - no eD2k server
+    /// needed.
     pub async fn resolve_keyword(
         &mut self,
         keyword: &str,
@@ -1353,69 +1654,31 @@ impl KadNode {
         // lookup converges perfectly on an empty part of the keyspace. Proven
         // 2026-08-07: "Yes Prime Minister" -> 0, "minister" -> a full page.
         // eMule sends `m_listWords.front()` (SearchManager.cpp:140-141) and
-        // filters the results by the rest, which is what the tail of this
-        // function now does.
+        // filters the results by the rest, which `drive_lookup` does per
+        // result. The full `words` ride along as a search-expression tree so
+        // THAT NODE filters before choosing what to send back - without that,
+        // a common primary keyword returns a bounded sample of an enormous
+        // pool and the wanted file is simply not in it; local filtering cannot
+        // recover what was never sampled.
         crate::stats::note_kad_lookup();
         let words = mule_kad::kad_keywords(keyword);
         let Some(primary) = words.first().cloned() else {
             return Ok(Vec::new()); // nothing indexable (all tokens under 3 bytes)
         };
         let target = kad_keyword_target(&primary);
-        let seeds = self.closest_wire_contacts(&target, 50);
-        if seeds.is_empty() {
-            return Err(KadError::NotReady); // bootstrap first
-        }
-        let mut lookup = Lookup::new(target, seeds);
-        for _round in 0..12 {
-            let batch = lookup.next_queries(ALPHA_QUERY, K);
-            if batch.is_empty() {
-                break;
-            }
-            let answers = self.find_node_batch(&batch, &target, per_query).await;
-            for (node, answer) in batch.iter().zip(answers) {
-                let Some((contacts, verified, sender_vk)) = answer else {
-                    continue;
-                };
-                self.note_responder(node, verified, sender_vk);
-                for c in &contacts {
-                    self.add_contact(c.id, c.ip, c.udp_port, c.tcp_port, c.version, false);
-                }
-                lookup.on_response(contacts);
-            }
-        }
-
-        let mut files: Vec<FileResult> = Vec::new();
-        let in_tolerance: Vec<WireContact> = lookup
-            .closest(K)
-            .into_iter()
-            .filter(|n| target.distance(&n.id).within_tolerance())
-            .collect();
-        for group in in_tolerance.chunks(ALPHA_QUERY) {
-            let answers = self
-                .search_keyword_batch(group, &target, &words, per_query)
-                .await;
-            for (node, answer) in group.iter().zip(answers) {
-                let Some((found, verified, sender_vk)) = answer else {
-                    continue;
-                };
-                self.note_responder(node, verified, sender_vk);
-                for f in found {
-                    // The wire matched ONE word. Apply the rest locally, exactly
-                    // as eMule does per result (Search.cpp:1379-1395) - without
-                    // this, a search for "yes prime minister" hands back
-                    // everything on the network indexed under "yes".
-                    if !mule_kad::kad_filename_matches(&f.name, keyword) {
-                        continue;
-                    }
-                    if !files.iter().any(|e| e.hash == f.hash) {
-                        files.push(f);
-                    }
-                }
-            }
-            if files.len() >= want {
-                break;
-            }
-        }
+        let (_, files) = self
+            .drive_lookup(
+                target,
+                ValueAsk::Keyword {
+                    keyword,
+                    words: &words,
+                },
+                want,
+                per_query,
+                LOOKUP_DEADLINE_QUERIES,
+                LOOKUP_FIND_BUDGET,
+            )
+            .await?;
         Ok(files)
     }
 }
@@ -1521,13 +1784,15 @@ mod tests {
         );
     }
 
-    /// THE POINT OF `request_batch`: alpha is CONCURRENT, not batched-then-awaited.
+    /// THE POINT OF `request_batch`: its members are CONCURRENT, not
+    /// batched-then-awaited.
     ///
-    /// Three silent destinations at a 400ms per-query wait. Serially that is three
-    /// timeouts back to back (~1.2s), which is exactly what every Kad lookup used
-    /// to cost per round - `resolve_keyword` structurally 12 rounds x 3 x 750ms
-    /// before the keyword phase even began, and the ~10s search measured on device
-    /// 2026-08-07. One window is ~0.4s.
+    /// Three silent destinations at a 400ms per-query wait. Serially that is
+    /// three timeouts back to back (~1.2s); one window is ~0.4s. The lookups
+    /// no longer come through here (they run event-driven per-request
+    /// deadlines), but bootstrap does, and `bootstrap_any` walks candidates
+    /// serially on top of this - re-serialising the batch would multiply that
+    /// walk by ALPHA again.
     ///
     /// It fails by TIMING rather than by assertion, which is the only way this
     /// regression can show itself: re-serialising the sends breaks nothing
@@ -1571,8 +1836,7 @@ mod tests {
         assert!(
             elapsed < wait * 2,
             "three silent peers took {elapsed:?} for a {wait:?} window - the batch \
-             is being awaited one peer at a time again, so every Kad lookup round \
-             costs ALPHA_QUERY timeouts instead of one"
+             is being awaited one peer at a time again"
         );
     }
 
@@ -1743,10 +2007,12 @@ mod tests {
     /// path must capture for the send-side echo.
     const MOCK_SENDER_VK: u32 = 0xFEED_F00D;
 
-    /// A mock that answers ONLY the search opcodes, ignoring the FIND_NODE
-    /// requests a real lookup sends first, and loops rather than serving one
-    /// datagram - because the two tests below drive the whole public path, which
-    /// sends a lookup round before it ever searches. Aborted by the caller.
+    /// A faithful storing-node mock: it answers the lookup's FIND_NODE with an
+    /// EMPTY contact list - a real node always answers KADEMLIA2_REQ, and the
+    /// event-driven lookup, like eMule's JumpStart walk, only ever value-asks
+    /// a node that RESPONDED to its FIND (a tried-unresponded entry is erased
+    /// unasked, Search.cpp:330-340) - and then answers the search opcodes.
+    /// Loops rather than serving one datagram, and is aborted by the caller.
     fn spawn_search_only_mock(
         peer: UdpSocket,
         peer_id: Kad128,
@@ -1764,10 +2030,16 @@ mod tests {
                 let Ok((op, _)) = unpack_kad(&dec.payload) else {
                     continue;
                 };
-                if op != mule_kad::OP_SEARCH_SOURCE_REQ && op != mule_kad::OP_SEARCH_KEY_REQ {
-                    continue; // the lookup's FIND_NODE - a storing node answers neither
-                }
-                let (rop, rpayload) = mule_kad::build_search_res(&peer_id, &target, &[]);
+                let (rop, rpayload) = if op == mule_kad::OP_KAD2_REQ {
+                    // "I know nobody closer" - the honest answer of the node
+                    // closest to the target.
+                    mule_kad::build_kad2_res(&target, &[])
+                } else if op == mule_kad::OP_SEARCH_SOURCE_REQ || op == mule_kad::OP_SEARCH_KEY_REQ
+                {
+                    mule_kad::build_search_res(&peer_id, &target, &[])
+                } else {
+                    continue;
+                };
                 let dg = kad_obfuscate_response(
                     &pack_kad(rop, rpayload),
                     0x2468,
@@ -1850,6 +2122,305 @@ mod tests {
             node.with_routing(|t| t.verify_key_for(&peer_id, peer_ip, our_ip)),
             MOCK_SENDER_VK,
             "resolve_keyword stored the searched node's sender key"
+        );
+    }
+
+    // ---- the event-driven lookup's live-layer behaviours ----
+
+    /// A wire contact at a chosen IP, for the answer-filter tests.
+    fn wc(seed: u8, ip: u32) -> WireContact {
+        WireContact {
+            id: Kad128::from_hash(&[seed; 16]),
+            ip,
+            udp_port: 4672,
+            tcp_port: 4662,
+            version: 8,
+        }
+    }
+
+    /// eMule's per-answer subnet rule, following ITS CODE not its comment: the
+    /// comment at Search.cpp:457 says "/28 subnet" but the mask is 0xFFFFFF00,
+    /// which is a /24.
+    #[test]
+    fn an_answer_may_name_at_most_two_contacts_per_public_slash24() {
+        let kept = frontier_filter(
+            u32::from(Ipv4Addr::new(198, 51, 100, 1)),
+            vec![
+                wc(1, u32::from(Ipv4Addr::new(203, 0, 113, 1))),
+                wc(2, u32::from(Ipv4Addr::new(203, 0, 113, 2))),
+                wc(3, u32::from(Ipv4Addr::new(203, 0, 113, 3))),
+            ],
+        );
+        assert_eq!(
+            kept.len(),
+            2,
+            "the third contact in one public /24 must be dropped from the \
+             frontier (Search.cpp:458-473)"
+        );
+    }
+
+    /// The responder's own subnet is pre-seeded at count 1 (Search.cpp:424),
+    /// so its /24 admits only ONE listed contact, not two.
+    #[test]
+    fn the_responders_own_slash24_starts_at_one() {
+        let kept = frontier_filter(
+            u32::from(Ipv4Addr::new(203, 0, 113, 9)),
+            vec![
+                wc(1, u32::from(Ipv4Addr::new(203, 0, 113, 1))),
+                wc(2, u32::from(Ipv4Addr::new(203, 0, 113, 2))),
+            ],
+        );
+        assert_eq!(kept.len(), 1);
+    }
+
+    /// LAN ranges are exempt from the subnet cap (Search.cpp:458, IsLANIP) -
+    /// which is also what keeps offline rigs on RFC1918 addresses honest.
+    #[test]
+    fn lan_addresses_are_exempt_from_the_subnet_cap() {
+        let kept = frontier_filter(
+            u32::from(Ipv4Addr::new(198, 51, 100, 1)),
+            vec![wc(1, 0x0A00_0001), wc(2, 0x0A00_0002), wc(3, 0x0A00_0003)],
+        );
+        assert_eq!(kept.len(), 3);
+    }
+
+    /// The rules that predate the /24 cap: a node may not answer with itself,
+    /// and may not list one IP twice (Search.cpp:423/449).
+    #[test]
+    fn the_responders_ip_and_duplicate_ips_are_dropped() {
+        let kept = frontier_filter(
+            u32::from(Ipv4Addr::new(198, 51, 100, 1)),
+            vec![
+                wc(1, u32::from(Ipv4Addr::new(198, 51, 100, 1))), // itself
+                wc(2, u32::from(Ipv4Addr::new(203, 0, 113, 5))),
+                wc(3, u32::from(Ipv4Addr::new(203, 0, 113, 5))), // duplicate
+            ],
+        );
+        assert_eq!(kept.len(), 1);
+    }
+
+    /// THE SPLIT eMule actually has, pinned: one answer feeds the ROUTING
+    /// TABLE through the table's own gates (Process_KADEMLIA2_RES calls
+    /// AddUnfiltered for every basically-acceptable contact,
+    /// KademliaUDPListener.cpp:846) while the SEARCH FRONTIER faces the
+    /// stricter per-answer rules. A test that only checked the frontier would
+    /// pass with the table starved - the regression this one exists to
+    /// prevent, because a starved table is every FUTURE lookup's seed list.
+    #[tokio::test]
+    async fn one_answer_feeds_the_table_fully_and_the_frontier_capped() {
+        let mut node = KadNode::bind_with_identity(
+            "127.0.0.1:0".parse().unwrap(),
+            4662,
+            Kad128::from_words([5, 5, 5, 5]),
+            0x4444,
+        )
+        .await
+        .unwrap();
+        let responder = wc(0xAA, u32::from(Ipv4Addr::new(198, 51, 100, 7)));
+        let contacts: Vec<WireContact> = (1u8..=4)
+            .map(|i| wc(i, u32::from(Ipv4Addr::new(203, 0, 113, i))))
+            .collect();
+        let frontier = node.absorb_find_answer(&responder, false, 0, contacts.clone());
+        for c in &contacts {
+            assert!(
+                node.with_routing(|t| t.contains(&c.id)),
+                "the table must keep every contact that passes ITS OWN gates - \
+                 four distinct public IPs in one /24 are within the table's \
+                 MAX_CONTACTS_PER_SUBNET"
+            );
+        }
+        assert_eq!(
+            frontier.len(),
+            2,
+            "the frontier sees at most 2 of the four (the per-answer /24 rule)"
+        );
+    }
+
+    /// THE EVENT-DRIVEN CORE, live on the wire: a value ask goes out and is
+    /// ANSWERED while a silent peer's FIND_NODE is still in flight. The
+    /// round-based lookup could not start its value phase until the silent
+    /// peer's window expired, so this whole resolve took at least one
+    /// `per_query`; event-driven it finishes in milliseconds. The margin
+    /// (a 3s per-request deadline against a 1.5s assert) is wide enough for a
+    /// loaded test host.
+    #[tokio::test]
+    async fn a_value_ask_is_answered_while_a_silent_find_is_still_in_flight() {
+        let our_id = Kad128::from_words([8, 8, 8, 8]);
+        let our_ip = 0x0A00_0001u32;
+        let mut node =
+            KadNode::bind_with_identity("127.0.0.1:0".parse().unwrap(), 4662, our_id, 0x5555)
+                .await
+                .unwrap();
+        node.set_public_ip(our_ip);
+        let target = Kad128::from_hash(&[0x66; 16]);
+        let w = target.words();
+        // M: in tolerance and CLOSER than S; answers the FIND (empty) and then
+        // the source ask, with one HighID source.
+        let m_id = Kad128::from_words([w[0], w[1] ^ 1, w[2], w[3]]);
+        // S: in the frontier but FARTHER, and silent forever.
+        let s_id = Kad128::from_words([w[0], w[1] ^ 1, w[2], w[3] ^ 0xFFFF]);
+        let m_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let m_addr = m_sock.local_addr().unwrap();
+        let s_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let s_addr = s_sock.local_addr().unwrap();
+        node.with_routing(|t| {
+            t.add(m_id, ip_u32(&m_addr), m_addr.port(), 4662, 8, true);
+            t.add(s_id, ip_u32(&s_addr), s_addr.port(), 4662, 8, true);
+        });
+        let mock = tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            loop {
+                let Ok((n, from)) = m_sock.recv_from(&mut buf).await else {
+                    return;
+                };
+                let Some(dec) = kad_deobfuscate(&buf[..n], &m_id, 0, ip_u32(&from)) else {
+                    continue;
+                };
+                let Ok((op, _)) = unpack_kad(&dec.payload) else {
+                    continue;
+                };
+                let (rop, rpayload) = if op == mule_kad::OP_KAD2_REQ {
+                    mule_kad::build_kad2_res(&target, &[])
+                } else if op == mule_kad::OP_SEARCH_SOURCE_REQ {
+                    let result = mule_kad::SearchResult {
+                        answer: Kad128::from_hash(&[0x77; 16]),
+                        tags: vec![
+                            mule_kad::KadTag {
+                                name: mule_kad::TAG_SOURCETYPE,
+                                value: mule_kad::KadTagValue::Int(1),
+                            },
+                            mule_kad::KadTag {
+                                name: mule_kad::TAG_SOURCEPORT,
+                                value: mule_kad::KadTagValue::Int(4662),
+                            },
+                        ],
+                    };
+                    mule_kad::build_search_res(&m_id, &target, &[result])
+                } else {
+                    continue;
+                };
+                let dg = kad_obfuscate_response(
+                    &pack_kad(rop, rpayload),
+                    0x2468,
+                    dec.sender_vk,
+                    MOCK_SENDER_VK,
+                    0x80,
+                );
+                let _ = m_sock.send_to(&dg, from).await;
+            }
+        });
+
+        let ttfr0 = crate::stats::kad_first_results();
+        let t0 = std::time::Instant::now();
+        let out = node
+            .resolve_sources(&target, 1000, 1, Duration::from_secs(3))
+            .await
+            .unwrap();
+        let elapsed = t0.elapsed();
+        mock.abort();
+        drop(s_sock); // held silent until here so no ICMP shortcut
+        assert_eq!(out.sources.len(), 1, "M's source came back");
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "took {elapsed:?}: the value ask waited for the silent peer's \
+             deadline - the round barrier is back"
+        );
+        assert!(
+            crate::stats::kad_first_results() > ttfr0,
+            "time to first result must move with a lookup that found something"
+        );
+    }
+
+    /// A lookup whose only seed never answers ends when that request's OWN
+    /// deadline fires and the candidates are exhausted - not at the overall
+    /// deadline (16x per_query), and without an error: no sources is an
+    /// answer.
+    #[tokio::test]
+    async fn a_lookup_over_only_silent_seeds_ends_at_the_per_request_deadline() {
+        let mut node = KadNode::bind_with_identity(
+            "127.0.0.1:0".parse().unwrap(),
+            4662,
+            Kad128::from_words([9, 9, 9, 9]),
+            0x6666,
+        )
+        .await
+        .unwrap();
+        let target = Kad128::from_hash(&[0x21; 16]);
+        let w = target.words();
+        let s_id = Kad128::from_words([w[0], w[1] ^ 1, w[2], w[3]]);
+        let s_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let s_addr = s_sock.local_addr().unwrap();
+        node.with_routing(|t| t.add(s_id, ip_u32(&s_addr), s_addr.port(), 4662, 8, true));
+
+        let per_query = Duration::from_millis(300);
+        let t0 = std::time::Instant::now();
+        let out = node
+            .resolve_sources(&target, 1000, 5, per_query)
+            .await
+            .unwrap();
+        let elapsed = t0.elapsed();
+        drop(s_sock);
+        assert!(out.sources.is_empty());
+        assert_eq!(out.nodes_queried, 1);
+        assert!(
+            elapsed < per_query * 8,
+            "took {elapsed:?}: exhaustion should end the lookup right after \
+             the one per-request deadline, half the 16x overall deadline"
+        );
+    }
+
+    /// eMule never value-asks a node that did not answer its FIND - the
+    /// JumpStart walk erases a tried-unresponded entry unasked (Search.cpp:
+    /// 330-340). The old round-based code DID ask such nodes; this pins the
+    /// deliberate change, on the wire: the mock counts what actually reaches
+    /// it.
+    #[tokio::test]
+    async fn a_node_that_never_answers_find_node_is_never_value_asked() {
+        let mut node = KadNode::bind_with_identity(
+            "127.0.0.1:0".parse().unwrap(),
+            4662,
+            Kad128::from_words([6, 6, 6, 6]),
+            0x7777,
+        )
+        .await
+        .unwrap();
+        let target = Kad128::from_hash(&[0x33; 16]);
+        let w = target.words();
+        let peer_id = Kad128::from_words([w[0], w[1] ^ 1, w[2], w[3]]);
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        node.with_routing(|t| t.add(peer_id, ip_u32(&peer_addr), peer_addr.port(), 4662, 8, true));
+        let asks = Arc::new(AtomicU64::new(0));
+        let asks_seen = Arc::clone(&asks);
+        let mock = tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            loop {
+                let Ok((n, from)) = peer.recv_from(&mut buf).await else {
+                    return;
+                };
+                let Some(dec) = kad_deobfuscate(&buf[..n], &peer_id, 0, ip_u32(&from)) else {
+                    continue;
+                };
+                let Ok((op, _)) = unpack_kad(&dec.payload) else {
+                    continue;
+                };
+                if op == mule_kad::OP_SEARCH_SOURCE_REQ {
+                    asks_seen.fetch_add(1, Ordering::Relaxed);
+                }
+                // Answers NOTHING - a FIND left unanswered is the case.
+            }
+        });
+
+        let out = node
+            .resolve_sources(&target, 1000, 1, Duration::from_millis(250))
+            .await
+            .unwrap();
+        mock.abort();
+        assert_eq!(out.nodes_searched, 0, "we must not even send the ask");
+        assert_eq!(
+            asks.load(Ordering::Relaxed),
+            0,
+            "a SEARCH_SOURCE_REQ reached a node that never answered our FIND"
         );
     }
 

@@ -196,13 +196,14 @@ const SOURCES_WAIT: Duration = Duration::from_secs(10);
 /// `ALPHA_QUERY` queries one at a time, so the lookup alone was structurally
 /// 12 x 3 x `KAD_PER_QUERY` = 27s and every search ran until this cap cut it
 /// off. That is the ~10s submit-to-results measured on device 2026-08-07, with
-/// the server arm having answered in well under a second. With the alpha queries
-/// actually concurrent the structural worst case is 12 rounds plus 4 keyword
-/// windows = 12s, so this is a bound again and a normal search finishes far
-/// inside it.
+/// the server arm having answered in well under a second. Since 2026-08-08 the
+/// lookup is EVENT-DRIVEN (eMule CSearch; `KadNode::drive_lookup`): its own
+/// overall deadline is 16 x `KAD_PER_QUERY` = 12s, inside this cap, and a
+/// normal lookup terminates on results or exhaustion long before either.
 const KAD_SEARCH_WAIT: Duration = Duration::from_secs(15);
-/// Per-node wait during a Kad keyword lookup. One ROUND costs this, not
-/// `ALPHA_QUERY` times this - see `KadNode::request_batch`.
+/// PER-REQUEST deadline during a Kad lookup - each request races its own
+/// clock, so a silent peer costs itself, not a round (there are no rounds -
+/// see `KadNode::drive_lookup`).
 const KAD_PER_QUERY: Duration = Duration::from_millis(750);
 
 /// How often a RUNNING engine refreshes its Kad routing table.
@@ -215,17 +216,13 @@ const KAD_PER_QUERY: Duration = Duration::from_millis(750);
 /// built inside one rather than maintained across days.
 const KAD_REFRESH_EVERY: Duration = Duration::from_secs(120);
 
-/// Wall-clock cap on ONE `maintain_kad` round.
+/// Wall-clock cap on ONE `maintain_kad` pass.
 ///
-/// `refresh_routing` is bounded only STRUCTURALLY - `REFRESH_ROUNDS` rounds at
-/// `KAD_PER_QUERY` apiece - and `heartbeat()` holds the engine lock across it.
-/// A structural bound is not a deadline, and this was the only Kad call in the
-/// tree without one.
-///
-/// It is now a SAFETY NET rather than the thing that ends every run: the round's
-/// alpha queries go out together (2026-08-07), so a full round costs 3s instead
-/// of 9s and finishes. Pinned by `a_kad_maintenance_round_fits_inside_its_
-/// deadline`, which fails if either half of that stops being true.
+/// `refresh_routing` carries its own deadline - `REFRESH_DEADLINE_QUERIES`
+/// times `KAD_PER_QUERY` - but `heartbeat()` holds the engine lock across it,
+/// so this outer timeout stays as the SAFETY NET rather than the thing that
+/// ends every run. Pinned by `a_kad_maintenance_round_fits_inside_its_
+/// deadline`, which fails if the refresh deadline grows past the budget.
 const KAD_MAINTENANCE_BUDGET: Duration = Duration::from_secs(3);
 
 /// Stop actively growing the table past this. Not a protocol rule - a battery
@@ -4628,19 +4625,19 @@ impl Engine {
         rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut bytes);
         let target = Kad128::from_hash(&bytes);
         let before = kad.contacts_known();
-        // A DEADLINE, not just a round count. `refresh_routing`'s bound is
-        // structural - REFRESH_ROUNDS rounds at KAD_PER_QUERY each - and this runs
-        // under the engine lock via `heartbeat()`. Every OTHER Kad call site
-        // already wraps in a timeout (search, find_sources); this one did not, and
-        // it was the only periodic one. Row 8bx treated a 15s lock hold as a real
-        // defect. Since the alpha queries went concurrent the round costs 3s
-        // rather than 9s and normally completes, so this is now the net and not
-        // the knife.
+        // AN OUTER DEADLINE on top of the refresh's own. `refresh_routing`
+        // runs its event-driven lookup to a deadline of
+        // REFRESH_DEADLINE_QUERIES x KAD_PER_QUERY, and this runs under the
+        // engine lock via `heartbeat()`. Every OTHER Kad call site already
+        // wraps in a timeout (search, find_sources); this one did not, and it
+        // was the only periodic one. Row 8bx treated a 15s lock hold as a real
+        // defect. The refresh normally finishes inside its own deadline, so
+        // this is the net and not the knife.
         //
         // Partial work is KEPT: `add_contact` mutates the table as answers
-        // arrive, so a cancelled round still leaves everything it learned. The
+        // arrive, so a cancelled pass still leaves everything it learned. The
         // gain is measured from the table itself rather than taken from the
-        // return value, which a timed-out round never produces.
+        // return value, which a timed-out pass never produces.
         let _ = timeout(
             KAD_MAINTENANCE_BUDGET,
             kad.refresh_routing(&target, KAD_PER_QUERY),
@@ -4898,29 +4895,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A maintenance round must FIT INSIDE its deadline, so the timeout is a
+    /// A maintenance pass must FIT INSIDE its deadline, so the timeout is a
     /// safety net rather than the thing that ends every run.
     ///
     /// THIS RELATIONSHIP INVERTED on 2026-08-07 and the inversion is the point.
     /// `refresh_routing` used to issue its `ALPHA_QUERY` queries one after
-    /// another, so a round cost `REFRESH_ROUNDS * ALPHA_QUERY * KAD_PER_QUERY` =
-    /// 9s against a 3s deadline: the deadline always fired, and maintenance got
-    /// through about four of its twelve queries before being cut off. Alpha is a
-    /// CONCURRENCY parameter, and now that the queries actually go out together a
-    /// round costs `REFRESH_ROUNDS * KAD_PER_QUERY` and completes.
-    ///
-    /// Asserted rather than remembered, so re-serialising the batch - which
-    /// breaks nothing functionally - fails here instead of silently restoring a
-    /// 9s lock hold on the heartbeat.
+    /// another, so a pass cost 4 rounds x 3 x `KAD_PER_QUERY` = 9s against a 3s
+    /// deadline: the deadline always fired, and maintenance got through about
+    /// four of its twelve queries before being cut off. The refresh is now an
+    /// event-driven lookup whose own deadline is `REFRESH_DEADLINE_QUERIES *
+    /// KAD_PER_QUERY`, and that deadline must stay inside the heartbeat's
+    /// budget or the budget silently becomes the thing that ends every pass
+    /// again - cancelling `refresh_routing` mid-flight instead of letting it
+    /// finish.
     #[test]
     fn a_kad_maintenance_round_fits_inside_its_deadline() {
-        let structural = KAD_PER_QUERY * crate::kad_live::REFRESH_ROUNDS as u32;
+        let structural = KAD_PER_QUERY * crate::kad_live::REFRESH_DEADLINE_QUERIES;
         assert!(
             structural <= KAD_MAINTENANCE_BUDGET,
-            "a refresh round can cost {structural:?} against a {KAD_MAINTENANCE_BUDGET:?} \
+            "a refresh pass can cost {structural:?} against a {KAD_MAINTENANCE_BUDGET:?} \
              deadline, so the heartbeat cuts maintenance off part-way every time - \
-             either the alpha queries are being awaited one at a time again, or \
-             REFRESH_ROUNDS / KAD_PER_QUERY grew past the budget"
+             REFRESH_DEADLINE_QUERIES / KAD_PER_QUERY grew past the budget"
         );
     }
 

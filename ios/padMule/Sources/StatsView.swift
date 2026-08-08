@@ -98,15 +98,17 @@ struct StatsView: View {
                     value: String(format: "%.1fs", model.uiPollMaxGapSecs))
             }
 
-            // THE KAD LOOKUP PROFILE. A search's remaining cost is the Kad arm,
-            // and the arm's cost is one of two things: the round trips a lookup
-            // genuinely needs, or batch windows held open by peers that never
-            // answer. Those call for opposite responses - the first is
-            // irreducible, the second is fixed by removing the round barrier -
-            // and from outside they look identical. This panel tells them apart.
+            // THE KAD LOOKUP PROFILE. The old panel counted lookup ROUNDS and
+            // rounds held open by a silent peer; it answered its question (57%
+            // silent, row 8cm) and the lookup went event-driven, so rounds no
+            // longer exist to count. What replaces them: time to first result
+            // (the number a search feels), the timeout share (the network's
+            // health), the reply-RTT histogram (what a request costs when it
+            // is answered at all), and the in-flight high-water mark (whether
+            // the concurrency is actually used).
             Section("Kad lookup") {
                 Text(
-                    "A lookup round ends when its last peer answers, or at the per-query deadline if one never does. If \"with a SILENT peer\" is most of \"rounds run\", the rounds are paying full timeouts and the barrier is the cost; if it is small, the cost is the round trips the lookup genuinely needs."
+                    "Every request races its own deadline now - no rounds. \"Time to first result\" is what a search feels; the TIMEOUT row against requests sent is the network's health (a timeout is not a slow reply, so it is never in an RTT bucket); the high-water mark shows the lookup's concurrency actually being used."
                 )
                 .font(.caption)
                 .foregroundStyle(.secondary)

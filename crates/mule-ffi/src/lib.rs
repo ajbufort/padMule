@@ -1055,16 +1055,17 @@ impl MuleEngine {
         mule_engine::stats::fetch_report()
     }
 
-    /// THE KAD LOOKUP PROFILE, as a printable block: rounds run, how many of
-    /// them were held open by a peer that never answered, requests sent vs
-    /// answered, and the average round / value-window duration.
+    /// THE KAD LOOKUP PROFILE, as a printable block: time to first result and
+    /// to completion per value lookup, requests sent / answered / timed out
+    /// per kind, a per-request RTT histogram with timeouts as their own row,
+    /// and the in-flight high-water mark.
     ///
-    /// It exists to settle ONE question with data rather than argument: a batch
-    /// round ends either when its last member answers or at the full
-    /// `KAD_PER_QUERY` deadline, and which of those dominates decides whether
-    /// eMule's event-driven `CSearch` (no rounds, keyword requests interleaved
-    /// with the lookup) is worth building. `with a SILENT peer` against
-    /// `rounds run` IS the reading. See `mule_engine::stats`.
+    /// The previous panel counted lookup ROUNDS and rounds held open by a
+    /// silent peer; it answered its question (57% silent - build-progress row
+    /// 8cm, the before-figure) and the lookup went EVENT-DRIVEN (eMule
+    /// CSearch: per-request deadlines, value asks interleaved), so rounds no
+    /// longer exist to count. See `mule_engine::stats` for why each field
+    /// survives the rewrite.
     ///
     /// LOCK-FREE, like `fetch_report` and for the same reason.
     pub fn kad_report(&self) -> String {
