@@ -105,7 +105,7 @@ unchanged.
 | `KADEMLIA2_PING` | `KADEMLIA2_PONG` carrying **the requester's UDP port as a u16** | this is the one that stops the eviction. The payload is not empty: eMule's comment is "currently it is however only used to determine ones external port" (`Process_KADEMLIA2_PING`, :1970-1977), so the port we echo is how the peer learns its own external port. No builder exists for this - `build_pong` is new. |
 | `KADEMLIA2_REQ` | `KADEMLIA2_RES` with the closest contacts | capped at the REQUESTED count; never the requester itself; verified-only, since `closest_to` already is. |
 | `KADEMLIA2_BOOTSTRAP_REQ` | `BOOTSTRAP_RES` | rate-limited harder - see amplification. |
-| `KADEMLIA2_SEARCH_KEY_REQ` / `SEARCH_SOURCE_REQ` | **empty `SEARCH_RES`** | DELIBERATE DEVIATION - see below. |
+| `KADEMLIA2_SEARCH_KEY_REQ` / `SEARCH_SOURCE_REQ` | **nothing - stay silent** | Matches eMule. The earlier "empty SEARCH_RES" deviation was REVERSED 2026-08-07 once the deferred 0.50a check was actually run - see below. |
 | `KADEMLIA2_PUBLISH_*` | ignored | we store nothing; answering "stored" would be a lie. |
 | `FIREWALLED*` / `FINDBUDDY*` / `CALLBACK` | ignored | NAT traversal, its own design. |
 
@@ -113,21 +113,49 @@ Every response builder already exists in `mule-kad::message` (`build_hello_res`,
 `build_kad2_res`, `build_bootstrap_res`, `build_search_res`), written for the
 codec tests. Step 1 is wiring, not new wire code.
 
-### The empty SEARCH_RES - a deliberate, documented deviation
+### The empty SEARCH_RES - PROPOSED, then REVERSED by its own deferred check
 
-padMule stores nothing, so it has no results. It answers an EMPTY `SEARCH_RES`
-rather than staying silent.
+An earlier draft had padMule answer an EMPTY `SEARCH_RES` rather than staying
+silent, reasoning that silence costs the searcher a full per-query timeout -
+exactly the cost we measured on OURSELVES (62% of rounds, 84% of the cap) - so an
+empty answer would be a courtesy and strictly cheaper for the network.
 
-Justification: silence costs the searcher a full per-query timeout, which is
-exactly the cost we measured on OURSELVES (62% of rounds, 84% of the cap). An
-empty answer is wire-legal, is the same courtesy padMule wants from others, and
-is strictly cheaper for the network than being one more silent node.
+That draft deferred one thing: "the 0.50a behaviour to be checked and cited
+during implementation." **The check was run 2026-08-07 and it reverses the
+decision.**
 
-Decided by Anthony 2026-08-07 with the deviation understood as irrelevant here.
-It is recorded as a deviation regardless, with the 0.50a behaviour to be checked
-and cited during implementation, following the precedent of the recursive UDP
-server crawl (`OP_SERVER_LIST_REQ2`, [[feature-server-hunter]]) - a deviation
-neither authority performs, shipped with its reasoning written down.
+**eMule 0.50a STAYS SILENT.** `Process_KADEMLIA2_SEARCH_KEY_REQ`
+(`KademliaUDPListener.cpp:1115`) hands off to `CIndexed::SendValidKeywordResult`
+(`Indexed.cpp:696`), which builds and sends a packet ONLY inside
+`if (m_mapKeyword.Lookup(CCKey(uKeyID.GetData()), pCurrKeyHash))`. No entry for
+that keyword means no packet. There is no empty-`SEARCH_RES` path in stock eMule
+at all.
+
+**The cost the draft did not weigh: FINGERPRINTING.** padMule stores nothing, so
+it would answer empty to essentially every search that reached it - and since no
+stock client ever emits that packet, each one identifies padMule to any node that
+searches a keyword we lack. That is a far louder signal than
+[[padmule-enhancement-channel]] is willing to send, and that channel goes to
+deliberate lengths (provably-ignored HELLO-tag carrier rules) to stay invisible.
+Paying a fingerprint to save strangers 750ms is the wrong trade.
+
+**DECIDED 2026-08-07 by Anthony, on that evidence: stay silent, match eMule.**
+A searcher that reaches us budgets for a silent node already - that is the normal
+case on this network, and it is what our own lookup does when a peer never
+answers. Nothing about the serve loop's actual prize changes: staying in other
+clients' routing tables comes from PING, HELLO and FIND_NODE, none of which this
+touches.
+
+Practical effect on the build: `parse_search_key_req` / `parse_search_source_req`
+are NOT needed - the only new codec is `build_pong` - and padMule never parses an
+attacker-supplied search payload or expression tree at all, which is strictly less
+attack surface than the draft had.
+
+This entry is kept rather than deleted because the REASONING is the record: a
+deviation proposed on plausible grounds, and refuted by the check its own author
+deferred. The rule it re-proves is [[decisions-and-lessons]] 2026-07-18 - "for
+anything a peer observes, a proposed improvement is a HYPOTHESIS until checked
+against eMule."
 
 ## Security
 

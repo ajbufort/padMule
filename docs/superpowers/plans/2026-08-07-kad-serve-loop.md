@@ -16,12 +16,64 @@
 
 | File | Responsibility |
 |---|---|
-| `crates/mule-kad/src/message.rs` (modify) | Add `parse_search_key_req`, `parse_search_source_req`, `build_pong`. Wire codecs only. |
+| `crates/mule-kad/src/message.rs` (modify) | Add `build_pong` and `build_ping`. Wire codecs only. (`parse_search_key_req` / `parse_search_source_req` were dropped by AMENDMENT 1 - we never parse a search request now.) |
 | `crates/mule-engine/src/kad_serve.rs` (create) | PURE inbound-request handling: given an opcode, payload and a view of our table, return the answer. No sockets, no locks, no I/O - so every rule is unit-testable. |
 | `crates/mule-engine/src/kad_live.rs` (modify) | Owns the socket task, routes replies to waiters, calls `kad_serve` for requests, holds the table behind a mutex. |
 | `crates/mule-engine/src/lib.rs` (modify) | Declare `mod kad_serve;`. |
 
 `kad_serve.rs` is deliberately separate and pure: the answering RULES (who gets a reply, what it contains, when the ACK bit is set) are the part worth testing exhaustively, and they must not need a socket to test.
+
+---
+
+## AMENDMENTS (2026-08-07, from the pre-execution review of this plan)
+
+Three findings from checking this plan's code against the real APIs and the spec.
+Each is folded into the task it affects; recorded here so the change is visible
+rather than silently absorbed.
+
+**AMENDMENT 1 - SEARCH_KEY_REQ / SEARCH_SOURCE_REQ: STAY SILENT, do not answer
+empty.** The spec deferred "the 0.50a behaviour to be checked during
+implementation"; the check was run and it REVERSES the deviation. eMule's
+`CIndexed::SendValidKeywordResult` (`Indexed.cpp:696`) sends a packet only inside
+`if (m_mapKeyword.Lookup(...))` - no entry, no packet, and there is no
+empty-`SEARCH_RES` path in stock eMule anywhere. Since padMule stores nothing it
+would answer empty to nearly every search reaching it, and no stock client emits
+that packet, so each one is a padMule fingerprint. Anthony decided on that
+evidence: match eMule. **Effect:** Task 1 loses `parse_search_key_req` and
+`parse_search_source_req` (only `build_pong` and `build_ping` are new); Task 5
+loses its two empty-answer tests and gains silence tests; padMule never parses an
+attacker-supplied search payload or expression tree at all.
+
+**AMENDMENT 2 - do NOT start the read loop in `bind_with_identity`.** Task 7 Step
+4 said to. But `start_kad` configures the node AFTER binding it, in this order:
+`bind_with_identity` -> `set_advertised_udp_port` -> `set_ip_filter` ->
+`set_public_ip` -> `seed_routing` -> `bootstrap_any`. A loop spawned at bind
+captures `ip_filter: None` and `advertised_udp_port: None`, which would mean (a)
+inbound-learned contacts BYPASS the user's IP blocklist - silently regressing the
+"ipfilter Kad UDP coverage" row in [[security-model]] from OPERATIONAL - and (b)
+our HELLO_RES and BOOTSTRAP_RES would advertise the BOUND port rather than the
+ADVERTISED one, so behind a VPN remote-to-local forward we would answer peers
+with a port nobody forwards. That is worse than not answering: we would be in
+their table at a dead address. This is the "moved the check == removed the check"
+class ([[decisions-and-lessons]] 2026-07-18). **Effect:** the loop reads its
+configuration through SHARED handles rather than captured copies -
+`ip_filter: Arc<std::sync::Mutex<Option<Arc<IpFilter>>>>` and
+`advertised_udp_port: Arc<AtomicU32>` (0 = "advertise what we bound"), both
+written by the existing setters and read by the loop each time it answers. The
+routing table is already becoming an `Arc<Mutex<..>>` in Task 6, so this is the
+same move applied to the other two. Spawn point stays in `bind_with_identity`;
+what changes is that nothing is captured by value.
+
+**AMENDMENT 3 - handle inbound `KADEMLIA2_HELLO_RES_ACK` (new Task 7b).** The
+spec's table requires it ("marks the sender IP-verified; eMule hard-drops this
+opcode on an invalid receiver key - match that") and NO task implemented it.
+`parse_hello_res_ack` already exists and is unused on the receive side. This is
+not optional polish: Task 3 makes padMule SET the `0x04` bit that ASKS peers for
+an ACK, so without this we would ask for something we then ignore - the Wave-4d
+"advertise no capability you do not honour" lesson in a new place. Worse, since
+`closest_to` is verified-only (row 8ao), a peer that proves its IP to us and is
+never recorded as verified can never appear in any answer we give, so the whole
+handshake would be thrown away.
 
 ---
 
