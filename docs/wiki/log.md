@@ -701,3 +701,33 @@ Append-only, timestamped record of Ingest / Query / Lint passes.
   limiter (`FloodTracker` still has no call site), storing an inbound HELLO
   sender's verify key, wiring `accept_hello_res_ack` into the loop, and the
   external oracle proof - nothing here is device- or oracle-verified.
+
+- 2026-08-07 **The ACK is honoured and the flood gate is live - 8ck's two open
+  edges closed.** padMule had started ASKING peers for a HELLO_RES_ACK and was
+  dropping the proof when it arrived: the "advertise no capability you do not
+  honour" shape for the third time here, and worse than usual because
+  `closest_to` is verified-only since 8ao - a peer that completed the handshake
+  and went unrecorded could never appear in any answer we give, so the whole
+  exchange was theatre. `RoutingTable::verify_contact` is eMule's
+  `VerifyContact` (RoutingZone.cpp:980-996): the bit is set ONLY when the stored
+  address matches the datagram source, which is the entire security value given
+  a KadID is semi-public. The SOLICITATION gate the spec had missed is in too -
+  180s window, entry CONSUMED on match, recorded BEFORE the send because a
+  peer's ACK can be on the wire before our own `send_to` future resolves.
+  `FloodTracker` finally has a production call site with eMule's exact budgets;
+  the ACK is deliberately exempt from it, as in eMule, since throttling it would
+  throttle a handshake we solicited. **The one deliberate deviation:** both
+  tracking maps are keyed by an attacker-controlled UDP source address, so they
+  are capped and pruned - eMule prunes on a desktop timer, and an unbounded map
+  is a memory-exhaustion vector against a ~100MB jetsam budget; growth is
+  refused fail-open for a new ip, because dropping every unknown source under a
+  spoofed spray would be a self-inflicted outage.
+  **TWO METHOD NOTES.** The mutation checks ran with a COMPILE GUARD this time,
+  after the morning's lesson that a mutant which fails to build reads as a false
+  green - all four RED. And the solicited-ACK test failed first for a real
+  reason: on loopback the HELLO's own contact-add is refused by the
+  routable-public gate, so there was no table entry for the ACK to verify. Left
+  alone it would have asserted about a contact that never existed - the exact
+  vacuity that made row 8cj's first listener test worthless. The contact is now
+  seeded explicitly, which makes the test about the ACK PATH, its actual
+  subject. Gate: 677 tests over three consecutive full runs.
