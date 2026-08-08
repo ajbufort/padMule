@@ -27,6 +27,18 @@ KEY=/mnt/c/Users/ajbuf/AppData/Roaming/Sideloadly/key.pem
 BUNDLE=us.ajbconsulting.padMule.Q444CHAF2Z
 WORK="${CLAUDE_JOB_DIR:-/tmp}/ship"
 
+# ONE SHIP AT A TIME. Two overlapping runs on 2026-08-07 both reached the
+# install and both LOST it: iOS answers a second concurrent installation with
+# "Coordinator superseded", so the earlier one dies and the later one can die
+# too. The device is a single resource and the lock says so.
+LOCK=/tmp/padmule-ship.lock
+exec 9>"$LOCK"
+if ! flock -n 9; then
+  echo "ABORT: another ship is in flight (holding $LOCK). The device takes one \
+installation at a time - a second one supersedes the first and can lose both." >&2
+  exit 1
+fi
+
 SHA=$(git rev-parse HEAD)
 SHORT=$(git rev-parse --short HEAD)
 echo "== shipping $SHORT =="
