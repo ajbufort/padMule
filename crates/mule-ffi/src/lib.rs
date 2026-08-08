@@ -464,13 +464,13 @@ async fn ranked_to_hits(g: &Engine, ranked: Vec<RankedFile>) -> Vec<SearchHit> {
     out
 }
 
-/// The single object the native UI holds. Thread-safe; drive it with the
-/// lifecycle methods and poll [`MuleEngine::drain_events`].
 /// How recently bytes must have landed for a row to read as ACTIVE. Three
 /// seconds spans an ordinary gap between blocks without holding the light on
 /// through a real stall.
 const RECEIVING_WINDOW_SECS: u64 = 3;
 
+/// The single object the native UI holds. Thread-safe; drive it with the
+/// lifecycle methods and poll [`MuleEngine::drain_events`].
 #[derive(uniffi::Object)]
 pub struct MuleEngine {
     rt: Runtime,

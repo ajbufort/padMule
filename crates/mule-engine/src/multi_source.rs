@@ -464,10 +464,6 @@ impl Download {
         }
     }
 
-    /// How many CONNECTED sources came from each discovery channel, as
-    /// `(server, kad, source-exchange)`. Feeds the per-transfer origin badge:
-    /// "which channel is actually feeding this download" is invisible otherwise,
-    /// and it is the question a user asks when one file flies and another crawls.
     /// How long a source stays counted in the badge after we last heard from it.
     /// A peer that dropped ten minutes ago is not "a source you have" in any
     /// sense a user means.
@@ -493,6 +489,10 @@ impl Download {
         )
     }
 
+    /// How many CONNECTED sources came from each discovery channel, as
+    /// `(server, kad, source-exchange)`. Feeds the per-transfer origin badge:
+    /// "which channel is actually feeding this download" is invisible otherwise,
+    /// and it is the question a user asks when one file flies and another crawls.
     pub async fn source_origins(&self) -> (u32, u32, u32) {
         let now = crate::credit_store::now_secs() as u64;
         let g = self.sources.lock().await;
@@ -1379,11 +1379,6 @@ where
     download_from_peer_at(fs, dl, bail_on_queue, None, PeerSession::default()).await
 }
 
-/// As [`download_from_peer`], but `peer` names the source address (so a rating +
-/// comment it sends via OP_FILEDESC, and an identity verification, can be recorded
-/// against it) and `sec` carries the secure-ident context (our RSA identity +
-/// whether the peer advertised support), enabling mutual secure-identification
-/// inline with the transfer. `sec = None` disables it (plain download).
 /// The blocks this session has reserved, released when it is dropped.
 ///
 /// A DESTRUCTOR rather than a line at the end of the function, and the
@@ -1427,6 +1422,11 @@ impl Drop for HeldBlocks<'_> {
     }
 }
 
+/// As [`download_from_peer`], but `peer` names the source address (so a rating +
+/// comment it sends via OP_FILEDESC, and an identity verification, can be recorded
+/// against it) and `sec` carries the secure-ident context (our RSA identity +
+/// whether the peer advertised support), enabling mutual secure-identification
+/// inline with the transfer. `sec = None` disables it (plain download).
 pub async fn download_from_peer_at<S>(
     fs: &mut FramedStream<S>,
     dl: &Download,
