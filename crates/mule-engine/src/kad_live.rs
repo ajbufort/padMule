@@ -14,20 +14,27 @@
 //! same u32 feeds `udp_verify_key`, so the key we issue on send matches the one
 //! we recompute on receive (same peer, same convention both directions).
 
+use crate::kad_serve::{answer_request, ServeIdentity};
 use mule_files::{IpFilter, KadContact};
 use mule_kad::{
     build_bootstrap_req, build_hello_req, build_hello_res_ack, build_kad2_req,
     build_search_key_req_restrictive, build_search_source_req, is_acceptable_contact,
-    kad_deobfuscate, kad_keyword_target, kad_obfuscate_request, pack_kad, parse_bootstrap_res,
-    parse_hello, parse_kad2_res, parse_search_res, unpack_kad, BootstrapRes, FileResult, Hello,
-    Lookup, RoutingTable, Source, WireContact, ALPHA_QUERY, K, KAD_FIND_NODE, OP_BOOTSTRAP_RES,
-    OP_HELLO_RES, OP_KAD2_RES, OP_SEARCH_RES,
+    kad_deobfuscate, kad_keyword_target, kad_obfuscate_request, kad_obfuscate_response, pack_kad,
+    parse_bootstrap_res, parse_hello, parse_kad2_res, parse_search_res, unpack_kad, BootstrapRes,
+    FileResult, Hello, Lookup, RoutingTable, Source, WireContact, ALPHA_QUERY, K, KAD_FIND_NODE,
+    OP_BOOTSTRAP_RES, OP_HELLO_RES, OP_KAD2_RES, OP_SEARCH_RES,
 };
 use mule_proto::Kad128;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::time::{timeout, Instant};
+
+/// The message a poisoned lock would carry. A panic while holding one of these
+/// locks is already a bug; propagating the poison is the honest response.
+const LOCK_POISONED: &str = "kad lock poisoned";
 
 /// The contact count padMule requests in a KADEMLIA2_REQ (KAD_FIND_NODE = 0x0B).
 /// A KADEMLIA2_RES with more than this is a malicious over-long answer and is
@@ -122,32 +129,299 @@ impl From<mule_proto::IoError> for KadError {
 }
 
 /// A live Kad node: a bound UDP socket plus our identity and routing table.
+///
+/// The socket is OWNED by a read-loop task spawned at bind (see
+/// [`run_read_loop`]); every datagram either satisfies a pending outbound
+/// request or is answered as an inbound request. The fields the loop must see
+/// live behind SHARED handles (`Arc`), because `start_kad` configures the node
+/// AFTER binding it - a loop that captured `ip_filter: None` or
+/// `advertised_udp_port: None` at bind time would let inbound-learned contacts
+/// bypass the user's blocklist and advertise the BOUND port instead of the
+/// forwarded one (the "moved the check == removed the check" shape).
 pub struct KadNode {
-    socket: UdpSocket,
+    socket: Arc<UdpSocket>,
     kad_id: Kad128,
     udp_key: u32,
     tcp_port: u16,
     /// The UDP port we actually BOUND.
     udp_port: u16,
-    /// The UDP port to ADVERTISE, when it differs from the bound one. A VPN
-    /// forwarder that maps a remote port to a DIFFERENT local port makes these
-    /// two genuinely different numbers: we must bind the local one to receive,
-    /// but tell peers the remote one or they dial a port nobody forwards. The
-    /// eD2k TCP side has had this split since 8bd; Kad used one value for both,
-    /// which is the gap that split predicted would need closing "only if a
-    /// remap is needed" - it is.
-    advertised_udp_port: Option<u16>,
-    routing: RoutingTable,
+    /// The UDP port to ADVERTISE, when it differs from the bound one (0 =
+    /// "advertise what we bound"). A VPN forwarder that maps a remote port to a
+    /// DIFFERENT local port makes these two genuinely different numbers: we
+    /// must bind the local one to receive, but tell peers the remote one or
+    /// they dial a port nobody forwards. The eD2k TCP side has had this split
+    /// since 8bd. Shared with the read loop, which answers HELLOs with it.
+    advertised_udp_port: Arc<AtomicU32>,
+    /// The routing table, reached from two directions: the inbound request
+    /// handler reads it, lookups write it. A `std` mutex held for one table
+    /// operation and NEVER across an await - use [`KadNode::with_routing`].
+    routing: Arc<Mutex<RoutingTable>>,
     /// The user IP blocklist (ipfilter.dat/.p2p), if loaded. eMule consults it on
     /// every Kad routing insert (RoutingZone.cpp:477); padMule threads the engine's
-    /// filter in so a blocklisted range cannot poison the routing table.
-    ip_filter: Option<std::sync::Arc<IpFilter>>,
+    /// filter in so a blocklisted range cannot poison the routing table. Shared
+    /// with the read loop so inbound-learned contacts face it too.
+    ip_filter: Arc<Mutex<Option<Arc<IpFilter>>>>,
     /// Our current public IPv4 (the live equivalent of eMule's
     /// `theApp.GetPublicIP`), learned from the UPnP/SSDP HighID path. A peer's
     /// verify key is `udp_verify_key(peer_secret, THIS)`, so we only echo a stored
     /// key while this still matches what it was minted against. 0 = unknown (echo
     /// no key - byte-identical to the pre-hard-verify wire).
     current_public_ip: u32,
+    /// Outbound requests waiting for their reply, matched by the read loop.
+    pending: Arc<Mutex<Vec<PendingSlot>>>,
+    /// Slot id source, so `request_batch` can remove exactly its own slots.
+    next_seq: AtomicU64,
+    /// The owning read loop. Aborted on drop, so `set_kad(None)` still closes
+    /// the socket and a resume's rebind never races a stale reader.
+    read_loop: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for KadNode {
+    fn drop(&mut self) {
+        // The loop holds an `Arc` of the socket; without this the task - and
+        // the bound port - would outlive the node, and a resume's fresh loop
+        // would race the stale one for datagrams.
+        self.read_loop.abort();
+    }
+}
+
+/// What a matched reply delivers to its waiter: the payload, the
+/// receiver-key verdict (eMule bValidReceiverKey), and the sender key the peer
+/// wants echoed next time.
+type ReplyAnswer = (Vec<u8>, bool, u32);
+
+/// One in-flight outbound request: what it takes to match a reply back to it.
+struct PendingSlot {
+    seq: u64,
+    dest: SocketAddr,
+    dest_ip: u32,
+    /// Our sender verify key for this destination - the value the peer echoes
+    /// as the reply's receiver key (eMule bValidReceiverKey).
+    sender_vk: u32,
+    /// The opcode this slot awaits. Part of the match, so an interleaved
+    /// REQUEST from the same peer falls through to the serve path instead of
+    /// being eaten as a non-matching "reply".
+    expect: u8,
+    tx: tokio::sync::oneshot::Sender<ReplyAnswer>,
+}
+
+/// Add a contact to `routing` only if it passes EVERY gate a wire-learned
+/// contact faces: routable public ip:port, no legacy DNS-port node, the user's
+/// ipfilter, and the anti-sybil per-IP//24 caps. THE ONLY insert path - the
+/// node's methods and the read loop both come through here, so an
+/// inbound-learned contact cannot bypass what an outbound-learned one faces.
+fn gated_add_contact(
+    routing: &Mutex<RoutingTable>,
+    ip_filter: &Mutex<Option<Arc<IpFilter>>>,
+    c: &WireContact,
+    verified: bool,
+) {
+    if !is_acceptable_contact(c.ip, c.udp_port, /*allow_private=*/ false) {
+        return;
+    }
+    // Drop a DNS-port contact from a LEGACY node (anti-reflection: a nodes.dat
+    // naming `victim:53` would spray Kad requests at a DNS server). eMule gates
+    // this on version <= KADEMLIA_VERSION5_48a (0x05), keeping modern nodes, so
+    // match that exactly rather than a blanket reject (which is stricter than
+    // eMule - it would drop a node eMule keeps).
+    if c.udp_port == 53 && c.version <= 5 {
+        return;
+    }
+    // The user blocklist gates Kad inserts exactly as it gates eD2k sources
+    // (eMule RoutingZone.cpp:477): a range the user chose to block never enters
+    // the routing table. Fail-open when no filter is loaded. Clone the Arc out
+    // so the filter guard is not held while the routing lock is taken.
+    let filter = ip_filter.lock().expect(LOCK_POISONED).clone();
+    if let Some(f) = filter {
+        if f.is_blocked_u32(c.ip) {
+            return;
+        }
+    }
+    // Anti-sybil (live-layer): cap how many contacts share one IP / /24, so a
+    // hostile node cannot flood our routing table with fake IDs behind one
+    // address. Skip the cap ONLY for a genuine refresh (same id, SAME ip); a
+    // known id arriving at a DIFFERENT ip is a hijack attempt (KadIDs are
+    // semi-public) and faces the cap on the new ip like a new contact (Zone::add
+    // also clears its verified bit on the ip change). Interop-safe: the real Kad
+    // network is IP-diverse, so a legitimate peer is never dropped. One lock
+    // across check-and-add, so the cap cannot be raced past.
+    let mut t = routing.lock().expect(LOCK_POISONED);
+    let refresh = t.ip_of(&c.id) == Some(c.ip);
+    if c.ip != 0 && !refresh {
+        let (same_ip, same_subnet) = t.ip_counts(c.ip);
+        if same_ip >= mule_kad::MAX_CONTACTS_PER_IP
+            || same_subnet >= mule_kad::MAX_CONTACTS_PER_SUBNET
+        {
+            return;
+        }
+    }
+    t.add(c.id, c.ip, c.udp_port, c.tcp_port, c.version, verified);
+}
+
+/// The closest VERIFIED contacts to `target` as wire contacts, cloned out of
+/// the lock so no caller holds it while doing I/O.
+fn closest_wire_contacts_in(
+    routing: &Mutex<RoutingTable>,
+    target: &Kad128,
+    want: usize,
+) -> Vec<WireContact> {
+    routing
+        .lock()
+        .expect(LOCK_POISONED)
+        .closest_to(target, want)
+        .into_iter()
+        .map(|c| WireContact {
+            id: c.id,
+            ip: c.ip,
+            udp_port: c.udp_port,
+            tcp_port: c.tcp_port,
+            version: c.version,
+        })
+        .collect()
+}
+
+/// What the owning read loop needs. Copies of the immutable identity, and the
+/// SAME `Arc` handles the node's setters write through - never captured VALUES,
+/// which is the whole point of AMENDMENT 2: `start_kad` configures the node
+/// after binding it, so a value captured at spawn would freeze `ip_filter` at
+/// `None` and the advertised port at "bound".
+struct ReadLoop {
+    socket: Arc<UdpSocket>,
+    kad_id: Kad128,
+    udp_key: u32,
+    tcp_port: u16,
+    /// The BOUND port - the fallback when nothing is advertised.
+    udp_port: u16,
+    advertised_udp_port: Arc<AtomicU32>,
+    routing: Arc<Mutex<RoutingTable>>,
+    ip_filter: Arc<Mutex<Option<Arc<IpFilter>>>>,
+    pending: Arc<Mutex<Vec<PendingSlot>>>,
+}
+
+/// The single reader of the Kad socket, for the node's life.
+///
+/// Before this loop existed the socket was read ONLY inside `request_batch`,
+/// while awaiting our own replies - so an inbound HELLO, PING or FIND_NODE was
+/// dropped on the floor, padMule answered nothing, and it aged out of every
+/// routing table that learned it (eMule's OnSmallTimer pings the oldest contact
+/// per bin and evicts what stays silent). Each datagram now goes one of three
+/// ways: deliver to the pending outbound request it answers, answer it as an
+/// inbound request via `kad_serve`, or drop it.
+async fn run_read_loop(ctx: ReadLoop) {
+    let mut buf = vec![0u8; 8192];
+    loop {
+        // A UDP socket can surface an ICMP port-unreachable as a recv error
+        // (Linux ECONNREFUSED), which is routine when a peer is gone. Each call
+        // consumes one queued error, so continuing cannot spin unboundedly.
+        let Ok((n, from)) = ctx.socket.recv_from(&mut buf).await else {
+            continue;
+        };
+        let from_ip = ip_u32(&from);
+        let Some(dec) = kad_deobfuscate(&buf[..n], &ctx.kad_id, ctx.udp_key, from_ip) else {
+            continue; // plaintext or wrong key
+        };
+        let Ok((op, payload)) = unpack_kad(&dec.payload) else {
+            continue;
+        };
+
+        // (a) A pending outbound request waiting on this datagram? The demux
+        // rules are `request_batch`'s, preserved verbatim: the EXACT address
+        // first, so two contacts on one IP (MAX_CONTACTS_PER_IP permits them)
+        // cannot swap answers; then the first slot waiting on the same IP,
+        // because a reply may arrive from a different source port than was
+        // dialled. The opcode is part of the match, so an interleaved REQUEST
+        // from a peer we are awaiting falls through to the serve path below.
+        let slot = {
+            let mut pending = ctx.pending.lock().expect(LOCK_POISONED);
+            pending
+                .iter()
+                .position(|p| p.dest == from && p.expect == op)
+                .or_else(|| {
+                    pending
+                        .iter()
+                        .position(|p| p.dest_ip == from_ip && p.expect == op)
+                })
+                // Vec::remove, not swap_remove: "first slot waiting on that IP"
+                // is an ORDER-dependent rule, and reordering the survivors
+                // would quietly change who is first for the next datagram.
+                .map(|i| pending.remove(i))
+        };
+        if let Some(slot) = slot {
+            // bValidReceiverKey = the reply echoed the verify key we issued for
+            // this destination (eMule ClientUDPSocket.cpp:127). A send to a
+            // receiver that already timed out is the datagram arriving after
+            // the deadline - dropped, exactly as before the loop existed.
+            let _ = slot
+                .tx
+                .send((payload, dec.receiver_vk == slot.sender_vk, dec.sender_vk));
+            continue;
+        }
+
+        // (b) An inbound request. `valid_receiver_key` is the same verdict as
+        // above, computed for the SENDER: it echoed the key we issue for its
+        // address, proving it receives there.
+        let valid_receiver_key = dec.receiver_vk == mule_kad::udp_verify_key(ctx.udp_key, from_ip);
+        // An inbound HELLO carries enough to be RECORDED (the other served
+        // requests name no sender id). Through the gated path only: an inbound
+        // requester faces the ipfilter, the port-53 guard and the anti-sybil
+        // caps exactly like a wire-learned contact - eMule's
+        // Process2HelloRequest does the same via AddContact2.
+        if op == mule_kad::OP_HELLO_REQ {
+            if let Ok(h) = parse_hello(&payload) {
+                gated_add_contact(
+                    &ctx.routing,
+                    &ctx.ip_filter,
+                    &WireContact {
+                        id: h.id,
+                        ip: from_ip,
+                        // The address we can actually reach it at, not a
+                        // claimed one (eMule uses the datagram source too).
+                        udp_port: from.port(),
+                        tcp_port: h.tcp_port,
+                        version: h.version,
+                    },
+                    valid_receiver_key,
+                );
+            }
+        }
+        // NOTE: an inbound OP_HELLO_RES_ACK (mark the sender IP-verified;
+        // eMule hard-drops it on an invalid receiver key) routes from here
+        // when its handler lands - it is a peer's reaction to OUR answer, not
+        // a request, so `answer_request` stays silent on it by design.
+        // Read at ANSWER time through the shared handle, never captured at
+        // spawn: `start_kad` sets this after binding (AMENDMENT 2).
+        let advertised = match ctx.advertised_udp_port.load(Ordering::Relaxed) {
+            0 => ctx.udp_port,
+            p => p as u16,
+        };
+        let me = ServeIdentity {
+            kad_id: ctx.kad_id,
+            tcp_port: ctx.tcp_port,
+            advertised_udp_port: advertised,
+        };
+        let Some(answer) = answer_request(
+            op,
+            &payload,
+            from.port(),
+            &me,
+            valid_receiver_key,
+            |t, want| closest_wire_contacts_in(&ctx.routing, t, want),
+        ) else {
+            continue; // (c) not served - most of the protocol, deliberately
+        };
+        // Keyed and addressed the way every faithful responder in this file's
+        // tests already answers: RC4 on the key the sender asked us to echo
+        // (dec.sender_vk), our own verify key for its address riding along so
+        // it can verify US on its next packet.
+        let datagram = kad_obfuscate_response(
+            &pack_kad(answer.opcode, answer.payload),
+            rand::random(),
+            dec.sender_vk,
+            mule_kad::udp_verify_key(ctx.udp_key, from_ip),
+            rand::random(),
+        );
+        let _ = ctx.socket.send_to(&datagram, from).await;
+    }
 }
 
 impl KadNode {
@@ -175,30 +449,56 @@ impl KadNode {
         kad_id: Kad128,
         udp_key: u32,
     ) -> Result<Self, KadError> {
-        let socket = bind_kad_socket(bind_addr)?;
+        let socket = Arc::new(bind_kad_socket(bind_addr)?);
         let udp_port = socket.local_addr()?.port();
+        let advertised_udp_port = Arc::new(AtomicU32::new(0));
+        let routing = Arc::new(Mutex::new(RoutingTable::new(kad_id)));
+        let ip_filter: Arc<Mutex<Option<Arc<IpFilter>>>> = Arc::new(Mutex::new(None));
+        let pending: Arc<Mutex<Vec<PendingSlot>>> = Arc::new(Mutex::new(Vec::new()));
+        // The owning read loop, for the node's whole life. It shares the
+        // HANDLES above rather than capturing values, so configuration applied
+        // after this point (`set_ip_filter`, `set_advertised_udp_port`) is
+        // visible to it - see AMENDMENT 2 in the kad-serve-loop plan.
+        let read_loop = tokio::spawn(run_read_loop(ReadLoop {
+            socket: Arc::clone(&socket),
+            kad_id,
+            udp_key,
+            tcp_port,
+            udp_port,
+            advertised_udp_port: Arc::clone(&advertised_udp_port),
+            routing: Arc::clone(&routing),
+            ip_filter: Arc::clone(&ip_filter),
+            pending: Arc::clone(&pending),
+        }));
         Ok(KadNode {
             socket,
             kad_id,
             udp_key,
             tcp_port,
             udp_port,
-            advertised_udp_port: None,
-            routing: RoutingTable::new(kad_id),
-            ip_filter: None,
+            advertised_udp_port,
+            routing,
+            ip_filter,
             current_public_ip: 0,
+            pending,
+            next_seq: AtomicU64::new(0),
+            read_loop,
         })
     }
 
     /// Advertise a UDP port different from the one we bound (a VPN remote->local
     /// remap). `None` restores "advertise what we bound".
     pub fn set_advertised_udp_port(&mut self, port: Option<u16>) {
-        self.advertised_udp_port = port.filter(|&p| p != 0);
+        let p = port.filter(|&p| p != 0).map_or(0, u32::from);
+        self.advertised_udp_port.store(p, Ordering::Relaxed);
     }
 
     /// The UDP port peers should dial us on.
     fn advertised_udp(&self) -> u16 {
-        self.advertised_udp_port.unwrap_or(self.udp_port)
+        match self.advertised_udp_port.load(Ordering::Relaxed) {
+            0 => self.udp_port,
+            p => p as u16,
+        }
     }
 
     /// Set our current public IPv4 (from the UPnP/SSDP HighID path), against which
@@ -211,26 +511,54 @@ impl KadNode {
     /// Install the user IP blocklist so blocklisted ranges are dropped from every
     /// routing insert (matching eMule). `None` = no filter (fail-open).
     pub fn set_ip_filter(&mut self, filter: Option<std::sync::Arc<IpFilter>>) {
-        self.ip_filter = filter;
+        *self.ip_filter.lock().expect(LOCK_POISONED) = filter;
     }
 
     pub fn kad_id(&self) -> Kad128 {
         self.kad_id
     }
-    pub fn routing(&self) -> &RoutingTable {
-        &self.routing
-    }
-    /// Mutable access to the live table. TEST-ONLY: it exists so the engine's
-    /// lifecycle tests can seed a node the way a real session would fill it
-    /// (lookups + `note_responder`), which is the only way to drive the
-    /// checkpoint path with a table that actually differs from the persisted one.
-    /// Production code must reach the table through the gated `add_contact`.
+
+    /// The address the Kad socket is bound to. Test-only for now: the loop's
+    /// tests aim datagrams at it; no production caller exists yet (the engine
+    /// binds a KNOWN port). Lift the cfg when one appears.
     #[cfg(test)]
-    pub(crate) fn routing_mut(&mut self) -> &mut RoutingTable {
-        &mut self.routing
+    pub(crate) fn local_addr(&self) -> SocketAddr {
+        self.socket
+            .local_addr()
+            .expect("a bound socket has a local address")
     }
+
+    /// A NON-owning view of the socket, so a test can watch it actually die.
+    ///
+    /// Exists because `Drop::abort` is otherwise unobservable: the node is gone
+    /// by the time you would ask, and the property that matters - "the read
+    /// loop released the socket" - is about a task we no longer hold a handle
+    /// to. A `Weak` outlives both and answers exactly that question.
+    #[cfg(test)]
+    pub(crate) fn socket_weak(&self) -> std::sync::Weak<UdpSocket> {
+        Arc::downgrade(&self.socket)
+    }
+
+    /// Run `f` against the routing table.
+    ///
+    /// A `std` mutex held for the length of one table operation and NEVER
+    /// across an await - the same discipline `Engine::public_ip` and
+    /// `harvested_servers` already follow. The table is reached from two
+    /// directions (the inbound handler reads it, lookups write it), which is
+    /// why it needs a lock at all.
+    pub(crate) fn with_routing<R>(&self, f: impl FnOnce(&mut RoutingTable) -> R) -> R {
+        let mut g = self.routing.lock().expect(LOCK_POISONED);
+        f(&mut g)
+    }
+
+    /// The closest VERIFIED contacts to `target`, as wire contacts. Clones out
+    /// of the lock so callers never hold it while doing I/O.
+    pub(crate) fn closest_wire_contacts(&self, target: &Kad128, want: usize) -> Vec<WireContact> {
+        closest_wire_contacts_in(&self.routing, target, want)
+    }
+
     pub fn contacts_known(&self) -> usize {
-        self.routing.len()
+        self.with_routing(|t| t.len())
     }
 
     /// Seed this node's routing table from contacts we already hold (nodes.dat
@@ -263,17 +591,20 @@ impl KadNode {
             self.add_contact(c.id, c.ip, c.udp_port, c.tcp_port, c.version, c.verified);
             // Only for a contact that actually survived the gates - otherwise a
             // blocked address could still park a key against its id.
-            if c.udp_key != 0 && self.routing.contains(&c.id) {
-                self.routing
-                    .note_verify_key(&c.id, c.ip, c.udp_key, c.udp_key_ip);
+            if c.udp_key != 0 {
+                self.with_routing(|t| {
+                    if t.contains(&c.id) {
+                        t.note_verify_key(&c.id, c.ip, c.udp_key, c.udp_key_ip);
+                    }
+                });
             }
         }
-        self.routing.len()
+        self.contacts_known()
     }
 
-    /// Add a contact to the routing table only if its IP:port is a routable
-    /// public address with a usable UDP port (eMule 0.70b hardening) - junk /
-    /// unroutable / port-0 contacts never enter the table.
+    /// Add a contact to the routing table only if it passes the wire-contact
+    /// gates - see [`gated_add_contact`], the ONE insert path, which the read
+    /// loop shares.
     fn add_contact(
         &mut self,
         id: Kad128,
@@ -283,43 +614,18 @@ impl KadNode {
         version: u8,
         verified: bool,
     ) {
-        if !is_acceptable_contact(ip, udp_port, /*allow_private=*/ false) {
-            return;
-        }
-        // Drop a DNS-port contact from a LEGACY node (anti-reflection: a nodes.dat
-        // naming `victim:53` would spray Kad requests at a DNS server). eMule gates
-        // this on version <= KADEMLIA_VERSION5_48a (0x05), keeping modern nodes, so
-        // match that exactly rather than a blanket reject (which is stricter than
-        // eMule - it would drop a node eMule keeps).
-        if udp_port == 53 && version <= 5 {
-            return;
-        }
-        // The user blocklist gates Kad inserts exactly as it gates eD2k sources
-        // (eMule RoutingZone.cpp:477): a range the user chose to block never enters
-        // the routing table. Fail-open when no filter is loaded.
-        if let Some(f) = &self.ip_filter {
-            if f.is_blocked_u32(ip) {
-                return;
-            }
-        }
-        // Anti-sybil (live-layer): cap how many contacts share one IP / /24, so a
-        // hostile node cannot flood our routing table with fake IDs behind one
-        // address. Skip the cap ONLY for a genuine refresh (same id, SAME ip); a
-        // known id arriving at a DIFFERENT ip is a hijack attempt (KadIDs are
-        // semi-public) and faces the cap on the new ip like a new contact (Zone::add
-        // also clears its verified bit on the ip change). Interop-safe: the real Kad
-        // network is IP-diverse, so a legitimate peer is never dropped.
-        let refresh = self.routing.ip_of(&id) == Some(ip);
-        if ip != 0 && !refresh {
-            let (same_ip, same_subnet) = self.routing.ip_counts(ip);
-            if same_ip >= mule_kad::MAX_CONTACTS_PER_IP
-                || same_subnet >= mule_kad::MAX_CONTACTS_PER_SUBNET
-            {
-                return;
-            }
-        }
-        self.routing
-            .add(id, ip, udp_port, tcp_port, version, verified);
+        gated_add_contact(
+            &self.routing,
+            &self.ip_filter,
+            &WireContact {
+                id,
+                ip,
+                udp_port,
+                tcp_port,
+                version,
+            },
+            verified,
+        );
     }
 
     /// Record a RESPONDING node in one move: insert/refresh it (through the
@@ -331,8 +637,8 @@ impl KadNode {
     /// dropping it).
     fn note_responder(&mut self, c: &WireContact, verified: bool, sender_vk: u32) {
         self.add_contact(c.id, c.ip, c.udp_port, c.tcp_port, c.version, verified);
-        self.routing
-            .note_verify_key(&c.id, c.ip, sender_vk, self.current_public_ip);
+        let our_ip = self.current_public_ip;
+        self.with_routing(|t| t.note_verify_key(&c.id, c.ip, sender_vk, our_ip));
     }
 
     /// Send an obfuscated Kad request (NodeID-keyed on `target_id`, our
@@ -391,22 +697,12 @@ impl KadNode {
         expect: u8,
         wait: Duration,
     ) -> Vec<Result<(Vec<u8>, bool, u32), KadError>> {
-        /// One in-flight request: what it takes to match a reply back to it.
-        struct Pending {
-            dest: SocketAddr,
-            dest_ip: u32,
-            /// Our sender verify key for this destination - the value the peer
-            /// echoes as the reply's receiver key (eMule bValidReceiverKey).
-            sender_vk: u32,
-            answer: Result<(Vec<u8>, bool, u32), KadError>,
-        }
-        impl Pending {
-            fn waiting(&self) -> bool {
-                matches!(self.answer, Err(KadError::Timeout))
-            }
-        }
-
-        let mut pending: Vec<Pending> = Vec::with_capacity(reqs.len());
+        // The socket's single reader is the owning loop (`run_read_loop`); this
+        // REGISTERS a slot per request and awaits its oneshot. The matching
+        // rules live in the loop, moved verbatim: exact address first, then the
+        // first slot waiting on the same IP.
+        let mut slots: Vec<Result<(u64, tokio::sync::oneshot::Receiver<ReplyAnswer>), KadError>> =
+            Vec::with_capacity(reqs.len());
         for (target_id, dest, frame) in reqs {
             let dest_ip = ip_u32(dest);
             let sender_vk = mule_kad::udp_verify_key(self.udp_key, dest_ip);
@@ -416,9 +712,8 @@ impl KadNode {
             // which is byte-identical to the pre-hard-verify wire. This is a FIELD
             // flip only; the RC4 obfuscation stays NodeID-keyed, byte-faithful to
             // eMule (EncryptedDatagramSocket.cpp: NodeID always wins when present).
-            let echo_vk = self
-                .routing
-                .verify_key_for(target_id, dest_ip, self.current_public_ip);
+            let our_ip = self.current_public_ip;
+            let echo_vk = self.with_routing(|t| t.verify_key_for(target_id, dest_ip, our_ip));
             let datagram = kad_obfuscate_request(
                 frame,
                 target_id,
@@ -427,82 +722,64 @@ impl KadNode {
                 sender_vk,      // our key, want this echoed so WE can verify IT
                 rand::random(), // marker randomness
             );
-            // A send that fails is THIS request's failure, not the batch's - the
-            // others are already on the wire and their answers are still coming.
-            let answer = match self.socket.send_to(&datagram, *dest).await {
-                Ok(_) => Err(KadError::Timeout), // replaced when the reply lands
-                Err(e) => Err(KadError::Io(e)),
-            };
-            pending.push(Pending {
+            let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            // Register BEFORE sending, so a reply (loopback is this fast)
+            // cannot arrive while its slot does not exist yet.
+            self.pending.lock().expect(LOCK_POISONED).push(PendingSlot {
+                seq,
                 dest: *dest,
                 dest_ip,
                 sender_vk,
-                answer,
+                expect,
+                tx,
             });
+            // A send that fails is THIS request's failure, not the batch's - the
+            // others are already on the wire and their answers are still coming.
+            // Its slot is withdrawn at once: no reply is coming, and a dead slot
+            // must not swallow another request's IP-fallback match (the old
+            // loop's `waiting()` check excluded exactly these).
+            match self.socket.send_to(&datagram, *dest).await {
+                Ok(_) => slots.push(Ok((seq, rx))),
+                Err(e) => {
+                    self.pending
+                        .lock()
+                        .expect(LOCK_POISONED)
+                        .retain(|p| p.seq != seq);
+                    slots.push(Err(KadError::Io(e)));
+                }
+            }
         }
 
-        let mut outstanding = pending.iter().filter(|p| p.waiting()).count();
+        // ONE deadline for the whole batch: each slot awaits only what remains
+        // of the shared window, so a batch of silent peers costs one window,
+        // not one per peer.
         let deadline = Instant::now() + wait;
-        let mut buf = vec![0u8; 8192];
-        // A UDP socket can surface an ICMP port-unreachable as a recv error
-        // (Linux ECONNREFUSED), which is routine when one peer in a batch is
-        // gone. Skipping it would let a persistent error spin the loop until the
-        // deadline, so bound the skips instead of trusting the clock alone.
-        let mut recv_errors = 0u32;
-        while outstanding > 0 {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-            let (n, from) = match timeout(remaining, self.socket.recv_from(&mut buf)).await {
-                Ok(Ok(v)) => v,
-                Ok(Err(_)) => {
-                    recv_errors += 1;
-                    if recv_errors > 32 {
-                        break;
-                    }
-                    continue;
+        let mut answers = Vec::with_capacity(slots.len());
+        let mut batch_seqs = Vec::with_capacity(slots.len());
+        for slot in slots {
+            match slot {
+                Err(e) => answers.push(Err(e)),
+                Ok((seq, rx)) => {
+                    batch_seqs.push(seq);
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    answers.push(match timeout(remaining, rx).await {
+                        Ok(Ok(answer)) => Ok(answer),
+                        // Elapsed, or the loop task is gone (node dropping).
+                        _ => Err(KadError::Timeout),
+                    });
                 }
-                Err(_) => break, // the deadline - every unanswered slot stays Timeout
-            };
-            let from_ip = ip_u32(&from);
-            // Match the EXACT address first, so a batch holding two contacts on one
-            // IP cannot hand one peer's answer to the other - the routing table
-            // permits up to MAX_CONTACTS_PER_IP of them, so this is reachable.
-            // Fall back to the first slot waiting on that IP, which is the looser
-            // rule a single `request` has always used: a reply arriving from a
-            // different source port than we dialled is still that peer's reply.
-            let Some(i) = pending
-                .iter()
-                .position(|p| p.dest == from && p.waiting())
-                .or_else(|| {
-                    pending
-                        .iter()
-                        .position(|p| p.dest_ip == from_ip && p.waiting())
-                })
-            else {
-                continue; // unsolicited traffic from a node this batch is not asking
-            };
-            let p = &mut pending[i];
-            let Some(dec) = kad_deobfuscate(&buf[..n], &self.kad_id, self.udp_key, from_ip) else {
-                continue; // plaintext or wrong key - not our reply
-            };
-            let Ok((op, payload)) = unpack_kad(&dec.payload) else {
-                continue;
-            };
-            if op != expect {
-                continue; // a different opcode from the same peer (e.g. HELLO_REQ)
             }
-            // bValidReceiverKey = GetUDPVerifyKey(senderIP) == packet receiver key
-            // (eMule ClientUDPSocket.cpp:127). The value we issued as our sender key
-            // is exactly udp_verify_key(our_key, dest_ip), so the peer echoing it
-            // back means the key round-tripped.
-            // dec.sender_vk is the key THIS peer wants us to echo next time; the
-            // caller stores it (note_verify_key) so a later request verifies us.
-            p.answer = Ok((payload, dec.receiver_vk == p.sender_vk, dec.sender_vk));
-            outstanding -= 1;
         }
-        pending.into_iter().map(|p| p.answer).collect()
+        // Withdraw every slot this batch registered. Answered ones are already
+        // gone (the loop removes on delivery); the unanswered MUST go now, or a
+        // stale slot would swallow the next batch's reply from the same peer
+        // and feed it to a receiver nobody holds.
+        self.pending
+            .lock()
+            .expect(LOCK_POISONED)
+            .retain(|p| !batch_seqs.contains(&p.seq));
+        answers
     }
 
     /// Send a BOOTSTRAP_REQ to one contact and parse its BOOTSTRAP_RES, seeding
@@ -533,8 +810,8 @@ impl KadNode {
         );
         // Store the verify key it handed us (bound to our current public IP) so a
         // later request to it echoes the key and it verifies us in return.
-        self.routing
-            .note_verify_key(&res.id, contact.ip, sender_vk, self.current_public_ip);
+        let our_ip = self.current_public_ip;
+        self.with_routing(|t| t.note_verify_key(&res.id, contact.ip, sender_vk, our_ip));
         for c in &res.contacts {
             self.add_contact(c.id, c.ip, c.udp_port, c.tcp_port, c.version, false);
         }
@@ -683,7 +960,9 @@ impl KadNode {
                 // some other address: a KadID is semi-public, so that is precisely
                 // how an attacker takes over a known node's identity (eMule
                 // CRoutingZone::IsAcceptableContact, RoutingZone.cpp:1014-1020).
-                contacts.retain(|c| self.routing.is_acceptable_answer(&c.id, c.ip, c.udp_port));
+                self.with_routing(|t| {
+                    contacts.retain(|c| t.is_acceptable_answer(&c.id, c.ip, c.udp_port))
+                });
                 Some((contacts, verified, sender_vk))
             })
             .collect()
@@ -746,19 +1025,8 @@ impl KadNode {
     /// keeps improving, not one perfect lookup.
     pub async fn refresh_routing(&mut self, target: &Kad128, per_query: Duration) -> usize {
         crate::stats::note_kad_lookup();
-        let before = self.routing.len();
-        let seeds: Vec<WireContact> = self
-            .routing
-            .closest_to(target, 50)
-            .into_iter()
-            .map(|c| WireContact {
-                id: c.id,
-                ip: c.ip,
-                udp_port: c.udp_port,
-                tcp_port: c.tcp_port,
-                version: c.version,
-            })
-            .collect();
+        let before = self.contacts_known();
+        let seeds = self.closest_wire_contacts(target, 50);
         if seeds.is_empty() {
             return 0; // nothing to ask - bootstrap first
         }
@@ -784,7 +1052,7 @@ impl KadNode {
                 lookup.on_response(contacts);
             }
         }
-        self.routing.len().saturating_sub(before)
+        self.contacts_known().saturating_sub(before)
     }
 
     /// The Wave-6 goal: resolve an ed2k `file_hash` to sources. Runs an iterative
@@ -800,18 +1068,7 @@ impl KadNode {
     ) -> Result<ResolveOutcome, KadError> {
         crate::stats::note_kad_lookup();
         // Seed the lookup from the routing table's closest-to-hash contacts.
-        let seeds: Vec<WireContact> = self
-            .routing
-            .closest_to(file_hash, 50)
-            .into_iter()
-            .map(|c| WireContact {
-                id: c.id,
-                ip: c.ip,
-                udp_port: c.udp_port,
-                tcp_port: c.tcp_port,
-                version: c.version,
-            })
-            .collect();
+        let seeds = self.closest_wire_contacts(file_hash, 50);
         if seeds.is_empty() {
             return Err(KadError::NotReady); // no routing table - bootstrap first
         }
@@ -943,18 +1200,7 @@ impl KadNode {
             return Ok(Vec::new()); // nothing indexable (all tokens under 3 bytes)
         };
         let target = kad_keyword_target(&primary);
-        let seeds: Vec<WireContact> = self
-            .routing
-            .closest_to(&target, 50)
-            .into_iter()
-            .map(|c| WireContact {
-                id: c.id,
-                ip: c.ip,
-                udp_port: c.udp_port,
-                tcp_port: c.tcp_port,
-                version: c.version,
-            })
-            .collect();
+        let seeds = self.closest_wire_contacts(&target, 50);
         if seeds.is_empty() {
             return Err(KadError::NotReady); // bootstrap first
         }
@@ -1107,7 +1353,7 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            socket2::SockRef::from(&node.socket)
+            socket2::SockRef::from(&*node.socket)
                 .reuse_address()
                 .unwrap(),
             "the Kad UDP socket must set SO_REUSEADDR"
@@ -1401,8 +1647,7 @@ mod tests {
         let peer_ip = ip_u32(&peer_addr);
         // Seeded straight into the table: `closest_to` hands out VERIFIED contacts
         // only, and this stands in for one a live lookup had already proved.
-        node.routing
-            .add(peer_id, peer_ip, peer_addr.port(), 4662, 8, true);
+        node.with_routing(|t| t.add(peer_id, peer_ip, peer_addr.port(), 4662, 8, true));
         let mock = spawn_search_only_mock(peer, peer_id, target);
 
         node.resolve_sources(&target, 1000, 1, Duration::from_millis(300))
@@ -1410,7 +1655,7 @@ mod tests {
             .unwrap();
         mock.abort();
         assert_eq!(
-            node.routing.verify_key_for(&peer_id, peer_ip, our_ip),
+            node.with_routing(|t| t.verify_key_for(&peer_id, peer_ip, our_ip)),
             MOCK_SENDER_VK,
             "resolve_sources stored the searched node's sender key"
         );
@@ -1433,8 +1678,7 @@ mod tests {
         let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let peer_addr = peer.local_addr().unwrap();
         let peer_ip = ip_u32(&peer_addr);
-        node.routing
-            .add(peer_id, peer_ip, peer_addr.port(), 4662, 8, true);
+        node.with_routing(|t| t.add(peer_id, peer_ip, peer_addr.port(), 4662, 8, true));
         let mock = spawn_search_only_mock(peer, peer_id, target);
 
         node.resolve_keyword("minister", 1, Duration::from_millis(300))
@@ -1442,7 +1686,7 @@ mod tests {
             .unwrap();
         mock.abort();
         assert_eq!(
-            node.routing.verify_key_for(&peer_id, peer_ip, our_ip),
+            node.with_routing(|t| t.verify_key_for(&peer_id, peer_ip, our_ip)),
             MOCK_SENDER_VK,
             "resolve_keyword stored the searched node's sender key"
         );
@@ -1468,10 +1712,10 @@ mod tests {
         let peer_vk = 0xCAFE_BABEu32;
 
         // Inject the peer with the key it handed us, minted against OUR public IP.
-        node.routing
-            .add(peer_id, peer_ip, peer_addr.port(), 4662, 8, false);
-        node.routing
-            .note_verify_key(&peer_id, peer_ip, peer_vk, our_ip);
+        node.with_routing(|t| {
+            t.add(peer_id, peer_ip, peer_addr.port(), 4662, 8, false);
+            t.note_verify_key(&peer_id, peer_ip, peer_vk, our_ip);
+        });
 
         let (tx, rx) = tokio::sync::oneshot::channel::<u32>();
         let mock = tokio::spawn(async move {
@@ -1506,9 +1750,9 @@ mod tests {
         // IP-bound: after our public IP changes, the stored key no longer matches,
         // so we fall back to echoing 0 (byte-identical to the pre-hard-verify wire).
         node.set_public_ip(0x0B00_0002);
+        let now_ip = node.current_public_ip;
         assert_eq!(
-            node.routing
-                .verify_key_for(&peer_id, peer_ip, node.current_public_ip),
+            node.with_routing(|t| t.verify_key_for(&peer_id, peer_ip, now_ip)),
             0
         );
     }
@@ -1698,7 +1942,7 @@ mod tests {
         // re-pointing id1 onto it is refused; id1 stays at its original ip.
         node.add_contact(id1, 0x0808_0809, 4672, 4662, 8, false);
         assert_eq!(
-            node.routing().ip_of(&id1),
+            node.with_routing(|t| t.ip_of(&id1)),
             Some(0x0808_0808),
             "hijack to a full IP refused; id stays put"
         );
@@ -1727,6 +1971,277 @@ mod tests {
             false,
         );
         assert_eq!(node.contacts_known(), 1, "second id on the same IP refused");
+    }
+
+    /// Send one obfuscated HELLO_REQ from a fresh mock peer to `ours` and
+    /// return the parsed HELLO_RES. `echo_vk` is what the mock echoes as the
+    /// packet's receiver key - the node's own verify key for 127.0.0.1 to play
+    /// a sender whose IP is already proven, anything else to play an unproven
+    /// one.
+    async fn drive_hello(ours: SocketAddr, node_id: &Kad128, echo_vk: u32) -> Hello {
+        let peer_id = Kad128::from_hash(&[0x77; 16]);
+        let peer_key = 0x5A5Au32;
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (op, payload) = build_hello_req(
+            &peer_id,
+            4662,
+            Some(peer.local_addr().unwrap().port()),
+            None,
+        );
+        // The sender key we hand the node is our verify key for ITS address, so
+        // its receiver-keyed answer decrypts here - the same role a real v8
+        // peer plays.
+        let my_vk = udp_verify_key(peer_key, ip_u32(&ours));
+        let dg = kad_obfuscate_request(
+            &pack_kad(op, payload),
+            node_id,
+            0x3333,
+            echo_vk,
+            my_vk,
+            0x40,
+        );
+        peer.send_to(&dg, ours).await.unwrap();
+        let mut buf = vec![0u8; 8192];
+        let (n, from) = timeout(Duration::from_secs(3), peer.recv_from(&mut buf))
+            .await
+            .expect("the HELLO must be answered")
+            .unwrap();
+        let dec = kad_deobfuscate(&buf[..n], &peer_id, peer_key, ip_u32(&from)).unwrap();
+        let (rop, rpayload) = unpack_kad(&dec.payload).unwrap();
+        assert_eq!(rop, OP_HELLO_RES);
+        parse_hello(&rpayload).unwrap()
+    }
+
+    /// THE REGRESSION ONE SHARED SOCKET MAKES POSSIBLE: an inbound request
+    /// arriving while an outbound request is waiting for its reply. Before the
+    /// owning loop, the only reader was the reply collector and it DISCARDED
+    /// anything it was not waiting for - so a peer's PING was dropped on the
+    /// DROPPING THE NODE MUST STOP ITS READ LOOP, or `pause()` never releases
+    /// the Kad port.
+    ///
+    /// The loop owns an `Arc<UdpSocket>`. If it outlives the node the socket
+    /// stays bound, and the fresh loop a `resume()` spawns RACES the stale one
+    /// for every inbound datagram - each is delivered to exactly one reader, so
+    /// the loser silently loses replies. Clean pause/resume is a hard
+    /// requirement here (docs/wiki/lifecycle-and-reactivation.md) and this is
+    /// the half of it the read loop introduced.
+    ///
+    /// Watched through a `Weak` because the property is about a task we no
+    /// longer hold: once the node is dropped there is nothing left to ask. The
+    /// abort is asynchronous - it takes effect when the runtime next polls the
+    /// task - so this yields rather than sleeping, and fails on a bounded wait
+    /// instead of hanging.
+    #[tokio::test]
+    async fn dropping_the_node_stops_its_read_loop_and_releases_the_socket() {
+        let node = KadNode::bind_with_identity(
+            "127.0.0.1:0".parse().unwrap(),
+            4662,
+            Kad128::from_words([7, 7, 7, 7]),
+            0x5150,
+        )
+        .await
+        .unwrap();
+        let socket = node.socket_weak();
+        assert!(
+            socket.upgrade().is_some(),
+            "precondition: the socket is alive while the node is"
+        );
+
+        drop(node);
+
+        for _ in 0..1000 {
+            if socket.upgrade().is_none() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!(
+            "the read loop outlived its node and still holds the socket - the \
+             Kad port would never be released on pause(), and a resumed node \
+             would race the stale loop for datagrams"
+        );
+    }
+
+    /// THE REGRESSION ONE SHARED SOCKET MAKES POSSIBLE: an inbound request
+    /// arriving while an outbound request is waiting for its reply. Before the
+    /// owning loop, the only reader was the reply collector and it DISCARDED
+    /// anything it was not waiting for - so a peer's PING was dropped on the
+    /// floor and padMule aged out of every routing table that learned it. Both
+    /// sides must work at once.
+    #[tokio::test]
+    async fn an_inbound_request_is_answered_while_a_reply_is_outstanding() {
+        let our_id = Kad128::from_words([5, 5, 5, 5]);
+        let mut node =
+            KadNode::bind_with_identity("127.0.0.1:0".parse().unwrap(), 4662, our_id, 0x1234)
+                .await
+                .unwrap();
+        let _ = node.local_addr(); // the accessor the loop's tests rely on
+
+        // A peer that PINGS us while our own request to it is in flight.
+        let peer_id = Kad128::from_hash(&[0x66; 16]);
+        let peer_key = 0x9999u32;
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+
+        let mock = tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            // 1. our BOOTSTRAP_REQ arrives
+            let (n, from) = peer.recv_from(&mut buf).await.unwrap();
+            let dec = kad_deobfuscate(&buf[..n], &peer_id, peer_key, ip_u32(&from)).unwrap();
+            // 2. before answering, PING the node - this is the interleaving
+            let (po, pp) = mule_kad::build_ping();
+            let my_vk = udp_verify_key(peer_key, ip_u32(&from));
+            let dg = kad_obfuscate_request(
+                &pack_kad(po, pp),
+                &Kad128::from_words([5, 5, 5, 5]),
+                0x1111,
+                0,
+                my_vk,
+                0x40,
+            );
+            peer.send_to(&dg, from).await.unwrap();
+            // 3. now answer the bootstrap
+            let (ro, rp) = build_bootstrap_res(&peer_id, 4662, 8, &[]);
+            let ack = kad_obfuscate_response(&pack_kad(ro, rp), 0x2468, dec.sender_vk, 0, 0x80);
+            peer.send_to(&ack, from).await.unwrap();
+            // 4. and read OUR pong - bounded, so an unanswered ping FAILS the
+            // test instead of hanging it
+            match timeout(Duration::from_secs(3), peer.recv_from(&mut buf)).await {
+                Ok(Ok((n2, from2))) => {
+                    let dec2 =
+                        kad_deobfuscate(&buf[..n2], &peer_id, peer_key, ip_u32(&from2)).unwrap();
+                    Some(unpack_kad(&dec2.payload).unwrap())
+                }
+                _ => None,
+            }
+        });
+
+        let res = node
+            .bootstrap_from(&test_contact(peer_id, peer_addr), Duration::from_secs(3))
+            .await;
+        assert!(
+            res.is_ok(),
+            "the reply must reach its waiter despite the interleaved request"
+        );
+        let (pong_op, pong_payload) = mock
+            .await
+            .unwrap()
+            .expect("the inbound PING must have been answered");
+        assert_eq!(pong_op, mule_kad::OP_PONG);
+        assert_eq!(
+            pong_payload,
+            peer_addr.port().to_le_bytes().to_vec(),
+            "the PONG carries the REQUESTER's port - how it learns its external port"
+        );
+    }
+
+    /// AMENDMENT 2: `start_kad` configures the node AFTER binding it, and the
+    /// read loop is spawned AT bind - so the loop must read its configuration
+    /// through the SHARED handles the setters write. A loop that captured the
+    /// advertised port at spawn would see `None` and answer with the BOUND
+    /// port, putting us in peers' tables at a dead address behind a VPN
+    /// remote-to-local forward. This test FAILS against that capture.
+    #[tokio::test]
+    async fn an_inbound_hello_is_answered_with_config_applied_after_bind() {
+        let our_id = Kad128::from_words([8, 8, 8, 8]);
+        let mut node =
+            KadNode::bind_with_identity("127.0.0.1:0".parse().unwrap(), 4662, our_id, 0x4242)
+                .await
+                .unwrap();
+        let ours = node.local_addr();
+        // AFTER bind, exactly as start_kad orders it.
+        node.set_advertised_udp_port(Some(5999));
+
+        let hello = drive_hello(ours, &our_id, 0).await;
+        assert_eq!(hello.id, our_id);
+        assert_eq!(
+            hello.source_udp_port,
+            Some(5999),
+            "the HELLO_RES must advertise the port set AFTER bind, not the bound one - \
+             a loop that captured config at spawn cannot see it"
+        );
+    }
+
+    /// An inbound HELLO's sender is recorded through the SAME gated path as a
+    /// wire-learned contact. Loopback is not a routable public address, so the
+    /// gate must refuse it - a raw insert that bypassed `gated_add_contact`
+    /// would put 127.0.0.1 in the table and fail this.
+    #[tokio::test]
+    async fn an_inbound_hello_sender_faces_the_add_contact_gates() {
+        let our_id = Kad128::from_words([9, 9, 9, 9]);
+        let node =
+            KadNode::bind_with_identity("127.0.0.1:0".parse().unwrap(), 4662, our_id, 0x5151)
+                .await
+                .unwrap();
+        let ours = node.local_addr();
+        let _ = drive_hello(ours, &our_id, 0).await; // answered...
+        assert_eq!(
+            node.contacts_known(),
+            0,
+            "...but a loopback sender must not enter the routing table"
+        );
+    }
+
+    /// The ACK bit in our HELLO_RES must reflect the REAL receiver-key verdict:
+    /// a sender that echoed the verify key we issue for its address has proved
+    /// its IP and must NOT be asked to prove it again (eMule
+    /// `bAddedOrUpdated && !bValidReceiverKey`, KademliaUDPListener.cpp:601).
+    #[tokio::test]
+    async fn a_verified_hello_sender_is_not_asked_for_an_ack() {
+        let our_id = Kad128::from_words([6, 6, 6, 6]);
+        let our_key = 0x7777u32;
+        let node =
+            KadNode::bind_with_identity("127.0.0.1:0".parse().unwrap(), 4662, our_id, our_key)
+                .await
+                .unwrap();
+        let ours = node.local_addr();
+
+        // The key we issue for the mock's address (loopback) - echoing it back
+        // is the proof of IP the verdict is about.
+        let proven_vk = udp_verify_key(our_key, ip_u32(&"127.0.0.1:1".parse().unwrap()));
+        let proven = drive_hello(ours, &our_id, proven_vk).await;
+        assert!(
+            proven.misc_options.is_none_or(|m| m & 0x04 == 0),
+            "a sender that proved its IP must not be asked for an ACK, got {:?}",
+            proven.misc_options
+        );
+
+        let unproven = drive_hello(ours, &our_id, 0xBAD0_BEEF).await;
+        assert_eq!(
+            unproven.misc_options,
+            Some(0x04),
+            "an unproven sender must be asked for the verification ACK"
+        );
+    }
+
+    /// The table is reachable from two places once the socket loop exists - the
+    /// request handler reads it, lookups write it - so it lives behind a lock.
+    /// This pins that the lock is taken per operation: a closure that takes it,
+    /// does its work and drops the guard is the only allowed shape (never held
+    /// across an await).
+    #[tokio::test]
+    async fn the_routing_table_is_shared_and_readable_while_a_lookup_holds_the_node() {
+        let node = KadNode::bind_with_identity(
+            "127.0.0.1:0".parse().unwrap(),
+            4662,
+            Kad128::from_words([2, 2, 2, 2]),
+            0x4321,
+        )
+        .await
+        .unwrap();
+        node.with_routing(|t| {
+            t.add(
+                Kad128::from_hash(&[9; 16]),
+                0x0A00_0001,
+                4672,
+                4662,
+                8,
+                true,
+            )
+        });
+        assert_eq!(node.contacts_known(), 1);
+        let closest = node.closest_wire_contacts(&Kad128::from_hash(&[9; 16]), 5);
+        assert_eq!(closest.len(), 1);
     }
 
     #[tokio::test]
