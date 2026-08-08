@@ -7579,6 +7579,13 @@ mod tests {
         // explicitly - otherwise the assertion below passes on a listener that
         // was never there, which is the first thing this test did wrong.
         engine.set_offline(true);
+        // AN EPHEMERAL PORT, not the 4662 default. Two tests in this module bind
+        // a listener, cargo runs them on separate threads, and `start_listener`
+        // treats a bind failure as survivable (it stays LowID and returns) - so
+        // whichever lost the race left `listener: None` and tripped its own
+        // precondition. That is a FLAKE, not a finding: it passed alone and
+        // failed in the full suite, which is the worst way for a gate to fail.
+        engine.set_ports(0, 4662, 0, 4672);
         engine.start().await;
         engine.start_listener().await;
         assert_eq!(engine.state(), EngineState::Running);
@@ -7618,6 +7625,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let (mut engine, _rx) = Engine::new(&dir).unwrap();
         engine.set_offline(true);
+        // Ephemeral, for the same reason as the seeding test above: these two
+        // both bind a listener and would otherwise race for the 4662 default.
+        engine.set_ports(0, 4662, 0, 4672);
         engine.start().await;
         engine.start_listener().await;
         assert!(engine.listener.is_some(), "precondition: a listener exists");
