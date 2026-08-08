@@ -320,6 +320,28 @@ impl RoutingTable {
         all.iter().find(|c| c.id == *id).map(|c| c.ip)
     }
 
+    /// Mark the contact with `id` IP-VERIFIED, but ONLY if the address we have
+    /// stored for it matches `ip`. Returns whether it was verified.
+    ///
+    /// eMule's `CRoutingZone::VerifyContact` (RoutingZone.cpp:980-996): a miss
+    /// returns false (:982-984), a stored-IP MISMATCH returns false without
+    /// touching anything (:985-986), and only an exact match sets the bit
+    /// (:991). The mismatch rule is the whole security value - a KadID is
+    /// semi-public, so without it anyone could complete the handshake from any
+    /// address and have somebody else's contact marked verified.
+    ///
+    /// Idempotent: re-verifying an already-verified contact is a no-op that
+    /// still returns true, exactly as there.
+    pub fn verify_contact(&mut self, id: &Kad128, ip: u32) -> bool {
+        match self.root.find_mut(id) {
+            Some(c) if c.ip == ip => {
+                c.verified = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// (contacts sharing this exact IP, contacts sharing its /24 subnet). Used by
     /// the live layer to enforce the anti-sybil cap before inserting a network
     /// contact.
@@ -385,6 +407,37 @@ impl RoutingTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// eMule's VerifyContact rule, which is the whole point of the three-way
+    /// HELLO handshake: the bit is set only when the address we already have
+    /// for that ID matches the address the ACK arrived from. A KadID is
+    /// semi-public, so without the mismatch check anyone could complete the
+    /// handshake from any address and have someone else's contact verified.
+    #[test]
+    fn verify_contact_sets_the_bit_only_on_an_exact_ip_match() {
+        let mut t = RoutingTable::new(Kad128::from_hash(&[0x01; 16]));
+        let id = Kad128::from_hash(&[0x22; 16]);
+        t.add(id, 0x0A00_0001, 4672, 4662, 8, false);
+
+        assert!(
+            !t.verify_contact(&id, 0x0A00_0002),
+            "a DIFFERENT ip must not verify - that is the hijack this blocks"
+        );
+        assert!(
+            !t.contacts().iter().any(|c| c.id == id && c.verified),
+            "the mismatch must not have set the bit as a side effect"
+        );
+
+        let unknown = Kad128::from_hash(&[0x33; 16]);
+        assert!(!t.verify_contact(&unknown, 0x0A00_0001), "a miss is false");
+
+        assert!(t.verify_contact(&id, 0x0A00_0001), "the exact ip verifies");
+        assert!(t.contacts().iter().any(|c| c.id == id && c.verified));
+        assert!(
+            t.verify_contact(&id, 0x0A00_0001),
+            "idempotent: re-verifying is a no-op that still returns true"
+        );
+    }
     use mule_files::read_nodes_dat;
 
     const NODES: &[u8] = include_bytes!("../../mule-files/tests/fixtures/nodes.dat");
