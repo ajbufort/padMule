@@ -944,3 +944,40 @@ Append-only, timestamped record of Ingest / Query / Lint passes.
   CENTRE hits the label and silently does nothing (tap the right edge, then READ
   THE VALUE BACK); and the search field is an `XCUIElementTypeTextField`, not a
   `SearchField`.
+
+- 2026-08-08 **THE SEEDING CPU HYPOTHESIS WAS WRONG - the poll is exonerated.**
+  The experiment: same conditions as 2026-08-07 (background seeding, serving
+  nobody, server connected), ONE variable changed - `shouldRunFastPoll`
+  throttles the full UI snapshot to 1 tick in 5 while `.seeding`. Result over 30
+  samples: **15 above 5% CPU, 15 below, zero deaths, footprint flat at 32.0-32.1MB.**
+  Against 2026-08-07's 27-of-58 (46.6%) that is the SAME distribution, with the
+  snapshot running at a fifth of its former rate. **So padMule's own 1 Hz poll
+  is not the cost; the audio keepalive is.** Worth knowing before anyone spent a
+  day moving the clock into Rust to reclaim CPU it was never spending.
+  **The hypothesis had a visible hole and it should have been weighted harder:**
+  a 1 Hz signal would be caught by nearly ANY sampling window, not half of them,
+  so a 50/50 split never fitted a once-a-second cause. The reasoning was
+  recorded as a hypothesis with its hole stated, and the experiment was built to
+  answer it rather than to confirm it, which is why one soak settled it.
+  **What does NOT change:** moving the 1s clock out of the UI runloop into Rust
+  is still right, for ROBUSTNESS - a background posture resting on the UI's
+  runloop is fragile and eight duties fail silently if it stops. It just buys no
+  CPU. The state-aware poll stays too: doing five times less work for a UI
+  nobody is looking at is correct regardless of what it costs.
+  Still open on the battery question: what the keepalive itself actually spends,
+  and whether an audio session can be made cheaper. That is now the only
+  candidate left.
+
+- 2026-08-08 **`main` has 89 commits again, and eleven branches are gone.**
+  PR #12 rebase-merged - the first time since 2026-08-05 that this work reached
+  `main`. All three CI checks green, including the Swift suite that had not
+  compiled since e3ed990. Verified after: trees byte-identical between
+  `origin/main` and the branch, history linear (0 merge commits), and the gate
+  re-run on the merged `main` itself at 678 tests.
+  The eleven long-merged branches were deleted, but **verified against the
+  REBASED main by patch-id (`git cherry`), not ancestry** - ancestry would have
+  called all eleven unmerged, because a rebase changes every SHA. Their tips are
+  recorded in `/home/ajbufort/padmule-deleted-branches-2026-08-08.txt`, outside
+  the repo, recoverable with `git push origin <sha>:refs/heads/<name>`.
+  `worktree-wave11-aich` kept its LOCAL branch because a LOCKED worktree still
+  holds it; a lock is a deliberate signal and was not overridden.
