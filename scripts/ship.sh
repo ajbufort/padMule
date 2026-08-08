@@ -21,6 +21,11 @@
 #      from a FRESH extraction directory - the check that caught (2).
 #   4. The installed build is confirmed by reading it back off the device, never
 #      by assuming the install succeeded.
+#   5. origin/<branch> must ALREADY be at HEAD. `gh workflow run --ref` builds
+#      the REMOTE ref, so an unpushed commit silently builds the wrong tree.
+#      Added 2026-08-08 after 12 local commits sent CI to build the tip from
+#      before them; guard 2 caught it, but reported "no run found" rather than
+#      the actual cause.
 #
 # Usage: scripts/ship.sh [--no-install]
 set -euo pipefail
@@ -53,6 +58,21 @@ if [ -n "$(git status --porcelain)" ]; then
 fi
 
 BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+
+# THE REMOTE MUST ALREADY BE AT HEAD. `gh workflow run --ref` dispatches against
+# the REMOTE branch, so an unpushed commit builds whatever origin last saw - and
+# every downstream guard then correctly refuses the artifact, reporting the
+# useless "no run found for <sha>" instead of the actual cause. Cost one ship on
+# 2026-08-08, with 12 local commits and CI happily building the tip from before
+# them. Checked here so the message names the real problem.
+REMOTE_SHA="$(git rev-parse "origin/$BRANCH" 2>/dev/null || true)"
+if [ "$REMOTE_SHA" != "$SHA" ]; then
+  echo "ABORT: origin/$BRANCH is at ${REMOTE_SHA:-<no remote branch>}, HEAD is $SHA." >&2
+  echo "       CI builds the REMOTE ref, so it would build the wrong tree." >&2
+  echo "       Push first:  git push origin $BRANCH" >&2
+  exit 1
+fi
+
 echo "-- dispatching CI on this sha"
 # ALL THREE, and all three are CHECKED below. Until 2026-08-07 this script
 # dispatched the Rust gate and never read its conclusion, and never dispatched
