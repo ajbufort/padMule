@@ -6,6 +6,7 @@ AI-maintained knowledge base. Start here. See `/CLAUDE.md` for the schema and
 the Ingest / Query / Lint workflows.
 
 ## START HERE
+- [[handoff-for-fable]] - the briefing for an AGENT picking up the next round: what to do, how this project judges work, the device-measurement traps, the hard WDA deadline, and the hazards to inherit knowingly. Written 2026-08-08.
 - [[handoff-next-session]] - the living handoff: current state, open tasks, the top next action, and what was proven vs assumed. Replace wholesale each session.
 
 ## Architecture
