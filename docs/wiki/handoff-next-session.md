@@ -23,13 +23,17 @@ FIND_NODE answer rate was the same in both arms, so the win is structural.
 - **Gate**: **700** Rust tests (0 failed, 2 ignored - both documented
   live-network tests), `clippy --workspace --all-targets -- -D warnings` clean,
   `fmt --check` clean, ASCII clean. Swift suite is 6 files and GREEN again.
-- **Branch `kad-csearch`**, ahead of `main` (`54384f2`, which equals
-  `origin/main`). **The last CODE commit is `9b3402b`** (the CSearch rewrite);
-  `eb7ee3c` is the tree the off-device A/B below was measured on, and anything
-  after it is docs. **Check `git status` and `git log` for the tip rather than
-  trusting a sha written here** - a "state of the tree" line that names its own
-  HEAD is stale the moment it is committed, which is exactly how row 8cn came to
-  say "NOT committed" in the commit that committed it.
+- **MERGED TO `main` 2026-08-08.** `kad-csearch` was fast-forwarded into `main`
+  (8 commits, `--ff-only`, so history stays LINEAR - still 0 merge commits), the
+  gate was re-run on the merged `main` ITSELF at 700 tests, and `main` is pushed.
+  `kad-csearch` is now IDENTICAL to `main` and is a deletable duplicate.
+- **The last CODE commit is `9b3402b`** (the CSearch rewrite). Nothing under
+  `crates/`, `ios/` or the manifests has changed since `c656555`, so **the build
+  installed on the device IS `main`'s current shipped code** - a doc-only tip does
+  not need a reship. **Check `git log` for the tip rather than trusting a sha
+  written here** - a "state of the tree" line that names its own HEAD is stale the
+  moment it is committed, which is exactly how row 8cn came to say "NOT
+  committed" in the commit that committed it.
 - **PUSHED, and all three CI workflows are GREEN for `c656555`** (dispatched by
   `ship.sh`, artifact verified, signed and installed). The branch-only CI hole
   below is therefore closed for THIS sha specifically - it is not closed in
@@ -40,8 +44,10 @@ FIND_NODE answer rate was the same in both arms, so the win is structural.
   ancestry calls it unmerged. Recorded in [[log]] 2026-08-08.
 - `worktree-wave11-aich` is a LOCKED worktree (10 ahead / 122 behind). A lock is
   a deliberate signal; do not override it.
-- No CI ever ran for `eb7ee3c` itself (branch tips are not built automatically);
-  `c656555` was dispatched explicitly by `ship.sh`. See the CI hole below.
+- CI: `c656555` was dispatched explicitly by `ship.sh` and went green on all
+  three. The push to `main` then fired all three AGAIN for the merged tip, which
+  is the first time this work has had automatic CI coverage - branch tips never
+  do. See the CI hole below.
 - **Installed on device: `c656555`** - confirmed by `CFBundleVersion` read back
   off the device AND, more decisively, by the Stats panel's own text ("Every
   request races its own deadline now - no rounds"), which exists only in this
