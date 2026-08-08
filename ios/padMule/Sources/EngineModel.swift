@@ -1240,26 +1240,6 @@ final class EngineModel: ObservableObject {
     /// True while a refresh() poll is in flight; see refresh()'s doc comment.
     private var refreshInFlight = false
 
-    /// Pull a fresh snapshot off the main thread. Events are NOT drained here
-    /// any more - `pumpEvents()` owns that, on its own queue, so a banner or a
-    /// status change still arrives while a long engine call is holding `work`.
-    /// This half takes the ENGINE LOCK, so it stalls behind a long search or
-    /// crawl - by design, and honestly: only the Status scalars lag. It also
-    /// drives `heartbeat()`, so the 1s timer must keep firing it even when no
-    /// screen shows transfers.
-    ///
-    /// Guarded by `refreshInFlight` so a slow call ahead of this one on the
-    /// serial `work` queue (e.g. a 20s search) cannot let the 1s timer stack
-    /// dozens of queued jobs in front of something urgent like pause(). The
-    /// heartbeat still fires every ~1s once the in-flight one clears; this
-    /// only caps concurrency at one.
-    /// The LOCK-FREE half: transfers, the shared library, the sharing switch,
-    /// byte totals and the port-mapping flag. None of these touches the engine
-    /// mutex in the Rust seam, so they keep answering while a ~20s search or
-    /// ~10s crawl holds it - which is exactly when the progress numbers used to
-    /// freeze. Runs on its own queue for the same reason the event pump does:
-    /// `work` is serial, so sharing it would reintroduce the very stall this
-    /// removes. No in-flight guard needed - these calls cannot block.
     /// Both halves, for a caller that means "update the screen NOW" - a cancel, a
     /// priority change, a finished action. `refresh()` alone no longer touches
     /// the transfer list (that moved to `refreshFast`), so an action handler that
@@ -1272,6 +1252,13 @@ final class EngineModel: ObservableObject {
         refresh()
     }
 
+    /// The LOCK-FREE half: transfers, the shared library, the sharing switch,
+    /// byte totals and the port-mapping flag. None of these touches the engine
+    /// mutex in the Rust seam, so they keep answering while a ~20s search or
+    /// ~10s crawl holds it - which is exactly when the progress numbers used to
+    /// freeze. Runs on its own queue for the same reason the event pump does:
+    /// `work` is serial, so sharing it would reintroduce the very stall this
+    /// removes. No in-flight guard needed - these calls cannot block.
     private func refreshFast() {
         guard let e = engine else { return }
         eventQueue.async { [weak self] in
@@ -1328,6 +1315,19 @@ final class EngineModel: ObservableObject {
         }
     }
 
+    /// Pull a fresh snapshot off the main thread. Events are NOT drained here
+    /// any more - `pumpEvents()` owns that, on its own queue, so a banner or a
+    /// status change still arrives while a long engine call is holding `work`.
+    /// This half takes the ENGINE LOCK, so it stalls behind a long search or
+    /// crawl - by design, and honestly: only the Status scalars lag. It also
+    /// drives `heartbeat()`, so the 1s timer must keep firing it even when no
+    /// screen shows transfers.
+    ///
+    /// Guarded by `refreshInFlight` so a slow call ahead of this one on the
+    /// serial `work` queue (e.g. a 20s search) cannot let the 1s timer stack
+    /// dozens of queued jobs in front of something urgent like pause(). The
+    /// heartbeat still fires every ~1s once the in-flight one clears; this
+    /// only caps concurrency at one.
     private func refresh() {
         guard let e = engine, !refreshInFlight else { return }
         refreshInFlight = true

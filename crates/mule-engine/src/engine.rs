@@ -1280,24 +1280,6 @@ pub struct SearchFilters {
     pub global: bool,
 }
 
-/// The padMule engine. Create with [`Engine::new`], drive with the lifecycle
-/// methods, observe via the returned event receiver.
-/// The parts of the engine a READ-ONLY caller can reach WITHOUT the engine lock.
-///
-/// Every FFI poll used to go through `Mutex<Engine>`, so a ~20s search or ~10s
-/// crawl - which holds `&mut self` across its whole `tokio::join!` - blocked the
-/// 1s UI poll behind it and the transfer numbers froze. But five of those polls
-/// never needed engine STATE at all: the downloads list, the shared library, the
-/// sharing switch and the public IP are already `Arc`s, and the byte totals are
-/// process-global atomics. They took the lock purely because they were methods
-/// on `Engine`.
-///
-/// Handing out clones is not a new pattern here - the engine already clones
-/// these same `Arc`s into spawned tasks in seven places - and none of them is
-/// ever REASSIGNED, so a handle taken once at construction stays valid for the
-/// engine's life. That last property is what makes this safe; if any of these
-/// fields were ever replaced rather than mutated in place, a handle would
-/// silently go stale and the UI would read a dead copy forever.
 /// Status scalars PUBLISHED as atomics so a reader never takes the engine lock.
 ///
 /// WHY: measured on device 2026-08-07, a "Refresh server list" tapped 1.9s into
@@ -1338,6 +1320,22 @@ impl StatusPub {
     }
 }
 
+/// The parts of the engine a READ-ONLY caller can reach WITHOUT the engine lock.
+///
+/// Every FFI poll used to go through `Mutex<Engine>`, so a ~20s search or ~10s
+/// crawl - which holds `&mut self` across its whole `tokio::join!` - blocked the
+/// 1s UI poll behind it and the transfer numbers froze. But five of those polls
+/// never needed engine STATE at all: the downloads list, the shared library, the
+/// sharing switch and the public IP are already `Arc`s, and the byte totals are
+/// process-global atomics. They took the lock purely because they were methods
+/// on `Engine`.
+///
+/// Handing out clones is not a new pattern here - the engine already clones
+/// these same `Arc`s into spawned tasks in seven places - and none of them is
+/// ever REASSIGNED, so a handle taken once at construction stays valid for the
+/// engine's life. That last property is what makes this safe; if any of these
+/// fields were ever replaced rather than mutated in place, a handle would
+/// silently go stale and the UI would read a dead copy forever.
 #[derive(Clone)]
 pub struct EngineHandles {
     downloads: Arc<Mutex<Vec<Arc<Download>>>>,
@@ -1503,6 +1501,8 @@ fn fold_probe_round(h: &mut ProbeHealth, answered: bool, users: u32, files: u32)
     }
 }
 
+/// The padMule engine. Create with [`Engine::new`], drive with the lifecycle
+/// methods, observe via the returned event receiver.
 pub struct Engine {
     identity: NodeIdentity,
     config_dir: PathBuf,
@@ -1528,11 +1528,11 @@ pub struct Engine {
     /// Complete files we will serve to peers, populated as downloads finish.
     /// Shared with the listener, which serves them on request (the upload side).
     shared: Arc<Mutex<Vec<SharedFile>>>,
+    /// Status scalars mirrored for lock-free reads - see [`StatusPub`].
+    status: StatusPub,
     /// Set when the shared library grows mid-session (a download finishing), so
     /// the next downloads() poll re-announces it to the server (OP_OFFERFILES).
     /// Cloned into each download's completion task, which has no path to `server`.
-    /// Status scalars mirrored for lock-free reads - see [`StatusPub`].
-    status: StatusPub,
     shared_dirty: Arc<AtomicBool>,
     /// Servers a connected server advertised via OP_SERVERLIST, awaiting merge
     /// into server.met on the 1s heartbeat. The heartbeat is the race-free spot:
@@ -1571,12 +1571,6 @@ pub struct Engine {
     connection: Option<ServerInfo>,
     /// The live Kad node (owns the UDP socket), once bootstrapped.
     kad: Option<KadNode>,
-    /// Our public IPv4, as UPnP/SSDP reported it (`theApp.GetPublicIP`). Learned
-    /// in `map_port`, fed to the Kad node so it can echo a peer's UDP verify key
-    /// (bound to THIS ip) and be verified faster. `None` until a mapping succeeds;
-    /// a stale value only disables the echo (the key-echo gate is IP-equality),
-    /// never mis-verifies. Host order (first octet = MSByte), matching
-    /// `udp_verify_key`. Never emitted - it is our public IP verbatim.
     /// The last HighID client id we were assigned, which IS our public address.
     /// Kept ONLY to notice a change; never emitted, never rendered.
     last_public_id: Option<u32>,
@@ -1602,6 +1596,13 @@ pub struct Engine {
     /// misleading - when a VPN tunnel is carrying the traffic, because the
     /// mapping would be made on the LAN router the tunnel bypasses.
     upnp_enabled: bool,
+    /// Our public IPv4, as UPnP/SSDP reported it (`theApp.GetPublicIP`). Learned
+    /// in `map_port`, fed to the Kad node so it can echo a peer's UDP verify key
+    /// (bound to THIS ip) and be verified faster. `None` until a mapping succeeds;
+    /// a stale value only disables the echo (the key-echo gate is IP-equality),
+    /// never mis-verifies. Host order (first octet = MSByte), matching
+    /// `udp_verify_key`. Never emitted - it is our public IP verbatim.
+    ///
     /// Shared so the spawned mapping-retry task can record a mapping it
     /// creates; a plain field could only ever be written on the engine task.
     public_ip: Arc<std::sync::Mutex<Option<Ipv4Addr>>>,
@@ -4232,9 +4233,6 @@ impl Engine {
         self.set_state(EngineState::Paused);
     }
 
-    /// App foregrounded: rebuild sockets, reconnect, re-bootstrap. Idempotent - a
-    /// no-op unless currently `Paused`. `Paused` -> `Running`. The real reconnect
-    /// (listener rebind, server link, Kad) runs between the two status lines.
     /// Background WITHOUT going quiet: keep serving what we already have.
     ///
     /// The difference from [`pause`](Self::pause), which is the whole feature:
@@ -4289,6 +4287,9 @@ impl Engine {
         self.emit_online_status();
     }
 
+    /// App foregrounded: rebuild sockets, reconnect, re-bootstrap. Idempotent - a
+    /// no-op unless currently `Paused`. `Paused` -> `Running`. The real reconnect
+    /// (listener rebind, server link, Kad) runs between the two status lines.
     pub async fn resume(&mut self) {
         // Coming back from a background SEED is a different, much smaller job -
         // see `resume_from_seeding`. Routed here so callers keep one entry point.
@@ -4508,21 +4509,6 @@ impl Engine {
         }
     }
 
-    /// Re-checkpoint periodically while RUNNING, so a kill that never reaches
-    /// `pause()` does not cost the whole session.
-    ///
-    /// A DELIBERATE DEVIATION from both authorities, flagged as such: eMule and
-    /// aMule each write `nodes.dat` only from `CRoutingZone`'s DESTRUCTOR
-    /// (RoutingZone.cpp:137-142 and :118-123 respectively) - i.e. on a clean
-    /// exit, never on a timer. That is sound for a desktop app that gets to run
-    /// its destructors. iPadOS does not offer that: the app is killed at
-    /// suspension as ROUTINE behavior, and `pause()` only runs if `.background`
-    /// is actually delivered first. So the platform, not the protocol, is the
-    /// reason - and nothing here touches the wire or the file FORMAT.
-    ///
-    /// Driven by the same 1s `downloads()` heartbeat as the other background
-    /// duties, and gated on elapsed time so all but one call in 300 is a clock
-    /// comparison.
     /// Re-drive ONE download that has gone idle. The missing retry: `spawn_fetch`
     /// is otherwise only ever called from `start()`, `resume()` and
     /// `add_download`, and a fetch task that exhausts its round budget without
@@ -4604,9 +4590,6 @@ impl Engine {
         true
     }
 
-    /// Periodically drop shared files the user deleted (see
-    /// `verify_shared_library`). Runs off the same 1s heartbeat as the other
-    /// maintainers, gated to `SHARE_VERIFY_EVERY`.
     /// Refresh the Kad routing table: one bounded lookup toward a RANDOM target,
     /// which pulls in every contact the answering nodes name.
     ///
@@ -4670,6 +4653,9 @@ impl Engine {
         gained
     }
 
+    /// Periodically drop shared files the user deleted (see
+    /// `verify_shared_library`). Runs off the same 1s heartbeat as the other
+    /// maintainers, gated to `SHARE_VERIFY_EVERY`.
     pub async fn maintain_share_verify(&mut self) -> u32 {
         if self.state != EngineState::Running
             || self.last_share_verify.elapsed() < SHARE_VERIFY_EVERY
@@ -4680,6 +4666,21 @@ impl Engine {
         self.verify_shared_library().await
     }
 
+    /// Re-checkpoint periodically while RUNNING, so a kill that never reaches
+    /// `pause()` does not cost the whole session.
+    ///
+    /// A DELIBERATE DEVIATION from both authorities, flagged as such: eMule and
+    /// aMule each write `nodes.dat` only from `CRoutingZone`'s DESTRUCTOR
+    /// (RoutingZone.cpp:137-142 and :118-123 respectively) - i.e. on a clean
+    /// exit, never on a timer. That is sound for a desktop app that gets to run
+    /// its destructors. iPadOS does not offer that: the app is killed at
+    /// suspension as ROUTINE behavior, and `pause()` only runs if `.background`
+    /// is actually delivered first. So the platform, not the protocol, is the
+    /// reason - and nothing here touches the wire or the file FORMAT.
+    ///
+    /// Driven by the same 1s `downloads()` heartbeat as the other background
+    /// duties, and gated on elapsed time so all but one call in 300 is a clock
+    /// comparison.
     pub async fn maintain_checkpoint(&mut self) {
         if self.state != EngineState::Running || self.last_checkpoint.elapsed() < CHECKPOINT_EVERY {
             return;
