@@ -1,7 +1,8 @@
 //! server.met: the eD2k server list. See docs/raw reference section 5
 //! (ServerList.cpp:94-197 load, 689-825 save).
 //!
-//! Layout: `u8` header (0xE0 on write; load accepts 0xE0 or 0x0E), `u32` server
+//! Layout: `u8` header (0xE0, or legacy 0x0E, on load; preserved on write - see
+//! below), `u32` server
 //! count, then per server: `u32` IP, `u16` port, `u32` tag count, then that many
 //! MET-format tags. The IP is stored verbatim (eMule byte-order convention);
 //! this codec keeps it opaque. Records preserve exactly what was read so a

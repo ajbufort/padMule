@@ -4,8 +4,8 @@
 //! directory with a real aMule install. The RSA identity lives in
 //! `cryptkey.dat`, handled in `mule-engine::secure_ident`.
 //!
-//! - `preferences.dat`: `<version u8><userhash 16>` (`Preferences.cpp:1040`,
-//!   `:1636`). The version byte is ignored on read. NB: like aMule, the read
+//! - `preferences.dat`: `<version u8><userhash 16>` (`Preferences.cpp:1040`
+//!   read, `:1637` write). The version byte is ignored on read. NB: like aMule, the read
 //!   applies the eMule marker bytes (hash[5]=14, hash[14]=111) IN MEMORY only,
 //!   so write(read(bytes)) is not bit-identical for a file whose stored hash
 //!   lacks the markers - compatible, but not a byte round-trip like the

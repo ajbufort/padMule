@@ -13,8 +13,11 @@
 //! credits.
 //!
 //! Records preserve every field as read (including `reserved` and the full
-//! 80-byte key blob regardless of `key_size`, which aMule admits may be garbage)
-//! so a read-then-write round-trips bit-for-bit.
+//! 80-byte key blob regardless of `key_size`, which aMule admits may be
+//! garbage), so every record that IS written back round-trips bit-for-bit.
+//! The FILE as a whole need not: the writer deliberately drops zero-transfer
+//! entries (`CreditEntry::is_empty`), matching aMule's save - pinned by
+//! `skips_entries_with_no_transfer_history`.
 
 use mule_proto::{IoError, Reader, Writer};
 
@@ -284,6 +287,11 @@ mod tests {
     /// boundary this test names.
     #[test]
     fn expiry_is_150_days() {
+        // Pin the MAGNITUDE, not just the boundary - every other assertion
+        // here is expressed in CREDIT_EXPIRE_SECS itself, so without this a
+        // wrong constant would still pass. 12960000 is upstream's literal:
+        // aMule ClientCreditsList.cpp:120, eMule 0.50a ClientCredits.cpp:245.
+        assert_eq!(CREDIT_EXPIRE_SECS, 12_960_000);
         let e = CreditEntry::new([0u8; 16], 1000);
         assert!(!e.is_expired(1000 + CREDIT_EXPIRE_SECS - 1));
         assert!(

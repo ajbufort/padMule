@@ -230,7 +230,17 @@ fn write_value(w: &mut Writer, v: &TagValue) {
         TagValue::Bool(x) => w.write_u8(*x),
         TagValue::BoolArray { bit_len, data } => {
             w.write_u16(*bit_len);
-            w.write_bytes(data);
+            // The payload length is DERIVED from bit_len ((bit_len/8)+1, the
+            // aMule quirk the reader applies), so a reader consumes exactly
+            // that many bytes. Cap/pad `data` to it - a hand-built mismatch
+            // would otherwise desync every tag that follows (the same
+            // prefix-payload rule as Blob/Bsob/write_string_u16 above).
+            let n = (*bit_len / 8) as usize + 1;
+            let take = n.min(data.len());
+            w.write_bytes(&data[..take]);
+            for _ in take..n {
+                w.write_u8(0);
+            }
         }
     }
 }
@@ -356,6 +366,71 @@ mod tests {
         let mut w = Writer::new();
         write_tag(&mut w, &tag);
         assert_eq!(w.into_inner(), bytes);
+    }
+
+    #[test]
+    fn a_mismatched_boolarray_cannot_desync_the_following_tag() {
+        // bit_len 8 declares (8/8)+1 = 2 payload bytes; hand the writer 4. A
+        // reader consumes exactly 2, so the writer must emit exactly 2 -
+        // otherwise the stray bytes are parsed as the start of the NEXT tag
+        // and the rest of the tag list desyncs.
+        let follow = Tag::id(0x02, TagValue::U32(0x1234_5678));
+        let long = Tag::id(
+            0x01,
+            TagValue::BoolArray {
+                bit_len: 8,
+                data: vec![0xAA, 0xBB, 0xCC, 0xDD],
+            },
+        );
+        let mut w = Writer::new();
+        write_tag(&mut w, &long);
+        write_tag(&mut w, &follow);
+        let bytes = w.into_inner();
+        let mut r = Reader::new(&bytes);
+        assert_eq!(
+            read_tag(&mut r).unwrap(),
+            Tag::id(
+                0x01,
+                TagValue::BoolArray {
+                    bit_len: 8,
+                    data: vec![0xAA, 0xBB],
+                }
+            ),
+            "excess payload is truncated to the declared length"
+        );
+        assert_eq!(
+            read_tag(&mut r).unwrap(),
+            follow,
+            "the following tag must survive"
+        );
+        assert_eq!(r.remaining(), 0);
+
+        // The short side: 2 bytes declared, 1 supplied - padded, not desynced.
+        let short = Tag::id(
+            0x03,
+            TagValue::BoolArray {
+                bit_len: 8,
+                data: vec![0xEE],
+            },
+        );
+        let mut w = Writer::new();
+        write_tag(&mut w, &short);
+        write_tag(&mut w, &follow);
+        let bytes = w.into_inner();
+        let mut r = Reader::new(&bytes);
+        assert_eq!(
+            read_tag(&mut r).unwrap(),
+            Tag::id(
+                0x03,
+                TagValue::BoolArray {
+                    bit_len: 8,
+                    data: vec![0xEE, 0x00],
+                }
+            ),
+            "short payload is zero-padded to the declared length"
+        );
+        assert_eq!(read_tag(&mut r).unwrap(), follow);
+        assert_eq!(r.remaining(), 0);
     }
 
     #[test]

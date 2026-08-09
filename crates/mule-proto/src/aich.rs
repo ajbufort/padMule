@@ -475,7 +475,10 @@ impl AichTree {
     /// All leaf hashes, left to right (the known2_64.met entry body,
     /// `WriteLowestLevelHashs` with `bNoIdent`). `None` unless complete.
     pub fn leaves(&self) -> Option<Vec<[u8; 20]>> {
-        let mut out = Vec::with_capacity(Self::leaf_count(self.file_size()) as usize * HASHSIZE);
+        // Clamped hint: the tree's file_size can trace back to a network
+        // claim, and an absurd one must not size an allocation (see
+        // `leaf_alloc_hint`).
+        let mut out = Vec::with_capacity(leaf_alloc_hint(self.file_size()) * HASHSIZE);
         if !self.root.write_lowest_level(&mut out, 0, true, true) {
             return None;
         }
@@ -663,6 +666,20 @@ impl AichTree {
     }
 }
 
+/// Pre-allocation hint for a leaf list. `file_size` can be a CLAIMED size off
+/// the network (a download's size from an ed2k link reaches
+/// [`AichLeafHasher::new`]), and a hostile claim near `u64::MAX` implies a
+/// multi-petabyte `Vec` before a single byte is validated - the same
+/// untrusted-count rule server.met and known2_64.met parsing already follow.
+/// So cap the HINT at what a file within OLD_MAX_FILE_SIZE implies (23,373
+/// leaves, ~467 KB). That ceiling is an allocation bound only, NOT a validity
+/// limit - larger files are legal (see hash.rs on the constant) and simply
+/// grow past the hint, since capacity is a hint, not a cap; results are
+/// identical either way.
+fn leaf_alloc_hint(file_size: u64) -> usize {
+    AichTree::leaf_count(file_size.min(OLD_MAX_FILE_SIZE)) as usize
+}
+
 fn read_u16(cur: &mut &[u8]) -> Option<u16> {
     if cur.len() < 2 {
         return None;
@@ -724,7 +741,9 @@ impl AichLeafHasher {
             file_size,
             pos: 0,
             cur: Sha1::new(),
-            leaves: Vec::with_capacity(AichTree::leaf_count(file_size) as usize),
+            // Clamped: `file_size` is a network claim here (see
+            // `leaf_alloc_hint`); the vec grows with the bytes actually fed.
+            leaves: Vec::with_capacity(leaf_alloc_hint(file_size)),
         })
     }
 
@@ -814,7 +833,9 @@ pub fn aich_from_base32(s: &str) -> Option<[u8; 20]> {
 }
 
 /// The AICH master hash (20-byte SHA-1 tree root) of a file's bytes. Returns
-/// `None` for an empty file or one past the eD2k size ceiling.
+/// `None` for an empty file or one past OLD_MAX_FILE_SIZE - which is the OLD
+/// 32-bit eD2k ceiling, not a protocol maximum (hash.rs is emphatic that
+/// larger files are legal); this in-memory convenience just declines them.
 pub fn aich_master_hash(data: &[u8]) -> Option<[u8; 20]> {
     let n = data.len() as u64;
     if n == 0 || n > OLD_MAX_FILE_SIZE {
@@ -1067,6 +1088,30 @@ mod tests {
         assert_eq!(count, 4, "0 siblings + 4 blocks");
         let mut rx = AichTree::with_master(size as u64, master).unwrap();
         assert!(rx.read_recovery_data(0, &payload));
+    }
+
+    /// An `AichLeafHasher` is constructed with a CLAIMED size off the network
+    /// (a download's size from an ed2k link), so the crate's untrusted-count
+    /// rule applies (see server_met.rs / known2_met.rs): do not pre-allocate
+    /// on the claim's say-so. Observed via `.capacity()` because the worst
+    /// pre-fix input - a near-u64::MAX claim requesting a multi-petabyte Vec -
+    /// aborts the runner rather than failing red; a 1 TB claim allocates
+    /// pre-fix (~5.45M entries, ~109 MB), so this assertion ran red cleanly
+    /// before the clamp landed.
+    #[test]
+    fn an_absurd_claimed_size_does_not_preallocate_past_the_legal_hint() {
+        let ceiling_leaves = AichTree::leaf_count(OLD_MAX_FILE_SIZE) as usize;
+        let h = AichLeafHasher::new(1_000_000_000_000).unwrap(); // 1 TB claim
+        assert!(
+            h.leaves.capacity() <= ceiling_leaves,
+            "pre-allocation must be clamped to the old-ceiling hint \
+             ({} leaves), got {}",
+            ceiling_leaves,
+            h.leaves.capacity()
+        );
+        // Legit sizes still get their exact pre-allocation.
+        let h = AichLeafHasher::new(10_000_000).unwrap();
+        assert!(h.leaves.capacity() >= 55, "10 MB needs its 55 leaves");
     }
 
     #[test]

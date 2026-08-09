@@ -11,11 +11,25 @@
 //! date, or a date at offset 2 with NO part-hash count (aMule
 //! PartFile.cpp:432-461). An 0xE0 file can ALSO be in that layout, flagged only
 //! by `00 00 02 01` at offset 24. `read_part_met` handles all of it;
-//! `write_part_met` emits ONLY the default layout above, so writing a parsed
-//! splitted file would produce bytes that contradict its own version byte. The
-//! engine never does: `part_store` sets 0xE0/0xE2 explicitly rather than
-//! preserving what it read. The bit-for-bit round-trip claim therefore covers
-//! the DEFAULT layout, which is the only one padMule writes.
+//! `write_part_met` emits ONLY the default layout above, and what that does to
+//! a parsed splitted file differs BY VARIANT - three cases, each pinned by a
+//! test here (row 8db):
+//!
+//! - temp == 0: rewrites BYTE-IDENTICALLY, because at date == 0 the two
+//!   layouts are the same bytes
+//!   (`a_temp0_splitted_file_round_trips_byte_identically_because_the_layouts_coincide`).
+//! - 0xE0 with the offset-24 marker: the marker is not reproduced, so the
+//!   rewrite drops to the default layout - a LOSSLESS value-preserving
+//!   normalization
+//!   (`an_0xe0_marker_file_rewrites_as_a_value_preserving_normalization`).
+//! - temp != 0: the one genuinely CORRUPT arm - the source layout has no
+//!   part-hash count, the writer emits one, and the desynced rewrite reparses
+//!   under its own version byte to a wrong date and hash
+//!   (`a_nonzero_temp_splitted_rewrite_contradicts_its_own_version_byte`).
+//!
+//! The engine writes none of them: `part_store` sets 0xE0/0xE2 explicitly
+//! rather than preserving what it read. The bit-for-bit round-trip claim above
+//! covers the DEFAULT layout, which is the only one padMule writes.
 //!
 //! The gap list (still-missing byte ranges) is encoded as ordinary tags whose
 //! string name is a GAPSTART (0x09) or GAPEND (0x0A) byte followed by the
@@ -137,11 +151,14 @@ pub fn read_part_met(bytes: &[u8]) -> Result<PartMet, IoError> {
 /// Serialize a part.met, reproducing aMule's DEFAULT byte layout (the one
 /// `PARTFILE_VERSION` / `PARTFILE_VERSION_LARGEFILE` describe).
 ///
-/// It does NOT emit the 0xE1 "splitted" layout - see the module doc. Hand it a
-/// `PartMet` parsed from a splitted file and it will write the default shape
-/// under whatever version byte that file carried, which no reader would then
-/// parse correctly. Callers set the version deliberately (`part_store` writes
-/// 0xE0/0xE2); this is a read-side import format, not a write target.
+/// It does NOT emit the 0xE1 "splitted" layout. Hand it a `PartMet` parsed
+/// from a splitted file and the outcome depends on the VARIANT (the module
+/// doc's three pinned cases): a temp==0 file round-trips byte-identically, an
+/// 0xE0-with-marker file rewrites as a lossless value-preserving
+/// normalization, and only a temp!=0 file rewrites into bytes that contradict
+/// their own version byte. Callers set the version deliberately (`part_store`
+/// writes 0xE0/0xE2); splitted is a read-side import format, not a write
+/// target.
 pub fn write_part_met(pm: &PartMet) -> Vec<u8> {
     let mut w = Writer::new();
     w.write_u8(pm.version);
@@ -360,9 +377,10 @@ mod tests {
     }
 
     /// PINNING THE WRITE-BACK HAZARD, case by case (2026-08-09). The module
-    /// doc says writing a parsed splitted file "would produce bytes that
-    /// contradict its own version byte" - building these fixtures shows the
-    /// three variants differ, and the pins record exactly which:
+    /// doc used to claim writing ANY parsed splitted file "would produce bytes
+    /// that contradict its own version byte" - building these fixtures showed
+    /// the three variants differ (only temp != 0 corrupts), the pins record
+    /// exactly which, and the module doc now states the narrowed truth:
     ///
     /// temp == 0: the sub-layout is `version | u32(0) | hash | u16 count |
     /// hashes | tags` and the DEFAULT layout is `version | u32 date | hash |

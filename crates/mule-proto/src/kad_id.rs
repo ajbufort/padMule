@@ -113,11 +113,17 @@ impl Kad128 {
     }
 
     /// True if this DISTANCE passes eMule's search plausibility check: the top
-    /// 32 bits (chunk 0) are <= 0x0100_0000. The exact complement of upstream's
-    /// `distance.Get32BitChunk(0) > SEARCHTOLERANCE -> reject` (Defines.h:
-    /// SEARCHTOLERANCE = 16777216; Search.cpp:464). NB the boundary is
-    /// INCLUSIVE: chunk0 == 0x0100_0000 admits distances slightly ABOVE 2^120
-    /// (up to 2^120 + 2^96 - 1), faithfully to eMule - the unit test pins it.
+    /// 32 bits (chunk 0) are <= 0x0100_0000 (SEARCHTOLERANCE = 16777216, eMule
+    /// 0.50a Defines.h:41, aMule Defines.h:46). NOT the exact complement of
+    /// upstream's rejection, which has a second conjunct:
+    /// `chunk0 > SEARCHTOLERANCE && !IsLanIP(...) -> reject` (aMule
+    /// Search.cpp:464, eMule 0.50a Search.cpp:543) - upstream still ACCEPTS an
+    /// out-of-tolerance answer from a LAN IP. padMule has no LAN exemption, so
+    /// it is strictly STRICTER: it can only reject contacts upstream would
+    /// keep, never accept ones upstream would drop (the safe direction). NB
+    /// the boundary is INCLUSIVE: chunk0 == 0x0100_0000 admits distances
+    /// slightly ABOVE 2^120 (up to 2^120 + 2^96 - 1), faithfully to eMule -
+    /// the unit test pins it.
     pub fn within_tolerance(&self) -> bool {
         self.words[0] <= 0x0100_0000
     }
