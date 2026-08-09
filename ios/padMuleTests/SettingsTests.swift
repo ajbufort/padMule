@@ -44,6 +44,15 @@ final class SettingsTests: XCTestCase {
     /// without the user deciding silently cancels the protection AND its banner.
     /// Walking onto cellular and back, or toggling "pause on cellular", both did
     /// exactly that.
+    ///
+    /// Since 2026-08-09 the pause also PERSISTS: the engine writes a marker
+    /// file the moment the guard fires and restores it at construction, and
+    /// `applyEffectiveSharing` consults the ENGINE's value directly (the
+    /// published mirror is poll-fed and launch-stale at boot). So the boot
+    /// preference push after a paused relaunch is exactly the nil case below:
+    /// wanted ON, paused, not user-initiated -> push nothing, stay paused,
+    /// keep saying why. The cross-launch round trip itself is engine-tested
+    /// (`the_ip_change_pause_survives_a_relaunch_until_the_user_resumes`).
     func testAnIncidentalRecomputeCannotCancelThePublicAddressPause() {
         // A network event or an unrelated Settings toggle: push NOTHING.
         XCTAssertNil(

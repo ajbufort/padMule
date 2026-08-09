@@ -1667,7 +1667,9 @@ pub struct Engine {
     /// Kept ONLY to notice a change; never emitted, never rendered.
     last_public_id: Option<u32>,
     /// True while sharing is off BECAUSE the address changed, so the UI can keep
-    /// saying why and `set_sharing(true)` can clear it.
+    /// saying why and `set_sharing(true)` can clear it. DURABLE: mirrored by a
+    /// marker file (see `ip_pause_path`) that `new()` restores, so a relaunch
+    /// comes back still paused - and still able to say why.
     sharing_paused_for_ip_change: bool,
     /// The port we BIND for inbound peer connections.
     listen_port: u16,
@@ -1728,6 +1730,21 @@ pub struct Engine {
     offline: bool,
 }
 
+/// Path of the ip-change pause marker. Its EXISTENCE is the state: written the
+/// moment `note_public_id` trips the guard, deleted when the user turns sharing
+/// back on (`set_sharing(true)`), checked by `Engine::new` so a relaunch comes
+/// back still paused. The pause must outlive the process, because the guard's
+/// whole premise is that the USER decides when to resume - as an in-memory
+/// latch it was the "an event is not state" defect again: the sharing
+/// PREFERENCE stays ON and is pushed at every boot, so an app relaunch
+/// silently resumed serving from the address the user did not choose (observed
+/// on glass 2026-08-09, a VPN recycle then a relaunch). The file's content is
+/// one explanatory line for a human reading the config dir; only existence is
+/// consulted.
+fn ip_pause_path(config_dir: &Path) -> PathBuf {
+    config_dir.join("sharing_paused_for_ip_change.txt")
+}
+
 impl Engine {
     /// Load (or create) the identity in `config_dir` and return the engine plus
     /// the event stream the UI drains.
@@ -1746,8 +1763,17 @@ impl Engine {
         });
         // The AICH hashset store: index built in one scan, torn tail truncated.
         let known2 = Arc::new(Known2Store::load(&config_dir));
+        // A pause the guard latched in a PREVIOUS launch: restore it before
+        // anything can serve. Restoring HERE - not waiting for the UI to push
+        // its stored preference - is what makes the upload listener and the
+        // Kad publish gate read sharing OFF from the process's first instant,
+        // and the status atomic is set too so the UI's first lock-free read
+        // can already say WHY.
+        let ip_paused = ip_pause_path(&config_dir).exists();
+        let status = StatusPub::default();
+        status.ip_paused.store(ip_paused, Ordering::Relaxed);
         let engine = Engine {
-            status: StatusPub::default(),
+            status,
             identity,
             downloads_dir: config_dir.join("downloads"),
             config_dir,
@@ -1767,7 +1793,7 @@ impl Engine {
             shared_dirty: Arc::new(AtomicBool::new(false)),
             harvested_servers: Arc::new(std::sync::Mutex::new(Vec::new())),
             add_servers_from_server: true,
-            sharing: Arc::new(AtomicBool::new(true)),
+            sharing: Arc::new(AtomicBool::new(!ip_paused)),
             upload_gate: Arc::new(UploadGate::new(MAX_UPLOAD_SLOTS, UPLOAD_QUEUE_CAP)),
             known_met_lock: Arc::new(Mutex::new(())),
             known2,
@@ -1777,7 +1803,7 @@ impl Engine {
             connection: None,
             kad: None,
             last_public_id: None,
-            sharing_paused_for_ip_change: false,
+            sharing_paused_for_ip_change: ip_paused,
             listen_port: TCP_PORT,
             advertised_port: TCP_PORT,
             kad_port: KAD_UDP_PORT,
@@ -2023,9 +2049,14 @@ impl Engine {
     pub fn set_sharing(&mut self, on: bool) {
         self.sharing.store(on, Ordering::Relaxed);
         if on {
-            // The user has decided; stop saying we paused for them.
+            // The user has decided; stop saying we paused for them. The
+            // persisted marker goes too, so a LATER relaunch does not
+            // re-pause - the OFF direction leaves it alone on purpose (a
+            // metered auto-pause or a leech-mode preference is not the user
+            // resolving the address change).
             self.sharing_paused_for_ip_change = false;
             self.status.ip_paused.store(false, Ordering::Relaxed);
+            let _ = std::fs::remove_file(ip_pause_path(&self.config_dir));
         }
     }
 
@@ -2052,6 +2083,14 @@ impl Engine {
                 self.sharing.store(false, Ordering::Relaxed);
                 self.sharing_paused_for_ip_change = true;
                 self.status.ip_paused.store(true, Ordering::Relaxed);
+                // Persisted HERE, synchronously, not when the UI notices: the
+                // process can die before any poll or event drain runs (jetsam
+                // can end a background seed at any moment), and this pause
+                // must outlive the process - `Engine::new` restores it.
+                let _ = std::fs::write(
+                    ip_pause_path(&self.config_dir),
+                    b"sharing was paused because the public address changed;\nthe user has not turned it back on yet\n",
+                );
                 self.emit(EngineEvent::PublicAddressChanged);
             }
             _ => {}
@@ -7398,6 +7437,73 @@ mod tests {
                 .any(|e| matches!(e, EngineEvent::PublicAddressChanged)),
             "and warn; got {evs:?}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ...and THE PAUSE SURVIVES A RELAUNCH. The guard's whole premise is that
+    /// the USER decides when to resume - but the pause was an in-memory latch
+    /// while the sharing preference (UserDefaults, pushed at every boot) stays
+    /// ON, so process death dropped the latch and the next launch silently
+    /// resumed serving from the address the user did not choose. Observed on
+    /// glass 2026-08-09 (a VPN recycle, then an app relaunch). This is the
+    /// "an event is not state" family again, in its worst placement.
+    ///
+    /// Four launches: trip the guard; relaunch (still paused, still says WHY,
+    /// through the lock-free handle the UI polls); an unrelated OFF push (the
+    /// metered pause) must not eat the persisted reason; the user resumes;
+    /// a later relaunch comes back sharing normally (not sticky-forever).
+    #[test]
+    fn the_ip_change_pause_survives_a_relaunch_until_the_user_resumes() {
+        let dir = tmp("ip-pause-relaunch");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Launch 1: the guard fires.
+        let (mut e1, _rx1) = Engine::new(&dir).unwrap();
+        e1.note_public_id(0x0102_0304, false);
+        e1.note_public_id(0x0506_0708, false);
+        assert!(!e1.is_sharing(), "precondition: the guard paused sharing");
+        drop(e1);
+
+        // Launch 2: the pause is back BEFORE any preference push. is_sharing()
+        // is the very atomic the upload listener and the Kad publish gate
+        // read, so this is the "correct from the first moment" property.
+        let (mut e2, _rx2) = Engine::new(&dir).unwrap();
+        assert!(
+            !e2.is_sharing(),
+            "a relaunch after the guard fired must come back with sharing OFF"
+        );
+        assert!(
+            e2.sharing_paused_for_ip_change(),
+            "...and still able to say WHY"
+        );
+        assert!(
+            e2.handles().sharing_paused_for_ip_change(),
+            "the lock-free handle the UI boot-reads and polls must agree"
+        );
+        // An OFF push (the metered auto-pause, or a leech-mode preference) is
+        // NOT the user resuming: it must not clear the persisted pause.
+        e2.set_sharing(false);
+        drop(e2);
+        let (mut e3, _rx3) = Engine::new(&dir).unwrap();
+        assert!(
+            e3.sharing_paused_for_ip_change(),
+            "an unrelated OFF push must not clear the persisted pause"
+        );
+
+        // The user resumes: the persisted pause goes with the latch...
+        e3.set_sharing(true);
+        assert!(e3.is_sharing());
+        assert!(!e3.sharing_paused_for_ip_change());
+        drop(e3);
+
+        // ...so a later, unrelated relaunch does NOT re-pause.
+        let (e4, _rx4) = Engine::new(&dir).unwrap();
+        assert!(
+            e4.is_sharing(),
+            "after the user resumes, a relaunch must not re-pause"
+        );
+        assert!(!e4.sharing_paused_for_ip_change());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

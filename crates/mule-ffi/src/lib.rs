@@ -727,7 +727,10 @@ impl MuleEngine {
 
     /// True while sharing is off BECAUSE the public address changed under us
     /// (a dropped VPN tunnel, a network switch). The UI keeps saying why until
-    /// the user turns sharing back on, which clears it.
+    /// the user turns sharing back on, which clears it. Persists across
+    /// launches: the engine restores it from disk at construction, so a fresh
+    /// process still reports true here - and still refuses to serve - until
+    /// the user resumes.
     pub fn sharing_paused_for_ip_change(&self) -> bool {
         self.handles.sharing_paused_for_ip_change() // LOCK-FREE
     }

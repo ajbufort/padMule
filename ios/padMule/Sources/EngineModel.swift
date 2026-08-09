@@ -663,6 +663,13 @@ final class EngineModel: ObservableObject {
             do {
                 let e = try MuleEngine(configDir: path, downloadsDir: docsPath)
                 let ident = e.identity()
+                // The engine RESTORES the ip-change pause from disk in its
+                // constructor (the guard fired in a PREVIOUS launch and the
+                // user has not resumed sharing). Captured here, before any
+                // poll exists, so the main-thread seed below cannot miss it.
+                // Both reads are lock-free.
+                let ipPaused = e.sharingPausedForIpChange()
+                let sharingNow = e.isSharing()
                 // Ports and the UPnP toggle MUST be pushed before start(): they
                 // take effect when the listener binds, and every launch builds a
                 // fresh engine - so applying them afterwards (with the other
@@ -690,6 +697,13 @@ final class EngineModel: ObservableObject {
                     self.engine = e
                     self.ready = true
                     self.identity = ident
+                    // Seed the pause mirror BEFORE the first preference push
+                    // and the first poll tick: after a relaunch with the
+                    // restored pause, the banner and the Shared-screen caption
+                    // must say WHY from the first frame, not a second later -
+                    // and the sharing switch must not read ON in the meantime.
+                    self.sharingPausedForIpChange = ipPaused
+                    self.sharing = sharingNow
                     // Re-apply persisted settings the moment the engine exists.
                     // Without this the engine keeps its own defaults and the
                     // user's choices look like they were ignored.
@@ -978,7 +992,13 @@ final class EngineModel: ObservableObject {
                 wanted: wanted,
                 pauseOnMetered: pauseOnMetered,
                 metered: meteredNow,
-                pausedForIpChange: sharingPausedForIpChange,
+                // From the ENGINE (a lock-free atomic read), not from the
+                // published mirror: the mirror is poll-fed, so it runs a tick
+                // stale in the steady state and a whole LAUNCH stale at boot -
+                // and the engine now RESTORES this pause from disk, so a boot
+                // push that misses it would set_sharing(true) and clear the
+                // very pause the launch was supposed to honour.
+                pausedForIpChange: e.sharingPausedForIpChange(),
                 userInitiated: userInitiated
             )
         else {
