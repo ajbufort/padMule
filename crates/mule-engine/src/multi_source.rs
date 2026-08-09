@@ -936,18 +936,47 @@ impl Download {
                 pos = (key + EMBLOCKSIZE).min(part_start + PARTSIZE);
             }
         }
-        // BLOCKING I/O, ON THE REACTOR, UNDER THE LOCK - the known cost of this
-        // path, recorded rather than quietly carried (2026-08-08 reanalysis).
-        // Every other slow operation in this file goes through `spawn_blocking`
-        // (the part MD4 in `localize_corruption`, the AICH block SHA-1 in
-        // `apply_aich_recovery`, and the `verify_whole_file*` rehashes);
-        // this one does not, and it runs on a runtime built with 2 worker
-        // threads (`MuleEngine::new`). Not changed here because the guard is
-        // held across the call, so moving the write off the reactor is a
-        // locking change rather than a wrapper - and because the effect is
-        // unmeasured. See the note at the runtime builder before optimising.
+        // The write+fdatasync runs on the BLOCKING POOL, off the async lock -
+        // fixed 2026-08-09 after an instrumented A/B pinned the cost of the
+        // old shape (a synchronous `write_block` on the reactor, under
+        // `inner`): a single 180KB write+fdatasync spiked to 207ms, the lock
+        // wait behind it averaged 3.4ms with a 945ms peak (worst observed
+        // 1.81s), and aggregate transfer capped near the ~47.5 MB/s
+        // one-thread serialized write rate. The split:
+        //
+        //   1. take `inner` only long enough to detach a writer (a dup'd fd
+        //      plus the store's own `std::sync::Mutex` - the same std-lock
+        //      pattern as `reserved`),
+        //   2. write+sync in `spawn_blocking`, with `inner` free for polls
+        //      and for this download's other sessions,
+        //   3. retake `inner` and close the gap ONLY after the sync returned
+        //      Ok, preserving the part_store module-doc invariant: the gap
+        //      list never claims bytes the disk does not durably hold.
+        //
+        // Writes stay SERIALIZED per store (endgame races two peers onto the
+        // SAME final block, and whole-block last-write-wins must not become
+        // an interleaving); the win is that the fsync no longer occupies a
+        // reactor worker or this download's lock. If this future is DROPPED
+        // mid-write (the per-peer session `timeout` in fetch.rs drops it),
+        // the blocking task still runs to completion but step 3 never
+        // happens: the gap stays open and the block is simply re-fetched -
+        // the harmless direction, exactly like a cancel landing before the
+        // old under-lock write. Reservations are unaffected either way
+        // (`HeldBlocks`' destructor owns those).
+        if data.is_empty() {
+            return Ok(());
+        }
+        let writer = {
+            let g = self.inner.lock().await;
+            g.store.detach_writer()?
+        };
+        let owned = data.to_vec();
+        tokio::task::spawn_blocking(move || writer.write_and_sync(start, &owned))
+            .await
+            .map_err(io::Error::other)??;
         let mut g = self.inner.lock().await;
-        g.store.write_block(start, data)
+        g.store.pf.fill_gap(start, start + data.len() as u64);
+        Ok(())
     }
 
     /// True if `addr`'s IP was banned for this download (caught delivering
@@ -2241,6 +2270,167 @@ mod tests {
         dl.commit(8, &[7u8; 56], None).await.unwrap();
         let row = dl.admission_row(now).await;
         assert!(row.1, "all 64 bytes committed: complete reports in field 1");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Concurrent commits to DISJOINT ranges - the normal multi-peer shape,
+    /// since `take_blocks` reserves disjoint blocks outside endgame - must
+    /// land every byte at its own offset and leave the gap list exact. Runs
+    /// on a multi-thread runtime so the spawn_blocking writes really overlap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_commits_to_disjoint_ranges_keep_bytes_and_gaps_exact() {
+        let dir = tmpdir("conc-commit");
+        const CHUNK: usize = 8 * 1024;
+        const CHUNKS: usize = 8;
+        let size = (CHUNK * CHUNKS) as u64;
+        let data: Vec<u8> = (0..size).map(|i| (i.wrapping_mul(31) >> 3) as u8).collect();
+        let store = PartStore::create(&dir, 1, [0x66; 16], size, b"conc.bin").unwrap();
+        let dl = Download::new(store);
+
+        // Commit every chunk EXCEPT number 3, all concurrently.
+        let mut tasks = Vec::new();
+        for c in (0..CHUNKS).filter(|&c| c != 3) {
+            let dl = Arc::clone(&dl);
+            let chunk = data[c * CHUNK..(c + 1) * CHUNK].to_vec();
+            tasks.push(tokio::spawn(async move {
+                dl.commit((c * CHUNK) as u64, &chunk, None).await
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap().unwrap();
+        }
+
+        // The gap list must say EXACTLY chunk 3 - not a byte more or less.
+        assert_eq!(dl.missing().await, CHUNK as u64, "exactly one chunk open");
+        {
+            let g = dl.inner.lock().await;
+            assert_eq!(
+                g.store.pf.gaps(),
+                &[mule_files::Gap {
+                    start: (3 * CHUNK) as u64,
+                    end: (4 * CHUNK) as u64
+                }],
+                "the one remaining gap is exactly the uncommitted chunk"
+            );
+        }
+        // Close it and the bytes must be exactly what each committer wrote.
+        dl.commit((3 * CHUNK) as u64, &data[3 * CHUNK..4 * CHUNK], None)
+            .await
+            .unwrap();
+        assert!(dl.is_complete().await);
+        let path = {
+            let g = dl.inner.lock().await;
+            g.store.part_path().to_path_buf()
+        };
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            data,
+            "every concurrent write landed at its own offset"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A commit whose future is DROPPED mid-write (the per-peer session
+    /// timeout in fetch.rs drops the whole session future) must fail in the
+    /// harmless direction: the write may still land on disk, but the gap
+    /// stays OPEN (the block is re-fetched) and no reservation is touched.
+    /// The store's write-serialization lock stalls the blocking write at a
+    /// deterministic point; one manual poll drives `commit` past its brief
+    /// `inner` hold and into the join-handle await, where we drop it.
+    #[tokio::test]
+    async fn a_commit_dropped_mid_write_leaves_the_gap_open_and_leaks_nothing() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let dir = tmpdir("drop-commit");
+        let data = vec![0xA5u8; 4096];
+        let store = PartStore::create(&dir, 1, [0x33; 16], 4096, b"drop.bin").unwrap();
+        let serial = store.write_serial_handle();
+        let part_path = store.part_path().to_path_buf();
+        let dl = Download::new(store);
+
+        // Stall the write, drive commit to its post-spawn await, drop it.
+        {
+            let stall = serial.lock().unwrap();
+            let mut fut = Box::pin(dl.commit(0, &data, None));
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(
+                matches!(fut.as_mut().poll(&mut cx), Poll::Pending),
+                "with the write stalled, commit must be parked at the join await"
+            );
+            drop(fut); // the session timeout firing mid-write
+            drop(stall);
+        }
+        // The orphaned blocking task runs to completion: the bytes land.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::fs::read(&part_path).unwrap() != data {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the detached write should still complete after the drop"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // ...but the accounting never ran: the gap is still open (re-download,
+        // the harmless direction) and nothing was reserved or leaked.
+        assert_eq!(
+            dl.missing().await,
+            4096,
+            "a dropped commit must not close the gap"
+        );
+        assert!(
+            dl.reserved_now().is_empty(),
+            "commit never touches reservations - dropped or not"
+        );
+        // A re-commit of the same block completes the download normally.
+        dl.commit(0, &data, None).await.unwrap();
+        assert!(dl.is_complete().await);
+        assert_eq!(std::fs::read(&part_path).unwrap(), data);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE defect this rework fixes: while a commit's write+fdatasync is in
+    /// flight, the download's `inner` lock must be FREE - the old shape held
+    /// it across the fsync (and a reactor worker with it), which is what put
+    /// 100-700ms hiccups into the 1s poll. Stall the write and prove a
+    /// status read still answers, and that the gap has not closed early.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_status_poll_answers_while_a_commit_write_is_stalled() {
+        let dir = tmpdir("stall-commit");
+        let data = vec![0x5Cu8; 4096];
+        let store = PartStore::create(&dir, 1, [0x44; 16], 4096, b"stall.bin").unwrap();
+        let serial = store.write_serial_handle();
+        let dl = Download::new(store);
+
+        // A dedicated thread holds the write lock (the FFI lock-free test's
+        // pattern), so no guard is held across an await here.
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let serial2 = Arc::clone(&serial);
+        let holder = std::thread::spawn(move || {
+            let _g = serial2.lock().unwrap();
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        held_rx.recv().unwrap();
+
+        let dl2 = Arc::clone(&dl);
+        let d2 = data.clone();
+        let commit = tokio::spawn(async move { dl2.commit(0, &d2, None).await });
+        // Let the commit task reach its stalled write.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // The poll answers although the write is mid-flight...
+        let missing = tokio::time::timeout(std::time::Duration::from_secs(2), dl.missing())
+            .await
+            .expect("inner must be free while the write+fsync is in flight");
+        // ...and the gap has NOT closed early: durability order is write,
+        // sync, THEN gap - never gap first.
+        assert_eq!(missing, 4096, "the gap must not close before the sync");
+
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        commit.await.unwrap().unwrap();
+        assert!(dl.is_complete().await);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

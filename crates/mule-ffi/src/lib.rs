@@ -502,28 +502,26 @@ impl MuleEngine {
             message: e.to_string(),
         })?;
         engine.set_downloads_dir(&downloads_dir);
-        // TWO WORKERS, AND THE RECEIVE PATH BLOCKS ON THEM. Flagged by the
-        // 2026-08-08 reanalysis and DELIBERATELY NOT CHANGED, because it is a
-        // hypothesis until someone measures it - but the next person to measure
-        // "padMule handles many downloads badly" should start here:
+        // FOUR WORKERS, SET FROM MEASUREMENT (2026-08-09 instrumented A/B: 20
+        // concurrent 256MB downloads through this FFI, one dedicated source
+        // each). Heartbeat max latency by worker count: 1 worker 395ms, 2
+        // (the old value) 299ms, 4 workers 151ms, 8 workers 56ms; poll ticks
+        // over 250ms: 26 / 41 / 0 / 0; aggregate throughput ~47-53 MB/s at 1
+        // worker, 52-59 at 2, 112 at 4, >=170 at 8 - two workers capped
+        // aggregate transfer at roughly 55 MB/s.
         //
-        //   `Download::commit` (multi_source.rs) takes the download's inner
-        //   lock and calls `PartStore::write_block`, which is a SYNCHRONOUS
-        //   `File::write_all` with no `spawn_blocking` - the one uninsulated
-        //   blocking call in an engine that otherwise wraps hashing, part
-        //   verification and AICH reads carefully. With 2 workers, two
-        //   concurrent ~180KB writes can occupy BOTH, stalling the server link,
-        //   the Kad loop and the UI poll for the duration.
-        //
-        // The max-active cap (`set_max_active_downloads`) defaults to 0 =
-        // unlimited, and each active download gets up to ~4 peer workers
-        // (`parallel_for_priority`), so at the default the offered load still
-        // scales with the number of downloads while the runtime does not.
-        // Raising this number is the cheap experiment; moving the write off the
-        // reactor is the real fix, and it needs care because the lock is held
-        // across it.
+        // The 2026-08-08 reanalysis suspect at this site is FIXED, not just
+        // papered over with threads: `Download::commit` (multi_source.rs) no
+        // longer holds the download lock across a synchronous write+fdatasync
+        // on the reactor - the write runs in `spawn_blocking` behind the
+        // store's own serialization lock (`PartStore::detach_writer`). The
+        // worker bump remains because throughput kept scaling with workers
+        // even at 8, i.e. the reactor was a binding constraint beyond the
+        // fsync alone (packet framing, zlib, obfuscation crypto all run on
+        // these threads). 4 is the knee that removes every >250ms poll tick
+        // without doubling thread count again for the tail beyond it.
         let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
+            .worker_threads(4)
             .enable_all()
             .build()
             .map_err(|e| FfiError::Io {

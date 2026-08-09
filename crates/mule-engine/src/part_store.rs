@@ -18,12 +18,16 @@
 //! corrupting a part (not harmless). This matters more here than on a desktop:
 //! iPadOS can suspend and kill us mid-write at any moment.
 //!
-//! I/O here is blocking. The driver calls it under a lock; an iOS build should
-//! wrap these in `spawn_blocking`.
+//! I/O here is blocking. The hot block-write path is detachable via
+//! [`PartStore::detach_writer`] so `Download::commit` runs the write+fsync on
+//! tokio's blocking pool without holding the download's async lock across it;
+//! the remaining calls (verification reads, met saves) still run under a lock.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex as StdMutex};
 
 use mule_files::part_met::{
     gap_tags, gaps as met_gaps, read_part_met, write_part_met, PartMet, PARTFILE_VERSION,
@@ -66,6 +70,16 @@ pub struct PartStore {
     part_path: PathBuf,
     met_path: PathBuf,
     file: File,
+    /// Serializes the data-file write+sync against every other writer, WITHOUT
+    /// involving the download's async lock - `Download::commit` detaches a
+    /// writer under a brief lock and runs the write+fdatasync on the blocking
+    /// pool while the async lock stays free (measured 2026-08-09: a single
+    /// 180KB write+fdatasync spiked to 207ms held on the reactor). `Arc`
+    /// because the detached write outlives its borrow of the store.
+    /// SERIALIZATION (not mere range-disjointness) is load-bearing: endgame
+    /// deliberately races two peers onto the SAME final block, and whole-block
+    /// "last full write wins" must not become an interleaving of two streams.
+    write_serial: Arc<StdMutex<()>>,
     pub pf: PartFile,
     pub name: Vec<u8>,
     /// The user's download priority (PR_LOW/PR_NORMAL/PR_HIGH). Persisted in
@@ -157,6 +171,7 @@ impl PartStore {
             part_path,
             met_path,
             file,
+            write_serial: Arc::new(StdMutex::new(())),
             pf: PartFile::new(hash, size),
             name: name.to_vec(),
             priority: PR_NORMAL,
@@ -262,6 +277,7 @@ impl PartStore {
             part_path,
             met_path,
             file,
+            write_serial: Arc::new(StdMutex::new(())),
             pf,
             name,
             priority,
@@ -272,23 +288,36 @@ impl PartStore {
     /// Write a received block, then close its gap.
     ///
     /// The order is the point: the bytes are on disk and synced before the gap
-    /// list stops asking for them. See the module docs.
+    /// list stops asking for them. See the module docs. The write itself goes
+    /// through [`DetachedWrite`] - the same serialized path `Download::commit`
+    /// uses from the blocking pool - so the two can never interleave.
     pub fn write_block(&mut self, start: u64, data: &[u8]) -> io::Result<()> {
         if data.is_empty() {
             return Ok(());
         }
-        let end = start + data.len() as u64;
-        if end > self.pf.size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "block runs past the end of the file",
-            ));
-        }
-        self.file.seek(SeekFrom::Start(start))?;
-        self.file.write_all(data)?;
-        self.file.sync_data()?;
-        self.pf.fill_gap(start, end);
+        self.detach_writer()?.write_and_sync(start, data)?;
+        self.pf.fill_gap(start, start + data.len() as u64);
         Ok(())
+    }
+
+    /// The pieces one block write needs OFF the store's lock: a dup'd handle,
+    /// the write-serialization lock, and the size bound. `Download::commit`
+    /// detaches under a brief hold of the download lock, runs
+    /// [`DetachedWrite::write_and_sync`] on the blocking pool, then retakes
+    /// the lock to close the gap.
+    pub fn detach_writer(&self) -> io::Result<DetachedWrite> {
+        Ok(DetachedWrite {
+            file: self.file.try_clone()?,
+            serial: Arc::clone(&self.write_serial),
+            size: self.pf.size,
+        })
+    }
+
+    /// The store's write-serialization lock, so a test can hold a detached
+    /// write still at a deterministic point.
+    #[cfg(test)]
+    pub(crate) fn write_serial_handle(&self) -> Arc<StdMutex<()>> {
+        Arc::clone(&self.write_serial)
     }
 
     /// Read a whole part back off disk (for verification).
@@ -424,6 +453,38 @@ impl PartStore {
     pub fn remove_backing_files(&self) {
         let _ = fs::remove_file(&self.part_path);
         let _ = fs::remove_file(&self.met_path);
+    }
+}
+
+/// One block's write, detached from the store so it can run on the blocking
+/// pool while the download's async lock stays free. Positional writes (pwrite)
+/// ONLY: the dup'd fd SHARES a cursor with the store's own handle (dup
+/// semantics), which `read_part`/`verify_part` still seek under the download
+/// lock, so a detached write must never move it.
+pub struct DetachedWrite {
+    file: File,
+    serial: Arc<StdMutex<()>>,
+    size: u64,
+}
+
+impl DetachedWrite {
+    /// Write `data` at `start` and fdatasync it. BLOCKING (a 180KB
+    /// write+fdatasync measured p99 6.3ms, spikes to 207ms under load) - call
+    /// it on the blocking pool, never on the reactor. Serialized against every
+    /// other writer to this store. Does NOT close the gap: the caller does
+    /// that under the download lock strictly AFTER this returns Ok, preserving
+    /// the module-doc invariant that the gap list never claims bytes the disk
+    /// does not durably hold.
+    pub fn write_and_sync(&self, start: u64, data: &[u8]) -> io::Result<()> {
+        if start + data.len() as u64 > self.size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "block runs past the end of the file",
+            ));
+        }
+        let _serialized = self.serial.lock().unwrap();
+        self.file.write_all_at(data, start)?;
+        self.file.sync_data()
     }
 }
 
@@ -723,6 +784,37 @@ mod tests {
             "the snapshot is exactly the leading bytes"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_detached_write_lands_bytes_without_touching_the_gap_list() {
+        // The split behind Download::commit's off-reactor write: DetachedWrite
+        // owns the write+sync (serialized, bounds-checked), and ONLY the caller
+        // closes the gap, strictly afterwards - so a commit cancelled between
+        // the two re-downloads the block (harmless) instead of the gap list
+        // claiming bytes that never synced (not harmless).
+        let dir = tmpdir("detached");
+        let data: Vec<u8> = (0..4000u32).map(|i| (i * 3) as u8).collect();
+        let mut s = PartStore::create(&dir, 1, [0x42; 16], 4000, b"d.bin").unwrap();
+        let w = s.detach_writer().unwrap();
+        w.write_and_sync(0, &data).unwrap();
+        // The bytes are on disk...
+        assert_eq!(fs::read(dir.join("001.part")).unwrap(), data);
+        // ...but the gap has NOT closed: that accounting belongs to the caller.
+        assert_eq!(
+            s.pf.missing(),
+            4000,
+            "a detached write must not close the gap"
+        );
+        // The caller's half: close it, and the store agrees with the disk
+        // (read_part seeks the store's own cursor - untouched by the detached
+        // write, which is positional-only on a dup'd fd).
+        s.pf.fill_gap(0, 4000);
+        assert!(s.is_complete());
+        assert_eq!(s.read_part(0).unwrap(), data);
+        // Same bounds rule as write_block.
+        assert!(w.write_and_sync(3999, &[0u8; 2]).is_err());
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
