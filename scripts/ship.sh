@@ -32,9 +32,11 @@
 #      Added 2026-08-08 after 12 local commits sent CI to build the tip from
 #      before them; guard 2 caught it, but reported "no run found" rather than
 #      the actual cause.
-#   6. An open XCUITest session is CLOSED before installing. An active one parks
-#      `apps install` indefinitely at zero CPU, which is indistinguishable from
-#      a slow install.
+#   6. An open XCUITest session is CLOSED before installing, and a RUNNING
+#      padMule is terminated. Either one has been observed parking
+#      `apps install` at zero CPU, which is indistinguishable from a slow
+#      install. (The session case is proven; the running-app case is a strong
+#      timing correlation from a single 2026-08-08 observation.)
 #
 # Usage: scripts/ship.sh [--no-install]
 set -euo pipefail
@@ -216,6 +218,28 @@ SESS=$(curl -s --max-time 8 localhost:8100/status \
 if [ -n "$SESS" ]; then
   echo "-- closing the open WDA session $SESS (it would block the install)"
   curl -s -X DELETE --max-time 15 "localhost:8100/session/$SESS" >/dev/null || true
+fi
+
+# AND TERMINATE THE APP ITSELF IF IT IS RUNNING. On 2026-08-08 an install sat
+# PARKED for ~9 minutes - `apps install` at ZERO CPU, 151 ticks unchanged across
+# a 10s sample - with NO WDA session open, so it was not the trap above. padMule
+# was RUNNING at the time; killing it at 20:06:41 was followed by
+# "Installation succeed" at 20:06:42. **ONE OBSERVATION, so this is a strong
+# timing correlation rather than proven causation** - but it matches the earlier
+# clean install that day, where closing the WDA session had already terminated
+# the app, and terminating a build you are about to REPLACE costs nothing.
+RUNPID=$(pymobiledevice3 developer dvt proclist 2>/dev/null | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+print(next((str(p.get('pid')) for p in d if str(p.get('name')) == 'padMule'), ''))
+" 2>/dev/null || true)
+if [ -n "$RUNPID" ]; then
+  echo "-- padMule is running (pid $RUNPID); terminating it before the install"
+  pymobiledevice3 developer dvt kill "$RUNPID" >/dev/null 2>&1 || true
+  sleep 2
 fi
 
 echo "-- installing"
