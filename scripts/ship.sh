@@ -243,7 +243,20 @@ if [ -n "$RUNPID" ]; then
 fi
 
 echo "-- installing"
-pymobiledevice3 apps install "$KIT/padmule-signed-$SHORT.ipa" 2>&1 | tail -1
+# BOUNDED, and for the same reason the CI wait is: this whole script holds the
+# flock, so an install that never returns does not just hang this run - it
+# blocks every later ship with "another ship is in flight" and no way to tell
+# that from a real one. Guards 6/6b remove the two KNOWN parking causes (an
+# open XCUITest session, a running padMule); a third would park here forever.
+# 10 minutes is ~20x a normal ~30s install and longer than either measured
+# parking episode.
+if ! timeout 600 pymobiledevice3 apps install "$KIT/padmule-signed-$SHORT.ipa" 2>&1 | tail -1; then
+  echo "ABORT: the install did not finish within 600s (or failed outright)." >&2
+  echo "       If it PARKED, the cause is a third blocker beyond the XCUITest" >&2
+  echo "       session and a running padMule - sample the installer's CPU twice:" >&2
+  echo "       parked ticks mean blocked, climbing ticks mean merely slow." >&2
+  exit 1
+fi
 
 # GUARD 4, FOR REAL. This block used to be a WebDriverAgent `/status` ping, and
 # the run ended by telling a HUMAN to read Settings - so the "closed loop" was
@@ -252,11 +265,16 @@ pymobiledevice3 apps install "$KIT/padmule-signed-$SHORT.ipa" 2>&1 | tail -1
 # that do not leave a new build installed, which is precisely why the version
 # has to come back OFF THE DEVICE rather than from the installer's exit.
 echo "-- reading the installed build back off the device"
+# EXACT bundle id, not a substring. `'padMule' in k` took the FIRST key merely
+# CONTAINING the name, so a second padMule left over under a different team
+# suffix could answer for this one - and a guard whose whole job is to not be
+# fooled must not read another app's version. $BUNDLE is derived from the
+# profile above and already validated non-empty.
 ON_DEV=$(pymobiledevice3 apps list 2>/dev/null | python3 -c "
 import sys,json
 d=json.load(sys.stdin)
-print(next((v.get('CFBundleVersion','') for k,v in d.items() if 'padMule' in k), ''))
-" 2>/dev/null || true)
+print(d.get(sys.argv[1],{}).get('CFBundleVersion',''))
+" "$BUNDLE" 2>/dev/null || true)
 [ "$ON_DEV" = "$SHORT" ] || {
   echo "ABORT: the device reports '$ON_DEV', expected '$SHORT' - the install did \
 NOT land, whatever the installer said" >&2; exit 1; }

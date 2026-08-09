@@ -342,7 +342,7 @@ struct ContentView: View {
                         + "your traffic may no longer be going through it.\n\n"
                         + "Sharing has NOT been paused by this warning - padMule pauses it "
                         + "automatically only once it confirms its public address actually changed. "
-                        + "To stop serving files right now, turn off Share uploads on the Status "
+                        + "To stop serving files right now, turn off Share uploads on the Shared "
                         + "screen, or use Stop."
                 )
             }

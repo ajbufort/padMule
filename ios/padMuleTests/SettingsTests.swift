@@ -85,12 +85,11 @@ final class SettingsTests: XCTestCase {
     func testDefaultsRegisterTheProtectiveValues() {
         // Both the sharing default and the metered-pause default must be ON, so a
         // fresh install protects a data plan without the user configuring anything.
-        let d = UserDefaults(suiteName: "padMule.test.defaults")!
-        d.removePersistentDomain(forName: "padMule.test.defaults")
-        d.register(defaults: [
-            SettingsKey.shareUploads: true,
-            SettingsKey.pauseSharingOnCellular: true,
-        ])
+        // Call the REAL registration (not a restated dictionary) - a test that
+        // registers its own defaults only proves UserDefaults.register works, and
+        // would stay green if SettingsDefaults flipped either key to false.
+        SettingsDefaults.register()
+        let d = UserDefaults.standard
         XCTAssertTrue(d.bool(forKey: SettingsKey.shareUploads))
         XCTAssertTrue(d.bool(forKey: SettingsKey.pauseSharingOnCellular))
     }

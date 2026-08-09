@@ -20,7 +20,11 @@ pub const MAX_NODES: usize = 200;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KadContact {
     pub id: Kad128,
-    /// IPv4, network-order octets as stored (pass-through; ntohl only to display).
+    /// IPv4 in HOST order - the `u32::from(Ipv4Addr)` convention, first octet in
+    /// the high byte. This is what `is_blocked_u32` / `is_acceptable_contact`
+    /// consume directly (see `engine::ip_from_met_u32`, which converts the
+    /// server.met LE u32 to reach this same order). Do NOT call it network
+    /// order: upstream `NetworkFunctions.h` takes Kad IPs in host order too.
     pub ip: u32,
     pub udp_port: u16,
     pub tcp_port: u16,

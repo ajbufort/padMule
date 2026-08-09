@@ -822,11 +822,21 @@ async fn http_roundtrip(host: &str, port: u16, request: &str) -> Result<String, 
         .write_all(request.as_bytes())
         .await
         .map_err(|e| UpnpError::Io(e.to_string()))?;
+    // Bound the response: an IGD is not fully trusted, and a plain
+    // `read_to_end` would pull an unbounded body into RAM on a device with a
+    // ~100MB jetsam budget. Real device descriptions and SOAP replies are a
+    // few KB; 64KB is generous. Every other wire allocation in the tree is
+    // bounded (packet.rs MAX_PACKET_SIZE, sources.rs MAX_SOURCES_PER_ANSWER);
+    // this was the outlier.
+    const MAX_HTTP_RESPONSE: u64 = 64 * 1024;
     let mut buf = Vec::new();
-    timeout(Duration::from_secs(5), stream.read_to_end(&mut buf))
-        .await
-        .map_err(|_| UpnpError::Io("read timeout".into()))?
-        .map_err(|e| UpnpError::Io(e.to_string()))?;
+    timeout(
+        Duration::from_secs(5),
+        (&mut stream).take(MAX_HTTP_RESPONSE).read_to_end(&mut buf),
+    )
+    .await
+    .map_err(|_| UpnpError::Io("read timeout".into()))?
+    .map_err(|e| UpnpError::Io(e.to_string()))?;
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 

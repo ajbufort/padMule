@@ -105,7 +105,12 @@ pub fn scan_known2_met(bytes: &[u8]) -> Result<Known2Index, IoError> {
 /// allocation larger than the store itself.
 pub fn read_known2_entry(bytes: &[u8], offset: u64) -> Result<Known2Entry, IoError> {
     let at = offset as usize;
-    if bytes.len() < at + ENTRY_HEADER {
+    // `offset` is a raw caller-supplied u64; a wild value must not wrap the
+    // bounds check (it would then panic on the slice below).
+    let Some(header_end) = at.checked_add(ENTRY_HEADER) else {
+        return Err(IoError::UnexpectedEof);
+    };
+    if bytes.len() < header_end {
         return Err(IoError::UnexpectedEof);
     }
     let mut root = [0u8; 20];
@@ -130,13 +135,33 @@ pub fn read_known2_entry(bytes: &[u8], offset: u64) -> Result<Known2Entry, IoErr
     Ok(Known2Entry { root, leaves })
 }
 
+/// Every entry's start offset, in file order, over the valid (non-torn) prefix
+/// `valid_len` reported by [`scan_known2_met`]. Unlike the `by_root` index this
+/// keeps DUPLICATE roots: dropping them would be silent data loss in a full
+/// read or a rewrite that promises byte-verbatim preservation. Every step lands
+/// inside `valid_len`, which the scan already proved holds only whole entries.
+fn entry_offsets(bytes: &[u8], valid_len: u64) -> Vec<u64> {
+    let mut offsets = Vec::new();
+    let mut pos = 1u64;
+    while pos < valid_len {
+        let at = pos as usize;
+        let count = u32::from_le_bytes([
+            bytes[at + HASHSIZE],
+            bytes[at + HASHSIZE + 1],
+            bytes[at + HASHSIZE + 2],
+            bytes[at + HASHSIZE + 3],
+        ]);
+        offsets.push(pos);
+        pos += ENTRY_HEADER as u64 + u64::from(count) * HASHSIZE as u64;
+    }
+    offsets
+}
+
 /// Full parse of a store (tools/tests; the engine uses the index + per-entry
 /// reads). A torn tail is silently dropped, like the scan.
 pub fn read_known2_met(bytes: &[u8]) -> Result<Vec<Known2Entry>, IoError> {
     let idx = scan_known2_met(bytes)?;
-    let mut offsets: Vec<u64> = idx.by_root.values().copied().collect();
-    offsets.sort_unstable();
-    offsets
+    entry_offsets(bytes, idx.valid_len)
         .into_iter()
         .map(|off| read_known2_entry(bytes, off))
         .collect()
@@ -151,13 +176,13 @@ pub fn remove_known2_entry(bytes: &[u8], root: &[u8; 20]) -> Option<Vec<u8>> {
     idx.by_root.get(root)?;
     let mut out = Vec::with_capacity(bytes.len());
     out.push(KNOWN2_MET_VERSION);
-    let mut offsets: Vec<(u64, [u8; 20])> = idx.by_root.iter().map(|(r, o)| (*o, *r)).collect();
-    offsets.sort_unstable();
-    for (off, r) in offsets {
-        if r == *root {
+    // File-order walk, not the dedup index: a store with a duplicate root would
+    // otherwise lose the second copy, since `by_root` cannot key it.
+    for off in entry_offsets(bytes, idx.valid_len) {
+        let at = off as usize;
+        if &bytes[at..at + HASHSIZE] == root {
             continue;
         }
-        let at = off as usize;
         let count = u32::from_le_bytes([
             bytes[at + HASHSIZE],
             bytes[at + HASHSIZE + 1],
@@ -291,5 +316,35 @@ mod tests {
             vec![leaf(1)],
             "first entry wins"
         );
+    }
+
+    #[test]
+    fn a_wild_offset_errors_instead_of_overflowing() {
+        // `read_known2_entry` is pub and takes a raw u64; an offset near the
+        // top of the range must not wrap `at + ENTRY_HEADER` past the length
+        // check and index out of bounds.
+        let s = store_of(&[(&leaf(0xAA), &[leaf(1)])]);
+        assert!(read_known2_entry(&s, u64::MAX).is_err());
+    }
+
+    #[test]
+    fn a_duplicate_root_survives_a_full_read_and_a_removal() {
+        // A store CAN hold a duplicate root (the case above pins first-wins for
+        // the index). Reading it back, or rewriting to drop a DIFFERENT entry,
+        // must not silently destroy the second copy: `by_root` cannot key it,
+        // so both paths have to walk the store in file order, not through the
+        // dedup map. The contract at `remove_known2_entry` promises the other
+        // entries are preserved byte-verbatim.
+        let mut s = store_of(&[(&leaf(0xAA), &[leaf(1)]), (&leaf(0xBB), &[leaf(3)])]);
+        s.extend_from_slice(&known2_entry_bytes(&leaf(0xAA), &[leaf(2)]));
+
+        let all = read_known2_met(&s).unwrap();
+        assert_eq!(all.len(), 3, "the duplicate-root entry is not dropped");
+        assert_eq!(all.iter().filter(|e| e.root == leaf(0xAA)).count(), 2);
+
+        let out = remove_known2_entry(&s, &leaf(0xBB)).unwrap();
+        let mut expected = store_of(&[(&leaf(0xAA), &[leaf(1)])]);
+        expected.extend_from_slice(&known2_entry_bytes(&leaf(0xAA), &[leaf(2)]));
+        assert_eq!(out, expected, "both duplicate entries survive the rewrite");
     }
 }

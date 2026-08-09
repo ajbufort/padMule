@@ -776,7 +776,11 @@ impl MuleEngine {
             let now = u64::from(mule_engine::credit_store::now_secs());
             for dl in self.handles.downloads().await {
                 let size = dl.size().await;
-                let have = size - dl.missing().await;
+                // `size` and `missing()` are read under separate locks, so the
+                // pair is not an atomic snapshot; `saturating_sub` keeps a
+                // transient `missing > size` from wrapping to a nonsense `have`
+                // in release (or panicking across the FFI in debug).
+                let have = size.saturating_sub(dl.missing().await);
                 let (rating, has_comment) = dl.rating_summary().await;
                 let origins = dl.source_origins().await;
                 let parts = dl.part_availability().await;

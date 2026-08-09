@@ -28,8 +28,11 @@ fn parses_the_real_fixture() {
     assert_eq!(c.tcp_port, 4662);
     assert_eq!(c.version, 8);
     assert!(c.verified);
-    // IP 226.80.49.93 stored network-order (first octet in the low byte here is
-    // 226 because the file stores it as the raw u32 our reader read LE).
+    // `c.ip` is HOST order (first octet in the HIGH byte), so its little-endian
+    // bytes are exactly the four bytes on disk - which is what this pins. The
+    // earlier note here read those LE bytes AS the address and so named the
+    // octets reversed; the real contact address is their host-order reading,
+    // not 226.80.x.
     let octets = c.ip.to_le_bytes();
     assert_eq!(octets, [226, 80, 49, 93]);
 }

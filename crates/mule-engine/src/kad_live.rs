@@ -1415,7 +1415,12 @@ impl KadNode {
                             let (op, p) = build_search_key_req_restrictive(&target, 0, words);
                             pack_kad(op, p)
                         }
-                        ValueAsk::None => unreachable!("no value asks with a zero budget"),
+                        // `harvest` gates on a non-zero value budget, which
+                        // `ValueAsk::None` never has, so this arm is not
+                        // reached today. `continue` rather than `unreachable!`
+                        // so a future budget change cannot unwind the whole
+                        // lookup driver (and the engine heartbeat with it).
+                        ValueAsk::None => continue,
                     };
                     if self
                         .spawn_lookup_request(
