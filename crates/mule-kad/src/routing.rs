@@ -23,6 +23,40 @@ pub const KK: u128 = 5;
 /// Maximum tree depth.
 pub const MAXLEVELS: u8 = 127;
 
+// --- CONTACT AGING (eMule `CContact`, Contact.cpp) ---
+// padMule had NO aging at all before 2026-08-08: nothing expired, nothing was
+// probed, nothing was ever removed. These are eMule's own numbers, read from
+// the source rather than the spec.
+/// A new or nodes.dat-loaded contact: unproven, no lease yet (`InitContact`,
+/// Contact.cpp:120-129 - type 3, expires 0). One failed probe from death.
+pub const KAD_TYPE_NEW: u8 = 3;
+/// A contact that has just proven itself alive (`UpdateType` hour-0 arm,
+/// Contact.cpp:233-236).
+pub const KAD_TYPE_ALIVE: u8 = 2;
+/// Probed and awaiting an answer. The only type a sweep may REMOVE
+/// (`OnSmallTimer`, RoutingZone.cpp:868-885).
+pub const KAD_TYPE_PROBED: u8 = 4;
+/// The lease a proven-alive contact gets (`UpdateType` hour-0, HR2S(1)).
+pub const ALIVE_LEASE_SECS: u64 = 3600;
+/// How long a probed contact has to answer before a sweep removes it
+/// (`CheckingType`, Contact.cpp:223 - MIN2S(2)).
+pub const PROBE_WINDOW_SECS: u64 = 120;
+/// `CheckingType` refuses to re-stamp within 10 seconds (Contact.cpp:218), so a
+/// burst of sweeps cannot march a contact to death faster than the wire allows.
+pub const CHECKING_TYPE_MIN_GAP: u64 = 10;
+
+/// What one [`RoutingTable::sweep`] pass did: who must be probed, and who was
+/// removed for failing to answer an earlier probe.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SweepOutcome {
+    /// Contacts to send a `KADEMLIA2_HELLO_REQ` to. Already stamped as probed,
+    /// so a sweep that fires while these are in flight will not re-probe them.
+    pub probes: Vec<Contact>,
+    /// Contacts removed this pass. The caller tombstones these so they are not
+    /// written back to nodes.dat.
+    pub removed: Vec<Kad128>,
+}
+
 /// One routing-table contact: a node plus its precomputed XOR distance to us.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Contact {
@@ -45,6 +79,16 @@ pub struct Contact {
     /// Our public IP when `udp_key` was minted; the key is only echoed while this
     /// still matches our current public IP (mirrors `CKadUDPKey::GetKeyValue`).
     pub udp_key_ip: u32,
+    /// eMule `CContact::m_byType`: 3 = new/unproven, 2 = proven alive, 4 =
+    /// probed and awaiting an answer. Lower is better-established. Only a
+    /// type-4 contact past its `expires` may be removed by a sweep.
+    pub kad_type: u8,
+    /// eMule `CContact::m_tExpires`, as an absolute second on the caller's
+    /// clock. `None` is eMule's 0 sentinel - "never stamped" - which the first
+    /// sweep replaces with `now` so the second sweep can probe it.
+    pub expires: Option<u64>,
+    /// eMule `CContact::m_tLastTypeSet`, guarding `CheckingType`'s 10s floor.
+    pub last_type_set: u64,
     /// self_id XOR id - fixed once we know our own ID, so kept here.
     distance: Kad128,
 }
@@ -72,6 +116,14 @@ impl Contact {
             verified,
             udp_key,
             udp_key_ip,
+            // eMule `InitContact`: every contact starts unproven with no lease,
+            // including one loaded from nodes.dat - aging is never persisted
+            // (nodes.dat carries no type/expiry field), so a restart re-proves
+            // everyone. That is what makes a dead seed die ~3-4 minutes into a
+            // session rather than never.
+            kad_type: KAD_TYPE_NEW,
+            expires: None,
+            last_type_set: 0,
         }
     }
 
@@ -146,7 +198,14 @@ impl Zone {
                 {
                     return;
                 }
-                let old = bin.remove(pos);
+                // IN PLACE, and the POSITION is the load-bearing half. eMule's
+                // found-contact branch returns without `PushToBottom`, which
+                // lives only inside `SetAlive` (RoutingZone.cpp:519-597,
+                // RoutingBin.cpp:136). Since the sweep probes the bin FRONT,
+                // rotating on hearsay would let a contact that other nodes keep
+                // naming dodge the probe forever - exactly the zombie this
+                // feature exists to kill. padMule rotated here until 2026-08-08.
+                let old = bin[pos].clone();
                 let mut contact = contact;
                 // The verified bit is monotonic ONLY while the IP is unchanged
                 // (eMule Contact.cpp:175-178 clears IsIpVerified on ANY ip change).
@@ -165,7 +224,15 @@ impl Zone {
                         contact.udp_key_ip = old.udp_key_ip;
                     }
                 }
-                bin.push(contact);
+                // Aging survives a same-address refresh and RESETS on a move:
+                // a new address is a new lease, exactly as the verified bit is
+                // already dropped above.
+                if old.ip == contact.ip {
+                    contact.kad_type = old.kad_type;
+                    contact.expires = old.expires;
+                    contact.last_type_set = old.last_type_set;
+                }
+                bin[pos] = contact;
                 return;
             }
             if bin.len() < K {
@@ -183,6 +250,77 @@ impl Zone {
         // Full, splittable leaf: split, then re-descend into the new subtree.
         self.split();
         self.add(contact);
+    }
+
+    /// eMule `CRoutingBin::SetAlive` (RoutingBin.cpp:125-138): `UpdateType`
+    /// plus `PushToBottom`. Returns true if the contact was found here.
+    fn set_alive(&mut self, id: &Kad128, now: u64) -> bool {
+        match &mut self.node {
+            Node::Leaf(bin) => {
+                let Some(pos) = bin.iter().position(|c| c.id == *id) else {
+                    return false;
+                };
+                let mut c = bin.remove(pos);
+                // Only `UpdateType`'s hour-0 arm. The 1h/1.5h/2h ladder needs a
+                // creation clock and every rung outlasts a padMule foreground
+                // session, so the branch that picks among them cannot be
+                // observed here - a documented, wire-neutral divergence.
+                c.kad_type = KAD_TYPE_ALIVE;
+                c.expires = Some(now + ALIVE_LEASE_SECS);
+                c.last_type_set = now;
+                bin.push(c); // PushToBottom: no longer the oldest
+                true
+            }
+            Node::Internal(zero, one) => zero.set_alive(id, now) || one.set_alive(id, now),
+        }
+    }
+
+    /// One `OnSmallTimer` pass over this subtree (eMule RoutingZone.cpp:860-905).
+    /// Removal and stamping run for EVERY leaf; only probe EMISSION is capped,
+    /// so a wide table cannot burst a HELLO at every bin at once (eMule gets
+    /// that stagger free from its per-zone timers, RoutingZone.cpp:124).
+    fn sweep(&mut self, now: u64, max_probes: usize, out: &mut SweepOutcome) {
+        match &mut self.node {
+            Node::Leaf(bin) => {
+                // 1. Remove the dead: probed, past expiry. No other type is ever
+                //    removed by a sweep, however stale it looks.
+                bin.retain(|c| {
+                    let dead = c.kad_type == KAD_TYPE_PROBED && c.expires.is_some_and(|e| e <= now);
+                    if dead {
+                        out.removed.push(c.id);
+                    }
+                    !dead
+                });
+                // 2. Stamp the never-stamped, so the NEXT sweep can probe them.
+                for c in bin.iter_mut().filter(|c| c.expires.is_none()) {
+                    c.expires = Some(now);
+                }
+                // 3. Probe the oldest DUE contact - the bin front.
+                if out.probes.len() >= max_probes || bin.is_empty() {
+                    return;
+                }
+                let front = &bin[0];
+                if front.expires.is_some_and(|e| e >= now) || front.kad_type == KAD_TYPE_PROBED {
+                    // Not due, or already awaiting an answer: rotate it away so
+                    // the next contact gets its turn (eMule PushToBottom).
+                    let c = bin.remove(0);
+                    bin.push(c);
+                    return;
+                }
+                let c = &mut bin[0];
+                if now.saturating_sub(c.last_type_set) < CHECKING_TYPE_MIN_GAP {
+                    return; // eMule's 10s floor on re-stamping
+                }
+                c.last_type_set = now;
+                c.expires = Some(now + PROBE_WINDOW_SECS);
+                c.kad_type = c.kad_type.saturating_add(1);
+                out.probes.push(c.clone());
+            }
+            Node::Internal(zero, one) => {
+                zero.sweep(now, max_probes, out);
+                one.sweep(now, max_probes, out);
+            }
+        }
     }
 
     /// Turn this full leaf into an internal node, redistributing its bin by each
@@ -309,6 +447,39 @@ impl RoutingTable {
     /// `id` at `ip` handed us, so we can echo it back and be verified. A no-op if
     /// the contact is absent or at a different IP (a key is IP-bound). Kept a
     /// separate call so `add`'s many callers stay untouched.
+    /// A contact has PROVEN itself alive - it answered something we sent, or
+    /// sent us a HELLO_REQ whose sender key matches the one we hold for it.
+    /// eMule `SetAlive` (RoutingBin.cpp:125-138), reached from the `bUpdate =
+    /// true` paths only: an inbound HELLO_REQ, a HELLO_RES to a request of ours
+    /// (which includes the sweep's own probe), and the BOOTSTRAP_RES responder.
+    /// NOT from find/value answers - eMule adds those with `bUpdate = false`
+    /// (KademliaUDPListener.cpp:846, signature RoutingZone.cpp:492), so hearsay
+    /// never refreshes a lease.
+    pub fn set_alive(&mut self, id: &Kad128, now: u64) -> bool {
+        self.root.set_alive(id, now)
+    }
+
+    /// One `OnSmallTimer` pass: remove contacts that failed their probe, stamp
+    /// the never-stamped, and hand back up to `max_probes` contacts to send a
+    /// HELLO_REQ to. PURE - the caller does the I/O and calls
+    /// [`set_alive`](RoutingTable::set_alive) on whoever answers.
+    ///
+    /// A contact walks eMule's exact death march: stamped by one sweep, probed
+    /// by the next (type -> 4, two minutes to answer), removed by the first
+    /// sweep past that. A nodes.dat seed starts at type 3, so a dead one is
+    /// gone ~3-4 minutes into a session.
+    ///
+    /// NO `InUse` REFCOUNT, deliberately. eMule needs one (Search.cpp:183 takes
+    /// seeds `bInUse = true`, released in `~CSearch` :148-150) because
+    /// `OnSmallTimer` `delete`s a `CContact*` a running search still points at.
+    /// padMule's lookups CLONE contacts out of the table, so a removal mid
+    /// lookup dangles nothing - the refcount would have no referent.
+    pub fn sweep(&mut self, now: u64, max_probes: usize) -> SweepOutcome {
+        let mut out = SweepOutcome::default();
+        self.root.sweep(now, max_probes, &mut out);
+        out
+    }
+
     pub fn note_verify_key(&mut self, id: &Kad128, ip: u32, key: u32, key_ip: u32) {
         if let Some(c) = self.root.find_mut(id) {
             if c.ip == ip {
@@ -429,6 +600,18 @@ impl RoutingTable {
         if self.enforce_verified {
             all.retain(|c| c.verified);
         }
+        // A contact awaiting a probe answer is one we already doubt: eMule
+        // seeds a search from `GetClosestTo(3, ...)` (Search.cpp:183), and the
+        // bin filter is `GetType() <= uMaxType` (RoutingBin.cpp:244), so type 4
+        // is excluded from lookups. This is the half of the feature that pays
+        // off immediately - a dying contact stops being handed out as a seed a
+        // full probe window before it is removed.
+        //
+        // NOT narrowed to eMule's SERVE rule (`GetClosestTo(2, ...)`,
+        // KademliaUDPListener.cpp:738) here: that changes what padMule TELLS
+        // other nodes and wants the amuled A/B oracle first. Recorded in the
+        // handoff as the remaining half.
+        all.retain(|c| c.kad_type < KAD_TYPE_PROBED);
         all.sort_by_key(|c| target.distance(&c.id));
         all.into_iter().take(count).cloned().collect()
     }
@@ -809,5 +992,280 @@ mod tests {
         // leaf, limited leaves because far zones stop splitting).
         let n = rt.len();
         assert!(n > 0 && n <= 50);
+    }
+
+    /// Find a contact by id, for the aging tests.
+    fn find_c(t: &RoutingTable, want: Kad128) -> Contact {
+        t.contacts()
+            .into_iter()
+            .find(|c| c.id == want)
+            .expect("contact present")
+    }
+
+    /// eMule `CRoutingBin::SetAlive` (RoutingBin.cpp:125-138) is `UpdateType`
+    /// plus `PushToBottom`: a contact that has just PROVEN itself alive gets a
+    /// fresh lease and goes to the back of its bin, so the sweep's "oldest"
+    /// (the front) keeps naming the least-recently-proven contact.
+    #[test]
+    fn set_alive_marks_a_contact_proven_and_moves_it_to_the_back_of_its_bin() {
+        let mut t = RoutingTable::new(id(0));
+        t.add(id(1), 0x0101_0101, 4672, 4662, 8, true);
+        t.add(id(2), 0x0202_0202, 4672, 4662, 8, true);
+
+        t.set_alive(&id(1), 500);
+
+        let c = find_c(&t, id(1));
+        assert_eq!(c.kad_type, KAD_TYPE_ALIVE, "UpdateType hour-0 arm");
+        assert_eq!(c.expires, Some(500 + ALIVE_LEASE_SECS));
+        assert_eq!(
+            t.contacts().last().unwrap().id,
+            id(1),
+            "PushToBottom: the freshly-proven contact is no longer the oldest"
+        );
+    }
+
+    /// A HEARSAY add - a contact named inside a third party's answer - must
+    /// touch NEITHER aging NOR bin position. eMule's found-contact branch
+    /// returns without `SetAlive`, and `PushToBottom` lives only inside
+    /// `SetAlive` (RoutingZone.cpp:519-597, RoutingBin.cpp:136); its
+    /// KADEMLIA2_RES handler passes `bUpdate = false`
+    /// (KademliaUDPListener.cpp:846, signature RoutingZone.cpp:492).
+    /// POSITION is the load-bearing half: the sweep probes the FRONT, so a
+    /// zombie that gets named often would rotate to the back and dodge the
+    /// probe forever - exactly the contact this feature exists to kill.
+    #[test]
+    fn a_hearsay_refresh_touches_neither_aging_nor_position() {
+        let mut t = RoutingTable::new(id(0));
+        t.add(id(1), 0x0101_0101, 4672, 4662, 8, true);
+        t.add(id(2), 0x0202_0202, 4672, 4662, 8, true);
+        t.add(id(3), 0x0303_0303, 4672, 4662, 8, true);
+        // Prove id2 then id1, leaving id2 in the MIDDLE: [id3, id2, id1]. The
+        // hearsay target must not already be at the back, or a rotation is a
+        // no-op and this test cannot see it - the first version of this test
+        // had exactly that hole and a rotate mutant survived it.
+        t.set_alive(&id(2), 100);
+        t.set_alive(&id(1), 100);
+        assert_eq!(
+            t.contacts().iter().map(|c| c.id).collect::<Vec<_>>(),
+            vec![id(3), id(2), id(1)],
+            "precondition: the hearsay target sits in the middle"
+        );
+
+        t.add(id(2), 0x0202_0202, 4672, 4662, 8, true); // hearsay, same address
+
+        let order: Vec<Kad128> = t.contacts().iter().map(|c| c.id).collect();
+        assert_eq!(
+            order,
+            vec![id(3), id(2), id(1)],
+            "hearsay must not rotate a contact out of the probe queue"
+        );
+        assert_eq!(
+            find_c(&t, id(2)).kad_type,
+            KAD_TYPE_ALIVE,
+            "aging untouched"
+        );
+        assert_eq!(find_c(&t, id(2)).expires, Some(100 + ALIVE_LEASE_SECS));
+    }
+
+    /// A new address is a new lease: aging resets exactly as the verified bit
+    /// already does, so a peer that moved must re-prove itself.
+    #[test]
+    fn an_ip_change_resets_aging_like_it_already_resets_verification() {
+        let mut t = RoutingTable::new(id(0));
+        t.add(id(2), 0x0202_0202, 4672, 4662, 8, false);
+        t.set_alive(&id(2), 100);
+
+        t.add(id(2), 0x0606_0606, 4672, 4662, 8, false);
+
+        let c = find_c(&t, id(2));
+        assert_eq!(
+            (c.kad_type, c.expires),
+            (KAD_TYPE_NEW, None),
+            "a new address re-proves from scratch"
+        );
+    }
+
+    /// THE DEATH MARCH, at eMule's own clocks (`OnSmallTimer`,
+    /// RoutingZone.cpp:860-905; `CheckingType` +2min, Contact.cpp:216-226):
+    /// sweep 1 only STAMPS `expires`, sweep 2 probes (type 3 -> 4), and the
+    /// first sweep past that expiry removes. A contact loaded from nodes.dat
+    /// starts at type 3, so a dead seed dies about 3-4 minutes into a session -
+    /// which is what makes this observable at all in a foreground-only client.
+    #[test]
+    fn a_silent_contact_walks_emules_exact_death_march() {
+        let mut t = RoutingTable::new(id(0));
+        t.add(id(1), 0x0101_0101, 4672, 4662, 8, true);
+
+        assert!(
+            t.sweep(100, 8).probes.is_empty(),
+            "sweep 1 stamps expires, it never probes"
+        );
+        let s = t.sweep(160, 8);
+        assert_eq!(
+            s.probes.iter().map(|c| c.id).collect::<Vec<_>>(),
+            vec![id(1)],
+            "sweep 2 probes the oldest due contact"
+        );
+        assert_eq!(find_c(&t, id(1)).kad_type, KAD_TYPE_PROBED);
+        assert_eq!(find_c(&t, id(1)).expires, Some(160 + PROBE_WINDOW_SECS));
+
+        assert!(
+            t.sweep(220, 8).removed.is_empty(),
+            "still inside the 2-minute probe window"
+        );
+        assert_eq!(t.sweep(340, 8).removed, vec![id(1)], "past expiry: removed");
+        assert_eq!(t.len(), 0);
+    }
+
+    /// The probe is a QUESTION, not a sentence: an answer cancels the march.
+    #[test]
+    fn an_answered_probe_cancels_the_death_march() {
+        let mut t = RoutingTable::new(id(0));
+        t.add(id(1), 0x0101_0101, 4672, 4662, 8, true);
+        t.sweep(100, 8);
+        t.sweep(160, 8); // probed: type 4
+        t.set_alive(&id(1), 170); // the HELLO_RES arrived
+
+        let s = t.sweep(340, 8);
+        assert!(s.removed.is_empty(), "an alive contact is never removed");
+        assert!(s.probes.is_empty(), "and it is not due again for an hour");
+        assert_eq!(find_c(&t, id(1)).kad_type, KAD_TYPE_ALIVE);
+    }
+
+    /// Only a type-4 contact past its expiry is removed. A contact with a stale
+    /// lease that has NOT been probed yet must be PROBED, never removed - eMule
+    /// guards removal on `GetType() == 4` (RoutingZone.cpp:868-885).
+    #[test]
+    fn an_unprobed_contact_is_never_removed_however_stale() {
+        let mut t = RoutingTable::new(id(0));
+        t.add(id(1), 0x0101_0101, 4672, 4662, 8, true);
+        t.set_alive(&id(1), 0); // type 2, lease to 3600
+
+        let s = t.sweep(9_999, 8);
+        assert!(s.removed.is_empty(), "type 2 is never removed by a sweep");
+        assert_eq!(s.probes.len(), 1, "it is asked, not executed");
+        assert_eq!(t.len(), 1);
+    }
+
+    /// THE BLACKHOLE HALF, and the reason this feature is urgent. The per-IP
+    /// cap is computed from live table CONTENTS, so an immortal contact holds
+    /// its address against every other Kad ID forever. Removal must free it.
+    #[test]
+    fn removal_frees_the_per_ip_and_subnet_slots() {
+        let mut t = RoutingTable::new(id(0));
+        t.add(id(1), 0x0101_0101, 4672, 4662, 8, true);
+        assert_eq!(t.ip_counts(0x0101_0101), (1, 1));
+
+        t.sweep(100, 8);
+        t.sweep(160, 8);
+        t.sweep(340, 8);
+
+        assert_eq!(
+            t.ip_counts(0x0101_0101),
+            (0, 0),
+            "the evicted contact no longer holds its address"
+        );
+    }
+
+    /// eMule staggers probe traffic with a per-zone timer (RoutingZone.cpp:124).
+    /// padMule sweeps the whole tree in one pass, so the cap is what stops a
+    /// first sweep over a wide table bursting a HELLO at every bin at once.
+    #[test]
+    fn probe_emission_is_capped_and_never_re_asks_an_in_flight_contact() {
+        let mut t = RoutingTable::new(id(0));
+        // Near-self ids so the tree splits into several leaf bins.
+        for i in 1..=24u8 {
+            let mut raw = [0u8; 16];
+            raw[0] = i;
+            t.add(
+                Kad128::from_hash(&raw),
+                0x0100_0000 + i as u32,
+                4672,
+                4662,
+                8,
+                true,
+            );
+        }
+        t.sweep(100, 64); // stamp everything; nothing is due yet
+
+        let first = t.sweep(200, 2);
+        assert_eq!(first.probes.len(), 2, "the cap is honoured");
+
+        // The SAME instant again: a bin already probed must stay silent (its
+        // front is type 4 and gets rotated away, not re-asked), and the pass
+        // must move on to a bin that has not been probed. Asserting "no
+        // overlap" rather than a second exact count, because how many leaf bins
+        // this id set produces is an implementation detail of the split rule -
+        // pinning that number would make this a test of the tree shape.
+        let second = t.sweep(200, 2);
+        assert!(
+            !second.probes.is_empty(),
+            "the pass moves on to another bin"
+        );
+        for c in &second.probes {
+            assert!(
+                !first.probes.iter().any(|p| p.id == c.id),
+                "an in-flight probe must never be re-sent in the same window"
+            );
+            assert_eq!(c.kad_type, KAD_TYPE_PROBED);
+        }
+    }
+
+    /// A contact we are already doubting must not be handed to a lookup as a
+    /// seed. eMule filters search seeds at `GetType() <= 3`
+    /// (Search.cpp:183 -> RoutingBin.cpp:244), which excludes exactly the
+    /// probed-and-unanswered type 4.
+    #[test]
+    fn a_contact_awaiting_its_probe_answer_is_not_handed_to_a_lookup() {
+        let mut t = RoutingTable::new(id(0));
+        t.add(id(1), 0x0101_0101, 4672, 4662, 8, true);
+        assert_eq!(t.closest_to(&id(9), 10).len(), 1, "seeded while healthy");
+
+        t.sweep(100, 8);
+        t.sweep(160, 8); // probed: type 4
+
+        assert!(
+            t.closest_to(&id(9), 10).is_empty(),
+            "a dying contact is withheld from lookups a probe window before it dies"
+        );
+        t.set_alive(&id(1), 170);
+        assert_eq!(t.closest_to(&id(9), 10).len(), 1, "answering restores it");
+    }
+
+    /// REGRESSION GUARD, and it pins FAITHFULNESS rather than a padMule choice.
+    /// eMule does NOT probe-the-oldest when a bin fills: `CRoutingZone::Add`'s
+    /// unsplittable-full branch is `bUpdate = false; return false`
+    /// (RoutingZone.cpp:617-620) and `CRoutingBin::AddContact` returns false
+    /// without probing anything (RoutingBin.cpp:116-122); aMule 3.0.1 is
+    /// identical (RoutingZone.cpp:503-514). The oldest contact is challenged
+    /// ONLY by the timer. This test exists because the classic Kademlia paper
+    /// says otherwise and padMule's own hazard list called this a defect until
+    /// 2026-08-08 - do not "fix" it toward the paper.
+    #[test]
+    fn a_full_unsplittable_bin_still_drops_the_newcomer() {
+        let mut t = RoutingTable::new(id(0));
+        for i in 1..=(K as u8 + 4) {
+            let mut raw = [0xF0; 16];
+            raw[15] = i;
+            t.add(
+                Kad128::from_hash(&raw),
+                0x0A00_0000 + i as u32,
+                4672,
+                4662,
+                8,
+                true,
+            );
+        }
+        let before = t.len();
+        let mut raw = [0xF0; 16];
+        raw[15] = 0xEE;
+        let newcomer = Kad128::from_hash(&raw);
+        t.add(newcomer, 0x0A00_00EE, 4672, 4662, 8, true);
+
+        assert_eq!(t.len(), before, "the table did not grow");
+        assert!(
+            !t.contacts().iter().any(|c| c.id == newcomer),
+            "the ARRIVING contact is the one dropped, exactly as eMule does"
+        );
     }
 }

@@ -166,6 +166,14 @@ fn gate_loaded_nodes(contacts: &[KadContact], filter: Option<&IpFilter>) -> Vec<
 /// Recursive-crawl bounds (see `Engine::crawl_servers`). Deliberately modest:
 /// this is the one path that contacts hosts the user never chose, so each hop
 /// is a paced trickle and the whole run is short enough to sit behind a button.
+/// How often the Kad liveness sweep runs - eMule's `OnSmallTimer` cadence
+/// (`Kademlia.cpp:274-278`, `MIN2S(1)`).
+const KAD_SWEEP_EVERY: Duration = Duration::from_secs(60);
+/// Probes emitted per sweep. eMule probes one contact per LEAF ZONE per minute
+/// and gets its stagger from per-zone timers (`RoutingZone.cpp:124`); padMule
+/// sweeps the whole tree in one pass, so this cap is the stagger. Small because
+/// the sweep runs under the engine lock: 2 x `KAD_PROBE_WAIT` bounds the hold.
+const KAD_SWEEP_MAX_PROBES: usize = 2;
 const MAX_CRAWL_ROUNDS: u32 = 3;
 const CRAWL_ASKS_PER_ROUND: usize = 40;
 const CRAWL_SEND_PACE: Duration = Duration::from_millis(40);
@@ -1510,6 +1518,8 @@ pub struct Engine {
     last_resume_retry: Instant,
     /// When `maintain_kad` last refreshed the routing table.
     last_kad_refresh: Instant,
+    /// When the liveness sweep (`OnSmallTimer`) last ran.
+    last_kad_sweep: Instant,
     events: mpsc::UnboundedSender<EngineEvent>,
     /// Persisted Kad contacts (loaded from / saved to `nodes.dat`).
     routing: RoutingTable,
@@ -1661,6 +1671,7 @@ impl Engine {
             last_share_verify: Instant::now(),
             last_resume_retry: Instant::now(),
             last_kad_refresh: Instant::now(),
+            last_kad_sweep: Instant::now(),
             events: tx,
             routing,
             downloads: Arc::new(Mutex::new(Vec::new())),
@@ -4703,6 +4714,39 @@ impl Engine {
     /// in turn.
     ///
     /// Returns contacts gained, for the caller's log and for tests.
+    /// THE `OnSmallTimer` HALF of Kad maintenance, which padMule did not have
+    /// until 2026-08-08: age contacts, probe the oldest due one in each bin,
+    /// and REMOVE whoever failed to answer. `maintain_kad` above is the
+    /// `OnBigTimer` half (a random-target lookup that GROWS the table); this is
+    /// the half that shrinks it, and without it nothing was ever removed - a
+    /// contact whose IP changed stayed as a lookup seed for the node's life and
+    /// held its stale address against every other Kad ID under
+    /// `MAX_CONTACTS_PER_IP`.
+    ///
+    /// Returns (probes sent, contacts removed).
+    pub async fn maintain_kad_liveness(&mut self) -> (usize, usize) {
+        if self.state != EngineState::Running || self.offline {
+            return (0, 0);
+        }
+        if self.last_kad_sweep.elapsed() < KAD_SWEEP_EVERY {
+            return (0, 0);
+        }
+        self.last_kad_sweep = Instant::now();
+        let Some(kad) = self.kad.as_mut() else {
+            return (0, 0);
+        };
+        let (sent, removed) = kad.run_liveness_sweep(KAD_SWEEP_MAX_PROBES).await;
+        // DELIBERATELY NO `EngineEvent::Kad` HERE. That variant carries a
+        // CONTACT COUNT, and the KB's most expensive Kad bug was one UI field
+        // written by two different measurements (build-progress 8ce: a live
+        // count landing on top of a persisted one, diagnosed as a table being
+        // thrown away and "fixed" as such). `Engine::kad_contacts()` already
+        // polls the live table once a second, so an eviction shows up there on
+        // its own - one field, one measurement. See the `an-event-is-not-state`
+        // memory before adding a second writer.
+        (sent, removed)
+    }
+
     pub async fn maintain_kad(&mut self) -> usize {
         if self.state != EngineState::Running || self.offline {
             return 0;

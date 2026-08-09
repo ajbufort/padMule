@@ -816,13 +816,18 @@ impl MuleEngine {
     /// It drains pending share re-announces, finalizes downloads that completed
     /// outside a fetch task, detects a server drop/kick, runs the periodic
     /// checkpoint, unshares files deleted in the Files app, re-drives idle
-    /// downloads, merges gossip-harvested servers into server.met, and refreshes
-    /// the Kad routing table. That is EIGHT: the sentence said seven for as long
-    /// as `maintain_kad` had existed, because it was added to the BODY without
+    /// downloads, merges gossip-harvested servers into server.met, refreshes the
+    /// Kad routing table, and runs the Kad LIVENESS SWEEP (eMule's
+    /// `OnSmallTimer`: probe the oldest due contact per bin, remove whoever
+    /// failed to answer). That is NINE: the sentence said seven for as long as
+    /// `maintain_kad` had existed, because it was added to the BODY without
     /// being added to the list that enumerates it - the same shape as a test
-    /// that pins "these callers" and names all but one.
+    /// that pins "these callers" and names all but one. It then drifted AGAIN
+    /// across the language boundary (the Swift caller still said seven after
+    /// this was corrected to eight), which is why the count is now stated in
+    /// both places and in the wiring comment below.
     ///
-    /// IF THIS STOPS BEING CALLED, all EIGHT stop SILENTLY - nothing errors and
+    /// IF THIS STOPS BEING CALLED, all NINE stop SILENTLY - nothing errors and
     /// nothing on screen changes; downloads simply stall, finished files are
     /// never shared, and a kick goes unnoticed. It used to be a side effect of
     /// `downloads()`, which made it impossible to forget but also forced every
@@ -852,6 +857,13 @@ impl MuleEngine {
             // Kad routing-table maintenance. Rate-limited to KAD_REFRESH_EVERY
             // inside, so calling it every heartbeat costs a comparison.
             self.inner.lock().await.maintain_kad().await;
+            // The OTHER half of Kad maintenance (eMule's OnSmallTimer): age
+            // contacts, probe the oldest due one per bin, remove whoever failed
+            // to answer. Rate-limited to KAD_SWEEP_EVERY inside. DUTY NINE -
+            // if you add another, update the count in the doc above AND in
+            // `EngineModel.startPolling`'s comment; that number has drifted
+            // twice already.
+            self.inner.lock().await.maintain_kad_liveness().await;
             // Refresh the derived status values LAST, so what the lock-free
             // readers see reflects everything this beat just did.
             self.inner.lock().await.publish_status();

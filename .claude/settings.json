@@ -34,5 +34,14 @@
         ]
       }
     ]
+  },
+  "permissions": {
+    "deny": [
+      "Bash(git checkout --:*)",
+      "Bash(git restore:*)",
+      "Bash(git reset --hard:*)",
+      "Bash(git clean:*)",
+      "Bash(git stash:*)"
+    ]
   }
 }

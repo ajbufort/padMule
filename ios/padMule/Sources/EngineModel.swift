@@ -1418,7 +1418,7 @@ final class EngineModel: ObservableObject {
         refreshInFlight = true
         work.async { [weak self] in
             // HEARTBEAT ONLY. It genuinely needs the engine lock - it drives
-            // eight background duties that fail SILENTLY if it stops - so it
+            // nine background duties that fail SILENTLY if it stops - so it
             // stays on the serial `work` queue and is allowed to be slow.
             //
             // What it must NOT do any more is carry the status reads with it.

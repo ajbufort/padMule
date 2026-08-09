@@ -49,6 +49,11 @@ const LOCK_POISONED: &str = "kad lock poisoned";
 /// A KADEMLIA2_RES with more than this is a malicious over-long answer and is
 /// dropped (eMule caps the response at the requested count, Search.cpp:377).
 const KAD_REQUESTED_CONTACTS: usize = 11;
+/// How long a liveness probe waits for its `HELLO_RES`. Short on purpose: the
+/// sweep runs under the engine lock, and a silent contact is not an error - it
+/// just does not get its lease renewed, and a later sweep removes it once its
+/// two-minute window lapses.
+const KAD_PROBE_WAIT: Duration = Duration::from_millis(1200);
 
 /// A maintenance refresh's overall deadline and spend, in `per_query` units:
 /// the lookup ends after `REFRESH_DEADLINE_QUERIES * per_query` and may send at
@@ -216,6 +221,12 @@ pub struct KadNode {
     /// The owning read loop. Aborted on drop, so `set_kad(None)` still closes
     /// the socket and a resume's rebind never races a stale reader.
     read_loop: tokio::task::JoinHandle<()>,
+    /// Session clock origin for contact aging. Deliberately MONOTONIC and
+    /// session-local rather than wall time: aging is never persisted (nodes.dat
+    /// carries no expiry field, exactly as eMule's does not), so a lease only
+    /// has to be comparable within the run that issued it - and a wall clock
+    /// that jumps must not mass-expire a healthy table.
+    aging_clock: Instant,
 }
 
 impl Drop for KadNode {
@@ -827,6 +838,7 @@ impl KadNode {
             pending,
             next_seq: AtomicU64::new(0),
             read_loop,
+            aging_clock: Instant::now(),
         })
     }
 
@@ -894,6 +906,57 @@ impl KadNode {
     /// `harvested_servers` already follow. The table is reached from two
     /// directions (the inbound handler reads it, lookups write it), which is
     /// why it needs a lock at all.
+    /// Seconds since this node bound its socket - the clock contact aging runs
+    /// on. See [`KadNode::aging_clock`].
+    fn aging_now(&self) -> u64 {
+        self.aging_clock.elapsed().as_secs()
+    }
+
+    /// ONE `OnSmallTimer` PASS (eMule `CRoutingZone::OnSmallTimer`,
+    /// RoutingZone.cpp:860-905), the half of Kad maintenance padMule never had:
+    /// contacts that failed a probe are REMOVED, and the oldest due contact in
+    /// each bin is asked to prove it is still there with a `KADEMLIA2_HELLO_REQ`
+    /// (eMule sends `SendMyDetails(KADEMLIA2_HELLO_REQ, ...)` at :898-917 - a
+    /// HELLO, never a PING; the PING/PONG traffic is the extern-port path).
+    ///
+    /// The table decides WHO (pure, offline-tested in `mule_kad::routing`);
+    /// this does the I/O. Probes run sequentially under a tight per-probe wait
+    /// and a small cap, because this is called from `heartbeat()` with the
+    /// engine lock held - the same constraint `maintain_kad` documents.
+    ///
+    /// Returns (probes sent, contacts removed).
+    pub async fn run_liveness_sweep(&mut self, max_probes: usize) -> (usize, usize) {
+        let now = self.aging_now();
+        let outcome = self.with_routing(|t| t.sweep(now, max_probes));
+        let removed = outcome.removed.len();
+        let mut sent = 0usize;
+        for c in outcome.probes {
+            let contact = KadContact {
+                id: c.id,
+                ip: c.ip,
+                udp_port: c.udp_port,
+                tcp_port: c.tcp_port,
+                version: c.version,
+                udp_key: c.udp_key,
+                udp_key_ip: c.udp_key_ip,
+                verified: c.verified,
+            };
+            sent += 1;
+            // `hello` already does the whole round trip - request, responder
+            // bookkeeping, and the ACK leg if the answer asks for one. A
+            // TIMEOUT IS NOT AN ERROR HERE and must not be treated as one:
+            // eviction is the expiry's job on a later sweep, exactly as
+            // eMule's fire-and-forget probe leaves it to `OnSmallTimer`.
+            if self.hello(&contact, KAD_PROBE_WAIT).await.is_ok() {
+                // It answered: cancel the death march (eMule `SetAlive`, from
+                // the `bUpdate = true` HELLO_RES path).
+                let at = self.aging_now();
+                self.with_routing(|t| t.set_alive(&c.id, at));
+            }
+        }
+        (sent, removed)
+    }
+
     pub(crate) fn with_routing<R>(&self, f: impl FnOnce(&mut RoutingTable) -> R) -> R {
         let mut g = self.routing.lock().expect(LOCK_POISONED);
         f(&mut g)
