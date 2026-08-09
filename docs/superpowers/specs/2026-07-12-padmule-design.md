@@ -12,7 +12,10 @@ polls" did not survive contact with the device ("an event is not state").
 (3) Search-expression encoding landed in mule-engine (search.rs), not
 mule-proto. (4) IP filter, categories, and AICH recovery did not make shipped
 v1 (open backlog - see the revised v1-scope decision in
-docs/wiki/decisions-and-lessons.md).
+docs/wiki/decisions-and-lessons.md). [STALE - annotated 2026-08-09: all three
+have since SHIPPED - IP filter 2026-07-18 (build-progress 8g), categories
+2026-07-19 (8i), AICH block recovery 2026-08-03 (wave 11, row 8bj). The
+v1-scope decision entry carries the same correction.]
 
 ## 1. Goal
 
