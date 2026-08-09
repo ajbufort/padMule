@@ -87,8 +87,11 @@ Details: `docs/wiki/decisions-and-lessons.md`, `docs/wiki/ref-source-trees.md`,
   SUPERSEDED IN PART 2026-08-07 (build-progress 8cj): background SEEDING ships -
   an `audio` keepalive plus `EngineState::Seeding` keeps the listener and server
   login up so peers keep downloading from us, default OFF, device-verified over a
-  70-minute soak at a flat ~32MB. Background DOWNLOADING stays unbuilt on purpose,
-  and Kad is dropped on the way in. Clean pause/resume is still required, because
+  70-minute soak at a flat ~32MB. Background DOWNLOADING stays unbuilt on purpose.
+  [CORRECTED 2026-08-09 (build-progress 8dh): Kad is NO LONGER dropped on the way
+  in - the node survives a seed (liveness sweep runs; growth refresh stays
+  Running-only); the soak with Kad kept up is still owed, since the 32MB figure
+  was measured without a Kad node.] Clean pause/resume is still required, because
   jetsam can end a seed at any moment.
 - The engine/UI seam is in-process FFI (`crates/mule-ffi`); the EC protocol is
   deferred entirely.
@@ -109,7 +112,7 @@ Details and what is portable from them: `docs/wiki/ref-ecosystem.md`.
 source "$HOME/.cargo/env"              # cargo is NOT on the default PATH
 
 cargo build --workspace
-cargo test --workspace                 # the unit gate (761 tests, offline)
+cargo test --workspace                 # the unit gate (786 tests, offline)
 cargo clippy --workspace --all-targets # must be warning-free
 cargo fmt --all -- --check
 
