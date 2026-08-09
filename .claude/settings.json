@@ -10,6 +10,29 @@
           }
         ]
       }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/ajbufort/claude-projects/padMule/.claude/hooks/precompact-handoff.sh",
+            "timeout": 15,
+            "statusMessage": "Updating the handoff before compaction..."
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/ajbufort/claude-projects/padMule/.claude/hooks/session-start-handoff.sh",
+            "timeout": 15
+          }
+        ]
+      }
     ]
   }
 }
