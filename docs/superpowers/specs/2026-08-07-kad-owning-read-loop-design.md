@@ -1,7 +1,10 @@
 # padMule: one owning Kad read loop - routing serve + event-driven lookup
 
 Date: 2026-08-07
-Status: DESIGN, not started
+Status: IMPLEMENTED + device-verified 2026-08-08 (both steps: the serve loop,
+build-progress rows 8ck/8cl/8cm; the event-driven CSearch, rows 8cn/8co). Landed
+on `kad-csearch`, fast-forwarded into `main` and the branch deleted 2026-08-08.
+Kept as the citation trail for why the code is shaped this way.
 
 Two changes that need the same restructure, so they are specified together and
 built in two verifiable steps. Doing them separately would mean doing the
