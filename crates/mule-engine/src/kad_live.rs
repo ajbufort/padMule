@@ -1982,13 +1982,19 @@ mod tests {
 
         let (op, payload) = build_bootstrap_req();
         let frame = pack_kad(op, payload);
+        // 10s, not 2s - the scaffold, not the subject. What this test asserts is
+        // that a peer echoing our sender key yields `valid`; how long the
+        // loopback round trip takes is incidental, and a tight budget turned a
+        // busy machine into a red suite roughly once in six full runs while the
+        // test passed 15/15 in isolation. Still bounded, so a peer that never
+        // answers still fails it.
         let (_res, valid, _sk) = node
             .request(
                 &peer_id,
                 peer_addr,
                 &frame,
                 OP_BOOTSTRAP_RES,
-                Duration::from_secs(2),
+                Duration::from_secs(10),
             )
             .await
             .unwrap();
@@ -2968,7 +2974,15 @@ mod tests {
         let dg = kad_obfuscate_request(&pack_kad(op, payload), &node_id, 0x1212, 0, its_vk, 0x40);
         peer.send_to(&dg, ours).await.unwrap();
 
-        for _ in 0..200 {
+        // 6s, not 2s. The PROPERTY is "the inbound hello's sender key ends up
+        // stored", not "within two seconds" - the wait is scaffolding, and a
+        // scaffold that fails under load reports a defect that is not there.
+        // This test and `request_reports_a_valid_receiver_key...` each flaked
+        // roughly once in six FULL-SUITE runs on a loaded box while passing
+        // 15-20/20 in isolation; a too-tight budget on a loopback datagram plus
+        // a task wake is all that was ever wrong. Still bounded, so a genuinely
+        // unstored key still fails - just not because the machine was busy.
+        for _ in 0..600 {
             if node.with_routing(|t| t.verify_key_for(&peer_id, peer_ip, our_public)) == its_vk {
                 return;
             }

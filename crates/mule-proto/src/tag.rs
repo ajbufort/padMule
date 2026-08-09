@@ -5,7 +5,11 @@
 //!
 //! Divergences from a fully general eD2k tag codec, matching aMule's MET file
 //! writers: `write_tag` never emits the compact `(type | 0x80)` short form or
-//! the inline STR1..STR16 types; those are accepted on read only.
+//! the inline STR1..STR16 types; those are accepted on read only. NB the match
+//! with aMule's writers covers the FORMS above; the TYPE set is wider on both
+//! sides of the seam, since `write_tag` will faithfully re-emit a BSOB it was
+//! handed - see [`TagValue::Bsob`] for why that is preservation rather than a
+//! divergence.
 //!
 //! Deliberate choices (not bugs):
 //! - UINT8/UINT16 values are PRESERVED at their on-disk width. aMule's reader
@@ -58,7 +62,23 @@ pub enum TagValue {
     Str(Vec<u8>),
     /// uint32-length blob.
     Blob(Vec<u8>),
-    /// uint8-length blob (aMule BSOB, e.g. legacy 8-byte filesize).
+    /// uint8-length blob (BSOB, e.g. a legacy 8-byte filesize).
+    ///
+    /// READ AND ROUND-TRIP ONLY - nothing in padMule ever CONSTRUCTS one for a
+    /// MET file, and that is deliberate. aMule's MET reader has no BSOB case at
+    /// all: it falls through to `throw CInvalidPacket("Unknown tag type
+    /// encountered ... cannot proceed!")` (Tag.cpp:171-179), which aborts the
+    /// whole FILE, not just the tag. eMule's writer likewise emits only
+    /// Str/Int/Float/Blob/Int64 (packets.cpp:716-722).
+    ///
+    /// Keeping it readable is still right, and so is writing it back: a MET
+    /// file that already contains a BSOB is one aMule cannot read either way,
+    /// so dropping the tag on a round-trip would silently CORRUPT the file
+    /// padMule was handed without making it any more readable. The rule is
+    /// "never synthesize one", which the type system cannot state and this
+    /// comment therefore does. (The Kad wire is a different matter entirely -
+    /// BSOB is legitimate there, and `mule_kad::KadTagValue::Bsob` is the type
+    /// that carries it, e.g. an 8-byte TAG_FILESIZE.)
     Bsob(Vec<u8>),
     /// A single boolean byte (TAGTYPE_BOOL). aMule reads and discards these; we
     /// keep the byte so the tag round-trips.

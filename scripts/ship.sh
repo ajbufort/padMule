@@ -19,13 +19,22 @@
 #      artifact was one step from being delivered as current.
 #   3. CFBundleVersion INSIDE the downloaded ipa must equal the short sha, read
 #      from a FRESH extraction directory - the check that caught (2).
-#   4. The installed build is confirmed by reading it back off the device, never
-#      by assuming the install succeeded.
+#   4. The installed build is confirmed by reading CFBundleVersion back OFF THE
+#      DEVICE and comparing it to the sha, never by assuming the install
+#      succeeded. `apps install` exits 0 on paths that leave no new build, so
+#      its exit status is not evidence. [Until 2026-08-08 this guard did not
+#      exist: the code carrying the label was a WebDriverAgent /status ping and
+#      the run ended by telling a HUMAN to read Settings, so the loop was open
+#      at its last link while the header claimed otherwise. Found by the row-8cp
+#      reanalysis and closed the same day.]
 #   5. origin/<branch> must ALREADY be at HEAD. `gh workflow run --ref` builds
 #      the REMOTE ref, so an unpushed commit silently builds the wrong tree.
 #      Added 2026-08-08 after 12 local commits sent CI to build the tip from
 #      before them; guard 2 caught it, but reported "no run found" rather than
 #      the actual cause.
+#   6. An open XCUITest session is CLOSED before installing. An active one parks
+#      `apps install` indefinitely at zero CPU, which is indistinguishable from
+#      a slow install.
 #
 # Usage: scripts/ship.sh [--no-install]
 set -euo pipefail
@@ -101,7 +110,20 @@ require_green () {
   done
   [ -n "$rid" ] || { echo "ABORT: no '$wf' run found for $SHORT" >&2; exit 1; }
   echo "-- $wf: run $rid" >&2
-  until [ "$(gh run view "$rid" --json status -q .status)" = "completed" ]; do sleep 20; done
+  # BOUNDED. This used to be an unbounded `until completed`, and it runs while
+  # the flock is HELD - so a queued or wedged runner blocked every later ship
+  # with "another ship is in flight" and no way to tell that from a real one.
+  # 40 minutes is generous against the ~12 the macOS jobs take.
+  local waited=0
+  until [ "$(gh run view "$rid" --json status -q .status)" = "completed" ]; do
+    sleep 20
+    waited=$((waited + 20))
+    if [ "$waited" -ge 2400 ]; then
+      echo "ABORT: '$wf' (run $rid) still not completed after 40min - not holding \
+the device lock any longer. Check it: gh run view $rid" >&2
+      exit 1
+    fi
+  done
   local conc; conc=$(gh run view "$rid" --json conclusion -q .conclusion)
   [ "$conc" = "success" ] || { echo "ABORT: '$wf' $conc - nothing reaches the device" >&2; exit 1; }
   # GUARD 2 per workflow: the run must BE this commit.
@@ -128,24 +150,73 @@ cp "$WORK/padMule-ipa/padMule.ipa" "/mnt/c/Users/ajbuf/Downloads/padMule-INSTALL
 cp "$WORK/padMule-ipa/padMule.ipa" "$KIT/padmule-unsigned-$SHORT.ipa"
 
 echo "-- signing"
-( cd "$KIT" && ./zsign -k "$KEY" -c cert.pem -m padmule.mobileprovision -b "$BUNDLE" \
-    -o "padmule-signed-$SHORT.ipa" "padmule-unsigned-$SHORT.ipa" ) | grep -E "Version|Signed OK" || true
+# A FAILING zsign MUST STOP THE SHIP. This was
+#   ( ... zsign ... ) | grep -E "Version|Signed OK" || true
+# where the `|| true` discarded zsign's exit status entirely (and under
+# pipefail the grep's too), so a signing failure printed nothing and the run
+# marched on to install whatever `padmule-signed-$SHORT.ipa` happened to be on
+# disk - which, on a re-ship of the same sha, is the PREVIOUS attempt's file.
+# Silently installing a stale build is exactly the class of lie guards 2 and 3
+# exist to prevent, so it is checked the same way.
+rm -f "$KIT/padmule-signed-$SHORT.ipa"
+if ! ( cd "$KIT" && ./zsign -k "$KEY" -c cert.pem -m padmule.mobileprovision -b "$BUNDLE" \
+    -o "padmule-signed-$SHORT.ipa" "padmule-unsigned-$SHORT.ipa" ) > "$WORK/zsign.log" 2>&1; then
+  echo "ABORT: zsign FAILED - nothing reaches the device. Its output:" >&2
+  tail -20 "$WORK/zsign.log" >&2
+  exit 1
+fi
+grep -E "Version|Signed OK" "$WORK/zsign.log" || true
+# And the file must actually exist now: `rm -f` above plus this turns "zsign
+# quietly wrote nothing" into an abort rather than an install of a ghost.
+[ -s "$KIT/padmule-signed-$SHORT.ipa" ] || {
+  echo "ABORT: zsign reported success but produced no signed ipa" >&2; exit 1; }
 
 if [ "${1:-}" = "--no-install" ]; then
   echo "== built and signed $SHORT (install skipped) =="
   exit 0
 fi
 
+# AN ACTIVE XCUITest SESSION BLOCKS `apps install` INDEFINITELY - ten minutes at
+# ZERO CPU parked in do_epoll_wait, released instantly by DELETE /session. It
+# looks exactly like a slow install, which is the worst kind of hang. Closing a
+# session we did not open is safe: it only ends UI DRIVING, which an install is
+# about to invalidate anyway, and the next `POST /session` re-creates it.
+SESS=$(curl -s --max-time 8 localhost:8100/status \
+  | python3 -c "import sys,json;print(json.load(sys.stdin).get('sessionId') or '')" 2>/dev/null || true)
+if [ -n "$SESS" ]; then
+  echo "-- closing the open WDA session $SESS (it would block the install)"
+  curl -s -X DELETE --max-time 15 "localhost:8100/session/$SESS" >/dev/null || true
+fi
+
 echo "-- installing"
 pymobiledevice3 apps install "$KIT/padmule-signed-$SHORT.ipa" 2>&1 | tail -1
 
-# GUARD 4: WDA must still answer. A Sideloadly round breaks it every time; the
-# zsign path does not, and this is what proves it did not.
+# GUARD 4, FOR REAL. This block used to be a WebDriverAgent `/status` ping, and
+# the run ended by telling a HUMAN to read Settings - so the "closed loop" was
+# open at its last link, and the header above it claimed a read-back that the
+# code never performed. `pymobiledevice3 apps install` also exits 0 on paths
+# that do not leave a new build installed, which is precisely why the version
+# has to come back OFF THE DEVICE rather than from the installer's exit.
+echo "-- reading the installed build back off the device"
+ON_DEV=$(pymobiledevice3 apps list 2>/dev/null | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+print(next((v.get('CFBundleVersion','') for k,v in d.items() if 'padMule' in k), ''))
+" 2>/dev/null || true)
+[ "$ON_DEV" = "$SHORT" ] || {
+  echo "ABORT: the device reports '$ON_DEV', expected '$SHORT' - the install did \
+NOT land, whatever the installer said" >&2; exit 1; }
+echo "-- CONFIRMED on the device: $ON_DEV"
+
+# WDA is a SEPARATE question from the install: a Sideloadly round breaks it every
+# time, the zsign path does not, and this is what proves it did not. Never fatal.
 curl -s --max-time 8 localhost:8100/status \
   | python3 -c "import sys,json;print('-- WDA ready:', json.load(sys.stdin)['value'].get('ready'))" \
-  2>/dev/null || echo "-- WDA NOT ANSWERING (device testing unavailable)"
+  2>/dev/null || echo "-- WDA NOT ANSWERING (UI driving unavailable; install is unaffected)"
 
-echo "== $SHORT on the device. CONFIRM IT by reading Settings > This device > Build =="
+echo "== $SHORT is ON the device, read back off it. =="
+echo "   Installed is not RUNNING: launch it to confirm execution -"
+echo "   pymobiledevice3 developer dvt launch $BUNDLE"
 
 # ---------------------------------------------------------------------------
 # AFTER A SHIP: the KB and the handoff are part of the loop, not a chore that

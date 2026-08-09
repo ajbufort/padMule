@@ -1,11 +1,21 @@
 //! part.met: metadata for one partial download. See docs/raw reference
 //! section 4 (PartFile.cpp:820-1053 save, 384-817 load).
 //!
-//! Layout: `u8` version (0xE0, or 0xE2 for a large file; 0xE1 edonkey-import is
-//! accepted on read), `u32` date, `16B` file hash, `u16` part-hash count + part
-//! hashes, `u32` tag count + MET tags. The tag list carries the fixed metadata,
-//! the gap list, and any extras, all flat. Fields are preserved verbatim so a
-//! read-then-write round-trips bit-for-bit.
+//! Layout: `u8` version (0xE0, or 0xE2 for a large file), `u32` date, `16B` file
+//! hash, `u16` part-hash count + part hashes, `u32` tag count + MET tags. The
+//! tag list carries the fixed metadata, the gap list, and any extras, all flat.
+//! Fields are preserved verbatim so a read-then-write round-trips bit-for-bit.
+//!
+//! THE 0xE1 "SPLITTED" LAYOUT IS DIFFERENT, and read-only. eDonkey's import
+//! format puts a selector `u32` at offset 1 and then either the hashset with NO
+//! date, or a date at offset 2 with NO part-hash count (aMule
+//! PartFile.cpp:432-461). An 0xE0 file can ALSO be in that layout, flagged only
+//! by `00 00 02 01` at offset 24. `read_part_met` handles all of it;
+//! `write_part_met` emits ONLY the default layout above, so writing a parsed
+//! splitted file would produce bytes that contradict its own version byte. The
+//! engine never does: `part_store` sets 0xE0/0xE2 explicitly rather than
+//! preserving what it read. The bit-for-bit round-trip claim therefore covers
+//! the DEFAULT layout, which is the only one padMule writes.
 //!
 //! The gap list (still-missing byte ranges) is encoded as ordinary tags whose
 //! string name is a GAPSTART (0x09) or GAPEND (0x0A) byte followed by the
@@ -62,12 +72,53 @@ pub fn read_part_met(bytes: &[u8]) -> Result<PartMet, IoError> {
     {
         return Err(IoError::BadTag(version));
     }
-    let date = r.read_u32()?;
-    let file_hash = read_hash16(&mut r)?;
-    let phcount = r.read_u16()?;
-    let mut part_hashes = Vec::new();
-    for _ in 0..phcount {
-        part_hashes.push(read_hash16(&mut r)?);
+    // WHICH LAYOUT? aMule decides with `isnewstyle` (PartFile.cpp:432-461) and
+    // the two layouts are NOT interchangeable - reading one as the other yields
+    // a plausible-looking but wrong hash and gap set, i.e. a silently corrupt
+    // import rather than an error. padMule read EVERY version with the
+    // old-style layout until 2026-08-08.
+    //
+    //   isnewstyle = (version == 0xE1)                          // "splitted"
+    //   plus, for 0xE0 only, a sniff of the 4 bytes at offset 24 for
+    //   `00 00 02 01`, which marks eDonkey's "old part style" (PMT_NEWOLD).
+    let splitted = version == PARTFILE_VERSION_EDONKEY
+        || (version == PARTFILE_VERSION && bytes.get(24..28) == Some(&[0, 0, 2, 1]));
+
+    let (date, file_hash, part_hashes);
+    if splitted {
+        // `temp` is read at offset 1. Its VALUE selects the sub-layout, and in
+        // the non-zero arm aMule seeks BACK to offset 2 - so the date overlaps
+        // the bytes just examined. Transcribed rather than tidied, because the
+        // overlap IS the format.
+        let temp = r.read_u32()?;
+        if temp == 0 {
+            // 0.48-era: hashset immediately, no date field.
+            date = 0;
+            file_hash = read_hash16(&mut r)?;
+            let phcount = r.read_u16()?;
+            let mut hs = Vec::new();
+            for _ in 0..phcount {
+                hs.push(read_hash16(&mut r)?);
+            }
+            part_hashes = hs;
+        } else {
+            // eDonkey "old part style": date at offset 2, hash, and NO
+            // part-hash count at all - the tag count follows the hash.
+            let mut r2 = Reader::new(bytes.get(2..).ok_or(IoError::UnexpectedEof)?);
+            date = r2.read_u32()?;
+            file_hash = read_hash16(&mut r2)?;
+            part_hashes = Vec::new();
+            r = r2;
+        }
+    } else {
+        date = r.read_u32()?;
+        file_hash = read_hash16(&mut r)?;
+        let phcount = r.read_u16()?;
+        let mut hs = Vec::new();
+        for _ in 0..phcount {
+            hs.push(read_hash16(&mut r)?);
+        }
+        part_hashes = hs;
     }
     let tagcount = r.read_u32()?;
     let mut tags = Vec::new();
@@ -83,7 +134,14 @@ pub fn read_part_met(bytes: &[u8]) -> Result<PartMet, IoError> {
     })
 }
 
-/// Serialize a part.met, reproducing aMule's byte layout.
+/// Serialize a part.met, reproducing aMule's DEFAULT byte layout (the one
+/// `PARTFILE_VERSION` / `PARTFILE_VERSION_LARGEFILE` describe).
+///
+/// It does NOT emit the 0xE1 "splitted" layout - see the module doc. Hand it a
+/// `PartMet` parsed from a splitted file and it will write the default shape
+/// under whatever version byte that file carried, which no reader would then
+/// parse correctly. Callers set the version deliberately (`part_store` writes
+/// 0xE0/0xE2); this is a read-side import format, not a write target.
 pub fn write_part_met(pm: &PartMet) -> Vec<u8> {
     let mut w = Writer::new();
     w.write_u8(pm.version);
@@ -228,14 +286,77 @@ mod tests {
         assert_eq!(write_part_met(&golden_parsed()), GOLDEN);
     }
 
+    /// THE 0xE1 "SPLITTED" LAYOUT IS NOT THE 0xE0 ONE, and reading one as the
+    /// other does not error - it yields a plausible, wrong hash and gap set,
+    /// which is a silently corrupt import.
+    ///
+    /// aMule (PartFile.cpp:432-461): `isnewstyle = (version == 0xE1)`, and then
+    /// a `temp = ReadUInt32()` at offset 1 selects between two sub-layouts -
+    /// `temp == 0` means the hashset follows immediately with NO date field,
+    /// anything else means seek BACK to offset 2, read the date there, read the
+    /// hash, and read NO part-hash count at all.
+    ///
+    /// THIS TEST REPLACES A TAUTOLOGICAL ONE that flipped the version byte on an
+    /// 0xE0-layout golden and asserted it round-tripped. Of course it did: both
+    /// sides used the same wrong layout, so the assertion compared padMule with
+    /// itself and could never fail. Fixtures here are built from the SOURCE
+    /// layout instead. **Validated by transcription, not against a real eDonkey
+    /// part.met - no such file was available.** Said plainly so the next reader
+    /// knows what this does and does not prove.
     #[test]
-    fn accepts_the_edonkey_import_version_byte() {
-        // 0xE1 (edonkey import) is accepted on read and preserved.
-        let mut bytes = GOLDEN.to_vec();
-        bytes[0] = PARTFILE_VERSION_EDONKEY;
-        let parsed = read_part_met(&bytes).unwrap();
-        assert_eq!(parsed.version, PARTFILE_VERSION_EDONKEY);
-        assert_eq!(write_part_met(&parsed), bytes);
+    fn the_splitted_layout_reads_its_own_shape_not_the_default_one() {
+        // temp == 0: version, 0u32, hash, u16 count, hashes, tagcount.
+        let mut b = vec![PARTFILE_VERSION_EDONKEY];
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&[0xAB; 16]);
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(&[0xCD; 16]);
+        b.extend_from_slice(&0u32.to_le_bytes()); // tagcount
+        let p = read_part_met(&b).unwrap();
+        assert_eq!(p.version, PARTFILE_VERSION_EDONKEY);
+        assert_eq!(p.file_hash, [0xAB; 16], "the hash must come from offset 5");
+        assert_eq!(p.part_hashes, vec![[0xCD; 16]]);
+        assert_eq!(p.date, 0, "this sub-layout has no date field at all");
+
+        // temp != 0: version, <1 byte>, date@2, hash, tagcount. No part count.
+        let mut b = vec![PARTFILE_VERSION_EDONKEY, 0x77];
+        b.extend_from_slice(&0x1234_5678u32.to_le_bytes()); // date at offset 2
+        b.extend_from_slice(&[0xEE; 16]);
+        b.extend_from_slice(&0u32.to_le_bytes()); // tagcount
+        let p = read_part_met(&b).unwrap();
+        assert_eq!(p.date, 0x1234_5678, "the date is read from offset 2");
+        assert_eq!(p.file_hash, [0xEE; 16]);
+        assert!(
+            p.part_hashes.is_empty(),
+            "this sub-layout carries no part-hash count"
+        );
+    }
+
+    /// The 0xE0 SNIFF: eDonkey's "old part style" wears the ordinary version
+    /// byte and is identified only by `00 00 02 01` at offset 24
+    /// (PartFile.cpp:435-445). Without the sniff it parses as a normal 0xE0 and
+    /// the difference is silent.
+    #[test]
+    fn an_0xe0_file_marked_old_part_style_takes_the_splitted_path() {
+        // Build a temp != 0 splitted body under an 0xE0 version byte, with the
+        // marker bytes landing at offset 24.
+        let mut b = vec![PARTFILE_VERSION, 0x77];
+        b.extend_from_slice(&0x0BAD_F00Du32.to_le_bytes()); // date at 2..6
+        b.extend_from_slice(&[0x11; 16]); // hash at 6..22
+        b.extend_from_slice(&0u32.to_le_bytes()); // tagcount at 22..26
+        assert_eq!(&b[24..26], &[0, 0], "fixture places the marker at 24");
+        b[24] = 0;
+        b[25] = 0;
+        b.push(2);
+        b.push(1);
+        // Bytes 24..28 are now 00 00 02 01 - the marker - so this 0xE0 file must
+        // be read with the SPLITTED layout, i.e. the date comes from offset 2.
+        let p = read_part_met(&b).unwrap();
+        assert_eq!(
+            p.date, 0x0BAD_F00D,
+            "the marker must switch this 0xE0 file onto the splitted layout"
+        );
+        assert_eq!(p.file_hash, [0x11; 16]);
     }
 
     #[test]

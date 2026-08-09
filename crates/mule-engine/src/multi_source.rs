@@ -824,6 +824,15 @@ impl Download {
                 pos = (key + EMBLOCKSIZE).min(part_start + PARTSIZE);
             }
         }
+        // BLOCKING I/O, ON THE REACTOR, UNDER THE LOCK - the known cost of this
+        // path, recorded rather than quietly carried (2026-08-08 reanalysis).
+        // Every other slow operation in this file goes through `spawn_blocking`
+        // (part MD4 at :886, the hashset at :1134, whole-file verify at :1246);
+        // this one does not, and it runs on a runtime built with 2 worker
+        // threads (`MuleEngine::new`). Not changed here because the guard is
+        // held across the call, so moving the write off the reactor is a
+        // locking change rather than a wrapper - and because the effect is
+        // unmeasured. See the note at the runtime builder before optimising.
         let mut g = self.inner.lock().await;
         g.store.write_block(start, data)
     }

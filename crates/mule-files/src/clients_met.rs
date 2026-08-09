@@ -69,11 +69,18 @@ impl CreditEntry {
         self.uploaded == 0 && self.downloaded == 0
     }
 
-    /// True if `now` is at least `CREDIT_EXPIRE_SECS` past `last_seen`. aMule
+    /// True if `now` is MORE than `CREDIT_EXPIRE_SECS` past `last_seen`. aMule
     /// drops such entries when loading; here the caller (the engine's
     /// credit_store) applies this predicate - `read_clients_met` keeps them.
+    ///
+    /// STRICTLY greater, matching both authorities to the second: they compute
+    /// `dwExpired = time(NULL) - 12960000` and drop on `nLastSeen < dwExpired`
+    /// (eMule 0.50a ClientCredits.cpp:245+255, aMule ClientCreditsList.cpp:
+    /// 120+148), so an entry exactly 150 days old has `nLastSeen == dwExpired`,
+    /// fails the `<`, and SURVIVES. This was `>=` until 2026-08-08 and dropped
+    /// it one second early - a peer's whole credit history, at the boundary.
     pub fn is_expired(&self, now: u32) -> bool {
-        now.saturating_sub(self.last_seen) >= CREDIT_EXPIRE_SECS
+        now.saturating_sub(self.last_seen) > CREDIT_EXPIRE_SECS
     }
 }
 
@@ -268,10 +275,22 @@ mod tests {
         assert!(read_clients_met(&bytes).is_err());
     }
 
+    /// The boundary is STRICTLY GREATER THAN, not >=, and both authorities say
+    /// so in the same words: `if (newcstruct->nLastSeen < dwExpired)` where
+    /// `dwExpired = time(NULL) - 12960000` (eMule 0.50a ClientCredits.cpp:245+255,
+    /// aMule ClientCreditsList.cpp:120+148). So an entry last seen EXACTLY
+    /// 12960000s ago is `nLastSeen == dwExpired`, which is NOT `<`, and survives.
+    /// padMule used `>=` and dropped it - one second early, at exactly the
+    /// boundary this test names.
     #[test]
     fn expiry_is_150_days() {
         let e = CreditEntry::new([0u8; 16], 1000);
         assert!(!e.is_expired(1000 + CREDIT_EXPIRE_SECS - 1));
-        assert!(e.is_expired(1000 + CREDIT_EXPIRE_SECS));
+        assert!(
+            !e.is_expired(1000 + CREDIT_EXPIRE_SECS),
+            "exactly 150 days old is NOT expired upstream - the comparison is \
+             `nLastSeen < now - 12960000`, and equality fails it"
+        );
+        assert!(e.is_expired(1000 + CREDIT_EXPIRE_SECS + 1));
     }
 }

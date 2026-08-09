@@ -496,6 +496,24 @@ impl MuleEngine {
             message: e.to_string(),
         })?;
         engine.set_downloads_dir(&downloads_dir);
+        // TWO WORKERS, AND THE RECEIVE PATH BLOCKS ON THEM. Flagged by the
+        // 2026-08-08 reanalysis and DELIBERATELY NOT CHANGED, because it is a
+        // hypothesis until someone measures it - but the next person to measure
+        // "padMule handles many downloads badly" should start here:
+        //
+        //   `Download::add_block` (multi_source.rs) takes the download's inner
+        //   lock and calls `PartStore::write_block`, which is a SYNCHRONOUS
+        //   `File::write_all` with no `spawn_blocking` - the one uninsulated
+        //   blocking call in an engine that otherwise wraps hashing, part
+        //   verification and AICH reads carefully. With 2 workers, two
+        //   concurrent ~180KB writes can occupy BOTH, stalling the server link,
+        //   the Kad loop and the UI poll for the duration.
+        //
+        // There is no cap on concurrent downloads either, and each gets up to ~4
+        // peer workers (`parallel_for_priority`), so the offered load scales
+        // with the number of downloads while the runtime does not. Raising this
+        // number is the cheap experiment; moving the write off the reactor is
+        // the real fix, and it needs care because the lock is held across it.
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()

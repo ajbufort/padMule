@@ -42,7 +42,9 @@ pub struct NodesDat {
     pub contacts: Vec<KadContact>,
 }
 
-/// Parse a nodes.dat (modern versioned form; also accepts v0/v1 records).
+/// Parse a nodes.dat (modern versioned form; v1..=3).
+///
+/// A v0 file yields ZERO contacts, matching aMule - see the refusal inside.
 pub fn read_nodes_dat(bytes: &[u8]) -> Result<NodesDat, IoError> {
     let mut r = Reader::new(bytes);
     let first = r.read_u32()?;
@@ -60,7 +62,20 @@ pub fn read_nodes_dat(bytes: &[u8]) -> Result<NodesDat, IoError> {
         let count = r.read_u32()?;
         (version, count, bootstrap)
     } else {
-        (0, first, false)
+        // A NONZERO FIRST DWORD IS A v0 FILE, AND v0 IS REFUSED - by aMule in so
+        // many words: "Don't read version 0 nodes.dat files, because they can't
+        // tell the kad version of the contacts stored", setting numContacts = 0
+        // (RoutingZone.cpp:169-172). That reason is the whole point: a v0 record
+        // carries a TYPE byte where v1+ carry the contact version, so every
+        // contact read from one has an unknown Kad version - and a Kad1 contact
+        // cannot speak the Kad2 wire padMule sends. padMule parsed these until
+        // 2026-08-08 and handed back contacts with `version: 0`, which the
+        // routing table now refuses anyway; refusing the FILE is both faithful
+        // and honest about why.
+        return Ok(NodesDat {
+            version: 0,
+            contacts: Vec::new(),
+        });
     };
 
     let mut contacts = Vec::new(); // untrusted count; records are fixed-size
@@ -149,26 +164,31 @@ mod tests {
     }
 
     #[test]
-    fn reads_a_v0_file_where_the_first_dword_is_the_count() {
+    fn a_v0_file_is_refused_because_it_cannot_name_its_contacts_kad_version() {
         // v0: no leading zero, no version field; 25-byte records ending in a
-        // "type" byte we discard.
+        // "type" byte where v1+ put the contact VERSION - which is exactly why
+        // aMule refuses the format outright ("they can't tell the kad version
+        // of the contacts stored", RoutingZone.cpp:169-172). This test used to
+        // assert padMule PARSED such a file and returned its contact, pinning a
+        // divergence as if it were a feature.
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&1u32.to_le_bytes()); // count (nonzero => v0)
         bytes.extend_from_slice(&Kad128::from_hash(&[0xCD; 16]).to_wire());
         bytes.extend_from_slice(&0x0102_0304u32.to_le_bytes()); // ip
         bytes.extend_from_slice(&4672u16.to_le_bytes()); // udp
         bytes.extend_from_slice(&4662u16.to_le_bytes()); // tcp
-        bytes.push(2); // type byte, discarded
+        bytes.push(2); // type byte - where v1+ put the contact version
+
+        // NOT an error: aMule logs and carries on with zero contacts, so a user
+        // with an ancient nodes.dat gets an empty table and a working client,
+        // not a failed start. The file is well-formed; it just cannot say what
+        // it needs to say.
         let n = read_nodes_dat(&bytes).unwrap();
         assert_eq!(n.version, 0);
-        assert_eq!(n.contacts.len(), 1);
-        let c = &n.contacts[0];
-        assert_eq!(c.ip, 0x0102_0304);
-        assert_eq!((c.udp_port, c.tcp_port), (4672, 4662));
-        // v0 has no contact version / udp key / verified flag.
-        assert_eq!(
-            (c.version, c.udp_key, c.udp_key_ip, c.verified),
-            (0, 0, 0, false)
+        assert!(
+            n.contacts.is_empty(),
+            "a v0 file must yield NO contacts - every one of them has an \
+             unknown Kad version, and a Kad1 contact cannot speak our wire"
         );
     }
 
