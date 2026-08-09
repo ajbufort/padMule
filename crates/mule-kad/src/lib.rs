@@ -30,7 +30,9 @@ pub use message::{
     TAG_SOURCEUPORT,
 };
 pub use routing::{
-    Contact, RoutingTable, K, KBASE, KK, MAXLEVELS, MAX_CONTACTS_PER_IP, MAX_CONTACTS_PER_SUBNET,
+    Contact, RoutingTable, SweepOutcome, ALIVE_LEASE_SECS, K, KAD_TYPE_ALIVE, KAD_TYPE_NEW,
+    KAD_TYPE_PROBED, KBASE, KK, MAXLEVELS, MAX_CONTACTS_PER_IP, MAX_CONTACTS_PER_SUBNET,
+    PROBE_WINDOW_SECS,
 };
 pub use udp_obf::{
     kad_deobfuscate, kad_obfuscate_request, kad_obfuscate_response, udp_verify_key, KadDecrypted,

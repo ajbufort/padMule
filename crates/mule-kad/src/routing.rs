@@ -275,6 +275,19 @@ impl Zone {
         }
     }
 
+    /// Delete a contact by id. eMule analog: `CRoutingBin::RemoveContact`,
+    /// reached from `OnSmallTimer` (RoutingZone.cpp:877).
+    fn remove(&mut self, id: &Kad128) -> bool {
+        match &mut self.node {
+            Node::Leaf(bin) => {
+                let before = bin.len();
+                bin.retain(|c| c.id != *id);
+                bin.len() != before
+            }
+            Node::Internal(zero, one) => zero.remove(id) || one.remove(id),
+        }
+    }
+
     /// One `OnSmallTimer` pass over this subtree (eMule RoutingZone.cpp:860-905).
     /// Removal and stamping run for EVERY leaf; only probe EMISSION is capped,
     /// so a wide table cannot burst a HELLO at every bin at once (eMule gets
@@ -459,6 +472,18 @@ impl RoutingTable {
         self.root.set_alive(id, now)
     }
 
+    /// Delete a contact by id, freeing its per-IP and per-/24 slots. Used to
+    /// propagate a live-table eviction into the PERSISTED table, so a contact
+    /// the sweep killed is not written back to nodes.dat and re-imported next
+    /// launch. eMule needs no equivalent: its routing zone is its ONLY contact
+    /// store and `WriteFile` samples it directly (`GetBootstrapContacts` ->
+    /// `TopDepth` -> `CRoutingBin::GetEntries`, which filters nothing), so a
+    /// contact `OnSmallTimer` deleted CANNOT reach its nodes.dat. padMule has a
+    /// second, monotonic store and therefore has to say so explicitly.
+    pub fn remove(&mut self, id: &Kad128) -> bool {
+        self.root.remove(id)
+    }
+
     /// One `OnSmallTimer` pass: remove contacts that failed their probe, stamp
     /// the never-stamped, and hand back up to `max_probes` contacts to send a
     /// HELLO_REQ to. PURE - the caller does the I/O and calls
@@ -595,23 +620,42 @@ impl RoutingTable {
     /// The `count` contacts closest (by XOR distance) to `target` - the candidate
     /// set an iterative lookup starts from.
     pub fn closest_to(&self, target: &Kad128, count: usize) -> Vec<Contact> {
+        self.closest_to_max_type(target, count, KAD_TYPE_NEW)
+    }
+
+    /// The contacts padMule will hand to ANOTHER NODE that asked
+    /// (`KADEMLIA2_REQ`). Stricter than the lookup pool by one type, and that is
+    /// eMule's rule, not a padMule choice: it serves from
+    /// `GetClosestTo(2, ...)` (`Process_KADEMLIA2_REQ`,
+    /// KademliaUDPListener.cpp:738) while seeding its own search from
+    /// `GetClosestTo(3, ...)` (`CSearch::Go`, Search.cpp:183); the bin filter is
+    /// `GetType() <= uMaxType && IsIpVerified()` (RoutingBin.cpp:244). aMule
+    /// 3.0.1 matches (KademliaUDPListener.cpp:662).
+    ///
+    /// The point is honesty toward the asker: a type-3 contact is one WE have
+    /// never had an answer from, so passing it on spends the asker's dial and
+    /// timeout on our guess. A fresh table is all type 3 (`InitContact`), so a
+    /// fresh eMule answers with a count-0 `KADEMLIA2_RES` too - a stock packet,
+    /// not silence, and not a fingerprint. padMule promotes more slowly than
+    /// eMule (2 global probes/min against one per leaf ZONE), so it will serve
+    /// emptier for longer; that is a recorded divergence in DEGREE. Do not
+    /// compensate by loosening this gate.
+    pub fn closest_to_serving(&self, target: &Kad128, count: usize) -> Vec<Contact> {
+        self.closest_to_max_type(target, count, KAD_TYPE_ALIVE)
+    }
+
+    fn closest_to_max_type(&self, target: &Kad128, count: usize, max_type: u8) -> Vec<Contact> {
         let mut all: Vec<&Contact> = Vec::new();
         self.root.collect(&mut all);
         if self.enforce_verified {
             all.retain(|c| c.verified);
         }
-        // A contact awaiting a probe answer is one we already doubt: eMule
-        // seeds a search from `GetClosestTo(3, ...)` (Search.cpp:183), and the
-        // bin filter is `GetType() <= uMaxType` (RoutingBin.cpp:244), so type 4
-        // is excluded from lookups. This is the half of the feature that pays
-        // off immediately - a dying contact stops being handed out as a seed a
-        // full probe window before it is removed.
-        //
-        // NOT narrowed to eMule's SERVE rule (`GetClosestTo(2, ...)`,
-        // KademliaUDPListener.cpp:738) here: that changes what padMule TELLS
-        // other nodes and wants the amuled A/B oracle first. Recorded in the
-        // handoff as the remaining half.
-        all.retain(|c| c.kad_type < KAD_TYPE_PROBED);
+        // eMule's `GetClosestTo(uMaxType, ...)` shape: the bin filter is
+        // `GetType() <= uMaxType && IsIpVerified()` (RoutingBin.cpp:244). Type 4
+        // (probed, awaiting an answer) is therefore excluded from BOTH pools -
+        // a contact we already doubt stops being handed out a full probe window
+        // before it is removed.
+        all.retain(|c| c.kad_type <= max_type);
         all.sort_by_key(|c| target.distance(&c.id));
         all.into_iter().take(count).cloned().collect()
     }
@@ -1165,6 +1209,52 @@ mod tests {
             (0, 0),
             "the evicted contact no longer holds its address"
         );
+    }
+
+    /// Removal must free the address slots, exactly as a sweep eviction does -
+    /// this is the same blackhole property, reached by the path the engine uses
+    /// to propagate an eviction into the persisted table.
+    #[test]
+    fn remove_deletes_the_contact_and_frees_its_ip_slots() {
+        let mut t = RoutingTable::new(id(0));
+        t.add(id(1), 0x0101_0101, 4672, 4662, 8, true);
+        assert_eq!(t.ip_counts(0x0101_0101), (1, 1));
+
+        assert!(t.remove(&id(1)), "a known id reports removed");
+        assert_eq!(t.len(), 0);
+        assert_eq!(t.ip_counts(0x0101_0101), (0, 0));
+        assert!(!t.remove(&id(1)), "an absent id reports false");
+    }
+
+    /// THE SERVE GATE: what we hand another node is narrower than what we seed
+    /// our own lookups from, by exactly one type. eMule serves KADEMLIA2_REQ
+    /// from `GetClosestTo(2, ...)` (KademliaUDPListener.cpp:738) and seeds a
+    /// search from `GetClosestTo(3, ...)` (Search.cpp:183).
+    #[test]
+    fn the_serve_pool_holds_only_contacts_we_ourselves_proved_alive() {
+        let mut t = RoutingTable::new(id(0));
+        t.add(id(1), 0x0101_0101, 4672, 4662, 8, true);
+
+        // Type 3: good enough to seed OUR lookup, not good enough to pass on.
+        assert_eq!(t.closest_to(&id(9), 10).len(), 1);
+        assert!(
+            t.closest_to_serving(&id(9), 10).is_empty(),
+            "a contact we have never had an answer from must not be passed on"
+        );
+
+        // It answered us: now both pools hold it.
+        t.set_alive(&id(1), 100);
+        assert_eq!(t.closest_to(&id(9), 10).len(), 1);
+        assert_eq!(t.closest_to_serving(&id(9), 10).len(), 1);
+
+        // Probed and silent: withheld from both. TWO failed probes from ALIVE,
+        // not one - eMule's type is a consecutive-failure counter and
+        // `CheckingType` increments it, so an alive (2) contact goes 2 -> 3 -> 4.
+        t.sweep(3_700, 8); // not due yet: rotated, unprobed
+        t.sweep(3_800, 8); // probe 1: type 3
+        t.sweep(4_000, 8); // probe 2: type 4 - now doubted
+        assert!(t.closest_to(&id(9), 10).is_empty());
+        assert!(t.closest_to_serving(&id(9), 10).is_empty());
     }
 
     /// eMule staggers probe traffic with a per-zone timer (RoutingZone.cpp:124).

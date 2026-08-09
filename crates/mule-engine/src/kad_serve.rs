@@ -77,7 +77,18 @@ pub fn answer_request(
     from_udp_port: u16,
     me: &ServeIdentity,
     valid_receiver_key: bool,
-    closest: impl FnOnce(&Kad128, usize) -> Vec<WireContact>,
+    // TWO POOLS, because eMule uses two and they differ by design. A FIND
+    // answer comes from `GetClosestTo(2, ...)` - contacts we have ourselves had
+    // an answer from (`Process_KADEMLIA2_REQ`, KademliaUDPListener.cpp:738).
+    // A BOOTSTRAP answer comes from an UNFILTERED sample
+    // (`Process_KADEMLIA2_BOOTSTRAP_REQ` -> `GetBootstrapContacts` ->
+    // `TopDepth` -> `CRoutingBin::GetEntries`, which filters nothing) - and it
+    // must stay wide, because a bootstrapping node is exactly the caller that
+    // cannot afford a thin answer. Taking two closures rather than letting the
+    // CALLER pick one per opcode keeps that distinction here, in the pure
+    // module that owns the answering rules, instead of in the read loop.
+    closest_serving: impl FnOnce(&Kad128, usize) -> Vec<WireContact>,
+    bootstrap_pool: impl FnOnce(&Kad128, usize) -> Vec<WireContact>,
 ) -> Option<ServeAnswer> {
     match op {
         OP_PING => {
@@ -110,7 +121,7 @@ pub fn answer_request(
             // Our own cap still binds on top: `req_type` is attacker-controlled
             // and only masked to 5 bits (message.rs:481), so it can reach 31.
             let want = (req.req_type as usize).min(KAD_FIND_NODE_ANSWER_CAP);
-            let mut contacts = closest(&req.target, want);
+            let mut contacts = closest_serving(&req.target, want);
             // TRUNCATE HERE, do not merely ASK for the count. Passing the limit
             // to the closure and trusting it is the "moved the check == removed
             // the check" shape: the rule is ours, the wire consequence is ours,
@@ -121,7 +132,7 @@ pub fn answer_request(
             ServeAnswer::plain(o, p)
         }
         OP_BOOTSTRAP_REQ => {
-            let mut contacts = closest(&me.kad_id, KAD_BOOTSTRAP_ANSWER_CAP);
+            let mut contacts = bootstrap_pool(&me.kad_id, KAD_BOOTSTRAP_ANSWER_CAP);
             contacts.truncate(KAD_BOOTSTRAP_ANSWER_CAP);
             let (o, p) = build_bootstrap_res(&me.kad_id, me.tcp_port, KADEMLIA_VERSION, &contacts);
             ServeAnswer::plain(o, p)
@@ -262,13 +273,50 @@ mod tests {
         Vec::new()
     }
 
+    /// THE TWO POOLS MUST NOT BE CROSSED. A FIND answer comes from the narrow
+    /// serve pool (eMule `GetClosestTo(2, ...)`, KademliaUDPListener.cpp:738); a
+    /// BOOTSTRAP answer comes from the wide unfiltered one
+    /// (`GetBootstrapContacts` -> `TopDepth` -> `GetEntries`, no filter). Each
+    /// closure PANICS if the other opcode reaches it, so a caller that wires one
+    /// pool to both arms - which is what padMule did until 2026-08-09 - fails
+    /// here rather than silently over-sharing unproven contacts.
+    #[test]
+    fn a_find_answers_from_the_serve_pool_and_a_bootstrap_from_its_own() {
+        let target = Kad128::from_hash(&[7; 16]);
+        let req = mule_kad::build_kad2_req(mule_kad::KAD_FIND_NODE, &target, &me().kad_id).1;
+
+        let a = answer_request(
+            OP_KAD2_REQ,
+            &req,
+            5000,
+            &me(),
+            false,
+            |_, _| vec![contact(1, 0x0A00_0001)],
+            |_, _| panic!("a FIND must not draw from the bootstrap pool"),
+        )
+        .expect("a find must be answered");
+        assert_eq!(a.opcode, mule_kad::OP_KAD2_RES);
+
+        let b = answer_request(
+            OP_BOOTSTRAP_REQ,
+            &[],
+            5000,
+            &me(),
+            false,
+            |_, _| panic!("a BOOTSTRAP must not draw from the narrow serve pool"),
+            |_, _| vec![contact(2, 0x0A00_0002)],
+        )
+        .expect("a bootstrap must be answered");
+        assert_eq!(b.opcode, mule_kad::OP_BOOTSTRAP_RES);
+    }
+
     /// A PING is answered with the REQUESTER's port, which is how the peer
     /// learns its own external port - and answering at all is what stops eMule
     /// evicting us on its OnSmallTimer sweep, which is the whole point of the
     /// serve loop.
     #[test]
     fn a_ping_is_answered_with_the_requesters_port() {
-        let a = answer_request(OP_PING, &[], 5000, &me(), false, no_contacts)
+        let a = answer_request(OP_PING, &[], 5000, &me(), false, no_contacts, no_contacts)
             .expect("a ping must be answered");
         assert_eq!(a.opcode, mule_kad::OP_PONG);
         assert_eq!(a.payload, vec![0x88, 0x13]); // 5000 LE
@@ -278,7 +326,7 @@ mod tests {
     /// is most of the protocol (publish, notes, buddies, firewall checks).
     #[test]
     fn an_unserved_opcode_is_silently_ignored() {
-        assert!(answer_request(0x43, &[], 5000, &me(), false, no_contacts).is_none());
+        assert!(answer_request(0x43, &[], 5000, &me(), false, no_contacts, no_contacts).is_none());
     }
 
     fn contact(seed: u8, ip: u32) -> WireContact {
@@ -358,13 +406,21 @@ mod tests {
         // itself and could never fail - which is exactly what the first version
         // of this test did, and a mutation raising the cap to 100 sailed
         // straight through it.
-        let a = answer_request(OP_KAD2_REQ, &req, 5000, &me(), false, |t, _want| {
-            assert_eq!(
-                *t, target,
-                "the table must be asked for the REQUESTED target"
-            );
-            pool.clone()
-        })
+        let a = answer_request(
+            OP_KAD2_REQ,
+            &req,
+            5000,
+            &me(),
+            false,
+            |t, _want| {
+                assert_eq!(
+                    *t, target,
+                    "the table must be asked for the REQUESTED target"
+                );
+                pool.clone()
+            },
+            no_contacts,
+        )
         .expect("a find_node must be answered");
 
         assert_eq!(a.opcode, mule_kad::OP_KAD2_RES);
@@ -405,9 +461,15 @@ mod tests {
 
         // Ignores `want` for the same reason as the test above: a closure that
         // self-limits makes the assertion tautological.
-        let a = answer_request(OP_KAD2_REQ, &req, 5000, &me(), false, |_, _want| {
-            pool.clone()
-        })
+        let a = answer_request(
+            OP_KAD2_REQ,
+            &req,
+            5000,
+            &me(),
+            false,
+            |_, _want| pool.clone(),
+            no_contacts,
+        )
         .expect("a value lookup must be answered");
 
         let res = mule_kad::parse_kad2_res(&a.payload).unwrap();
@@ -430,9 +492,15 @@ mod tests {
             .map(|i| contact(i, 0x0A00_0000 + i as u32))
             .collect();
 
-        let a = answer_request(OP_KAD2_REQ, &req, 5000, &me(), false, |_, _want| {
-            pool.clone()
-        })
+        let a = answer_request(
+            OP_KAD2_REQ,
+            &req,
+            5000,
+            &me(),
+            false,
+            |_, _want| pool.clone(),
+            no_contacts,
+        )
         .expect("a store lookup must be answered");
 
         let res = mule_kad::parse_kad2_res(&a.payload).unwrap();
@@ -457,9 +525,15 @@ mod tests {
             .map(|i| contact(i, 0x0A00_0000 + i as u32))
             .collect();
 
-        let a = answer_request(OP_KAD2_REQ, &req, 5000, &me(), false, |_, _want| {
-            pool.clone()
-        })
+        let a = answer_request(
+            OP_KAD2_REQ,
+            &req,
+            5000,
+            &me(),
+            false,
+            |_, _want| pool.clone(),
+            no_contacts,
+        )
         .expect("an over-large ask is still answered, just capped");
 
         let res = mule_kad::parse_kad2_res(&a.payload).unwrap();
@@ -478,17 +552,30 @@ mod tests {
         let target = Kad128::from_hash(&[0x33; 16]);
         let someone_else = Kad128::from_hash(&[0xEE; 16]);
         let (_, req) = mule_kad::build_kad2_req(mule_kad::KAD_FIND_NODE, &target, &someone_else);
-        assert!(
-            answer_request(OP_KAD2_REQ, &req, 5000, &me(), false, |_, _| vec![contact(
-                1, 1
-            )])
-            .is_none()
-        );
+        assert!(answer_request(
+            OP_KAD2_REQ,
+            &req,
+            5000,
+            &me(),
+            false,
+            |_, _| vec![contact(1, 1)],
+            no_contacts,
+        )
+        .is_none());
     }
 
     #[test]
     fn a_malformed_find_node_is_not_answered() {
-        assert!(answer_request(OP_KAD2_REQ, &[0u8; 5], 5000, &me(), false, no_contacts).is_none());
+        assert!(answer_request(
+            OP_KAD2_REQ,
+            &[0u8; 5],
+            5000,
+            &me(),
+            false,
+            no_contacts,
+            no_contacts
+        )
+        .is_none());
     }
 
     /// A bootstrap answer carries our details plus contacts - it is how a cold
@@ -502,9 +589,21 @@ mod tests {
             .collect();
         // Ignores `want` for the same reason as the find_node test: a closure
         // that self-limits makes the cap assertion tautological.
-        let a = answer_request(OP_BOOTSTRAP_REQ, &[], 5000, &me(), false, |_, _want| {
-            pool.clone()
-        })
+        // The BOOTSTRAP pool is the SEVENTH argument, and passing `no_contacts`
+        // as the sixth is the point: a bootstrap answer must not be drawn from
+        // the narrow serve pool. eMule serves it from an unfiltered sample
+        // (`GetBootstrapContacts` -> `TopDepth` -> `CRoutingBin::GetEntries`,
+        // which filters nothing), because a bootstrapping node is exactly the
+        // caller that cannot afford a thin answer.
+        let a = answer_request(
+            OP_BOOTSTRAP_REQ,
+            &[],
+            5000,
+            &me(),
+            false,
+            no_contacts,
+            |_, _want| pool.clone(),
+        )
         .expect("bootstrap must be answered");
         assert_eq!(a.opcode, mule_kad::OP_BOOTSTRAP_RES);
         let res = mule_kad::parse_bootstrap_res(&a.payload).unwrap();
@@ -536,6 +635,7 @@ mod tests {
                 5000,
                 &me(),
                 false,
+                no_contacts,
                 no_contacts
             )
             .is_none(),
@@ -550,6 +650,7 @@ mod tests {
             5000,
             &me(),
             false,
+            no_contacts,
             no_contacts
         )
         .is_none());
@@ -559,7 +660,10 @@ mod tests {
     #[test]
     fn a_publish_is_ignored_rather_than_falsely_acknowledged() {
         for op in [0x43u8, 0x44, 0x45] {
-            assert!(answer_request(op, &[0u8; 40], 5000, &me(), false, no_contacts).is_none());
+            assert!(
+                answer_request(op, &[0u8; 40], 5000, &me(), false, no_contacts, no_contacts)
+                    .is_none()
+            );
         }
     }
 

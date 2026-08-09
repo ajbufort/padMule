@@ -4736,6 +4736,22 @@ impl Engine {
             return (0, 0);
         };
         let (sent, removed) = kad.run_liveness_sweep(KAD_SWEEP_MAX_PROBES).await;
+        // PROPAGATE THE EVICTION INTO THE PERSISTED TABLE. `Engine::routing` is
+        // monotonic and `checkpoint_contacts` folds it with the live one, so
+        // without this the contact the sweep just killed is written back to
+        // nodes.dat, re-imported next launch, re-blackholes its IP under
+        // MAX_CONTACTS_PER_IP = 1, and restarts its 3-4 minute march every
+        // session. No tombstone SET is needed and none is wanted: eMule's
+        // routing zone is its only contact store and `WriteFile` samples it
+        // directly, so a contact `OnSmallTimer` deleted cannot reach its
+        // nodes.dat at all. Deleting from both stores reproduces that
+        // structurally - and it keeps the inverse case working for free: a peer
+        // that returns at a NEW address is re-learned by the ordinary gated
+        // insert and persisted again, with no tombstone to outlive it.
+        for id in &removed {
+            self.routing.remove(id);
+        }
+        let removed = removed.len();
         // DELIBERATELY NO `EngineEvent::Kad` HERE. That variant carries a
         // CONTACT COUNT, and the KB's most expensive Kad bug was one UI field
         // written by two different measurements (build-progress 8ce: a live
@@ -5449,6 +5465,112 @@ mod tests {
     /// `shutdown` checkpointed and set the state while leaving TCP 4662 bound and
     /// Kad's UDP socket open), persist what the session learned, and leave the
     /// engine restartable without relaunching the app.
+    /// THE PERSISTENCE HALF of contact expiry, driven through the REAL caller
+    /// chain (`maintain_kad_liveness` -> `checkpoint`), not by calling
+    /// `RoutingTable::remove` directly - the whole defect was that the sweep
+    /// removed from the LIVE table while `checkpoint_contacts` re-folded the
+    /// monotonic `Engine::routing` on top, so a test that skipped the engine
+    /// would prove nothing about it.
+    ///
+    /// The second half is the one a naive tombstone SET would fail: a peer that
+    /// comes back at a NEW address must be persisted again. There is no
+    /// tombstone to outlive the re-observation because the eviction is a
+    /// deletion, exactly as it is in eMule's single store.
+    #[tokio::test]
+    async fn an_evicted_contact_is_dropped_from_nodes_dat_and_a_reborn_one_returns() {
+        use crate::kad_live::KadNode;
+        use mule_files::read_nodes_dat;
+
+        let dir = tmp("kad-evict-persist");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+        engine.set_offline(false);
+
+        // X is silent (nothing is bound at its address, so its probe times out).
+        // Y is the control: it must survive, or the test proves only that
+        // checkpointing can lose contacts.
+        let dead = KadContact {
+            id: Kad128::from_hash(&[0xA1; 16]),
+            ip: 0x0101_0101,
+            udp_port: 4672,
+            tcp_port: 4662,
+            version: 8,
+            udp_key: 0,
+            udp_key_ip: 0,
+            verified: true,
+        };
+        let control = KadContact {
+            id: Kad128::from_hash(&[0xB2; 16]),
+            ip: 0x0202_0202,
+            udp_port: 4672,
+            tcp_port: 4662,
+            version: 8,
+            udp_key: 0,
+            udp_key_ip: 0,
+            verified: true,
+        };
+        // ONLY the dead contact goes into the LIVE table. The control lives in
+        // the persisted table alone, so the sweep never touches it - which is
+        // what makes it a control. An unreachable contact placed in the live
+        // table beside the victim is not a control, it is a second victim: the
+        // first sweep STAMPS and then ROTATES the bin front, so whichever
+        // contact ends up second is the one probed first. The first version of
+        // this test put both in the live table and evicted the "control".
+        let node = KadNode::bind("127.0.0.1:0".parse().unwrap(), 4662)
+            .await
+            .unwrap();
+        node.with_routing(|t| t.load_nodes(std::slice::from_ref(&dead)));
+        engine.routing.load_nodes(&[dead.clone(), control.clone()]);
+        engine.kad = Some(node);
+        engine.state = EngineState::Running;
+
+        // Walk the death march: stamp, probe (X's HELLO times out), remove.
+        // The aging clock is advanced rather than slept on - the arms are gated
+        // on eMule's real 10s/120s intervals.
+        for step in 0..3 {
+            engine.last_kad_sweep = Instant::now() - KAD_SWEEP_EVERY;
+            engine.maintain_kad_liveness().await;
+            if let Some(k) = engine.kad.as_ref() {
+                k.advance_aging_for_test(if step == 0 { 60 } else { 200 });
+            }
+        }
+
+        engine.checkpoint();
+        let nd = read_nodes_dat(&std::fs::read(dir.join("nodes.dat")).unwrap()).unwrap();
+        assert!(
+            !nd.contacts.iter().any(|c| c.id == dead.id),
+            "an evicted contact must NOT be written back - it would be \
+             re-imported next launch and re-blackhole its IP"
+        );
+        assert!(
+            nd.contacts.iter().any(|c| c.id == control.id),
+            "the control must survive - this asserts an EVICTION happened, not \
+             a checkpoint that loses contacts"
+        );
+
+        // REBORN at a new address: re-learned by the live table, so the next
+        // checkpoint persists it again. A never-cleared tombstone set fails here.
+        let reborn = KadContact {
+            ip: 0x0505_0505,
+            ..dead.clone()
+        };
+        engine
+            .kad
+            .as_ref()
+            .unwrap()
+            .with_routing(|t| t.load_nodes(std::slice::from_ref(&reborn)));
+        engine.checkpoint();
+        let nd = read_nodes_dat(&std::fs::read(dir.join("nodes.dat")).unwrap()).unwrap();
+        assert!(
+            nd.contacts
+                .iter()
+                .any(|c| c.id == reborn.id && c.ip == 0x0505_0505),
+            "a peer that comes back at a new address must be persisted again"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn stop_releases_sockets_persists_and_can_restart() {
         use crate::kad_live::KadNode;

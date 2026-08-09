@@ -226,7 +226,7 @@ pub struct KadNode {
     /// carries no expiry field, exactly as eMule's does not), so a lease only
     /// has to be comparable within the run that issued it - and a wall clock
     /// that jumps must not mass-expire a healthy table.
-    aging_clock: Instant,
+    aging: Arc<AgingClock>,
 }
 
 impl Drop for KadNode {
@@ -268,6 +268,17 @@ fn gated_add_contact(
     ip_filter: &Mutex<Option<Arc<IpFilter>>>,
     c: &WireContact,
     verified: bool,
+    // `proven_alive`: this contact just PROVED itself alive - it answered
+    // something we sent, or sent us a HELLO_REQ. eMule promotes exactly here and
+    // nowhere else: `Add(..., bUpdate = true, ...)` reaches `SetAlive` on the
+    // found-contact branch (RoutingZone.cpp:588), and the only callers passing
+    // true are the inbound HELLO_REQ (KademliaUDPListener.cpp:591), a HELLO_RES
+    // to a request of ours (:672), and the BOOTSTRAP_RES responder (:567). A
+    // FIND answer promotes NOTHING - its contacts are added `bUpdate = false`
+    // (:846) and its responder is not added at all - so hearsay cannot renew a
+    // lease. `now` is the aging clock (see `KadNode::aging_now`).
+    proven_alive: bool,
+    now: u64,
 ) {
     if !is_acceptable_contact(c.ip, c.udp_port, /*allow_private=*/ false) {
         return;
@@ -308,11 +319,36 @@ fn gated_add_contact(
             return;
         }
     }
+    let known = t.contains(&c.id);
     t.add(c.id, c.ip, c.udp_port, c.tcp_port, c.version, verified);
+    // Only an EXISTING contact is promoted, matching eMule: its new-contact
+    // branch inserts at type 3 (`InitContact`) with no `SetAlive`, even from a
+    // HELLO. A first sighting is not yet a proof of liveness we can pass on.
+    if proven_alive && known {
+        t.set_alive(&c.id, now);
+    }
 }
 
 /// The closest VERIFIED contacts to `target` as wire contacts, cloned out of
 /// the lock so no caller holds it while doing I/O.
+fn closest_wire_contacts_serving_in(
+    routing: &Mutex<RoutingTable>,
+    target: &Kad128,
+    count: usize,
+) -> Vec<WireContact> {
+    let g = routing.lock().expect(LOCK_POISONED);
+    g.closest_to_serving(target, count)
+        .into_iter()
+        .map(|c| WireContact {
+            id: c.id,
+            ip: c.ip,
+            udp_port: c.udp_port,
+            tcp_port: c.tcp_port,
+            version: c.version,
+        })
+        .collect()
+}
+
 fn closest_wire_contacts_in(
     routing: &Mutex<RoutingTable>,
     target: &Kad128,
@@ -462,6 +498,31 @@ enum ValueAsk<'a> {
 /// which is the whole point of AMENDMENT 2: `start_kad` configures the node
 /// after binding it, so a value captured at spawn would freeze `ip_filter` at
 /// `None` and the advertised port at "bound".
+/// The contact-aging clock, shared by the node and its read loop so a promotion
+/// from an inbound HELLO and one from a probe answer are stamped on the SAME
+/// timeline. Session-MONOTONIC on purpose: aging is never persisted (neither
+/// client's nodes.dat has an expiry field), so a lease only has to be comparable
+/// within the run that issued it, and a wall-clock jump must not mass-expire a
+/// healthy table.
+pub(crate) struct AgingClock {
+    origin: Instant,
+    /// Test-only forward offset; always 0 in production.
+    offset: AtomicU64,
+}
+
+impl AgingClock {
+    fn new() -> Self {
+        Self {
+            origin: Instant::now(),
+            offset: AtomicU64::new(0),
+        }
+    }
+
+    pub(crate) fn now(&self) -> u64 {
+        self.origin.elapsed().as_secs() + self.offset.load(Ordering::Relaxed)
+    }
+}
+
 struct ReadLoop {
     socket: Arc<UdpSocket>,
     kad_id: Kad128,
@@ -481,6 +542,7 @@ struct ReadLoop {
     /// [`ACK_SOLICITED_WINDOW`].
     hello_res_sent: Arc<Mutex<HashMap<u32, StdInstant>>>,
     current_public_ip: Arc<AtomicU32>,
+    aging: Arc<AgingClock>,
 }
 
 /// How long a sent HELLO_RES makes an ACK from that IP acceptable.
@@ -698,6 +760,8 @@ async fn run_read_loop(ctx: ReadLoop) {
         // Process2HelloRequest does the same via AddContact2.
         if op == mule_kad::OP_HELLO_REQ {
             if let Ok(h) = parse_hello(&payload) {
+                // PROVEN: a HELLO_REQ arriving from this address is eMule's
+                // canonical liveness signal (bUpdate = true, :591).
                 gated_add_contact(
                     &ctx.routing,
                     &ctx.ip_filter,
@@ -711,6 +775,8 @@ async fn run_read_loop(ctx: ReadLoop) {
                         version: h.version,
                     },
                     valid_receiver_key,
+                    /*proven_alive=*/ true,
+                    ctx.aging.now(),
                 );
                 // STORE THE KEY IT HANDED US, exactly as `note_responder` does
                 // for a node that answered US. eMule's `AddContact2` takes the
@@ -748,6 +814,7 @@ async fn run_read_loop(ctx: ReadLoop) {
             from.port(),
             &me,
             valid_receiver_key,
+            |t, want| closest_wire_contacts_serving_in(&ctx.routing, t, want),
             |t, want| closest_wire_contacts_in(&ctx.routing, t, want),
         ) else {
             continue; // (c) not served - most of the protocol, deliberately
@@ -811,7 +878,9 @@ impl KadNode {
         let current_public_ip = Arc::new(AtomicU32::new(0));
         let flood = Arc::new(Mutex::new(HashMap::new()));
         let hello_res_sent = Arc::new(Mutex::new(HashMap::new()));
+        let aging = Arc::new(AgingClock::new());
         let read_loop = tokio::spawn(run_read_loop(ReadLoop {
+            aging: Arc::clone(&aging),
             flood: Arc::clone(&flood),
             current_public_ip: Arc::clone(&current_public_ip),
             hello_res_sent: Arc::clone(&hello_res_sent),
@@ -838,7 +907,7 @@ impl KadNode {
             pending,
             next_seq: AtomicU64::new(0),
             read_loop,
-            aging_clock: Instant::now(),
+            aging,
         })
     }
 
@@ -909,7 +978,16 @@ impl KadNode {
     /// Seconds since this node bound its socket - the clock contact aging runs
     /// on. See [`KadNode::aging_clock`].
     fn aging_now(&self) -> u64 {
-        self.aging_clock.elapsed().as_secs()
+        self.aging.now()
+    }
+
+    /// Push the aging clock FORWARD, for tests only. The sweep's arms are gated
+    /// on eMule's real intervals (a 10s `CheckingType` floor, a 120s probe
+    /// window), so without this no test could reach the probe or evict arms
+    /// without sleeping for minutes. Production leaves the offset at 0.
+    #[cfg(test)]
+    pub(crate) fn advance_aging_for_test(&self, secs: u64) {
+        self.aging.offset.fetch_add(secs, Ordering::Relaxed);
     }
 
     /// ONE `OnSmallTimer` PASS (eMule `CRoutingZone::OnSmallTimer`,
@@ -924,11 +1002,14 @@ impl KadNode {
     /// and a small cap, because this is called from `heartbeat()` with the
     /// engine lock held - the same constraint `maintain_kad` documents.
     ///
-    /// Returns (probes sent, contacts removed).
-    pub async fn run_liveness_sweep(&mut self, max_probes: usize) -> (usize, usize) {
+    /// Returns the probes sent and the ids REMOVED - the ids, not just a count,
+    /// because the caller must delete them from the persisted table too or the
+    /// next launch re-imports them (see `Engine::maintain_kad_liveness`).
+    pub async fn run_liveness_sweep(&mut self, max_probes: usize) -> (usize, Vec<Kad128>) {
         let now = self.aging_now();
         let outcome = self.with_routing(|t| t.sweep(now, max_probes));
-        let removed = outcome.removed.len();
+        let removed = outcome.removed;
+        crate::stats::note_kad_evicted(removed.len() as u64);
         let mut sent = 0usize;
         for c in outcome.probes {
             let contact = KadContact {
@@ -942,16 +1023,19 @@ impl KadNode {
                 verified: c.verified,
             };
             sent += 1;
+            crate::stats::note_kad_probe_sent();
             // `hello` already does the whole round trip - request, responder
             // bookkeeping, and the ACK leg if the answer asks for one. A
             // TIMEOUT IS NOT AN ERROR HERE and must not be treated as one:
             // eviction is the expiry's job on a later sweep, exactly as
             // eMule's fire-and-forget probe leaves it to `OnSmallTimer`.
             if self.hello(&contact, KAD_PROBE_WAIT).await.is_ok() {
-                // It answered: cancel the death march (eMule `SetAlive`, from
-                // the `bUpdate = true` HELLO_RES path).
-                let at = self.aging_now();
-                self.with_routing(|t| t.set_alive(&c.id, at));
+                crate::stats::note_kad_probe_answered();
+                // The lease refresh itself happens inside `hello` ->
+                // `note_responder(proven_alive = true)`, which is eMule's
+                // bUpdate = true HELLO_RES path (KademliaUDPListener.cpp:672).
+                // ONE promotion path, not two: a second `set_alive` here would
+                // be a rule with two implementations to keep in step.
             }
         }
         (sent, removed)
@@ -999,7 +1083,10 @@ impl KadNode {
     /// would then say the problem was fixed.
     pub fn seed_routing(&mut self, contacts: &[KadContact]) -> usize {
         for c in contacts {
-            self.add_contact(c.id, c.ip, c.udp_port, c.tcp_port, c.version, c.verified);
+            self.add_contact(
+                c.id, c.ip, c.udp_port, c.tcp_port, c.version, c.verified,
+                /*proven_alive=*/ false,
+            );
             // Only for a contact that actually survived the gates - otherwise a
             // blocked address could still park a key against its id.
             if c.udp_key != 0 {
@@ -1016,6 +1103,13 @@ impl KadNode {
     /// Add a contact to the routing table only if it passes the wire-contact
     /// gates - see [`gated_add_contact`], the ONE insert path, which the read
     /// loop shares.
+    ///
+    /// The argument list mirrors a wire contact plus the two verdicts the
+    /// CALLER holds and the table cannot infer: whether the peer's IP was
+    /// receiver-key verified, and whether this sighting is a proof of life
+    /// (eMule's `bUpdate`). Bundling them into a struct would move the
+    /// decision away from the call site that actually knows it.
+    #[allow(clippy::too_many_arguments)]
     fn add_contact(
         &mut self,
         id: Kad128,
@@ -1024,6 +1118,7 @@ impl KadNode {
         tcp_port: u16,
         version: u8,
         verified: bool,
+        proven_alive: bool,
     ) {
         gated_add_contact(
             &self.routing,
@@ -1036,6 +1131,8 @@ impl KadNode {
                 version,
             },
             verified,
+            proven_alive,
+            self.aging_now(),
         );
     }
 
@@ -1046,8 +1143,28 @@ impl KadNode {
     /// hears back from a node must call this, or that node's key is lost to the
     /// send-side echo (the 2026-08-02 reanalysis found the two search paths
     /// dropping it).
-    fn note_responder(&mut self, c: &WireContact, verified: bool, sender_vk: u32) {
-        self.add_contact(c.id, c.ip, c.udp_port, c.tcp_port, c.version, verified);
+    /// `proven_alive` is NOT simply "it answered": eMule promotes a lease only
+    /// on its `bUpdate = true` paths, and a KADEMLIA2_RES is not one of them -
+    /// it does not even re-add the responder (KademliaUDPListener.cpp:767-846).
+    /// padMule DOES add it there, deliberately, to capture the sender key (the
+    /// 2026-08-02 fix) - but that divergence must not grow a lease refresh, or
+    /// a node could keep itself in our serve pool by answering searches alone.
+    fn note_responder(
+        &mut self,
+        c: &WireContact,
+        verified: bool,
+        sender_vk: u32,
+        proven_alive: bool,
+    ) {
+        self.add_contact(
+            c.id,
+            c.ip,
+            c.udp_port,
+            c.tcp_port,
+            c.version,
+            verified,
+            proven_alive,
+        );
         let our_ip = self.current_public_ip.load(Ordering::Relaxed);
         self.with_routing(|t| t.note_verify_key(&c.id, c.ip, sender_vk, our_ip));
     }
@@ -1234,13 +1351,19 @@ impl KadNode {
             res.tcp_port,
             res.version,
             verified,
+            // PROVEN: the BOOTSTRAP_RES responder is one of eMule's three
+            // bUpdate = true paths (KademliaUDPListener.cpp:567).
+            /*proven_alive=*/
+            true,
         );
         // Store the verify key it handed us (bound to our current public IP) so a
         // later request to it echoes the key and it verifies us in return.
         let our_ip = self.current_public_ip.load(Ordering::Relaxed);
         self.with_routing(|t| t.note_verify_key(&res.id, contact.ip, sender_vk, our_ip));
         for c in &res.contacts {
-            self.add_contact(c.id, c.ip, c.udp_port, c.tcp_port, c.version, false);
+            self.add_contact(
+                c.id, c.ip, c.udp_port, c.tcp_port, c.version, false, /*proven_alive=*/ false,
+            );
         }
         Ok(res)
     }
@@ -1300,6 +1423,10 @@ impl KadNode {
             },
             verified,
             peer_vk,
+            // PROVEN: a HELLO_RES to a request of OURS - eMule's :672 path, and
+            // the leg the liveness probe rides on.
+            /*proven_alive=*/
+            true,
         );
         // Third leg: if the HELLO_RES requested an ACK, send it, echoing peer_vk.
         if hello.misc_options.is_some_and(|m| m & 0x04 != 0) {
@@ -1357,9 +1484,15 @@ impl KadNode {
         sender_vk: u32,
         contacts: Vec<WireContact>,
     ) -> Vec<WireContact> {
-        self.note_responder(responder, verified, sender_vk);
+        // NOT proven: a KADEMLIA2_RES is not a bUpdate = true path in eMule
+        // (it does not even re-add the responder). We add it only to capture the
+        // sender key; promoting here would let a node hold its place in our
+        // serve pool by answering searches alone.
+        self.note_responder(responder, verified, sender_vk, /*proven_alive=*/ false);
         for c in &contacts {
-            self.add_contact(c.id, c.ip, c.udp_port, c.tcp_port, c.version, false);
+            self.add_contact(
+                c.id, c.ip, c.udp_port, c.tcp_port, c.version, false, /*proven_alive=*/ false,
+            );
         }
         let mut frontier = frontier_filter(responder.ip, contacts);
         self.with_routing(|t| frontier.retain(|c| t.is_acceptable_answer(&c.id, c.ip, c.udp_port)));
@@ -1605,7 +1738,12 @@ impl KadNode {
                                 ReqKind::Value => {
                                     if let Ok(res) = parse_search_res(&payload) {
                                         out.search_responses += 1;
-                                        self.note_responder(&ev.contact, verified, sender_vk);
+                                        self.note_responder(
+                                            &ev.contact,
+                                            verified,
+                                            sender_vk,
+                                            /*proven_alive=*/ false,
+                                        );
                                         let had = results;
                                         match &value {
                                             ValueAsk::Sources { .. } => {
@@ -2741,6 +2879,7 @@ mod tests {
             4662,
             8,
             false,
+            /*proven_alive=*/ false,
         );
         assert_eq!(node.contacts_known(), 0, "blocklisted contact dropped");
         // ...but an allowed public IP does.
@@ -2751,6 +2890,7 @@ mod tests {
             4662,
             8,
             false,
+            /*proven_alive=*/ false,
         );
         assert_eq!(node.contacts_known(), 1, "allowed contact kept");
     }
@@ -2760,11 +2900,27 @@ mod tests {
         let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let mut node = KadNode::bind(bind, 4662).await.unwrap();
         // A LEGACY node (version <= 5) on DNS port 53 is dropped (anti-reflection)...
-        node.add_contact(Kad128::from_hash(&[1; 16]), 0x0808_0808, 53, 4662, 5, false);
+        node.add_contact(
+            Kad128::from_hash(&[1; 16]),
+            0x0808_0808,
+            53,
+            4662,
+            5,
+            false,
+            /*proven_alive=*/ false,
+        );
         assert_eq!(node.contacts_known(), 0, "legacy port-53 contact dropped");
         // ...but a MODERN node on 53 is KEPT - eMule keeps it, so we must not be
         // stricter (that would drop a peer eMule accepts).
-        node.add_contact(Kad128::from_hash(&[2; 16]), 0x0909_0909, 53, 4662, 8, false);
+        node.add_contact(
+            Kad128::from_hash(&[2; 16]),
+            0x0909_0909,
+            53,
+            4662,
+            8,
+            false,
+            /*proven_alive=*/ false,
+        );
         assert_eq!(
             node.contacts_known(),
             1,
@@ -2779,7 +2935,15 @@ mod tests {
         let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let mut node = KadNode::bind(bind, 4662).await.unwrap();
         let id1 = Kad128::from_hash(&[1; 16]);
-        node.add_contact(id1, 0x0808_0808, 4672, 4662, 8, false);
+        node.add_contact(
+            id1,
+            0x0808_0808,
+            4672,
+            4662,
+            8,
+            false,
+            /*proven_alive=*/ false,
+        );
         node.add_contact(
             Kad128::from_hash(&[2; 16]),
             0x0808_0809,
@@ -2787,10 +2951,19 @@ mod tests {
             4662,
             8,
             false,
+            /*proven_alive=*/ false,
         );
         // The attacker's ip (0x0808_0809) is already at the 1-per-IP cap, so
         // re-pointing id1 onto it is refused; id1 stays at its original ip.
-        node.add_contact(id1, 0x0808_0809, 4672, 4662, 8, false);
+        node.add_contact(
+            id1,
+            0x0808_0809,
+            4672,
+            4662,
+            8,
+            false,
+            /*proven_alive=*/ false,
+        );
         assert_eq!(
             node.with_routing(|t| t.ip_of(&id1)),
             Some(0x0808_0808),
@@ -2811,6 +2984,7 @@ mod tests {
             4662,
             8,
             false,
+            /*proven_alive=*/ false,
         );
         node.add_contact(
             Kad128::from_hash(&[2; 16]),
@@ -2819,6 +2993,7 @@ mod tests {
             4662,
             8,
             false,
+            /*proven_alive=*/ false,
         );
         assert_eq!(node.contacts_known(), 1, "second id on the same IP refused");
     }
@@ -2870,6 +3045,184 @@ mod tests {
         let (rop, rpayload) = unpack_kad(&dec.payload).unwrap();
         assert_eq!(rop, OP_HELLO_RES);
         Some(parse_hello(&rpayload).unwrap())
+    }
+
+    /// Send a KADEMLIA2_REQ (FIND_NODE) as a mock peer and return the contacts
+    /// the node answered with. Same role as `drive_hello_within`.
+    async fn drive_find(ours: SocketAddr, node_id: &Kad128, target: &Kad128) -> Vec<WireContact> {
+        let peer_id = Kad128::from_hash(&[0x66; 16]);
+        let peer_key = 0x6B6Bu32;
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (op, payload) = build_kad2_req(mule_kad::KAD_FIND_NODE, target, node_id);
+        let my_vk = udp_verify_key(peer_key, ip_u32(&ours));
+        let dg = kad_obfuscate_request(&pack_kad(op, payload), node_id, 0x3333, 0, my_vk, 0x40);
+        peer.send_to(&dg, ours).await.unwrap();
+        let mut buf = vec![0u8; 8192];
+        let (n, from) = timeout(Duration::from_secs(3), peer.recv_from(&mut buf))
+            .await
+            .expect("a FIND must be answered - eMule sends the RES even when empty")
+            .unwrap();
+        let dec = kad_deobfuscate(&buf[..n], &peer_id, peer_key, ip_u32(&from)).unwrap();
+        let (rop, rpayload) = unpack_kad(&dec.payload).unwrap();
+        assert_eq!(rop, OP_KAD2_RES);
+        mule_kad::parse_kad2_res(&rpayload).unwrap().contacts
+    }
+
+    /// THE SERVE GATE, AT THE CALLER. The pure rule is pinned in
+    /// `mule_kad::routing`; what this proves is that the READ LOOP asks the
+    /// narrow pool - a gate the wire path never consults is not a gate. (Both
+    /// halves of this feature initially had pure tests only, and a mutant that
+    /// pointed the read loop back at the wide pool sailed through the whole
+    /// suite.)
+    ///
+    /// eMule answers KADEMLIA2_REQ from `GetClosestTo(2, ...)`
+    /// (KademliaUDPListener.cpp:738): contacts it has itself had an answer from.
+    /// A type-3 contact is one WE have never heard from, so passing it on spends
+    /// the asker's dial on our guess.
+    #[tokio::test]
+    async fn an_inbound_find_is_answered_only_from_contacts_we_proved_ourselves() {
+        let our_id = Kad128::from_words([5, 5, 5, 5]);
+        let node =
+            KadNode::bind_with_identity("127.0.0.1:0".parse().unwrap(), 4662, our_id, 0x7171)
+                .await
+                .unwrap();
+        let ours = node.local_addr();
+        let target = Kad128::from_hash(&[0x31; 16]);
+        let known = Kad128::from_hash(&[0x32; 16]);
+        // A verified, routable contact - but one that has never answered US.
+        node.with_routing(|t| {
+            t.load_nodes(&[KadContact {
+                id: known,
+                ip: 0x0A0B_0C0D,
+                udp_port: 4672,
+                tcp_port: 4662,
+                version: 8,
+                udp_key: 0,
+                udp_key_ip: 0,
+                verified: true,
+            }])
+        });
+
+        let answered = drive_find(ours, &our_id, &target).await;
+        assert!(
+            answered.is_empty(),
+            "an unproven contact must not be passed to another node; got {answered:?}"
+        );
+
+        // Now it has proven itself alive to us - and only now may we vouch.
+        node.with_routing(|t| t.set_alive(&known, 100));
+        let answered = drive_find(ours, &our_id, &target).await;
+        assert_eq!(
+            answered.iter().map(|c| c.id).collect::<Vec<_>>(),
+            vec![known],
+            "a proven contact IS served"
+        );
+    }
+
+    /// PROMOTION IS NOT "IT WAS MENTIONED". eMule renews a lease only on its
+    /// `bUpdate = true` paths (an inbound HELLO_REQ :591, a HELLO_RES to our own
+    /// request :672, the BOOTSTRAP_RES responder :567); a KADEMLIA2_RES adds its
+    /// contacts `bUpdate = false` (:846) and does not re-add its responder at
+    /// all. Drives the free function directly - it is the ONLY insert path, so
+    /// this is the rule's one gate rather than a restatement of it.
+    #[tokio::test]
+    async fn only_a_proving_signal_renews_a_lease_never_hearsay() {
+        let routing = Mutex::new(RoutingTable::new(Kad128::from_words([1, 2, 3, 4])));
+        let filter: Mutex<Option<Arc<IpFilter>>> = Mutex::new(None);
+        let c = WireContact {
+            id: Kad128::from_hash(&[0x44; 16]),
+            // A ROUTABLE PUBLIC address: `gated_add_contact` refuses private
+            // ranges, so a 10.x contact never reaches the promotion rule at all.
+            ip: 0x0808_0808,
+            udp_port: 4672,
+            tcp_port: 4662,
+            version: 8,
+        };
+
+        // A FIRST sighting is never a promotion, even from a proving signal:
+        // eMule's new-contact branch inserts at type 3 with no SetAlive.
+        gated_add_contact(&routing, &filter, &c, true, /*proven_alive=*/ true, 10);
+        let t = |f: &dyn Fn(&RoutingTable) -> u8| f(&routing.lock().unwrap());
+        assert_eq!(
+            t(&|r| r.contacts()[0].kad_type),
+            mule_kad::KAD_TYPE_NEW,
+            "a first sighting is not yet a proof we can pass on"
+        );
+
+        // HEARSAY about a known contact: no lease.
+        gated_add_contact(
+            &routing, &filter, &c, true, /*proven_alive=*/ false, 20,
+        );
+        assert_eq!(
+            t(&|r| r.contacts()[0].kad_type),
+            mule_kad::KAD_TYPE_NEW,
+            "being named by a third party is not evidence of life"
+        );
+
+        // It answered us: NOW the lease renews.
+        gated_add_contact(&routing, &filter, &c, true, /*proven_alive=*/ true, 30);
+        assert_eq!(t(&|r| r.contacts()[0].kad_type), mule_kad::KAD_TYPE_ALIVE);
+        assert_eq!(
+            routing.lock().unwrap().contacts()[0].expires,
+            Some(30 + mule_kad::ALIVE_LEASE_SECS)
+        );
+    }
+
+    /// THE INSTRUMENT MUST BE FED BY THE DRIVER. The sweep policy is unit-tested
+    /// in `mule_kad::routing`; this proves `run_liveness_sweep` actually reports
+    /// what it did. A panel that stays at zero while the feature works is the
+    /// row-8by mistake (codecs with no driver), and on device these counters are
+    /// the ONLY way to tell "the sweep never ran" from "the table is healthy".
+    ///
+    /// Deltas, never absolutes: stats are process-global and the suite is
+    /// parallel.
+    #[tokio::test]
+    async fn the_liveness_sweep_feeds_the_probe_and_eviction_counters() {
+        let mut node = KadNode::bind_with_identity(
+            "127.0.0.1:0".parse().unwrap(),
+            4662,
+            Kad128::from_words([3, 1, 4, 1]),
+            0x2727,
+        )
+        .await
+        .unwrap();
+        // A routable address with nothing behind it: its probe cannot be
+        // answered, so it walks the full march to eviction.
+        node.with_routing(|t| {
+            t.load_nodes(&[KadContact {
+                id: Kad128::from_hash(&[0x51; 16]),
+                ip: 0x0808_0404,
+                udp_port: 4672,
+                tcp_port: 4662,
+                version: 8,
+                udp_key: 0,
+                udp_key_ip: 0,
+                verified: true,
+            }])
+        });
+
+        // Held across the whole measurement: a concurrent `reset_kad_stats()`
+        // would make the second read smaller than the first and no delta rule
+        // survives that.
+        let _stats = crate::stats::STATS_TEST_LOCK.lock();
+        let (sent0, _, eviction0) = crate::stats::kad_liveness_counts();
+        node.run_liveness_sweep(2).await; // stamps
+        node.advance_aging_for_test(60);
+        node.run_liveness_sweep(2).await; // probes (times out)
+        node.advance_aging_for_test(200);
+        node.run_liveness_sweep(2).await; // removes
+        let (sent1, _, eviction1) = crate::stats::kad_liveness_counts();
+
+        assert!(
+            sent1 > sent0,
+            "a probe went out but `probes sent` did not move - the panel would \
+             read as 'the sweep never ran'"
+        );
+        assert!(
+            eviction1 > eviction0,
+            "a contact was evicted but `contacts evicted` did not move"
+        );
+        assert_eq!(node.contacts_known(), 0, "and it really is gone");
     }
 
     /// DROPPING THE NODE MUST STOP ITS READ LOOP, or `pause()` never releases

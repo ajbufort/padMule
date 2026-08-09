@@ -380,6 +380,12 @@ static K_TTFR_MS: AtomicU64 = AtomicU64::new(0);
 /// Value lookups that ran to completion / total ms they took.
 static K_DONE_N: AtomicU64 = AtomicU64::new(0);
 static K_DONE_MS: AtomicU64 = AtomicU64::new(0);
+/// THE LIVENESS SWEEP (eMule's `OnSmallTimer`, padMule row 8cw): probes sent,
+/// probes that got a HELLO_RES inside the wait, and contacts removed for
+/// failing their probe window.
+static K_PROBE_SENT: AtomicU64 = AtomicU64::new(0);
+static K_PROBE_ANSWERED: AtomicU64 = AtomicU64::new(0);
+static K_EVICTED: AtomicU64 = AtomicU64::new(0);
 
 /// Reply-RTT histogram bucket upper bounds (ms); the 7th bucket is ">= last".
 /// Chosen around the deadlines in use (750ms on device, 1400ms in the CLI).
@@ -407,6 +413,9 @@ static KAD_REFS: &[&AtomicU64] = &[
     &K_TTFR_MS,
     &K_DONE_N,
     &K_DONE_MS,
+    &K_PROBE_SENT,
+    &K_PROBE_ANSWERED,
+    &K_EVICTED,
     &K_RTT[0],
     &K_RTT[1],
     &K_RTT[2],
@@ -415,6 +424,24 @@ static KAD_REFS: &[&AtomicU64] = &[
     &K_RTT[5],
     &K_RTT[6],
 ];
+
+/// One liveness probe (a `KADEMLIA2_HELLO_REQ`) went out.
+pub fn note_kad_probe_sent() {
+    K_PROBE_SENT.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A liveness probe was answered - the contact proved itself alive.
+pub fn note_kad_probe_answered() {
+    K_PROBE_ANSWERED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// `n` contacts were removed by a sweep for failing their probe window. Takes a
+/// COUNT because one sweep removes a batch.
+pub fn note_kad_evicted(n: u64) {
+    if n > 0 {
+        K_EVICTED.fetch_add(n, Ordering::Relaxed);
+    }
+}
 
 /// One `resolve_keyword` / `resolve_sources` / `refresh_routing` call started.
 pub fn note_kad_lookup() {
@@ -474,6 +501,29 @@ pub fn note_kad_first_result(ms: u64) {
 #[cfg(test)]
 pub(crate) fn kad_first_results() -> u64 {
     K_TTFR_N.load(Ordering::Relaxed)
+}
+
+/// Liveness counters, for the CALLER test. The pure sweep is unit-tested in
+/// `mule_kad`; what these prove is that `run_liveness_sweep` actually feeds the
+/// panel - a driver that sweeps correctly and reports nothing is the row-8by
+/// mistake. Asserted as one-directional DELTAS, never absolutes: these are
+/// process-global and the suite runs in parallel.
+/// Serializes the tests that RESET Kad stats against those that measure a
+/// delta across them. The counters are process-global and the suite runs in
+/// parallel, so a one-directional delta is normally enough - but a concurrent
+/// `reset_kad_stats()` can make a later read SMALLER than an earlier one, which
+/// no delta rule survives. Any test that either resets or spans a measurement
+/// must hold this.
+#[cfg(test)]
+pub(crate) static STATS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn kad_liveness_counts() -> (u64, u64, u64) {
+    (
+        K_PROBE_SENT.load(Ordering::Relaxed),
+        K_PROBE_ANSWERED.load(Ordering::Relaxed),
+        K_EVICTED.load(Ordering::Relaxed),
+    )
 }
 
 /// A value lookup (keyword / source) finished, `ms` after it started. Refresh
@@ -557,6 +607,31 @@ pub fn kad_report() -> String {
         "  value asks",
         pct(vt, vs)
     ));
+    // THE OnSmallTimer HALF. Read these against the FIND_NODE row above: the
+    // point of expiry is that dead contacts stop being handed to lookups as
+    // seeds, so a working feature shows the FIND timeout share FALLING across a
+    // session as evictions accumulate (device baseline 8co: 52% answered).
+    //
+    // TWO HONESTY NOTES, because this panel is easy to over-read:
+    // - "probes answered" is a BIASED sample and must never be quoted as swarm
+    //   health. The sweep probes each bin's FRONT - the least-recently-proven
+    //   contact it holds - so its answer rate reads LOW by construction. The
+    //   "value asks" row above is the unbiased same-session control.
+    // - "evicted 0" beside "sent 0" means THE SWEEP NEVER RAN, not a healthy
+    //   table. Sent climbing with answered near zero while contacts fall means
+    //   the probe I/O is broken and the sweep is executing a live table.
+    s.push_str("  LIVENESS (the OnSmallTimer half)\n");
+    let (ps, pa, ev) = (
+        K_PROBE_SENT.load(Ordering::Relaxed),
+        K_PROBE_ANSWERED.load(Ordering::Relaxed),
+        K_EVICTED.load(Ordering::Relaxed),
+    );
+    s.push_str(&format!(
+        "    {:<32} {ps:>6} / {pa}  ({} answered)\n",
+        "  probes sent / answered",
+        pct(pa, ps)
+    ));
+    s.push_str(&format!("    {:<32} {ev:>6}\n", "  contacts evicted"));
     // WHAT A REQUEST COSTS when it is answered at all. Timeouts are the row
     // after the histogram, never a bucket of it.
     s.push_str("  REPLY RTT\n");
@@ -658,12 +733,12 @@ mod tests {
     /// Every Kad counter must be in the reset list, or a stale value survives a
     /// reset -> reproduce -> read cycle and is read as fresh. Same guarantee the
     /// funnel gets from its macro, made explicit here because these are declared
-    /// by hand: 12 scalars + the 7 RTT buckets.
+    /// by hand: 15 scalars + the 7 RTT buckets.
     #[test]
     fn the_kad_reset_covers_every_kad_counter() {
         assert_eq!(
             KAD_REFS.len(),
-            19,
+            22,
             "a Kad counter was added or removed without updating KAD_REFS, so \
              reset_kad_stats no longer clears all of them"
         );
@@ -673,11 +748,17 @@ mod tests {
     /// on a fresh launch, when every denominator IS zero.
     #[test]
     fn the_kad_report_survives_having_measured_nothing() {
+        let _guard = STATS_TEST_LOCK.lock();
         reset_kad_stats();
         let s = kad_report();
         assert!(s.contains("lookups run"));
         assert!(s.contains("TIMEOUT (no reply)"));
         assert!(s.contains("in-flight high-water mark"));
+        assert!(
+            s.contains("LIVENESS (the OnSmallTimer half)"),
+            "the liveness section must print even having measured nothing - a \
+             fresh launch is exactly when it is read"
+        );
         assert!(s.contains('-'), "an empty ratio should read as '-', not 0%");
     }
 
