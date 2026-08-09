@@ -21,7 +21,7 @@ struct HelpView: View {
                 }
 
                 Section {
-                    Text("padMule only runs while it is open and on screen. iPadOS suspends apps you switch away from, so transfers pause when you leave and pick up when you come back.")
+                    Text("padMule only runs while it is open and on screen. iPadOS suspends apps you switch away from, so transfers pause when you leave and pick up when you come back. One exception: with \"Background seeding\" on in Settings, uploads keep going for a while after you leave - downloads still pause.")
                     Text("Leave padMule in the foreground while downloading. \"Keep screen awake while transferring\" in Settings stops the display sleeping mid-transfer, which would otherwise suspend the app.")
                 } header: {
                     Text("The one rule")
@@ -70,7 +70,7 @@ struct HelpView: View {
 
                 Section {
                     Text("Sharing your finished files is on by default. Peers give better queue positions to clients that share, so sharing makes your own downloads faster.")
-                    Text("padMule pauses sharing on its own in two cases: on a cellular or metered network, so it does not spend your data; and if your public address changes, which usually means a VPN tunnel dropped. Both tell you why, and both wait for you to turn it back on.")
+                    Text("padMule pauses sharing on its own in two cases: on a cellular or metered network, so it does not spend your data; and if it sees your public address change, which usually means a VPN tunnel dropped. Both tell you why, and both wait for you to turn it back on. Seeing the change needs a HighID login - if a tunnel drop also costs you HighID, padMule can only warn, and the warning has a Pause sharing button for exactly that.")
                     Text("Leech Mode is simply sharing turned off.")
                 } header: {
                     Text("Sharing")
@@ -87,7 +87,7 @@ struct HelpView: View {
                     row("Transfers", "What is downloading now. Swipe to remove, long-press to set priority or preview a video before it finishes.")
                     row("Shared", "What you are serving to others. You can rate and comment on your own files, or unshare one without deleting it.")
                     row("Stats", "Transfer rates and session totals.")
-                    row("Settings", "Sharing, server lists, ports and VPN, default priority, keep-awake.")
+                    row("Settings", "Sharing, server lists, ports and VPN, background seeding, default priority, keep-awake.")
                 } header: {
                     Text("The other screens")
                 }

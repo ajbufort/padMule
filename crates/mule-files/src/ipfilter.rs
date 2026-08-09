@@ -28,6 +28,13 @@ use std::net::Ipv4Addr;
 /// its level `<` this.
 pub const DEFAULT_IPFILTER_LEVEL: u8 = 127;
 
+/// The level eMule assigns an ipfilter.dat line that names NONE - or whose
+/// level field does not scan (`DFLT_FILTER_LEVEL`, IPFilter.cpp:36, applied
+/// in `ParseFilterLine1` whenever `sscanf` stops at 8 items). Distinct from
+/// [`DEFAULT_IPFILTER_LEVEL`], the blocking THRESHOLD levels are compared
+/// against; 100 < 127, so an unleveled line blocks by default, as upstream.
+pub const DEFAULT_LINE_LEVEL: u32 = 100;
+
 /// A parsed, level-filtered, merged IP blocklist.
 #[derive(Debug, Clone, Default)]
 pub struct IpFilter {
@@ -78,18 +85,23 @@ impl IpFilter {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            // Format A: `IPa - IPb , lvl , desc` - needs at least two commas.
+            // Format A (eMule `ParseFilterLine1`, IPFilter.cpp:348-386): a
+            // range, an OPTIONAL level, an OPTIONAL description. The authority
+            // rejects only a missing RANGE (`iItems < 8`); a missing or
+            // unscannable level gets `DFLT_FILTER_LEVEL`. padMule required all
+            // three fields until 2026-08-09 and silently dropped the shorter
+            // forms - fail-OPEN on a blocklist.
             let mut parsed = None;
             let commas: Vec<&str> = line.splitn(3, ',').collect();
-            if commas.len() == 3 {
-                if let (Some(range), Ok(lvl)) =
-                    (parse_range(commas[0]), commas[1].trim().parse::<u32>())
-                {
-                    if lvl <= 255 && (lvl as u8) < level {
-                        parsed = Some(range);
-                    } else {
-                        continue; // valid line, but not a blocking level
-                    }
+            if let Some(range) = parse_range(commas[0]) {
+                let lvl = commas
+                    .get(1)
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+                    .unwrap_or(DEFAULT_LINE_LEVEL);
+                if lvl <= 255 && (lvl as u8) < level {
+                    parsed = Some(range);
+                } else {
+                    continue; // valid line, but not a blocking level
                 }
             }
             // Format B: `desc : IPa - IPb` (level 0). Split on the LAST colon.
@@ -162,6 +174,38 @@ impl IpFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// eMule accepts a BARE range: `ParseFilterLine1` (IPFilter.cpp:348-386)
+    /// rejects only `iItems < 8`, and a line naming no level gets
+    /// `DFLT_FILTER_LEVEL` (100, IPFilter.cpp:36) - which blocks under the
+    /// default threshold. padMule dropped these lines FAIL-OPEN until
+    /// 2026-08-09: a blocklist entry the format authority honours was being
+    /// silently ignored.
+    #[test]
+    fn a_bare_range_line_blocks_at_the_default_line_level() {
+        let f = IpFilter::parse("1.2.3.4 - 1.2.3.5", DEFAULT_IPFILTER_LEVEL);
+        assert!(f.is_blocked("1.2.3.4".parse().unwrap()));
+        assert!(!f.is_blocked("1.2.3.6".parse().unwrap()));
+    }
+
+    /// The two-field form (`range , level`, no description): iItems == 9 with
+    /// `iDescStart` never assigned - accepted, at the NAMED level.
+    #[test]
+    fn a_range_and_level_line_without_description_blocks() {
+        let f = IpFilter::parse("1.2.3.4 - 1.2.3.5 , 0", DEFAULT_IPFILTER_LEVEL);
+        assert!(f.is_blocked("1.2.3.5".parse().unwrap()));
+    }
+
+    /// A garbage level field stops sscanf at iItems == 8 and eMule keeps the
+    /// line at the default level; dropping it would fail open.
+    #[test]
+    fn an_unparseable_level_field_defaults_rather_than_drops() {
+        let f = IpFilter::parse(
+            "1.2.3.4 - 1.2.3.5 , abc , some description",
+            DEFAULT_IPFILTER_LEVEL,
+        );
+        assert!(f.is_blocked("1.2.3.4".parse().unwrap()));
+    }
 
     #[test]
     fn parses_dotted_quad_host_order() {

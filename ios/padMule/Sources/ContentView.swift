@@ -109,6 +109,12 @@ private struct FunctionButton: View {
 
 struct ContentView: View {
     @EnvironmentObject var model: EngineModel
+    /// Read here so the Transfers notice can tell the TRUTH about leaving the
+    /// app: with background seeding armed, "leaving stops the transfer" is
+    /// false for uploads. Honest status is a hard requirement (lifecycle rule
+    /// 1), and this text asserted the pre-seeding rule unconditionally until
+    /// 2026-08-09.
+    @AppStorage(SettingsKey.backgroundSeeding) private var backgroundSeedingOn = false
     // Servers, not Search: padMule deliberately does not auto-connect, so
     // picking a server IS the first thing to do - landing on Search offered a
     // box that could not answer yet.
@@ -328,22 +334,32 @@ struct ContentView: View {
             // network to report a different public address back, which may not
             // happen until the next server login).
             //
-            // It does NOT pause sharing, and the text says so rather than
+            // It does NOT auto-pause sharing, and the text says so rather than
             // implying protection that did not happen. Auto-pausing on this
             // signal would be wrong: the detection is a heuristic that can fire
             // on a non-VPN `utun` interface, and stopping a user's uploads on a
             // false positive is a real cost. The engine's address-change guard
-            // is what actually pauses, on evidence rather than inference.
+            // is what actually pauses, on evidence rather than inference - but
+            // that guard is gated on a HighID login, and a tunnel drop that
+            // also costs HighID hides the change from it (found on glass,
+            // 2026-08-08). DECIDED 2026-08-09 (Anthony): give the warning a
+            // one-tap "Pause sharing now" instead of auto-pausing - no false
+            // positives, and the user is looking at this alert anyway.
             .alert("VPN appears to have dropped", isPresented: $model.vpnWentDown) {
-                Button("OK", role: .cancel) { model.vpnWentDown = false }
+                Button("Pause sharing now", role: .destructive) {
+                    model.setSharing(false)
+                    model.vpnWentDown = false
+                }
+                Button("Keep sharing", role: .cancel) { model.vpnWentDown = false }
             } message: {
                 Text(
                     "padMule can no longer see a VPN tunnel on this device. If you rely on a VPN, "
                         + "your traffic may no longer be going through it.\n\n"
-                        + "Sharing has NOT been paused by this warning - padMule pauses it "
-                        + "automatically only once it confirms its public address actually changed. "
-                        + "To stop serving files right now, turn off Share uploads on the Shared "
-                        + "screen, or use Stop."
+                        + "Sharing has NOT been paused by this warning - padMule pauses "
+                        + "automatically only once it confirms its public address actually "
+                        + "changed, and a drop that also costs HighID can hide that change. "
+                        + "\"Pause sharing now\" stops serving files immediately; turn Share "
+                        + "uploads back on once the tunnel is up."
                 )
             }
             .sheet(item: $ratingFor) { f in
@@ -734,10 +750,15 @@ struct ContentView: View {
                 // The honest notice (requirement 1). iPadOS reclaims sockets from
                 // a backgrounded app; saying otherwise would be a lie.
                 Label(
-                    "padMule only transfers while it is open and on screen. "
-                        + "iPadOS suspends background apps, so leaving stops the transfer. "
-                        + "Progress is always saved, and it restarts when you come back - "
-                        + "though a transfer that can't find sources again may need a nudge.",
+                    backgroundSeedingOn && model.sharing
+                        ? "padMule downloads only while it is open and on screen. "
+                            + "With background seeding on, uploads keep going for a while "
+                            + "after you leave; downloads pause and resume when you return. "
+                            + "Progress is always saved."
+                        : "padMule only transfers while it is open and on screen. "
+                            + "iPadOS suspends background apps, so leaving stops the transfer. "
+                            + "Progress is always saved, and it restarts when you come back - "
+                            + "though a transfer that can't find sources again may need a nudge.",
                     systemImage: "info.circle"
                 )
                 .font(.footnote)
@@ -1483,8 +1504,11 @@ struct ContentView: View {
                 Spacer()
                 if dl.complete {
                     Text("Done").font(.caption).foregroundStyle(.green)
-                } else if model.state == .paused {
-                    // Per-transfer Paused badge (requirement 3).
+                } else if model.state == .paused || model.state == .seeding {
+                    // Per-transfer Paused badge (requirement 3). Seeding counts:
+                    // downloads are stopped in that state too - only uploads
+                    // continue - and a badge keyed on .paused alone would show
+                    // an active-looking row in the app switcher snapshot.
                     Text("Paused")
                         .font(.caption2)
                         .padding(.horizontal, 6)
