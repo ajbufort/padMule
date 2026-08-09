@@ -9,10 +9,12 @@ struct RatePoint: Identifiable {
     let up: Double
 }
 
-/// Session transfer statistics: a live down/up rate chart over the last ~60s,
-/// the session byte totals, and the up:down ratio. Everything is derived
-/// client-side by sampling the engine's monotonic byte totals each poll (see
-/// EngineModel.sampleStats) - the engine only counts bytes, zero wire risk.
+/// Session transfer statistics: a live down/up rate chart over the last 60
+/// samples (~60s in the foreground; longer while background seeding throttles
+/// the poll to one tick in five), the session byte totals, and the up:down
+/// ratio. Everything is derived client-side by sampling the engine's monotonic
+/// byte totals each poll (see EngineModel.sampleStats) - the engine only
+/// counts bytes, zero wire risk.
 struct StatsView: View {
     @EnvironmentObject var model: EngineModel
 
@@ -70,19 +72,9 @@ struct StatsView: View {
                 statRow("Ratio (up:down)", ratioText)
             }
 
-            // THE FETCH FUNNEL. A transfer that shows sources but moves nothing
-            // is the one problem this app cannot explain from its own screens -
-            // the row says "20 sources" and 0 bytes, and there is nowhere to see
-            // WHY. This panel is that missing view: how far down the eD2k
-            // request sequence each peer session got, so a stall can be
-            // attributed to a stage instead of guessed at.
-            //
-            // It stays live without a refresh button because the 1s stats poll
-            // republishes `rateHistory`, re-rendering this body; the engine side
-            // is lock-free, so reading it never queues behind a busy engine.
             Section("UI responsiveness") {
                 Text(
-                    "The status poll is lock-free; the heartbeat needs the engine lock. During a long operation (a search) the first should keep climbing and the second should stall - that gap IS the contention, visible without guessing."
+                    "The status poll is lock-free; the heartbeat needs the engine lock. During a long operation (a search) the first should keep climbing and the second should stall - that gap IS the contention, visible without guessing. (While background seeding, the poll is deliberately throttled to one tick in five, so the heartbeat leading there is by design, not contention.)"
                 )
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -119,6 +111,16 @@ struct StatsView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
 
+            // THE FETCH FUNNEL. A transfer that shows sources but moves nothing
+            // is the one problem this app cannot explain from its own screens -
+            // the row says "20 sources" and 0 bytes, and there is nowhere to see
+            // WHY. This panel is that missing view: how far down the eD2k
+            // request sequence each peer session got, so a stall can be
+            // attributed to a stage instead of guessed at.
+            //
+            // It stays live without a refresh button because the 1s stats poll
+            // republishes `rateHistory`, re-rendering this body; the engine side
+            // is lock-free, so reading it never queues behind a busy engine.
             Section("Fetch diagnostics") {
                 Text(
                     "Where peer sessions die on the way to bytes. Counts are cumulative since launch, or since you last reset them."

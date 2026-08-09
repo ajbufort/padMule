@@ -31,12 +31,16 @@ import UIKit  // UIApplication.isIdleTimerDisabled (keep-screen-awake setting)
 /// public IP or client ID (`server_state_label` and `ServerInfo` exist precisely
 /// to keep those out of user-visible text), server addresses are public
 /// infrastructure, and the only local addresses that appear are RFC1918.
-/// Single source for the engine log's identity. `LoggingTests` pins these
-/// strings to the runbook; construct any engine-side Logger from them, never
-/// from a fresh literal, or the test cannot see the rename it exists to catch.
+/// Single source for the app's os_log identities (engine + keepalive).
+/// `LoggingTests` pins these strings to the runbook; construct any app-side
+/// Logger from them, never from a fresh literal, or the test cannot see the
+/// rename it exists to catch.
 enum EngineLogIdentity {
     static let subsystem = "us.ajbconsulting.padMule"
     static let category = "padMule.engine"
+    /// The background keepalive's category (`BackgroundKeepAlive`), same
+    /// subsystem - filter with `idevicesyslog -p padMule -m padMule.keepalive`.
+    static let keepaliveCategory = "padMule.keepalive"
 }
 
 let engineLog = Logger(subsystem: EngineLogIdentity.subsystem, category: EngineLogIdentity.category)
@@ -104,8 +108,10 @@ final class EngineModel: ObservableObject {
     /// The engine object exists and start() has returned. Until this is true every
     /// action would silently no-op (`guard let e = engine else { return }`), so the
     /// UI must show that it is still starting rather than looking live and inert.
-    /// Boot is 12-30s: two HTTP fetches, the always-failing multicast SSDP probe,
-    /// then unicast + SOAP, then Kad.
+    /// A warm boot is ~1s. The old "boot is 12-30s" claim here was the SUM of the
+    /// worst-case timeouts (two HTTP fetches, the always-failing multicast SSDP
+    /// probe, unicast + SOAP, then Kad), not a measurement - only a cold or
+    /// blocked network actually runs them all out.
     @Published private(set) var ready: Bool = false
     /// A stop (or a start after one) is in flight. Both talk to the router, so
     /// they take seconds; the Status screen shows progress instead of freezing.
@@ -143,6 +149,13 @@ final class EngineModel: ObservableObject {
     /// near the 1s poll period; if anything on this queue ever takes the engine
     /// lock again it jumps to the length of the longest operation, and the number
     /// on screen names the fault instead of hinting at it.
+    ///
+    /// SCOPE: it measures gaps between polls that were actually SCHEDULED.
+    /// While background-seeding the fast poll is deliberately skipped 4 ticks
+    /// in 5 (`shouldRunFastPoll`), and a skipped tick clears `lastUiPollAt` -
+    /// otherwise one seeding episode parked this max at ~5s forever, a number
+    /// that named the throttle rather than a fault and poisoned the 1.1s
+    /// device-pass regression bar.
     @Published private(set) var uiPollMaxGapSecs: Double = 0
     private var lastUiPollAt: Date?
     /// How many IP-blocklist ranges are loaded (0 = no ipfilter placed).
@@ -204,7 +217,10 @@ final class EngineModel: ObservableObject {
     private var lastSampleTime = Date()
     private var sampleIndex = 0
     private var statsPrimed = false
-    /// Samples kept, and therefore the chart's fixed X span: 60 seconds.
+    /// Samples kept, and therefore the chart's fixed X span: 60 SAMPLES -
+    /// about 60 seconds in the foreground. While background-seeding the fast
+    /// poll is throttled (`shouldRunFastPoll`), so samples arrive ~5s apart
+    /// and the same 60 points span proportionally more wall time.
     static let rateWindow = 60
     private let rateHistoryCap = EngineModel.rateWindow
 
@@ -216,7 +232,7 @@ final class EngineModel: ObservableObject {
     /// Early on that is a handful of points, and Swift Charts scaled the domain
     /// to fit them - so the live trace was squeezed into a sliver instead of
     /// using the width it had. Padding on the LEFT with zeros fixes the span at
-    /// a full minute and makes the newest sample always land on the right edge,
+    /// the full window and makes the newest sample always land on the right edge,
     /// so the trace scrolls leftwards the way a live rate graph should.
     var ratePlot: [RatePoint] {
         let recent = rateHistory.suffix(EngineModel.rateWindow)
@@ -471,7 +487,10 @@ final class EngineModel: ObservableObject {
 
     /// Retains the in-flight Open-In controller: UIKit does not, and a
     /// deallocated one dismisses its own menu instantly. Replaced per use, so at
-    /// most one is ever alive.
+    /// most one is ever alive. KNOWN AND ACCEPTED: after a successful hand-off
+    /// the last controller stays retained until the next use replaces it -
+    /// there is no reliable completion hook to clear it on, and one idle
+    /// controller costs nothing.
     private var openInController: UIDocumentInteractionController?
 
     /// Hand a finished file to ANOTHER app, full screen - as opposed to the row
@@ -983,6 +1002,15 @@ final class EngineModel: ObservableObject {
                 cmp = threeWay(fa, fb)
             case .priority: cmp = threeWay(a.priority, b.priority)
             }
+            // Deterministic tiebreak on equal keys, always ascending - the
+            // same idiom as presentedServers/presentedDownloadedFiles. Swift's
+            // sort does not promise stability, so without this equal-key rows
+            // could reorder between renders.
+            if cmp == .orderedSame {
+                let byName = a.name.localizedCaseInsensitiveCompare(b.name)
+                if byName != .orderedSame { return byName == .orderedAscending }
+                return a.hash < b.hash
+            }
             return transferSortAscending ? cmp == .orderedAscending : cmp == .orderedDescending
         }
         return xs
@@ -1164,7 +1192,12 @@ final class EngineModel: ObservableObject {
             return
         }
         engineLog.notice("lifecycle: entering background SEEDING (keepalive held)")
-        guard let e = engine else { return }
+        guard let e = engine else {
+            // No engine to seed with: hand the keepalive straight back, or the
+            // audio session would be held with nothing running behind it.
+            keepAlive.stop()
+            return
+        }
         work.async { [weak self] in
             e.pauseForSeeding()
             DispatchQueue.main.async { self?.refreshAll() }
@@ -1320,7 +1353,11 @@ final class EngineModel: ObservableObject {
 
     private func startPolling() {
         timer?.invalidate()
-        let t = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+        // The NON-scheduling initializer, added to the run loop exactly once
+        // (in .common, so it keeps firing during scroll). scheduledTimer had
+        // already registered it in .default, so the add made a second
+        // registration of the same timer.
+        let t = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self else { return }
                 self.pollTick &+= 1
@@ -1330,6 +1367,13 @@ final class EngineModel: ObservableObject {
                 self.pumpEvents()
                 if Self.shouldRunFastPoll(state: self.state, tick: self.pollTick) {
                     self.refreshFast()
+                } else {
+                    // A deliberately skipped tick must not count against the
+                    // poll-gap instrument: clear the baseline so the next
+                    // measured gap does not span throttled ticks. Without
+                    // this, one seeding episode pushed the max to ~5s - the
+                    // throttle's number, not a fault's.
+                    self.lastUiPollAt = nil
                 }
                 self.refresh()
             }
@@ -1423,7 +1467,7 @@ final class EngineModel: ObservableObject {
                 self.sharing = shr
                 self.portMapped = mapped
                 self.state = st
-                self.kadContacts = kad
+                self.setKadContacts(kad)
                 self.ipFilterRanges = ipf
                 self.server = srv
                 self.sharingPausedForIpChange = ipPause
@@ -1514,6 +1558,18 @@ final class EngineModel: ObservableObject {
         lastSampleTime = now
     }
 
+    /// The ONE owner of the kad-contacts change log. Both writers - the 1s
+    /// poll (refreshFast) and the `.kad` event - route through here, so a
+    /// change is logged exactly once by whichever path sees it first, and only
+    /// on change: a log that repeats itself once a second is a log nobody
+    /// reads. Main-thread only, like every other publish.
+    private func setKadContacts(_ n: UInt32) {
+        if n != kadContacts {
+            engineLog.info("kad contacts: \(n, privacy: .public)")
+        }
+        kadContacts = n
+    }
+
     private func apply(_ event: EngineEventFfi) {
         switch event {
         case .state(let s):
@@ -1564,12 +1620,12 @@ final class EngineModel: ObservableObject {
             engineLog.error("public address changed - sharing paused by the engine")
             publicAddressAlert = true
         case .kad(let contacts):
-            // Only on CHANGE: this one can arrive on every poll, and a log that
-            // repeats itself once a second is a log nobody reads.
-            if contacts != kadContacts {
-                engineLog.info("kad contacts: \(contacts, privacy: .public)")
-            }
-            kadContacts = contacts
+            // Through the ONE change-logging setter (see setKadContacts) - the
+            // compare used to live here alone, where it almost never fired:
+            // refreshFast folds the same engine counter in every tick, so by
+            // the time this event drained the value had already been assigned
+            // unlogged and the "change" had vanished.
+            setKadContacts(contacts)
         case .progress:
             break // downloads() already carries the numbers
         case .finished(let name):

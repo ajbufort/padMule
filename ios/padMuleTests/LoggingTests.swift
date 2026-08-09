@@ -26,6 +26,12 @@ final class LoggingTests: XCTestCase {
         XCTAssertEqual(
             EngineLogIdentity.category, "padMule.engine",
             "the runbook greps `-m padMule.engine`; renaming the category breaks the documented filter")
+        // The keepalive's category, pinned alongside the engine's:
+        // BackgroundKeepAlive builds its Logger from this, and until 2026-08-09
+        // it used fresh literals - exactly the evasion the doc above names.
+        XCTAssertEqual(
+            EngineLogIdentity.keepaliveCategory, "padMule.keepalive",
+            "filter with `-m padMule.keepalive`; renaming it breaks the documented keepalive filter")
     }
 
     /// The subsystem doubles as the app's bundle id, so a filter by app and a
@@ -42,8 +48,10 @@ final class LoggingTests: XCTestCase {
     /// interpolated into the log line.
     func testLoggingHostileServerTextIsSafe() {
         let nasty = "%@ %n %s \u{0000} \\ \" ' <script> \u{1F600} " + String(repeating: "A", count: 4096)
-        // Must not trap: os_log interpolation is type-safe, unlike a printf format.
+        // Must not trap: os_log interpolation is type-safe, unlike a printf
+        // format. The test's entire value is that this line RUNS without
+        // crashing - there is nothing to assert about it, and the decorative
+        // XCTAssertTrue(true) that used to follow it claimed otherwise.
         engineLog.notice("server: \(nasty, privacy: .public)")
-        XCTAssertTrue(true, "interpolating hostile server text must not crash")
     }
 }

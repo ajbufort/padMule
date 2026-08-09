@@ -1299,7 +1299,9 @@ struct ContentView: View {
         if srv.lowId {
             return (.orange, "Connected, LowID - peers cannot reach you directly")
         }
-        return (.green, "Connected - \(srv.name ?? srv.addr), HighID")
+        // serverLabel, not a third naming voice: it centralizes the
+        // "Name (ip:port)" rule and guards the empty-name case.
+        return (.green, "Connected - \(serverLabel(srv)), HighID")
     }
 
     /// "Kad network" row content: stopped when the engine itself is not
@@ -1521,20 +1523,20 @@ struct ContentView: View {
                 Spacer()
                 if let badge = TransferRowState.badge(
                     complete: dl.complete,
-                    engineStopped: model.state == .paused || model.state == .seeding,
+                    engineStopped: TransferRowState.engineStopped(model.state),
                     filePaused: dl.paused,
                     queued: dl.queued)
                 {
                     // Per-transfer state badge (requirement 3, eMule 0.70b's
                     // row vocabulary + padMule's Queued). The precedence lives
                     // in TransferRowState - pinned by its tests, and the row
-                    // calls THAT, so rule and caller cannot drift. Seeding
-                    // counts as stopped: downloads halt there, only uploads
-                    // continue.
-                    if badge == "Done" {
-                        Text(badge).font(.caption).foregroundStyle(.green)
+                    // calls THAT, so rule and caller cannot drift. Any
+                    // non-running engine state counts as stopped - seeding
+                    // included: downloads halt there, only uploads continue.
+                    if badge == .done {
+                        Text(badge.label).font(.caption).foregroundStyle(.green)
                     } else {
-                        Text(badge)
+                        Text(badge.label)
                             .font(.caption2)
                             .padding(.horizontal, 6)
                             .padding(.vertical, 2)
@@ -1611,10 +1613,11 @@ struct ContentView: View {
     /// Always present, in both states. An indicator that only appears when
     /// things are GOOD cannot be trusted to mean anything - its absence reads
     /// identically to "padMule has not looked", which is the failure mode this
-    /// whole class of row keeps producing. Saying OFF out loud is the point:
-    /// The VPN indicator. The VIEW lives in `VpnBadge.swift` so it can be
-    /// rendered in a test without a device and without a tunnel in the wanted
-    /// state - see `VpnBadgeTests`, which is what now guards its layout.
+    /// whole class of row keeps producing. Saying OFF out loud is the point.
+    ///
+    /// The VIEW lives in `VpnBadge.swift` so it can be rendered in a test
+    /// without a device and without a tunnel in the wanted state - see
+    /// `VpnBadgeTests`, which is what now guards its layout.
     private var vpnBadge: some View {
         VpnBadge(on: model.vpnActive)
     }
@@ -1678,10 +1681,11 @@ struct ContentView: View {
         else { return nil }
         let n = dl.partsUnavailable
         let seen = dl.partStatusReports
-        let reports = seen == 1 ? "1 peer report" : "\(seen) peer reports"
+        // `seen` >= minStatusesForGap (4) past the guard, so the plural is
+        // unconditional - a "1 peer report" arm here was unreachable.
         return n == 1
-            ? "1 part missing from all \(reports)"
-            : "\(n) parts missing from all \(reports)"
+            ? "1 part missing from all \(seen) peer reports"
+            : "\(n) parts missing from all \(seen) peer reports"
     }
 
     private func bytes(_ n: UInt64) -> String {

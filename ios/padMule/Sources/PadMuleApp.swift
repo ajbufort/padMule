@@ -57,10 +57,14 @@ struct PadMuleApp: App {
             .preferredColorScheme(darkMode ? .dark : .light)
             .task {
                 // Hold the splash until the engine is actually READY, not for a
-                // fixed 7s. The original intent was to cover the boot; the bug was
-                // that boot takes 12-30s (two HTTP fetches, the always-failing
-                // multicast SSDP probe, unicast + SOAP, then Kad), so a fixed
-                // delay reliably cleared EARLY and left a live-looking, inert UI.
+                // fixed 7s. The original intent was to cover the boot; the bug is
+                // that boot time is too variable for any fixed delay - a warm
+                // boot with lists on disk is ~1s, while a cold or blocked network
+                // can run the boot timeouts (two HTTP fetches, the always-failing
+                // multicast SSDP probe, unicast + SOAP, then Kad) out to a 12-30s
+                // SUM. (That figure is the sum of the timeouts, not a
+                // measurement.) So a fixed delay drags on the fast case and
+                // clears early on the slow one, leaving a live-looking, inert UI.
                 //
                 // Bounded on both sides: a MINIMUM so the brand does not flash past
                 // on a warm start, and a CEILING so a hung boot or a boot FAILURE

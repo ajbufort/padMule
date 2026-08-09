@@ -21,7 +21,7 @@ struct HelpView: View {
                 }
 
                 Section {
-                    Text("padMule only runs while it is open and on screen. iPadOS suspends apps you switch away from, so transfers pause when you leave and pick up when you come back. One exception: with \"Background seeding\" on in Settings, uploads keep going for a while after you leave - downloads still pause.")
+                    Text("padMule only runs while it is open and on screen. iPadOS suspends apps you switch away from, so transfers pause when you leave and pick up when you come back. One exception: with \"Keep sharing in the background\" on in Settings, uploads keep going for a while after you leave - downloads still pause.")
                     Text("Leave padMule in the foreground while downloading. \"Keep screen awake while transferring\" in Settings stops the display sleeping mid-transfer, which would otherwise suspend the app.")
                 } header: {
                     Text("The one rule")
@@ -39,6 +39,7 @@ struct HelpView: View {
 
                 Section {
                     Text("A transfer row turns amber while it is ACTUALLY receiving bytes. A row with no tint is registered but moving nothing right now - it may be waiting in a queue, hunting for sources, or simply have none online. That is normal on eD2k and not a fault; padMule keeps retrying.")
+                    Text("A row can also carry a badge. Done means finished and verified. Paused means that download is not running - you paused it from its long-press menu, or padMule itself is stopped or sharing in the background. Queued is padMule's own word: Settings can cap how many downloads run at once, and the extras wait as Queued, starting automatically when a slot frees.")
                 } header: {
                     Text("Reading the Transfers list")
                 }
@@ -84,7 +85,7 @@ struct HelpView: View {
                 }
 
                 Section {
-                    row("Transfers", "What is downloading now. Swipe to remove, long-press to set priority or preview a video before it finishes.")
+                    row("Transfers", "What is downloading now. Swipe to remove, long-press to pause or resume a file, set priority, or preview a video before it finishes.")
                     row("Shared", "What you are serving to others. You can rate and comment on your own files, or unshare one without deleting it.")
                     row("Stats", "Transfer rates and session totals.")
                     row("Settings", "Sharing, server lists, ports and VPN, background seeding, default priority, keep-awake.")

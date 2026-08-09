@@ -57,6 +57,16 @@ func present(
         // A STRICT weak ordering in both directions: descending compares the
         // other way (`orderedDescending`), NOT `!(a < b)` - which returns true for
         // equal elements and breaks the ordering contract `sort(by:)` requires.
+        //
+        // Equal keys fall to an explicit tiebreak (name, then hash), always
+        // ascending - the presentedServers idiom. Swift documents sort as NOT
+        // guaranteed stable, so a deterministic order must come from the
+        // comparator, not from input order happening to survive.
+        if cmp == .orderedSame {
+            let byName = a.name.localizedStandardCompare(b.name)
+            if byName != .orderedSame { return byName == .orderedAscending }
+            return a.hash < b.hash
+        }
         return ascending ? cmp == .orderedAscending : cmp == .orderedDescending
     }
     return xs

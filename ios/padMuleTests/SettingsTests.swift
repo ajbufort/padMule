@@ -122,22 +122,42 @@ final class SettingsTests: XCTestCase {
             "advertised Kad port must default to the bound one")
     }
 
-    func testServerListUrlValidationAndDedup() {
-        // The rule the model applies before accepting a URL: http/https only, and
-        // no duplicates. Re-stated here to pin the contract.
-        func accept(_ url: String, into list: inout [String]) -> Bool {
-            let u = url.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard u.hasPrefix("http://") || u.hasPrefix("https://") else { return false }
-            guard !list.contains(u) else { return false }
-            list.append(u)
-            return true
+    /// Calls the REAL `EngineModel.addServerListUrl`, not a restatement of its
+    /// rule - the restated version pinned an accept function this file wrote
+    /// itself and would have stayed green through any change in the model. The
+    /// method touches only UserDefaults + `notice`, so it runs fine without an
+    /// engine; the key is saved and restored so the test leaves no residue in
+    /// the shared defaults.
+    func testServerListUrlValidationAndDedupThroughTheRealMethod() {
+        let d = UserDefaults.standard
+        let saved = d.stringArray(forKey: SettingsKey.serverListUrls)
+        defer {
+            if let saved {
+                d.set(saved, forKey: SettingsKey.serverListUrls)
+            } else {
+                d.removeObject(forKey: SettingsKey.serverListUrls)
+            }
         }
-        var list = ["http://upd.emule-security.org/server.met"]
-        XCTAssertFalse(accept("ftp://nope/server.met", into: &list))
-        XCTAssertFalse(accept("upd.emule-security.org/server.met", into: &list)) // no scheme
-        XCTAssertFalse(accept("http://upd.emule-security.org/server.met", into: &list)) // dup
-        XCTAssertTrue(accept("https://ed2k.example/list.met", into: &list))
-        XCTAssertEqual(list.count, 2)
+        d.set(["http://upd.emule-security.org/server.met"], forKey: SettingsKey.serverListUrls)
+        let model = EngineModel()
+
+        model.addServerListUrl("ftp://nope/server.met")
+        XCTAssertEqual(
+            model.serverListUrls, ["http://upd.emule-security.org/server.met"],
+            "a non-http(s) scheme must be rejected")
+        XCTAssertNotNil(model.notice, "a rejected URL must tell the user why")
+        model.notice = nil
+
+        model.addServerListUrl("upd.emule-security.org/server.met")  // no scheme
+        XCTAssertEqual(model.serverListUrls.count, 1)
+
+        model.addServerListUrl("http://upd.emule-security.org/server.met")  // dup
+        XCTAssertEqual(model.serverListUrls.count, 1, "a duplicate must not be re-added")
+
+        model.addServerListUrl("  https://ed2k.example/list.met  ")  // trims, accepts
+        XCTAssertEqual(
+            model.serverListUrls,
+            ["http://upd.emule-security.org/server.met", "https://ed2k.example/list.met"])
     }
 
     /// A collapsed options group must NAME what is switched on inside it.
@@ -229,5 +249,24 @@ final class SettingsTests: XCTestCase {
             UserDefaults.standard.bool(forKey: SettingsKey.backgroundSeeding),
             "background seeding must default OFF - it runs while the user is not "
                 + "looking and costs battery")
+    }
+
+    /// The Downloads defaults, via the real `register()` path like the pins
+    /// above: max-active 0 (unlimited - the shipped behaviour; a nonzero
+    /// default would silently start queueing downloads on a fresh install) and
+    /// priority 1 (Normal). HONEST LIMIT on the first pin: `integer(forKey:)`
+    /// returns 0 for an absent key too, so it cannot distinguish "registered
+    /// as 0" from "not registered" - what it CAN catch is the registered
+    /// default changing to a nonzero value, which is the regression that
+    /// matters.
+    func testDownloadsDefaultsAreUnlimitedAndNormalPriority() {
+        SettingsDefaults.register()
+        let d = UserDefaults.standard
+        XCTAssertEqual(
+            d.integer(forKey: SettingsKey.maxActiveDownloads), 0,
+            "0 = unlimited, the shipped behaviour")
+        XCTAssertEqual(
+            d.integer(forKey: SettingsKey.defaultPriority), 1,
+            "new downloads must default to Normal priority")
     }
 }

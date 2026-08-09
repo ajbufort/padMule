@@ -78,8 +78,12 @@ final class PresentationTests: XCTestCase {
     // The regression this guards: a descending sort written as `!(a < b)` is NOT a
     // strict weak ordering (it returns true for equal elements), which Swift's
     // `sort(by:)` contract forbids. The fix uses a 3-way compare; verify order AND
-    // that equal keys keep input order (Swift 5 sort is stable).
-    func testDescendingSortIsStrictWeakOrderAndStable() {
+    // that equal keys fall to the explicit name tiebreak (always ascending).
+    // Swift documents sort as NOT guaranteed stable - an earlier version of this
+    // test asserted input order survived and credited "Swift 5 sort is stable",
+    // which pinned an accident; the order is now guaranteed by present()'s own
+    // tiebreaker, and the reversed-input case below is what proves that.
+    func testDescendingSortIsStrictWeakOrderWithDeterministicTiebreak() {
         let hits = [
             hit(name: "a", sources: 5), hit(name: "b", sources: 5),
             hit(name: "c", sources: 1), hit(name: "d", sources: 9),
@@ -87,6 +91,12 @@ final class PresentationTests: XCTestCase {
         let out = p(hits, sort: .sources, ascending: false)
         XCTAssertEqual(out.map(\.sources), [9, 5, 5, 1])
         XCTAssertEqual(out.filter { $0.sources == 5 }.map(\.name), ["a", "b"])
+        // Reversed input, same output: the equal-key order comes from the
+        // tiebreak, not from input order happening to survive.
+        let flipped = p(
+            [hit(name: "b", sources: 5), hit(name: "a", sources: 5)],
+            sort: .sources, ascending: false)
+        XCTAssertEqual(flipped.map(\.name), ["a", "b"])
     }
 
     func testAscendingSortBySize() {

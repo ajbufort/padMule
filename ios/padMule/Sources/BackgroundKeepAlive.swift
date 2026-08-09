@@ -30,7 +30,10 @@ import OSLog
 /// starting it does NOT stop their music or duck a podcast. A keepalive that
 /// silences the user's audio to keep a file sharing would be an obnoxious trade.
 final class BackgroundKeepAlive {
-    private let log = Logger(subsystem: "us.ajbconsulting.padMule", category: "padMule.keepalive")
+    // Constructed from EngineLogIdentity, never fresh literals - LoggingTests
+    // pins the strings, and its guard is that no other spelling exists.
+    private let log = Logger(
+        subsystem: EngineLogIdentity.subsystem, category: EngineLogIdentity.keepaliveCategory)
     private var player: AVAudioPlayer?
 
     /// True while the keepalive is holding the app awake.
@@ -39,22 +42,33 @@ final class BackgroundKeepAlive {
     /// Start the keepalive. Returns false if it could not be started, which the
     /// caller MUST treat as "we are about to be suspended" and fall back to a
     /// full pause - reporting a background seed we are not performing would be
-    /// the dishonest-status failure the lifecycle rules forbid.
+    /// the dishonest-status failure the lifecycle rules forbid. On ANY failure
+    /// the audio session is left deactivated: `stop()` only cleans up when
+    /// `isRunning` is true, so a failure path that kept the session active
+    /// would hold it forever with nothing playing.
     @discardableResult
     func start() -> Bool {
         guard !isRunning else { return true }
+        let session = AVAudioSession.sharedInstance()
         do {
-            let session = AVAudioSession.sharedInstance()
             // .playback is the category that survives the screen lock;
             // .mixWithOthers keeps the user's own audio playing.
             try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
             try session.setActive(true)
-
+        } catch {
+            log.error("keepalive: could not start: \(String(describing: error), privacy: .public)")
+            return false
+        }
+        // The session is ACTIVE from here on, so every failure below must hand
+        // it back before returning - `isRunning` is still false, so nothing
+        // else ever would.
+        do {
             let player = try AVAudioPlayer(data: Self.silentWav())
             player.numberOfLoops = -1  // forever: a session that ends is a suspend
             player.volume = 0
             guard player.play() else {
                 log.error("keepalive: AVAudioPlayer refused to play")
+                try? session.setActive(false, options: [.notifyOthersOnDeactivation])
                 return false
             }
             self.player = player
@@ -63,6 +77,7 @@ final class BackgroundKeepAlive {
             return true
         } catch {
             log.error("keepalive: could not start: \(String(describing: error), privacy: .public)")
+            try? session.setActive(false, options: [.notifyOthersOnDeactivation])
             return false
         }
     }
