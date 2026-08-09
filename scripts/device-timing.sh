@@ -41,7 +41,26 @@
 set -uo pipefail
 
 WDA=localhost:8100
-BUNDLE=us.ajbconsulting.padMule.Q444CHAF2Z
+# THE BUNDLE ID IS ASKED OF THE DEVICE, not written here. It embeds the Apple
+# TEAM ID - a personal account identifier - and this repo is public (CLAUDE.md).
+# The device already knows which padMule is installed, and this script is
+# talking to it regardless, so asking is both private and more truthful than a
+# literal: if a differently-signed build is installed, this drives THAT one
+# instead of failing to find a bundle nobody has. Override with
+# PADMULE_BUNDLE_ID.
+BUNDLE="${PADMULE_BUNDLE_ID:-$(pymobiledevice3 apps list 2>/dev/null | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+print(next((k for k in d if 'padMule' in k), ''))
+" 2>/dev/null)}"
+if [ -z "$BUNDLE" ]; then
+  echo "ABORT: no padMule bundle found on the device (is it installed, and is" >&2
+  echo "       the device reachable?). Set PADMULE_BUNDLE_ID to override." >&2
+  exit 1
+fi
 QUERY="${1:-yes prime minister}"
 REPEATS="${2:-5}"
 

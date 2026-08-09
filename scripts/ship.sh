@@ -42,7 +42,37 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 KIT=/home/ajbufort/padmule-resign
 KEY=/mnt/c/Users/ajbuf/AppData/Roaming/Sideloadly/key.pem
-BUNDLE=us.ajbconsulting.padMule.Q444CHAF2Z
+# THE BUNDLE ID COMES FROM THE PROVISIONING PROFILE, never from a literal here.
+#
+# Two reasons, and the second is the better one. (1) PRIVACY: the id embeds the
+# Apple TEAM ID, a personal account identifier, and this repo is public - the
+# same rule that keeps public IPs and client ids out of it (CLAUDE.md). (2)
+# CORRECTNESS: zsign must sign with the id the profile actually authorises, so
+# reading it FROM the profile makes a mismatch impossible instead of merely
+# unlikely. `padmule.mobileprovision` lives in $KIT, which is outside the repo.
+#
+# Override with PADMULE_BUNDLE_ID when signing against a different profile.
+BUNDLE="${PADMULE_BUNDLE_ID:-$(python3 - "$KIT/padmule.mobileprovision" <<'PYEOF'
+import plistlib, sys
+try:
+    raw = open(sys.argv[1], "rb").read()
+    start = raw.find(b"<?xml")
+    end = raw.find(b"</plist>") + len(b"</plist>")
+    d = plistlib.loads(raw[start:end])
+    # "application-identifier" is "<TEAMID>.<bundle id>"; drop the team prefix.
+    app_id = d["Entitlements"]["application-identifier"]
+    print(app_id.split(".", 1)[1])
+except Exception:
+    pass
+PYEOF
+)}"
+if [ -z "$BUNDLE" ]; then
+  echo "ABORT: could not read the bundle id from $KIT/padmule.mobileprovision." >&2
+  echo "       That profile is what authorises the signature, so guessing the id" >&2
+  echo "       would just produce an app the device refuses. Set PADMULE_BUNDLE_ID" >&2
+  echo "       to override." >&2
+  exit 1
+fi
 WORK="${CLAUDE_JOB_DIR:-/tmp}/ship"
 
 # ONE SHIP AT A TIME. Two overlapping runs on 2026-08-07 both reached the
