@@ -3048,6 +3048,10 @@ impl Engine {
         let filter = self.ip_filter.clone();
         let req = [PROT_EDONKEY, OP_SERVER_LIST_REQ2];
         let mut answered = 0u32;
+        // What the progress line reports: datagrams actually SENT. The state
+        // machine's `asked_count` includes addresses the ipfilter then
+        // stopped, and a server the filter stopped was not asked.
+        let mut sent = 0usize;
 
         for _ in 0..rounds.clamp(1, MAX_CRAWL_ROUNDS) {
             let asks = crawl.next_asks(CRAWL_ASKS_PER_ROUND);
@@ -3055,10 +3059,19 @@ impl Engine {
                 break;
             }
             // The ipfilter gates who we SEND to, not merely what we keep: a
-            // blocked address must receive nothing at all.
+            // blocked address must receive nothing at all. HOST ORDER for the
+            // consult - the raw met u32 is byte-REVERSED relative to the
+            // ranges `is_blocked_u32` holds, so passing it straight through
+            // asked every blocklisted server anyway (the same trap
+            // `merge_discovered_servers` carried until 2026-08-08; this was
+            // the third site).
             let targets: Vec<SocketAddr> = asks
                 .iter()
-                .filter(|(ip, _)| filter.as_deref().is_none_or(|f| !f.is_blocked_u32(*ip)))
+                .filter(|(ip, _)| {
+                    filter
+                        .as_deref()
+                        .is_none_or(|f| !f.is_blocked_u32(u32::from(ip_from_met_u32(*ip))))
+                })
                 .filter_map(|&(ip, port)| {
                     port.checked_add(4)
                         .map(|udp| SocketAddr::new(IpAddr::V4(ip_from_met_u32(ip)), udp))
@@ -3068,6 +3081,7 @@ impl Engine {
                 continue;
             }
             // Paced, so a round is a trickle rather than a burst at the network.
+            sent += targets.len();
             for t in &targets {
                 let _ = sock.send_to(&req, t).await;
                 tokio::time::sleep(CRAWL_SEND_PACE).await;
@@ -3101,17 +3115,16 @@ impl Engine {
         }
 
         let found = crawl.discovered().to_vec();
-        let asked = crawl.asked_count();
         if found.is_empty() {
             // Say so honestly: asking is cheap and most servers do not answer.
             self.emit(EngineEvent::Server(format!(
-                "Crawl asked {asked} server(s), {answered} answered - no new servers"
+                "Crawl asked {sent} server(s), {answered} answered - no new servers"
             )));
             return 0;
         }
         let added = self.merge_discovered_servers(found).await;
         self.emit(EngineEvent::Server(format!(
-            "Crawl asked {asked} server(s), {answered} answered - {added} new"
+            "Crawl asked {sent} server(s), {answered} answered - {added} new"
         )));
         added
     }
@@ -5594,6 +5607,52 @@ mod tests {
             evs.iter()
                 .any(|e| matches!(e, EngineEvent::Server(s) if s.contains("asked 0 server"))),
             "a LAN/loopback-only list must yield ZERO asks; got {evs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The ipfilter must gate who the crawl SENDS to, in HOST order. The
+    /// filter was consulted with the raw met u32 - byte-REVERSED relative to
+    /// the ranges `is_blocked_u32` holds - so a blocklisted server read as
+    /// some unrelated address and was asked anyway: the same defect
+    /// `merge_discovered_servers` carried until 2026-08-08, surviving at a
+    /// third site. Asserted on the production entry point, like the SSRF test
+    /// above: the progress line must report ZERO asks. The seed is in
+    /// 198.18.0.0/15 (benchmarking): `is_routable_public_v4` accepts it, so
+    /// it reaches the send gate, but the range is not routed on the real
+    /// internet - a regression leaks a datagram into a black hole, not at a
+    /// real host.
+    #[tokio::test]
+    async fn the_crawl_never_sends_to_a_blocklisted_server() {
+        let dir = tmp("crawl-blocklist");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let met_ip = |a: u8, b: u8, c: u8, d: u8| u32::from_le_bytes([a, b, c, d]);
+        std::fs::write(
+            dir.join("server.met"),
+            write_server_met(&ServerMet {
+                header: mule_files::server_met::SERVER_MET_HEADER,
+                servers: vec![Server {
+                    ip: met_ip(198, 18, 0, 1),
+                    port: 4661,
+                    tags: Vec::new(),
+                }],
+            }),
+        )
+        .unwrap();
+
+        let (mut engine, mut rx) = Engine::new(&dir).unwrap();
+        engine.ip_filter = Some(std::sync::Arc::new(IpFilter::parse(
+            "198.18.0.0 - 198.18.255.255 , 0 , blocked\n",
+            DEFAULT_IPFILTER_LEVEL,
+        )));
+        assert_eq!(engine.crawl_servers(1).await, 0);
+
+        let evs = drain(&mut rx).await;
+        assert!(
+            evs.iter()
+                .any(|e| matches!(e, EngineEvent::Server(s) if s.contains("asked 0 server"))),
+            "a blocklisted server must not be sent a crawl ask; got {evs:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
