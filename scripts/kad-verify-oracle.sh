@@ -226,7 +226,15 @@ done
 
 echo; echo "===== RESULT ====="
 echo "--- all oracle lines, in order ---"
-LOGS | grep "PADMULE-ORACLE" | sed 's/^/    /'
+# ONE sink here, not LOGS: this build mirrors the lines to stdout AND the
+# logfile, so a LOGS dump printed the whole block TWICE - with the
+# block-buffered stdout sink's unterminated last line glued to the logfile's
+# first (seen in the 2026-08-09 PASS log). The line-flushed logfile is the
+# complete copy; fall back to the stdout sink only if it holds no lines. No
+# text-level dedupe - identical PONG lines in one second are real events.
+ORACLE_LINES="$(grep "PADMULE-ORACLE" "$CFG/logfile" 2>/dev/null)"
+[ -n "$ORACLE_LINES" ] || ORACLE_LINES="$(grep "PADMULE-ORACLE" "$WORK/amuled.log" 2>/dev/null)"
+[ -n "$ORACLE_LINES" ] && printf '%s\n' "$ORACLE_LINES" | sed 's/^/    /'
 echo "--- serve node last heartbeats ---"
 tail -4 "$WORK/serve.log" | sed 's/^/    /'
 echo

@@ -2360,8 +2360,11 @@ mod tests {
             .map(|(i, d)| (Kad128::from_hash(&[0xA0 + i as u8; 16]), *d, frame.clone()))
             .collect();
 
+        // 10s, not 3s (8cs): the window only bounds the WAIT for both replies -
+        // the demux property under test is timing-free - and full-suite load
+        // once pushed a loopback reply past 3s.
         let answers = node
-            .request_batch(&reqs, OP_BOOTSTRAP_RES, Duration::from_secs(3))
+            .request_batch(&reqs, OP_BOOTSTRAP_RES, Duration::from_secs(10))
             .await;
 
         for (i, answer) in answers.into_iter().enumerate() {
@@ -2563,7 +2566,10 @@ mod tests {
         node.with_routing(|t| t.add(peer_id, peer_ip, peer_addr.port(), 4662, 8, true));
         let mock = spawn_search_only_mock(peer, peer_id, target);
 
-        node.resolve_sources(&target, 1000, 1, Duration::from_millis(300))
+        // 10s, not 300ms (8cs): the window only bounds the WAIT for the mock's
+        // replies - the property is the stored sender key, not latency - and a
+        // loaded box can push a loopback reply past a 300ms-class budget.
+        node.resolve_sources(&target, 1000, 1, Duration::from_secs(10))
             .await
             .unwrap();
         mock.abort();
@@ -2661,7 +2667,10 @@ mod tests {
             file_type: "Iso".to_string(),
         }];
         let stored = node
-            .publish_keyword(&target, &entries, Duration::from_millis(300))
+            // 10s, not 300ms (8cs): a loaded box can make the FIND reply miss a
+            // tight window, and then the store is never asked - the publish_source
+            // twin flaked exactly so; timing is not the subject here.
+            .publish_keyword(&target, &entries, Duration::from_secs(10))
             .await
             .unwrap();
         mock.abort();
@@ -2706,7 +2715,10 @@ mod tests {
                     udp_port: Some(4672),
                     crypt: 0,
                 },
-                Duration::from_millis(300),
+                // 10s, not 300ms (8cs): a loaded box made the FIND reply miss the
+                // window once, so the store was never asked; timing is not the
+                // subject here and the walk still terminates on exhaustion.
+                Duration::from_secs(10),
             )
             .await
             .unwrap();
@@ -2738,7 +2750,10 @@ mod tests {
         node.with_routing(|t| t.add(peer_id, peer_ip, peer_addr.port(), 4662, 8, true));
         let mock = spawn_search_only_mock(peer, peer_id, target);
 
-        node.resolve_keyword("minister", 1, Duration::from_millis(300))
+        // 10s, not 300ms (8cs): same wait-not-property shape as the sources twin
+        // above - the assert is the stored sender key, and the walk still ends
+        // by exhaustion, so the headroom costs nothing on a passing run.
+        node.resolve_keyword("minister", 1, Duration::from_secs(10))
             .await
             .unwrap();
         mock.abort();
@@ -3071,8 +3086,11 @@ mod tests {
                 let _ = peer.send_to(&dg, from).await;
             }
         });
+        // 10s, not 300ms (8cs): under full-suite load the big reply once missed
+        // the window entirely (left 0, right 20); the cap under test is about
+        // COUNT, not latency, and the search still stops at the total.
         let out = node
-            .resolve_sources(&target, 1000, 1000, Duration::from_millis(300))
+            .resolve_sources(&target, 1000, 1000, Duration::from_secs(10))
             .await
             .unwrap();
         mock.abort();
@@ -3175,8 +3193,11 @@ mod tests {
                 }
             }));
         }
+        // 10s, not 300ms (8cs): the assert is the 300-result accumulation CAP,
+        // a count with no timing content; the window only bounds the wait for
+        // five loopback replies, which full-suite load can push past 300ms.
         let files = node
-            .resolve_keyword("minister", 1000, Duration::from_millis(300))
+            .resolve_keyword("minister", 1000, Duration::from_secs(10))
             .await
             .unwrap();
         for m in &mocks {
