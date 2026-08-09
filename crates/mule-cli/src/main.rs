@@ -54,15 +54,9 @@ fn demo_login() -> LoginRequest {
     }
 }
 
-/// Decode a server.met IP uint32 (first octet in the low byte) to an Ipv4Addr.
-fn ip_from_met_u32(ip: u32) -> Ipv4Addr {
-    Ipv4Addr::new(
-        ip as u8,
-        (ip >> 8) as u8,
-        (ip >> 16) as u8,
-        (ip >> 24) as u8,
-    )
-}
+// The met-u32 -> host conversion lives in mule-files now; this was one of the
+// four private copies the 2026-08-09 consolidation removed.
+use mule_files::ip_from_met_u32;
 
 /// Print server events from `rx` until the channel closes.
 fn spawn_event_printer(mut rx: mpsc::Receiver<ServerEvent>) -> tokio::task::JoinHandle<()> {

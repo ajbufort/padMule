@@ -51,13 +51,10 @@ pub struct PeerSource {
 }
 
 /// eD2k-convention IP u32 (first octet in the low byte) to an `Ipv4Addr`.
+/// Delegates to THE one definition (2026-08-09 consolidation); the local name
+/// stays because "ed2k ip" is what this module's call sites are converting.
 fn ed2k_ip(ip: u32) -> Ipv4Addr {
-    Ipv4Addr::new(
-        ip as u8,
-        (ip >> 8) as u8,
-        (ip >> 16) as u8,
-        (ip >> 24) as u8,
-    )
+    mule_files::ip_from_met_u32(ip)
 }
 
 /// A publicly routable unicast IPv4 - the only thing that can be a real eD2k

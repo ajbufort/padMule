@@ -33,7 +33,6 @@
 //! Whole-net scanning stays out of scope (docs/wiki/feature-server-hunter.md).
 
 use std::collections::HashSet;
-use std::net::Ipv4Addr;
 
 /// A server address in padMule's met convention: `ip` is the server.met u32
 /// (little-endian, low byte = first octet) and `port` is the TCP port.
@@ -51,12 +50,9 @@ pub const MAX_CRAWL_DISCOVERED: usize = 1000;
 /// 127.0.0.1, a LAN address, or a multicast range must never become something
 /// we send a datagram to.
 pub fn is_crawlable(ip: u32, port: u16) -> bool {
-    // The met u32 is LITTLE-endian (low byte = first octet), so the dotted quad
-    // is its LE bytes - the same conversion `engine::ip_from_met_u32` does.
-    // Spelled with to_le_bytes rather than to_be(), which would silently invert
-    // on a big-endian target (the IP byte-order landmine, docs/wiki/
-    // protocol-understanding.md).
-    port != 0 && crate::fetch::is_routable_public_v4(Ipv4Addr::from(ip.to_le_bytes()))
+    // THE one met-u32 conversion (mule-files, 2026-08-09 consolidation); this
+    // used to be an inline `to_le_bytes` spelling of the same thing.
+    port != 0 && crate::fetch::is_routable_public_v4(mule_files::ip_from_met_u32(ip))
 }
 
 /// The crawl frontier: who has been asked, who is next, and what was learned.

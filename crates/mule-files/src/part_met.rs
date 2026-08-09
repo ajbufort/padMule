@@ -359,6 +359,86 @@ mod tests {
         assert_eq!(p.file_hash, [0x11; 16]);
     }
 
+    /// PINNING THE WRITE-BACK HAZARD, case by case (2026-08-09). The module
+    /// doc says writing a parsed splitted file "would produce bytes that
+    /// contradict its own version byte" - building these fixtures shows the
+    /// three variants differ, and the pins record exactly which:
+    ///
+    /// temp == 0: the sub-layout is `version | u32(0) | hash | u16 count |
+    /// hashes | tags` and the DEFAULT layout is `version | u32 date | hash |
+    /// u16 count | hashes | tags` - **at date == 0 they COINCIDE**, so this
+    /// round trip is byte-identical by coincidence of layout, not by design.
+    #[test]
+    fn a_temp0_splitted_file_round_trips_byte_identically_because_the_layouts_coincide() {
+        let mut b = vec![PARTFILE_VERSION_EDONKEY];
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&[0xAB; 16]);
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(&[0xCD; 16]);
+        b.extend_from_slice(&0u32.to_le_bytes());
+        let p = read_part_met(&b).unwrap();
+        assert_eq!(
+            write_part_met(&p),
+            b,
+            "date==0 makes the two layouts the same bytes; if this ever fails, \
+             the writer grew a splitted arm and the module doc is stale"
+        );
+    }
+
+    /// temp != 0: the source layout has NO part-hash count field, and the
+    /// writer always emits one - so the rewrite is a byte-count DESYNC that
+    /// reparses (under the version byte it kept) into a DIFFERENT date and
+    /// hash. This is the one genuinely corrupt arm of the hazard. The engine
+    /// never hits it (`part_store` sets 0xE0/0xE2 on a fresh `PartMet`), but
+    /// the public API allows it, and this pin keeps the hazard visible.
+    #[test]
+    fn a_nonzero_temp_splitted_rewrite_contradicts_its_own_version_byte() {
+        let mut b = vec![PARTFILE_VERSION_EDONKEY, 0x77];
+        b.extend_from_slice(&0x1234_5678u32.to_le_bytes());
+        b.extend_from_slice(&[0xEE; 16]);
+        b.extend_from_slice(&0u32.to_le_bytes());
+        let p = read_part_met(&b).unwrap();
+        assert_eq!(p.date, 0x1234_5678);
+        let rewritten = write_part_met(&p);
+        assert_ne!(rewritten, b, "the writer does not emit the splitted shape");
+        let back = read_part_met(&rewritten).unwrap();
+        assert_ne!(
+            back.date, p.date,
+            "reparsing the rewrite under its own 0xE1 byte yields a WRONG date"
+        );
+        assert_ne!(
+            back.file_hash, p.file_hash,
+            "and a WRONG hash - the corrupt-rewrite arm of the hazard"
+        );
+    }
+
+    /// The 0xE0-with-marker variant: the writer does not reproduce the
+    /// `00 00 02 01` sniff bytes, so the rewrite drops back to the DEFAULT
+    /// layout - and because the version byte was already 0xE0, the result
+    /// reparses into the SAME values. A lossless normalization, not a
+    /// corruption; what breaks is only the module's bit-for-bit round-trip
+    /// claim, which its doc already scopes to the default layout.
+    #[test]
+    fn an_0xe0_marker_file_rewrites_as_a_value_preserving_normalization() {
+        let mut b = vec![PARTFILE_VERSION, 0x77];
+        b.extend_from_slice(&0x0BAD_F00Du32.to_le_bytes());
+        b.extend_from_slice(&[0x11; 16]);
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b[24] = 0;
+        b[25] = 0;
+        b.push(2);
+        b.push(1);
+        let p = read_part_met(&b).unwrap();
+        assert_eq!(p.date, 0x0BAD_F00D, "parsed via the marker's splitted path");
+        let rewritten = write_part_met(&p);
+        assert_ne!(rewritten, b, "the marker is not reproduced");
+        assert_eq!(
+            read_part_met(&rewritten).unwrap(),
+            p,
+            "but every VALUE survives - the rewrite is a normalization"
+        );
+    }
+
     #[test]
     fn rejects_bad_version() {
         let bytes = [0x99u8, 0, 0, 0, 0];

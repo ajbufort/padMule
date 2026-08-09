@@ -76,16 +76,10 @@ use tokio::time::timeout;
 const TCP_PORT: u16 = 4662;
 const KAD_UDP_PORT: u16 = 4672;
 
-/// Decode a server.met IP uint32 (first octet in the LOW byte - the eD2k
-/// convention, not network order).
-fn ip_from_met_u32(ip: u32) -> Ipv4Addr {
-    Ipv4Addr::new(
-        ip as u8,
-        (ip >> 8) as u8,
-        (ip >> 16) as u8,
-        (ip >> 24) as u8,
-    )
-}
+// `ip_from_met_u32` is now THE one definition in mule-files (2026-08-09); this
+// crate re-imports it rather than keeping the copy that let three byte-order
+// bugs breed at three different call sites.
+use mule_files::ip_from_met_u32;
 
 /// A routing table's live contacts in the on-disk `nodes.dat` shape. Taking the
 /// table (not a `&[Contact]`) keeps mule-kad's contact type out of this signature.

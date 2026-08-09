@@ -240,6 +240,15 @@ pub fn build_pong(requester_udp_port: u16) -> (u8, Vec<u8>) {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireContact {
     pub id: Kad128,
+    /// IPv4 in HOST order - the `u32::from(Ipv4Addr)` convention, first octet
+    /// in the HIGH byte, exactly like `nodes.dat`'s `KadContact.ip` (eMule
+    /// keeps contact IPs host-order and `WriteUInt32`s them LE, so our LE read
+    /// recovers the host value directly). `is_blocked_u32` and
+    /// `Ipv4Addr::from(u32)` take it RAW; running it through
+    /// `mule_files::ip_from_met_u32` (the `.met` low-byte-first convention)
+    /// reverses every address - the byte-order bug class fixed three times in
+    /// 2026-08 (rows 8cq/8ct). This comment exists because this field feeds
+    /// the Kad blocklist gate and carried no convention note at all.
     pub ip: u32,
     pub udp_port: u16,
     pub tcp_port: u16,
