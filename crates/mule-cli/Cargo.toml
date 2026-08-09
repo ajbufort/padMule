@@ -12,5 +12,6 @@ path = "src/main.rs"
 [dependencies]
 mule-proto = { path = "../mule-proto" }
 mule-files = { path = "../mule-files" }
+mule-kad = { path = "../mule-kad" }
 mule-engine = { path = "../mule-engine" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }

@@ -1,16 +1,16 @@
 //! mule-cli: the headless dev + live-network harness for the engine on Linux.
-//! 30 subcommands across the whole surface: server login + lifecycle (login,
+//! 31 subcommands across the whole surface: server login + lifecycle (login,
 //! login-any, listen), server search + offers (global-search, server-search,
 //! related-search, offer-search, offer-hold), hashing + serving (hash-file,
 //! serve-file), peer transfer + diagnostics (peer-download, peer-probe,
 //! sec-ident), the full Kad surface (kad-bootstrap, kad-serve, kad-search,
-//! kad-fetch, kad-keyword), AICH (aich-hash, aich-probe), links + filters (link,
-//! ipfilter), discovery (server-crawl), port mapping (upnp, upnp-unicast,
-//! upnp-query, upnp-unmap, natpmp), and the completion-optimized fetchers
-//! (search-download, fetch-complete). Run with no arguments for usage; the match
-//! in `main` is the authoritative list. (This header read "26" and listed 27
-//! while shipping 30 until the 2026-08-08 reanalysis - keep the count honest
-//! when adding a subcommand.)
+//! kad-fetch, kad-keyword, kad-publish), AICH (aich-hash, aich-probe), links +
+//! filters (link, ipfilter), discovery (server-crawl), port mapping (upnp,
+//! upnp-unicast, upnp-query, upnp-unmap, natpmp), and the completion-optimized
+//! fetchers (search-download, fetch-complete). Run with no arguments for usage;
+//! the match in `main` is the authoritative list. (This header read "26" and
+//! listed 27 while shipping 30 until the 2026-08-08 reanalysis - keep the count
+//! honest when adding a subcommand.)
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::path::Path;
@@ -30,7 +30,8 @@ use mule_engine::{
     SecIdentCtx, ServerEvent, ServerLink, ServerState, SharedFile, SourceRegistry,
 };
 use mule_files::{read_nodes_dat, read_server_met};
-use mule_proto::{ed2k_hash, Kad128};
+use mule_kad::{kad_filename_matches, kad_keyword_target, kad_keywords, KeywordEntry};
+use mule_proto::{ed2k_hash, md4, Kad128};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -2117,6 +2118,179 @@ async fn cmd_kad_keyword(nodes_path: &str, keyword: &str) {
     print!("\nKAD LOOKUP\n{}", mule_engine::stats::kad_report());
 }
 
+/// The DISK hex of one keyword's Kad target: the exact 16 bytes a nodes.dat
+/// contact id or an amuled preferencesKad.dat identity carries for that target
+/// (per-dword byte reversal of the canonical MD4 - `Kad128::to_wire`). The
+/// store oracle uses this to pin a real amuled's Kad ID ONTO the keyword
+/// target so every 2^120 tolerance gate (store, search, publish) passes.
+/// `None` unless the phrase yields exactly ONE indexable word - publishing is
+/// per-word (eMule STOREKEYWORD), so a multi-word phrase would silently target
+/// only its first word.
+fn keyword_target_disk_hex(phrase: &str) -> Option<String> {
+    match kad_keywords(phrase).as_slice() {
+        [w] => Some(hex16(&kad_keyword_target(w).to_wire())),
+        _ => None,
+    }
+}
+
+/// STORE-ORACLE driver: publish ONE keyword record (word -> filename/size)
+/// through the engine's real publish path (`KadNode::publish_keyword`, the same
+/// walk the app's publish duty drives) and report how many nodes acked the
+/// STORE. Exits nonzero on zero acks.
+///
+/// An ack alone is NOT proof of storage: the publish handler sends
+/// KADEMLIA2_PUBLISH_RES even when `CIndexed::AddKeyword` (Indexed.cpp:474)
+/// REJECTS the entry (KademliaUDPListener.cpp:1091-1108, "we still send a
+/// success" - the busy-node white lie; a failure report would make hot nodes
+/// shed popular keywords onto their neighbours). That is why
+/// scripts/kad-store-oracle.sh follows this command with an amulecmd search
+/// and passes only when the record comes back.
+async fn cmd_kad_publish(
+    nodes_path: &str,
+    keyword: &str,
+    filename: &str,
+    size: u64,
+    bind_ip: Option<&str>,
+) {
+    // Exactly ONE indexable word: publishing is per-word, and a silent
+    // first-word pick would let the oracle publish a different word than the
+    // one its search asks for.
+    let words = kad_keywords(keyword);
+    let word = match words.as_slice() {
+        [w] => w.clone(),
+        [] => {
+            eprintln!("keyword '{keyword}' has no indexable word (3+ bytes)");
+            std::process::exit(1);
+        }
+        _ => {
+            eprintln!("one word only (publishing is per-word); '{keyword}' splits into {words:?}");
+            std::process::exit(1);
+        }
+    };
+    if size == 0 {
+        // The storing node drops size-0 entries (Indexed.cpp AddKeyword) - and
+        // still acks, so this would "succeed" while proving nothing.
+        eprintln!("size must be nonzero - a storing node rejects size-0 entries");
+        std::process::exit(1);
+    }
+    if !kad_filename_matches(filename, &word) {
+        // Not fatal for the STORE itself, but the searcher filters results
+        // whose name lacks the searched word (eMule SearchTermsMatch), so an
+        // oracle run with this pairing stores fine and still FAILS the search.
+        println!(
+            "WARN: filename '{filename}' does not contain the word '{word}' - \
+             a keyword search for it will filter this record out"
+        );
+    }
+
+    let bytes = match std::fs::read(nodes_path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("cannot read {nodes_path}: {e}");
+            std::process::exit(1);
+        }
+    };
+    let parsed = match read_nodes_dat(&bytes) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("bad nodes.dat: {e:?}");
+            std::process::exit(1);
+        }
+    };
+    let contacts: Vec<_> = parsed
+        .contacts
+        .into_iter()
+        .filter(|c| c.version >= 2)
+        .collect();
+    let bind_addr: IpAddr = match bind_ip {
+        Some(s) => match s.parse() {
+            Ok(ip) => ip,
+            Err(e) => {
+                eprintln!("bad bind IP {s}: {e}");
+                std::process::exit(1);
+            }
+        },
+        None => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+    };
+    let bind: SocketAddr = SocketAddr::new(bind_addr, 4672);
+    let mut node = match KadNode::bind(bind, 4662).await {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("bind failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    println!(
+        "bound Kad UDP on {bind}; our KadID {:08x?}",
+        node.kad_id().words()
+    );
+    let seeded = node.seed_routing(&contacts);
+    println!(
+        "seeded routing with {seeded} of {} contacts",
+        contacts.len()
+    );
+
+    // Bootstrap so the walk has live contacts. Retried a little because a
+    // just-started far side may not be listening yet (kad-serve pattern).
+    let mut introduced = false;
+    for attempt in 1..=5u32 {
+        match node
+            .bootstrap_any(&contacts, Duration::from_millis(1200), 40)
+            .await
+        {
+            Ok((i, res)) => {
+                println!(
+                    "BOOTSTRAP_RES from contact #{i}: version {}, tcp {}, {} contacts",
+                    res.version,
+                    res.tcp_port,
+                    res.contacts.len()
+                );
+                introduced = true;
+                break;
+            }
+            Err(e) => {
+                println!("bootstrap attempt {attempt}: {e}");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+    if !introduced {
+        eprintln!("no contact answered a BOOTSTRAP_REQ; nothing to publish at");
+        std::process::exit(1);
+    }
+
+    let target = kad_keyword_target(&word);
+    println!(
+        "publishing '{filename}' ({size} B) under '{word}' -> target {} (disk hex {})",
+        hex16(&target.to_hash()),
+        hex16(&target.to_wire())
+    );
+    let entry = KeywordEntry {
+        // Any stable 16-byte file id works for the oracle; derived from the
+        // name so reruns publish the same record.
+        file_id: Kad128::from_hash(&md4(filename.as_bytes())),
+        name: filename.to_string(),
+        size,
+        complete_sources: 1,
+        file_type: String::new(),
+    };
+    match node
+        .publish_keyword(&target, &[entry], Duration::from_millis(1400))
+        .await
+    {
+        Ok(0) => {
+            println!("PUBLISH_ACKS=0");
+            eprintln!("no node acked the STORE");
+            std::process::exit(1);
+        }
+        Ok(n) => println!("PUBLISH_ACKS={n}"),
+        Err(e) => {
+            eprintln!("publish failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 /// Attempt a NAT-PMP port mapping against the gateway - opens our port for
 /// HighID without a manual forward (on routers that speak NAT-PMP).
 async fn cmd_natpmp(gateway: &str, port: u16) {
@@ -2833,6 +3007,30 @@ async fn main() {
             }
         }
         Some("kad-keyword") if args.len() == 4 => cmd_kad_keyword(&args[2], &args[3]).await,
+        // Helper form: print the keyword target's nodes.dat/preferencesKad.dat
+        // DISK hex, so a harness can pin a storing node's Kad ID onto it.
+        Some("kad-publish") if args.len() == 4 && args[2] == "--keyword-target" => {
+            match keyword_target_disk_hex(&args[3]) {
+                Some(hex) => println!("{hex}"),
+                None => {
+                    eprintln!("need exactly one indexable word (3+ bytes): {}", args[3]);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some("kad-publish") if args.len() == 6 || args.len() == 7 => match args[5].parse::<u64>() {
+            Ok(size) => {
+                cmd_kad_publish(
+                    &args[2],
+                    &args[3],
+                    &args[4],
+                    size,
+                    args.get(6).map(String::as_str),
+                )
+                .await
+            }
+            Err(_) => eprintln!("bad size: {}", args[5]),
+        },
         Some("link") if args.len() == 3 || args.len() == 4 => {
             cmd_link(&args[2], args.get(3).map(String::as_str)).await
         }
@@ -2924,6 +3122,12 @@ async fn main() {
             eprintln!("  mule-cli kad-search <nodes.dat> <ed2k-hash-hex> <size>");
             eprintln!("  mule-cli kad-fetch <nodes.dat> <ed2k-hash-hex> <size> <out>");
             eprintln!("  mule-cli kad-keyword <nodes.dat> <keyword>");
+            eprintln!(
+                "  mule-cli kad-publish <nodes.dat> <keyword> <filename> <size> [bind-ip]   (STORE a keyword record)"
+            );
+            eprintln!(
+                "  mule-cli kad-publish --keyword-target <keyword>   (print the target's nodes.dat disk hex)"
+            );
             eprintln!("  mule-cli aich-hash <path> [entry-out.bin]");
             eprintln!(
                 "  mule-cli aich-probe <host> <port> <hash> <size> <part>   (live 0x9E/0x9B check)"
@@ -2945,5 +3149,42 @@ async fn main() {
             eprintln!("  mule-cli upnp-unmap <port>");
             eprintln!("  mule-cli natpmp <gateway-ip> <port>");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RFC 1320 vector: MD4("abc") = a448017aaf21d8525fc10ae87aa6729d. The
+    /// keyword path lowercases first, so "ABC" shares that target, and the
+    /// DISK hex is the per-dword byte reversal a nodes.dat contact id (and an
+    /// amuled preferencesKad.dat) carries - the byte order the store oracle
+    /// writes into the storing node's identity. An independent vector, not a
+    /// round-trip through the same code.
+    #[test]
+    fn keyword_target_disk_hex_matches_the_rfc1320_md4_vector() {
+        assert_eq!(
+            keyword_target_disk_hex("ABC").as_deref(),
+            Some("7a0148a452d821afe80ac15f9d72a67a")
+        );
+    }
+
+    #[test]
+    fn keyword_target_needs_exactly_one_indexable_word() {
+        assert_eq!(keyword_target_disk_hex("ab"), None, "under 3 bytes");
+        assert_eq!(keyword_target_disk_hex("two words"), None, "per-word only");
+    }
+
+    /// The oracle's filename/keyword pairing assumption: the published name
+    /// must CONTAIN the published word, or the searching client itself filters
+    /// the returned record out (eMule ProcessResultKeyword -> SearchTermsMatch)
+    /// and the oracle fails AFTER a perfectly good store.
+    #[test]
+    fn oracle_filename_carries_its_keyword() {
+        assert!(kad_filename_matches(
+            "padstoreoracle-proof.txt",
+            "padstoreoracle"
+        ));
     }
 }
