@@ -321,10 +321,39 @@ struct Inner {
 /// re-requests only touch the tail of the download.
 const ENDGAME_LIMIT: u64 = 4 * crate::transfer::EMBLOCKSIZE;
 
+/// How recently bytes must have landed for a row to KEEP its slot under the
+/// max-active cap (the `receiving` field of [`Download::admission_row`]).
+/// Deliberately NOT the UI's 3s receiving light (mule-ffi
+/// `RECEIVING_WINDOW_SECS`): a blinked-off light is cosmetic, a lost slot is
+/// not, so this window is sized against the machinery instead. Data commits
+/// land per delivered packet (~10KB), so 30s of silence means under ~350 B/s,
+/// no meaningful claim to a slot; the retry sweep that hands a freed slot to
+/// the queue runs every 24-45s (engine.rs `RESUME_RETRY_EVERY` and its
+/// x`RESUME_RETRY_DUTY` floor), so a dead holder releases within about one
+/// sweep period, while a badge-grade window would flap admission between
+/// sweeps; and the per-peer session timeout is 45s, so the slot frees on the
+/// same order as a wedged session's own teardown.
+pub const SLOT_KEEP_WINDOW_SECS: u64 = 30;
+
 /// Which registry rows are QUEUED under a max-active cap. Input rows are
-/// `(user_paused, complete)` in REGISTRY (add) order; `true` out means: not
-/// paused, not complete, but past the cap - reported as Queued and NOT driven.
-/// `cap == 0` means unlimited. Paused and complete rows consume no slot.
+/// `(user_paused, complete, receiving)` in REGISTRY (add) order - build them
+/// with [`Download::admission_row`], THE one row constructor, so every caller
+/// shares one staleness window and one field order. `true` out means: not
+/// paused, not complete, but past the cap - reported as Queued and NOT
+/// driven. `cap == 0` means unlimited. Paused and complete rows consume no
+/// slot.
+///
+/// Admission is two passes over the same add order: rows ACTIVELY RECEIVING
+/// (bytes within [`SLOT_KEEP_WINDOW_SECS`]) keep their slots first, then the
+/// remaining slots go to the rest in add order. DECIDED (Anthony,
+/// 2026-08-09): resuming an older paused row must NOT preempt a row that is
+/// pulling bytes - on glass (build 0c846d1, cap 1) the promoted row wore
+/// "Queued" from 41.8MB to 67.5MB while visibly receiving, a dishonest badge
+/// AND an established pipeline discarded. A row that stops receiving for the
+/// window is ordinary again on the next recompute, so add order hands the
+/// slot to the waiting row. If MORE rows than `cap` are receiving (the cap
+/// was lowered mid-flight), the excess queues in add order - flags stop
+/// DRIVING a row; they never kill its in-flight task.
 ///
 /// THE ONE DEFINITION of the admission rule, used by the engine's sweeps and
 /// by the FFI's row builder - a re-implementation on either side is exactly
@@ -332,20 +361,28 @@ const ENDGAME_LIMIT: u64 = 4 * crate::transfer::EMBLOCKSIZE;
 /// padMule's own wire-neutral policy (Anthony, 2026-08-09); eMule 0.70b has
 /// no max-active cap, so its row vocabulary is only REUSED here ("Queued" is
 /// padMule's word - eMule's "Waiting" means active-but-nothing-transferring).
-pub fn queued_flags(cap: u32, rows: &[(bool, bool)]) -> Vec<bool> {
-    let mut admitted = 0u32;
-    rows.iter()
-        .map(|&(paused, complete)| {
-            if paused || complete {
-                return false;
+pub fn queued_flags(cap: u32, rows: &[(bool, bool, bool)]) -> Vec<bool> {
+    let mut queued = vec![false; rows.len()];
+    if cap == 0 {
+        return queued;
+    }
+    let mut slots = cap;
+    // Two admission passes over the SAME add order: first the rows actively
+    // receiving (they keep their slots), then everyone else into whatever
+    // slots remain.
+    for wants_receiving in [true, false] {
+        for (i, &(paused, complete, receiving)) in rows.iter().enumerate() {
+            if paused || complete || receiving != wants_receiving {
+                continue;
             }
-            if cap != 0 && admitted >= cap {
-                return true;
+            if slots == 0 {
+                queued[i] = true;
+            } else {
+                slots -= 1;
             }
-            admitted += 1;
-            false
-        })
-        .collect()
+        }
+    }
+    queued
 }
 
 impl Download {
@@ -435,6 +472,26 @@ impl Download {
     pub fn is_receiving(&self, now_secs: u64, window_secs: u64) -> bool {
         let last = self.last_byte_at.load(Ordering::Relaxed);
         last != 0 && now_secs.saturating_sub(last) <= window_secs
+    }
+
+    /// The `(user_paused, complete, receiving)` row this download contributes
+    /// to [`queued_flags`] - THE one row constructor, so the engine's sweeps
+    /// and the FFI's row builder cannot drift on the staleness window
+    /// ([`SLOT_KEEP_WINDOW_SECS`]) or the field order.
+    pub async fn admission_row(&self, now_secs: u64) -> (bool, bool, bool) {
+        (
+            self.is_paused(),
+            self.is_complete().await,
+            self.is_receiving(now_secs, SLOT_KEEP_WINDOW_SECS),
+        )
+    }
+
+    /// Test-only: back-date the last-received stamp, so going STALE (a real
+    /// 30s wall-clock wait) is expressible in a unit test. The read side
+    /// (`is_receiving`) stays the production path.
+    #[cfg(test)]
+    pub(crate) fn set_last_byte_at(&self, at_secs: u64) {
+        self.last_byte_at.store(at_secs, Ordering::Relaxed);
     }
 
     /// When the retry sweep last picked this download (engine-uptime seconds).
@@ -2027,26 +2084,164 @@ mod tests {
     fn queued_flags_admit_in_add_order_and_skip_paused_and_complete() {
         // cap 0: nothing queues, whatever the mix.
         assert_eq!(
-            queued_flags(0, &[(false, false), (true, false), (false, true)]),
+            queued_flags(
+                0,
+                &[
+                    (false, false, false),
+                    (true, false, false),
+                    (false, true, false)
+                ]
+            ),
             vec![false, false, false]
         );
         // cap 1 over three drivable rows: first admitted, rest queued.
         assert_eq!(
-            queued_flags(1, &[(false, false), (false, false), (false, false)]),
+            queued_flags(
+                1,
+                &[
+                    (false, false, false),
+                    (false, false, false),
+                    (false, false, false)
+                ]
+            ),
             vec![false, true, true]
         );
         // A PAUSED first row consumes no slot: the second is admitted instead
         // - which is also the promotion rule (pausing an active download
         // admits the next queued one on the very next recompute).
         assert_eq!(
-            queued_flags(1, &[(true, false), (false, false), (false, false)]),
+            queued_flags(
+                1,
+                &[
+                    (true, false, false),
+                    (false, false, false),
+                    (false, false, false)
+                ]
+            ),
             vec![false, false, true]
         );
         // A COMPLETE row consumes no slot either.
         assert_eq!(
-            queued_flags(1, &[(false, true), (false, false)]),
+            queued_flags(1, &[(false, true, false), (false, false, false)]),
             vec![false, false]
         );
+    }
+
+    /// The 2026-08-09 decision: under the cap, a row ACTIVELY RECEIVING keeps
+    /// its slot ahead of add order; once stale (receiving=false) it is
+    /// ordinary again and add order rules. On glass (build 0c846d1, cap 1)
+    /// resuming an older paused row flipped the younger, still-pulling
+    /// promoted row to "Queued" at 41.8MB - and it kept pulling to 67.5MB
+    /// wearing that badge.
+    #[test]
+    fn queued_flags_a_receiving_row_keeps_its_slot_ahead_of_add_order() {
+        // cap 1: the YOUNGER receiving row keeps the slot; the older resumed
+        // (idle) row queues - the exact on-glass preemption, refused.
+        assert_eq!(
+            queued_flags(1, &[(false, false, false), (false, false, true)]),
+            vec![true, false]
+        );
+        // The receiving row wins from the middle too, over add-order
+        // neighbours on BOTH sides.
+        assert_eq!(
+            queued_flags(
+                1,
+                &[
+                    (false, false, false),
+                    (false, false, true),
+                    (false, false, false)
+                ]
+            ),
+            vec![true, false, true]
+        );
+        // STALE (past SLOT_KEEP_WINDOW_SECS, so receiving=false): add order
+        // rules again and the older waiter takes the slot back - release is
+        // a recompute, not an event.
+        assert_eq!(
+            queued_flags(1, &[(false, false, false), (false, false, false)]),
+            vec![false, true]
+        );
+        // Receiving rows FILL the cap in add order; the excess queues (the
+        // cap was lowered mid-flight - flags stop driving a row, they cannot
+        // unsend its bytes).
+        assert_eq!(
+            queued_flags(
+                2,
+                &[
+                    (false, false, true),
+                    (false, false, false),
+                    (false, false, true),
+                    (false, false, true)
+                ]
+            ),
+            vec![false, true, false, true]
+        );
+        // Paused and complete rows consume no slot even with a fresh byte
+        // stamp (paused mid-burst), and cap 0 stays unlimited.
+        assert_eq!(
+            queued_flags(
+                1,
+                &[
+                    (true, false, true),
+                    (false, true, true),
+                    (false, false, false)
+                ]
+            ),
+            vec![false, false, false]
+        );
+        assert_eq!(
+            queued_flags(0, &[(false, false, true), (false, false, false)]),
+            vec![false, false]
+        );
+    }
+
+    /// `admission_row` is THE row constructor for `queued_flags`: the field
+    /// order (paused, complete, receiving) and the slot window are pinned
+    /// HERE, so the engine sweeps and the FFI row builder cannot drift apart.
+    /// The receiving stamp comes from the PRODUCTION path (`commit`).
+    #[tokio::test]
+    async fn admission_row_reports_paused_complete_and_windowed_receiving() {
+        let dir = std::env::temp_dir().join(format!("padmule-admrow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = PartStore::create(&dir, 1, [0x5A; 16], 64, b"row.bin").unwrap();
+        let dl = Download::new(store);
+        let now = u64::from(crate::credit_store::now_secs());
+
+        assert_eq!(
+            dl.admission_row(now).await,
+            (false, false, false),
+            "registered, no bytes yet: not receiving"
+        );
+        dl.commit(0, &[7u8; 8], None).await.unwrap();
+        assert_eq!(
+            dl.admission_row(now).await,
+            (false, false, true),
+            "a commit stamps the row as receiving"
+        );
+        dl.set_last_byte_at(now.saturating_sub(SLOT_KEEP_WINDOW_SECS));
+        assert_eq!(
+            dl.admission_row(now).await,
+            (false, false, true),
+            "the boundary second is still inside the window"
+        );
+        dl.set_last_byte_at(now.saturating_sub(SLOT_KEEP_WINDOW_SECS + 1));
+        assert_eq!(
+            dl.admission_row(now).await,
+            (false, false, false),
+            "one second past the window: stale"
+        );
+        dl.set_paused(true).await;
+        assert_eq!(
+            dl.admission_row(now).await,
+            (true, false, false),
+            "paused reports in field 0"
+        );
+        dl.set_paused(false).await;
+        dl.commit(8, &[7u8; 56], None).await.unwrap();
+        let row = dl.admission_row(now).await;
+        assert!(row.1, "all 64 bytes committed: complete reports in field 1");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Pausing stops the block spigot exactly like cancelling: take_blocks

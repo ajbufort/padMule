@@ -214,9 +214,12 @@ pub struct DownloadInfo {
     /// flag survives a restart. The row says "Paused".
     pub paused: bool,
     /// Past the max-active cap: registered, not paused, not driven YET -
-    /// admitted in add order when a slot frees. The row says "Queued".
+    /// admitted in add order when a slot frees, except that a row ACTIVELY
+    /// RECEIVING keeps its slot first (so resuming an older row cannot flip a
+    /// pulling row to "Queued" mid-transfer). The row says "Queued".
     /// padMule's own policy (eMule has no such cap); derived by the same
-    /// `queued_flags` rule the engine's sweeps enforce.
+    /// `queued_flags` rule the engine's sweeps enforce, over rows built by
+    /// the same `Download::admission_row` constructor.
     pub queued: bool,
     /// True if bytes landed in the last few seconds - "actually receiving right
     /// now", as opposed to merely registered and hopeful. A TIME window, not an
@@ -781,11 +784,13 @@ impl MuleEngine {
             let now = u64::from(mule_engine::credit_store::now_secs());
             let dls = self.handles.downloads().await;
             // Queued is derived by THE one admission rule the sweeps enforce
-            // (mule_engine::multi_source::queued_flags) over the same ordered
-            // rows and the same shared cap - not re-implemented here.
+            // (mule_engine::multi_source::queued_flags) over rows built by
+            // the one constructor (Download::admission_row - same staleness
+            // window, same field order) and the same shared cap - not
+            // re-implemented here.
             let mut rows = Vec::with_capacity(dls.len());
             for dl in &dls {
-                rows.push((dl.is_paused(), dl.is_complete().await));
+                rows.push(dl.admission_row(now).await);
             }
             let queued = mule_engine::multi_source::queued_flags(self.handles.max_active(), &rows);
             for (i, dl) in dls.iter().enumerate() {
@@ -841,8 +846,11 @@ impl MuleEngine {
     /// enumerates it - the same shape as a test that pins "these callers" and
     /// names all but one. It then drifted AGAIN across the language boundary
     /// (the Swift caller still said seven after this was corrected to eight),
-    /// which is why the count is stated in both places and in the wiring
-    /// comment below.
+    /// so the number now lives ONLY on this side of the seam - Swift's
+    /// `EngineModel.refresh()` points here instead of keeping a copy - and
+    /// `the_stated_heartbeat_duty_count_matches_the_calls_the_body_makes`
+    /// derives the real count from the body and goes RED when this sentence,
+    /// or the wiring comment below, disagrees.
     ///
     /// IF THIS STOPS BEING CALLED, all TEN stop SILENTLY - nothing errors and
     /// nothing on screen changes; downloads simply stall, finished files are
@@ -881,11 +889,13 @@ impl MuleEngine {
             // PUBLISH one due shared file/keyword to the Kad DHT (eMule's STORE
             // half). Rate-limited to KAD_PUBLISH_EVERY inside, one job per
             // pass, bounded at KAD_PUBLISH_BUDGET. DUTY TEN - if you add
-            // another, update the count in the doc above AND in
-            // `EngineModel.refresh()`'s comment (NOT startPolling - the count
-            // lives beside the `e.heartbeat()` call). This count drifted four
-            // times before it was pinned in both languages (7->8->9->10); keep
-            // all three sites in sync so it does not drift a fifth.
+            // another, update the count HERE and in the doc above; the
+            // source-scan test named there stays RED until both agree with
+            // the body. Swift states no number any more (its refresh() points
+            // at this roster), because a count across the language boundary
+            // is one no Rust test can reach - which is how this drifted FIVE
+            // times (7->8->9->10, and a wiki page was still saying eight on
+            // 2026-08-09) before it was pinned.
             self.inner.lock().await.maintain_kad_publish().await;
             // Refresh the derived status values LAST, so what the lock-free
             // readers see reflects everything this beat just did.
@@ -1486,5 +1496,80 @@ mod tests {
         );
         hog.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE STATED HEARTBEAT DUTY COUNT CANNOT ROT. The prose above
+    /// `heartbeat()` says how many background duties the beat drives, and that
+    /// number drifted FIVE times (7->8->9->10, plus a wiki page still saying
+    /// eight on 2026-08-09) because nothing pinned it: a duty was added to the
+    /// BODY without being added to the sentence that counts it.
+    ///
+    /// Two INDEPENDENT sides, in the spirit of mule-engine's
+    /// `every_kad_counter_reaches_the_reset`:
+    /// - the CODE side scans `heartbeat()`'s own body for the engine calls it
+    ///   actually makes, minus the one deliberately framed as a refresh (the
+    ///   status publish);
+    /// - the PROSE side is the literal phrases "That is <N>:", "all <N> stop"
+    ///   and "DUTY <N>" that state the count, where <N> is the number word
+    ///   RENDERED FROM THE CODE COUNT, not written into this test.
+    ///
+    /// Add an eleventh duty without touching the prose and the rendered word
+    /// moves while the phrases stand still - RED. Bump the prose without
+    /// adding the duty and the phrases move while the rendered word stands
+    /// still - RED. The expected number appears nowhere in this test, and no
+    /// phrase is spelled out here with a real number word inside it, so the
+    /// whole-file scan can never match the test against itself.
+    ///
+    /// What it CANNOT catch: a duty that skips the one-lock-per-duty pattern
+    /// (batched under a shared guard, or driven through `self.handles`); a
+    /// second refresh-not-duty call (conservatively RED until the exclusion
+    /// below names it); and any count stated OUTSIDE this file - which is
+    /// exactly why Swift's `EngineModel.refresh()` no longer states one, and
+    /// why the wiki sites belong to the KB pass, not to this test.
+    #[test]
+    fn the_stated_heartbeat_duty_count_matches_the_calls_the_body_makes() {
+        let src = include_str!("lib.rs");
+        // concat!, so this test's own source cannot match the marker.
+        let sig = concat!("pub fn heart", "beat(&self)");
+        let start = src.find(sig).expect("heartbeat() not found in lib.rs");
+        // The body ends at the first close brace back at method indent.
+        let end = src[start..]
+            .find("\n    }")
+            .expect("heartbeat() body end not found");
+        let body = &src[start..start + end];
+
+        // Every engine call the beat makes takes the lock per duty, so the
+        // lock-take is the countable footprint of a duty.
+        let engine_calls = body.matches("self.inner.lock().await.").count();
+        let refreshes = body.matches(concat!("publish", "_status")).count();
+        assert_eq!(
+            refreshes, 1,
+            "the beat should end with exactly ONE status refresh; a second \
+             refresh-not-duty call must be named in this exclusion"
+        );
+        let duties = engine_calls - refreshes;
+
+        const WORDS: [&str; 17] = [
+            "ZERO", "ONE", "TWO", "THREE", "FOUR", "FIVE", "SIX", "SEVEN", "EIGHT", "NINE", "TEN",
+            "ELEVEN", "TWELVE", "THIRTEEN", "FOURTEEN", "FIFTEEN", "SIXTEEN",
+        ];
+        assert!(duties < WORDS.len(), "{duties} duties - extend WORDS");
+        let word = WORDS[duties];
+
+        // Scan the whole file, so a phrase moved within it still counts.
+        for phrase in [
+            format!("That is {word}:"),
+            format!("all {word} stop"),
+            format!("DUTY {word}"),
+        ] {
+            assert!(
+                src.contains(&phrase),
+                "heartbeat() drives {duties} duties but the prose never says \
+                 {phrase:?} - the stated count has drifted from the body \
+                 again; update the doc comment and the wiring comment (Swift \
+                 states no number by design, and the wiki sites are the KB \
+                 pass's job)"
+            );
+        }
     }
 }

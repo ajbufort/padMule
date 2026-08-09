@@ -404,18 +404,19 @@ const MAX_INBOUND_CONNS: usize = 200;
 const MAX_INBOUND_PER_IP: u32 = 16;
 
 /// Which registry rows a called-back source may DRIVE: the one admission rule
-/// (`multi_source::queued_flags`, same `(paused, complete)` rows in add order)
-/// composed with the paused/complete skip the sweeps already apply. The
+/// (`multi_source::queued_flags`, same `(paused, complete, receiving)` rows
+/// in add order) composed with the paused/complete skip the sweeps already
+/// apply. The
 /// listener's `InboundKind::Source` arm used to iterate every registered
 /// download with neither check, so a row the UI reported as "Queued" (or
 /// paused) transferred whenever a LowID source dialed back - the callback path
 /// was a hole in the cap. Pinned by its own test because the listener seam
 /// (a real silent inbound connection) is not exercised offline.
-fn callback_drive_flags(cap: u32, rows: &[(bool, bool)]) -> Vec<bool> {
+fn callback_drive_flags(cap: u32, rows: &[(bool, bool, bool)]) -> Vec<bool> {
     let queued = crate::multi_source::queued_flags(cap, rows);
     rows.iter()
         .zip(queued)
-        .map(|(&(paused, complete), q)| !paused && !complete && !q)
+        .map(|(&(paused, complete, _receiving), q)| !paused && !complete && !q)
         .collect()
 }
 /// Total wall-clock budget for the resume-fetch pass in `start()`, and the
@@ -595,6 +596,27 @@ fn load_ip_filter(config_dir: &Path) -> Option<Arc<IpFilter>> {
     } else {
         Some(Arc::new(filter))
     }
+}
+
+/// Whether the user's blocklist forbids SENDING a datagram to this address -
+/// THE one send gate for the server UDP fan-outs (status probe, global
+/// search, crawl). Scoped to PUBLICLY ROUTABLE targets on purpose: a user
+/// blocklisting a PUBLIC address is an unambiguous instruction not to talk to
+/// it, while private/loopback entries in community lists are almost always
+/// generic reserved-range boilerplate rather than a statement about the
+/// user's own LAN - and a loopback or LAN server the user added themselves is
+/// legitimate (padMule's own eserver oracle runs on 127.0.0.1,
+/// scripts/eserver-oracle.sh). Ingestion vetting (`vet_downloaded_servers`)
+/// still drops what a downloaded list tries to introduce; this closes the
+/// residual gap of an entry that was in server.met before the blocklist
+/// loaded, or was hand-added.
+///
+/// BYTE ORDER: takes an `Ipv4Addr`, so a met-order u32 cannot reach the
+/// filter unconverted (the bug that shipped at three sites) - convert with
+/// `ip_from_met_u32` at the call site; `IpFilter::is_blocked` does the
+/// host-order `u32::from` itself.
+fn blocklist_forbids_send(filter: Option<&IpFilter>, ip: Ipv4Addr) -> bool {
+    crate::fetch::is_routable_public_v4(ip) && filter.is_some_and(|f| f.is_blocked(ip))
 }
 
 /// Rebuild the shared library from `known.met`: every complete file a prior
@@ -1072,13 +1094,16 @@ fn kad_to_search(f: &mule_kad::FileResult) -> SearchResultFile {
 
 /// Global server UDP search (#9): send OP_GLOBSEARCHREQ to every server in
 /// `server.met`'s UDP port (TCP port + 4), skipping `connected` (already queried
-/// over TCP), and collect OP_GLOBSEARCHRES replies for `budget`. Best-effort:
-/// honors only replies from IPs we asked (anti-spoof), dedupes by hash, and
-/// returns `[]` on any setup failure. Bounded to the first `MAX_GLOBAL_SERVERS`.
+/// over TCP) and any entry the user's blocklist gates (`blocklist_forbids_send`,
+/// publicly routable targets only), and collect OP_GLOBSEARCHRES replies for
+/// `budget`. Best-effort: honors only replies from IPs we asked (anti-spoof),
+/// dedupes by hash, and returns `[]` on any setup failure. Bounded to the first
+/// `MAX_GLOBAL_SERVERS`.
 async fn global_udp_search(
     config_dir: &Path,
     params: &SearchParams,
     connected: Option<SocketAddr>,
+    filter: Option<&IpFilter>,
     budget: Duration,
 ) -> Vec<SearchResultFile> {
     const MAX_GLOBAL_SERVERS: usize = 40;
@@ -1140,6 +1165,15 @@ async fn global_udp_search(
         let ip = ip_from_met_u32(srv.ip);
         if connected == Some(SocketAddr::new(IpAddr::V4(ip), srv.port)) {
             continue; // already queried over TCP
+        }
+        // THE BLOCKLIST GATES THIS SEND (2026-08-09), publicly routable targets
+        // only - `blocklist_forbids_send` has the scoping rationale. `ip` is
+        // the real address (converted from the met u32 just above), so the
+        // filter sees host order. Skipped BEFORE `asked`, so a reply spoofed
+        // from a gated address stays rejected, and before the pace sleep, so a
+        // gated entry costs the fan-out no time.
+        if blocklist_forbids_send(filter, ip) {
+            continue;
         }
         asked.lock().await.insert(ip);
         let _ = sock
@@ -1556,7 +1590,8 @@ pub struct Engine {
     last_share_verify: Instant,
     last_resume_retry: Instant,
     /// Max simultaneously-DRIVEN downloads (0 = unlimited); the rest report
-    /// QUEUED and are admitted in add order as slots free. Shared with
+    /// QUEUED and are admitted in add order as slots free, except that a row
+    /// ACTIVELY RECEIVING keeps its slot first. Shared with
     /// `EngineHandles` so the FFI row builder reads the same value the sweeps
     /// enforce; the one admission rule is `multi_source::queued_flags`.
     max_active: Arc<std::sync::atomic::AtomicU32>,
@@ -2418,9 +2453,10 @@ impl Engine {
                             // callback path bypassed the max-active cap
                             // entirely (multi_source.rs's contract: queued rows
                             // are "NOT driven").
+                            let now = u64::from(now_secs());
                             let mut rows = Vec::with_capacity(pending.len());
                             for d in &pending {
-                                rows.push((d.is_paused(), d.is_complete().await));
+                                rows.push(d.admission_row(now).await);
                             }
                             let cap = max_active.load(Ordering::Relaxed);
                             let drive = callback_drive_flags(cap, &rows);
@@ -2698,7 +2734,10 @@ impl Engine {
     /// port (TCP + 4), returning the list enriched with liveness + fresh
     /// user/file counts. A server that answers OP_GLOBSERVSTATRES within the
     /// budget is `alive` (selectable); the rest are shown greyed out. Best-effort:
-    /// a missing/unreadable list yields an empty vec.
+    /// a missing/unreadable list yields an empty vec. A blocklisted publicly
+    /// routable entry stays LISTED but is never pinged (`blocklist_forbids_send`),
+    /// so it reads dead - and an unpinned Prune will then drop it, which is the
+    /// blocklist's intent.
     pub async fn probe_server_list(&self) -> Vec<ServerEntry> {
         let connected = self.server.as_ref().map(|l| l.addr());
         let Ok(bytes) = std::fs::read(self.config_dir.join("server.met")) else {
@@ -2739,7 +2778,25 @@ impl Engine {
         // the protocol); names learned this round are collected then persisted.
         let desc_challenge = desc_req_challenge((std::process::id() as u16) ^ 0xA5C3);
         let mut learned: Vec<(SocketAddr, String)> = Vec::new();
-        for e in &servers {
+        // THE BLOCKLIST GATES THESE SENDS (2026-08-09), publicly routable
+        // targets only - `blocklist_forbids_send` has the scoping rationale
+        // (the eserver oracle on 127.0.0.1 and any LAN server stay probeable).
+        // Decided ONCE per entry and reused by the awaiting counters and the
+        // answer matching below, so a gated server is neither pinged, nor
+        // waited for, nor believed. `e.addr` was built with `ip_from_met_u32`
+        // above, so this is the real address, not the met-order u32.
+        let filter = self.ip_filter.as_deref();
+        let sendable: Vec<bool> = servers
+            .iter()
+            .map(|e| match e.addr.ip() {
+                IpAddr::V4(v4) => !blocklist_forbids_send(filter, v4),
+                IpAddr::V6(_) => true,
+            })
+            .collect();
+        for (e, &send) in servers.iter().zip(&sendable) {
+            if !send {
+                continue;
+            }
             if let Some(udp) = e.addr.port().checked_add(4) {
                 let target = SocketAddr::new(e.addr.ip(), udp);
                 let _ = sock.send_to(&req, target).await;
@@ -2761,11 +2818,17 @@ impl Engine {
         // to the deadline unconditionally, so a list that answered in 200ms still
         // cost six seconds under the engine lock.
         let hard_deadline = tokio::time::Instant::now() + PROBE_COLLECT_BUDGET;
-        // What we are still waiting for: a status answer from everyone, and a name
-        // from everyone who has none. A server whose name we already have owes us
-        // nothing further, so its silence must not hold the round open.
-        let mut awaiting_status = servers.len();
-        let mut awaiting_name = servers.iter().filter(|e| e.name.is_empty()).count();
+        // What we are still waiting for: a status answer from everyone WE ASKED,
+        // and a name from everyone asked who has none. A server whose name we
+        // already have owes us nothing further, so its silence must not hold the
+        // round open - and a blocklist-gated server was never asked at all, so
+        // it owes nothing either.
+        let mut awaiting_status = sendable.iter().filter(|&&s| s).count();
+        let mut awaiting_name = servers
+            .iter()
+            .zip(&sendable)
+            .filter(|&(e, &s)| s && e.name.is_empty())
+            .count();
         // The quiet period only starts once answers are actually FLOWING. Before
         // the first one there is no burst to be at the end of, and cutting the
         // round short there would cost every server a miss on a cold start - when
@@ -2788,12 +2851,18 @@ impl Engine {
                     if n >= 2 && buf[0] == PROT_EDONKEY && buf[1] == OP_GLOBSERVSTATRES =>
                 {
                     // Verify the echoed challenge (anti-spoof) as well as the src.
+                    // The zip re-checks the send gate: an answer "from" a gated
+                    // server was never solicited (the fixed challenge is
+                    // spoofable), and must not settle a debt it does not owe -
+                    // the counters no longer include it.
                     if let Some((challenge, users, files)) = parse_serv_stat_res(&buf[2..n]) {
                         if challenge == SERV_STAT_CHALLENGE {
-                            if let Some(e) = servers.iter_mut().find(|e| {
-                                e.addr.ip() == src.ip()
-                                    && e.addr.port().checked_add(4) == Some(src.port())
-                            }) {
+                            if let Some((e, _)) =
+                                servers.iter_mut().zip(&sendable).find(|(e, &s)| {
+                                    s && e.addr.ip() == src.ip()
+                                        && e.addr.port().checked_add(4) == Some(src.port())
+                                })
+                            {
                                 // Only the FIRST answer from a server settles its
                                 // debt - a duplicate must not drive the counter
                                 // below what is genuinely outstanding.
@@ -2814,10 +2883,13 @@ impl Engine {
                     if let Some(desc) = parse_server_desc_res(&buf[2..n], desc_challenge) {
                         let name = desc.name.trim().to_string();
                         if !name.is_empty() {
-                            if let Some(e) = servers.iter_mut().find(|e| {
-                                e.addr.ip() == src.ip()
-                                    && e.addr.port().checked_add(4) == Some(src.port())
-                            }) {
+                            // Same gate re-check as the status handler above.
+                            if let Some((e, _)) =
+                                servers.iter_mut().zip(&sendable).find(|(e, &s)| {
+                                    s && e.addr.ip() == src.ip()
+                                        && e.addr.port().checked_add(4) == Some(src.port())
+                                })
+                            {
                                 // Only ADOPT a learned name; never overwrite one
                                 // the user's own server.met already carries.
                                 if e.name.is_empty() {
@@ -3021,7 +3093,11 @@ impl Engine {
     /// purpose: a LAN or loopback server the user added themselves is
     /// legitimate and stays usable (padMule's own eserver oracle runs on
     /// 127.0.0.1), so gating the send sites would have broken a supported setup
-    /// while leaving the injection path open.
+    /// while leaving the injection path open. (Since 2026-08-09 the send sites
+    /// ARE gated too, but only for blocklisted PUBLICLY ROUTABLE targets -
+    /// `blocklist_forbids_send` - so the oracle/LAN case still holds while the
+    /// residual gap closes: an entry that predated the blocklist, or was
+    /// hand-added, no longer receives probes or global searches.)
     fn vet_downloaded_servers(met: ServerMet, filter: Option<&IpFilter>) -> ServerMet {
         let servers = met
             .servers
@@ -3145,24 +3221,20 @@ impl Engine {
             if asks.is_empty() {
                 break;
             }
-            // THIS CRAWL's ipfilter stance: it gates who we SEND to, not
-            // merely what we keep - a blocked address gets no datagram from
-            // here. Stated for this path only, not as an engine-wide rule:
-            // probe_server_list and global_udp_search deliberately fan out
-            // unfiltered and vet at INGESTION instead (a recorded open
-            // decision, not an oversight). HOST ORDER for the consult - the
-            // raw met u32 is byte-REVERSED relative to the ranges
-            // `is_blocked_u32` holds, so passing it straight through asked
-            // every blocklisted server anyway (the same trap
-            // `merge_discovered_servers` carried until 2026-08-08; this was
-            // the third site).
+            // The ipfilter gates who we SEND to, not merely what we keep - a
+            // blocked address gets no datagram from here. Since 2026-08-09 the
+            // consult is THE shared send gate (`blocklist_forbids_send`, also
+            // on the status probe and the global search fan-outs); its
+            // public-only scoping is a no-op on this path, because
+            // `is_crawlable` already admits only routable PUBLIC addresses to
+            // the frontier. The met u32 is converted BEFORE the consult - the
+            // raw form is byte-REVERSED relative to the ranges the filter
+            // holds, and passing it straight through asked every blocklisted
+            // server anyway (the same trap `merge_discovered_servers` carried
+            // until 2026-08-08; this was the third site).
             let targets: Vec<SocketAddr> = asks
                 .iter()
-                .filter(|(ip, _)| {
-                    filter
-                        .as_deref()
-                        .is_none_or(|f| !f.is_blocked_u32(u32::from(ip_from_met_u32(*ip))))
-                })
+                .filter(|(ip, _)| !blocklist_forbids_send(filter.as_deref(), ip_from_met_u32(*ip)))
                 .filter_map(|&(ip, port)| {
                     port.checked_add(4)
                         .map(|udp| SocketAddr::new(IpAddr::V4(ip_from_met_u32(ip)), udp))
@@ -3637,9 +3709,11 @@ impl Engine {
             extension: None,
         };
         // Global UDP search (#9) reads server.met + the connected server's addr
-        // (to skip it) before the &mut borrows below; it runs concurrently.
+        // (to skip it) + the blocklist (its send gate) before the &mut borrows
+        // below; it runs concurrently.
         let config_dir = self.config_dir.clone();
         let connected = self.server.as_ref().map(|l| l.addr());
+        let ip_filter = self.ip_filter.clone();
         let do_global = filters.global;
         // The server link and the Kad node are separate fields, so both can be
         // borrowed and driven at once.
@@ -3672,7 +3746,14 @@ impl Engine {
             },
             async {
                 if do_global {
-                    global_udp_search(&config_dir, &params, connected, SEARCH_WAIT).await
+                    global_udp_search(
+                        &config_dir,
+                        &params,
+                        connected,
+                        ip_filter.as_deref(),
+                        SEARCH_WAIT,
+                    )
+                    .await
                 } else {
                     Vec::new()
                 }
@@ -3916,9 +3997,10 @@ impl Engine {
             // Admission for the NEW row, by the one rule. Registered either
             // way - a queued download is a real entry that the sweep drives
             // the moment a slot frees.
+            let now = u64::from(now_secs());
             let mut rows = Vec::with_capacity(guard.len());
             for d in guard.iter() {
-                rows.push((d.is_paused(), d.is_complete().await));
+                rows.push(d.admission_row(now).await);
             }
             let cap = self.max_active.load(Ordering::Relaxed);
             *crate::multi_source::queued_flags(cap, &rows)
@@ -4268,15 +4350,17 @@ impl Engine {
             // The ONE admission rule (multi_source::queued_flags): user-paused
             // rows are never driven, and past the max-active cap the rest are
             // QUEUED - reported, not driven; a freed slot admits the next in
-            // add order on this very sweep, no event needed.
+            // add order on this very sweep, no event needed (a row actively
+            // receiving keeps its slot first).
+            let now = u64::from(now_secs());
             let mut rows = Vec::with_capacity(guard.len());
             for dl in guard.iter() {
-                rows.push((dl.is_paused(), dl.is_complete().await));
+                rows.push(dl.admission_row(now).await);
             }
             let queued = crate::multi_source::queued_flags(cap, &rows);
             let mut v = Vec::new();
             for (i, dl) in guard.iter().enumerate() {
-                let (paused, complete) = rows[i];
+                let (paused, complete, _receiving) = rows[i];
                 // Skip ones already being fetched: pause() does not abort in-flight
                 // tasks, so a still-running fetch must not be re-driven (spawn_fetch
                 // would bail anyway, but this also avoids wasted source-finding under
@@ -4499,22 +4583,29 @@ impl Engine {
     /// The difference from [`pause`](Self::pause), which is the whole feature:
     /// the inbound listener and the server login STAY UP, so peers can keep
     /// downloading from us and the server keeps handing us out as a source.
-    /// Everything that INITIATES work stops - the Kad node is dropped, and
+    /// Everything that INITIATES user-facing work stops -
     /// `maintain_resume_fetches` / `maintain_kad` / `maintain_share_verify`
-    /// already gate on `Running`, so they fall silent for free.
+    /// gate on `Running`, so they fall silent for free.
     ///
     /// WHY SEEDING IS THE PART WORTH KEEPING ALIVE. It is the cheapest thing
     /// the engine does - no source hunting, no lookups, no block scheduling -
     /// and on eD2k it is what earns standing: the credit system rewards upload,
     /// so a client that only ever takes is one every queue puts last.
     ///
-    /// KAD IS DROPPED DELIBERATELY, not overlooked. Nothing about serving needs
-    /// it: peers find us through the server's index and through source exchange.
-    /// Kad PUBLISHING (row 8de) pauses with the node - `maintain_kad_publish`
-    /// consumes nothing without a live Kad node - and the records already
-    /// published simply expire on eMule's own 5h/24h clocks at the storing
-    /// nodes, which is the honest foreground-publisher story. Keeping a UDP
-    /// node alive against that would spend battery for little benefit.
+    /// KAD STAYS UP (DECIDED 2026-08-09, reversing the launch behaviour that
+    /// dropped it here). Since publishing shipped (row 8de) a seeding session
+    /// has real Kad duties: `maintain_kad_publish` admits Seeding and keeps
+    /// the 5h/24h source/keyword records fresh at the storing nodes, and the
+    /// node's read loop keeps answering the network, so we are not aged out
+    /// of other nodes' routing tables and a resume no longer rebuilds the
+    /// live table from one bootstrap response. The same audio keepalive that
+    /// keeps the TCP listener and the server login alive (row 8cj) keeps this
+    /// UDP socket schedulable - suspension is what kills sockets, and the
+    /// keepalive's whole job is preventing it. What `set_kad(None)` was ALSO
+    /// doing here - folding the live table into the persisted one - is kept
+    /// below, without the teardown. The maintenance split while seeding
+    /// (liveness sweep on, growth refresh off) is decided and argued at the
+    /// `maintain_kad_liveness` / `maintain_kad` gates.
     ///
     /// THIS ONLY MEANS ANYTHING UNDER AN AUDIO KEEPALIVE. Without one iOS
     /// suspends the process seconds later and every socket here dies with it -
@@ -4526,9 +4617,12 @@ impl Engine {
         if self.state != EngineState::Running {
             return;
         }
-        // Drop the Kad node through set_kad so its live table is absorbed into
-        // the persisted one first - the rule set_kad exists to make unforgettable.
-        self.set_kad(None);
+        // Fold the live table into the persisted one WITHOUT dropping the node
+        // - the same discipline `set_kad` makes unforgettable, minus the
+        // teardown. `checkpoint` below unions the live table into nodes.dat by
+        // itself, but `self.routing` must be current too or a later
+        // node-dropping path would write a stale union.
+        self.absorb_kad_routing();
         // Persist NOW rather than trusting the background to last: jetsam can
         // take the process at any moment and gives no warning.
         self.persist_downloads().await;
@@ -4539,13 +4633,16 @@ impl Engine {
 
     /// Come back to the foreground from [`pause_for_seeding`].
     ///
-    /// Much smaller than `resume()` because much less was torn down: the
-    /// listener and the server link never stopped, so only Kad has to come
-    /// back. Calling the full `resume()` here would abort a LIVE listener and
-    /// re-dial a server we are still logged into.
+    /// Much smaller than `resume()` because almost nothing was torn down: the
+    /// listener, the server link AND (since 2026-08-09) the Kad node all
+    /// survive a seed. Calling the full `resume()` here would abort a LIVE
+    /// listener and re-dial a server we are still logged into - and an
+    /// unconditional `start_kad` would bind a second UDP socket, or replace a
+    /// live table with a bootstrap-sized one. Kad is rebuilt only when the
+    /// seed was entered without a node (offline, or a failed bind).
     async fn resume_from_seeding(&mut self) {
         self.set_state(EngineState::Running);
-        if !self.offline {
+        if !self.offline && self.kad.is_none() {
             self.start_kad().await;
         }
         self.emit_online_status();
@@ -4845,7 +4942,7 @@ impl Engine {
             // frees and queued_flags recomputes).
             let mut rows = Vec::with_capacity(guard.len());
             for dl in guard.iter() {
-                rows.push((dl.is_paused(), dl.is_complete().await));
+                rows.push(dl.admission_row(now).await);
             }
             let queued = crate::multi_source::queued_flags(cap, &rows);
             guard
@@ -4896,8 +4993,21 @@ impl Engine {
     /// `MAX_CONTACTS_PER_IP`.
     ///
     /// Returns (probes sent, contacts removed).
+    ///
+    /// RUNS WHILE SEEDING TOO (decided 2026-08-09, when `pause_for_seeding`
+    /// stopped dropping the node). A background seed keeps the node serving
+    /// and publishing for hours, which is exactly when contacts die around
+    /// it - and without the sweep nothing is EVER removed (a contact's type
+    /// moves only here and in `set_alive`), so the serve pool
+    /// (`closest_to_serving`, the contacts we hand OTHER nodes) fills with
+    /// peers that answered once and died, and every publish walk seeds from
+    /// them. The cost is small and bounded: at most KAD_SWEEP_MAX_PROBES (2)
+    /// HELLOs per 60s pass, ~1.2s worst-case each under the engine lock. The
+    /// GROWTH half (`maintain_kad`) deliberately stays Running-only - see its
+    /// doc for the other side of the split. Flip the state predicate below if
+    /// the device soak says otherwise.
     pub async fn maintain_kad_liveness(&mut self) -> (usize, usize) {
-        if self.state != EngineState::Running || self.offline {
+        if !matches!(self.state, EngineState::Running | EngineState::Seeding) || self.offline {
             return (0, 0);
         }
         if self.last_kad_sweep.elapsed() < KAD_SWEEP_EVERY {
@@ -4942,18 +5052,15 @@ impl Engine {
     /// decision to build a foreground-only publisher (records age out when we
     /// stop, so a publisher that vanishes leaves nothing stale for long).
     ///
-    /// Runs while RUNNING or SEEDING and only while SHARING is on. The state
-    /// gate ADMITS Seeding, but today that arm idles: `pause_for_seeding`
-    /// drops the Kad node on the way in, so while seeding `self.kad` is None
-    /// and the availability guard below returns before anything is stamped or
-    /// consumed. That is the honest foreground-publisher story - publishing
-    /// pauses with Kad and the records age out on their own 5h/24h clocks at
-    /// the storing nodes. Seeding stays in the gate because it is harmless
-    /// and becomes correct the day Kad is kept up while seeding (an open
-    /// design question for the handoff, not decided here). SOURCE records
-    /// need a reachable address, so they are gated on a known public identity
-    /// (HighID); KEYWORD records make no reachability claim and publish
-    /// either way.
+    /// Runs while RUNNING or SEEDING and only while SHARING is on. The
+    /// Seeding arm is LIVE since 2026-08-09: `pause_for_seeding` keeps the
+    /// Kad node up, so a background seed keeps republishing on the 5h/24h
+    /// clocks instead of letting its records age out at the storing nodes -
+    /// which is the point of seeding Kad-visibly. (Before that date the node
+    /// was dropped on the way in and this arm idled at the availability
+    /// guard below.) SOURCE records need a reachable address, so they are
+    /// gated on a known public identity (HighID); KEYWORD records make no
+    /// reachability claim and publish either way.
     ///
     /// Returns how many nodes stored this job's record (0 when nothing was due).
     pub async fn maintain_kad_publish(&mut self) -> usize {
@@ -4969,10 +5076,12 @@ impl Engine {
         // KAD AVAILABILITY, checked BEFORE the cadence stamp and the refill.
         // `refill` stamps the republish clocks AT ENQUEUE, so a pass that
         // cannot publish must consume nothing: with these guards after the
-        // stamp/refill/pop (as first shipped), a seeding session - which
-        // always has `kad: None` - burned its whole due set at one job per
+        // stamp/refill/pop (as first shipped), a seeding session - which,
+        // until the node started surviving `pause_for_seeding` (2026-08-09),
+        // always had `kad: None` - burned its whole due set at one job per
         // 10s, marked "published", and nothing republished for up to 5h/24h
-        // after returning to Running.
+        // after returning to Running. Still reachable without seeding: any
+        // Running pass before `start_kad`, or after a failed bind.
         if self.kad.as_ref().is_none_or(|k| k.contacts_known() == 0) {
             return 0; // no node, or nothing to walk from - bootstrap first
         }
@@ -5084,6 +5193,19 @@ impl Engine {
     /// keyword search lands in is uniform. Successive random targets walk the
     /// whole space, which is the same effect eMule gets by refreshing each bin
     /// in turn.
+    ///
+    /// DELIBERATELY NOT RUN WHILE SEEDING, unlike the liveness sweep and the
+    /// publisher (both admit Seeding since 2026-08-09, when the node started
+    /// surviving `pause_for_seeding`). Growth buys search breadth -
+    /// KAD_TABLE_TARGET exists for keyword-search quality - and a seeding
+    /// session never searches; meanwhile this is the most expensive periodic
+    /// Kad duty (a full iterative lookup, up to KAD_MAINTENANCE_BUDGET under
+    /// the engine lock, every KAD_REFRESH_EVERY) in the one mode where
+    /// battery is the open question (row 8cj's unexplained CPU split). The
+    /// table still learns while seeding without it: every publish answer is
+    /// absorbed (`absorb_find_answer`) and every inbound HELLO_REQ is a
+    /// proven-alive insert. Flip the state predicate below if the device
+    /// soak says otherwise.
     ///
     /// Returns contacts gained, for the caller's log and for tests.
     pub async fn maintain_kad(&mut self) -> usize {
@@ -5294,6 +5416,36 @@ mod tests {
         let gated = gate_loaded_nodes(&contacts, Some(&filter));
         let ips: Vec<u32> = gated.iter().map(|c| c.ip).collect();
         assert_eq!(ips, vec![0x0808_0404, 0x2596_24FA]);
+    }
+
+    /// THE send gate for the server UDP fan-outs: forbids a blocklisted PUBLIC
+    /// target, allows a blocklisted loopback/LAN one (the eserver-oracle case),
+    /// and allows anything the filter does not cover.
+    #[test]
+    fn blocklist_forbids_send_is_public_only_and_host_order() {
+        let filter = IpFilter::parse(
+            "198.18.0.0 - 198.18.255.255 , 0 , blocked\n\
+             127.0.0.0 - 127.255.255.255 , 0 , reserved-range boilerplate\n",
+            DEFAULT_IPFILTER_LEVEL,
+        );
+        let f = Some(&filter);
+        // A blocklisted PUBLIC address: an unambiguous "do not talk to it".
+        assert!(blocklist_forbids_send(f, Ipv4Addr::new(198, 18, 0, 1)));
+        // A blocklisted LOOPBACK address: still sendable - community lists
+        // blanket the reserved ranges, and the user's own oracle lives there.
+        assert!(!blocklist_forbids_send(f, Ipv4Addr::new(127, 0, 0, 1)));
+        // Public but not blocklisted, and no filter at all: sendable.
+        assert!(!blocklist_forbids_send(f, Ipv4Addr::new(85, 17, 116, 222)));
+        assert!(!blocklist_forbids_send(None, Ipv4Addr::new(198, 18, 0, 1)));
+        // THE BYTE-ORDER PIN: the helper takes an `Ipv4Addr`, so a met-order
+        // u32 cannot reach the filter unconverted. The met spelling of
+        // 198.18.0.1 misread as host order is 1.0.18.198 - a public address
+        // the ranges above do NOT cover - so the raw u32 would sail through,
+        // which is exactly the three-times-shipped bug this shape prevents.
+        assert!(!blocklist_forbids_send(
+            f,
+            Ipv4Addr::from(u32::from_le_bytes([198, 18, 0, 1]))
+        ));
     }
 
     /// A REAL file on disk for a `SharedFile` fixture. The serve path verifies a
@@ -6162,6 +6314,255 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The Servers-screen status probe must not ping a blocklisted PUBLIC
+    /// server (the residual 8cq gap: an entry that predated the blocklist, or
+    /// was hand-added, kept receiving probes). Same 198.18.0.0/15 benchmarking
+    /// seed as the crawl test above: `is_routable_public_v4` accepts it, so it
+    /// reaches the send gate, but a regression leaks the datagram into a black
+    /// hole, not at a real host. Observable by TIMING, the same instrument as
+    /// `the_probe_stops_as_soon_as_every_server_has_answered`: a gated server
+    /// is neither pinged nor WAITED for, so the round returns at once - while
+    /// an ungated, silent 198.18 target holds the round open for the full
+    /// `PROBE_COLLECT_BUDGET`. The entry must still be LISTED (greyed out):
+    /// gating the send must not hide the user's own server.met contents.
+    #[tokio::test]
+    async fn the_probe_never_pings_a_blocklisted_public_server() {
+        let dir = tmp("probe-blocklist-public");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("server.met"),
+            write_server_met(&ServerMet {
+                header: mule_files::server_met::SERVER_MET_HEADER,
+                servers: vec![Server {
+                    ip: u32::from_le_bytes([198, 18, 0, 1]),
+                    port: 4661,
+                    tags: Vec::new(),
+                }],
+            }),
+        )
+        .unwrap();
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+        engine.ip_filter = Some(std::sync::Arc::new(IpFilter::parse(
+            "198.18.0.0 - 198.18.255.255 , 0 , blocked\n",
+            DEFAULT_IPFILTER_LEVEL,
+        )));
+
+        let t0 = std::time::Instant::now();
+        let rows = engine.probe_server_list().await;
+        let elapsed = t0.elapsed();
+
+        assert_eq!(rows.len(), 1, "the entry stays listed, just never pinged");
+        assert!(!rows[0].alive);
+        assert!(
+            elapsed < PROBE_COLLECT_BUDGET / 3,
+            "the probe took {elapsed:?} for a list that owes it nothing - it \
+             is waiting on (so it must have pinged) a blocklisted public server"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The oracle case the public-only scoping exists for: a LOOPBACK server
+    /// the user's community blocklist happens to cover (reserved-range
+    /// boilerplate) must STILL be probed - scripts/eserver-oracle.sh and any
+    /// LAN server the user added by hand live on exactly such addresses.
+    /// Mutation check: drop the `is_routable_public_v4` qualifier from
+    /// `blocklist_forbids_send` and this fails on the `alive` assertion.
+    #[tokio::test]
+    async fn the_probe_still_pings_a_blocklisted_loopback_server() {
+        let dir = tmp("probe-blocklist-loopback");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A mock server on loopback (probe pings TCP port + 4).
+        let mock = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0u16)).await.unwrap();
+        let udp_port = mock.local_addr().unwrap().port();
+        let tcp_port = udp_port - 4;
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            loop {
+                let Ok((n, src)) = mock.recv_from(&mut buf).await else {
+                    return;
+                };
+                if n < 2 || buf[1] != OP_GLOBSERVSTATREQ {
+                    continue;
+                }
+                let mut res = vec![PROT_EDONKEY, OP_GLOBSERVSTATRES];
+                res.extend_from_slice(&SERV_STAT_CHALLENGE.to_le_bytes());
+                res.extend_from_slice(&7u32.to_le_bytes()); // users
+                res.extend_from_slice(&9u32.to_le_bytes()); // files
+                let _ = mock.send_to(&res, src).await;
+            }
+        });
+
+        std::fs::write(
+            dir.join("server.met"),
+            write_server_met(&ServerMet {
+                header: mule_files::server_met::SERVER_MET_HEADER,
+                servers: vec![Server {
+                    ip: u32::from_le_bytes(Ipv4Addr::LOCALHOST.octets()),
+                    port: tcp_port,
+                    // A name on file, so the round owes only the status answer.
+                    tags: vec![mule_proto::Tag::id(
+                        0x01,
+                        mule_proto::TagValue::Str(b"oracle".to_vec()),
+                    )],
+                }],
+            }),
+        )
+        .unwrap();
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+        engine.ip_filter = Some(std::sync::Arc::new(IpFilter::parse(
+            "127.0.0.0 - 127.255.255.255 , 0 , reserved-range boilerplate\n",
+            DEFAULT_IPFILTER_LEVEL,
+        )));
+
+        let rows = engine.probe_server_list().await;
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0].alive,
+            "a blocklisted LOOPBACK server must still be probed - the \
+             blocklist send gate is scoped to publicly routable targets"
+        );
+        assert_eq!(rows[0].users, Some(7));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A mock global-search server on loopback: answers OP_GLOBSEARCHREQ with
+    /// one OP_GLOBSEARCHRES record (`hash` repeated 16x, tagcount 0). Returns
+    /// the TCP port to write into server.met (the fan-out sends to TCP + 4).
+    async fn spawn_global_search_mock(hash: u8) -> u16 {
+        let mock = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0u16)).await.unwrap();
+        let tcp_port = mock.local_addr().unwrap().port() - 4;
+        tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            loop {
+                let Ok((n, src)) = mock.recv_from(&mut buf).await else {
+                    return;
+                };
+                if n < 2 || buf[0] != PROT_EDONKEY || buf[1] != crate::search::OP_GLOBSEARCHREQ {
+                    continue;
+                }
+                let mut res = vec![PROT_EDONKEY, OP_GLOBSEARCHRES];
+                res.extend_from_slice(&[hash; 16]);
+                res.extend_from_slice(&1u32.to_le_bytes()); // client id
+                res.extend_from_slice(&4662u16.to_le_bytes()); // client port
+                res.extend_from_slice(&0u32.to_le_bytes()); // tagcount
+                let _ = mock.send_to(&res, src).await;
+            }
+        });
+        tcp_port
+    }
+
+    /// The oracle case for the GLOBAL SEARCH fan-out: a loopback server the
+    /// community blocklist happens to cover must still be queried - the send
+    /// gate is scoped to publicly routable targets. Mutation check: drop the
+    /// `is_routable_public_v4` qualifier from `blocklist_forbids_send` and the
+    /// hit disappears.
+    #[tokio::test]
+    async fn a_global_search_still_queries_a_blocklisted_loopback_server() {
+        let dir = tmp("global-blocklist-loopback");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tcp_port = spawn_global_search_mock(0x5A).await;
+        std::fs::write(
+            dir.join("server.met"),
+            write_server_met(&ServerMet {
+                header: mule_files::server_met::SERVER_MET_HEADER,
+                servers: vec![Server {
+                    ip: u32::from_le_bytes(Ipv4Addr::LOCALHOST.octets()),
+                    port: tcp_port,
+                    tags: Vec::new(),
+                }],
+            }),
+        )
+        .unwrap();
+        let filter = IpFilter::parse(
+            "127.0.0.0 - 127.255.255.255 , 0 , reserved-range boilerplate\n",
+            DEFAULT_IPFILTER_LEVEL,
+        );
+        let params = SearchParams {
+            keyword: "x".into(),
+            ..Default::default()
+        };
+        let out = global_udp_search(
+            &dir,
+            &params,
+            None,
+            Some(&filter),
+            Duration::from_millis(500),
+        )
+        .await;
+        assert_eq!(
+            out.len(),
+            1,
+            "the blocklisted LOOPBACK server must still be asked and answer"
+        );
+        assert_eq!(out[0].hash, [0x5A; 16]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A blocklisted PUBLIC server gets NO global-search datagram. Proven
+    /// through the fan-out's own pacing: five blocklisted 198.18.x entries sit
+    /// AHEAD of a loopback mock in server.met. Gated, they cost nothing and
+    /// the mock is asked at once (its hit arrives inside the 500ms budget);
+    /// ungated, each costs a 200ms pace sleep - a full second for five - so
+    /// the send loop hits its deadline before ever reaching the mock and the
+    /// hit vanishes. (Under a regression the leaked datagrams go to
+    /// 198.18.0.0/15, the unrouted benchmarking range - the same black-hole
+    /// convention as the crawl's blocklist test.)
+    #[tokio::test]
+    async fn a_global_search_never_sends_to_a_blocklisted_public_server() {
+        let dir = tmp("global-blocklist-public");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tcp_port = spawn_global_search_mock(0x6B).await;
+        let mut servers: Vec<Server> = (1..=5u8)
+            .map(|d| Server {
+                ip: u32::from_le_bytes([198, 18, 0, d]),
+                port: 4661,
+                tags: Vec::new(),
+            })
+            .collect();
+        servers.push(Server {
+            ip: u32::from_le_bytes(Ipv4Addr::LOCALHOST.octets()),
+            port: tcp_port,
+            tags: Vec::new(),
+        });
+        std::fs::write(
+            dir.join("server.met"),
+            write_server_met(&ServerMet {
+                header: mule_files::server_met::SERVER_MET_HEADER,
+                servers,
+            }),
+        )
+        .unwrap();
+        let filter = IpFilter::parse(
+            "198.18.0.0 - 198.18.255.255 , 0 , blocked\n",
+            DEFAULT_IPFILTER_LEVEL,
+        );
+        let params = SearchParams {
+            keyword: "x".into(),
+            ..Default::default()
+        };
+        let out = global_udp_search(
+            &dir,
+            &params,
+            None,
+            Some(&filter),
+            Duration::from_millis(500),
+        )
+        .await;
+        assert_eq!(
+            out.len(),
+            1,
+            "five gated entries must cost the fan-out nothing - a paced send \
+             to any of them starves the un-blocklisted mock past the budget"
+        );
+        assert_eq!(out[0].hash, [0x6B; 16]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Offline means offline: no socket, no datagrams, no crawl.
     #[tokio::test]
     async fn a_crawl_is_a_no_op_when_offline() {
@@ -6589,18 +6990,17 @@ mod tests {
             "running + sharing reaches the scheduler"
         );
 
-        // Seeding is ADMITTED by the state gate. That is all this proves: in
-        // production `pause_for_seeding` drops the Kad node, so the duty idles
-        // while seeding (consuming nothing - see the no-kad test below); the
-        // admission is pinned so publishing works the day a seeding session
-        // keeps its Kad node up.
+        // Seeding is ADMITTED by the state gate - and LIVE in production
+        // since 2026-08-09, when `pause_for_seeding` stopped dropping the
+        // node. This arm pins only the admission; the real-work half (a job
+        // popped through a node that survived the seeding boundary) is
+        // `kad_publishing_pops_a_real_job_while_seeding`.
         engine.state = EngineState::Seeding;
         engine.last_kad_publish = old;
         engine.maintain_kad_publish().await;
         assert!(
             engine.last_kad_publish > old,
-            "the state gate must admit Seeding (idle today only because \
-             seeding drops the Kad node)"
+            "the state gate must admit Seeding - background seeds republish now"
         );
 
         let (jobs1, _) = crate::stats::kad_publish_counts();
@@ -6616,9 +7016,11 @@ mod tests {
     /// 5h/24h republish clocks AT ENQUEUE (kad_publish.rs), so a pass that
     /// refilled, popped a job and only then noticed there was no Kad node had
     /// marked work "published" that never left the box - a seeding session
-    /// (which always has `kad: None`, see `pause_for_seeding`) burned its whole
-    /// due set at one job per 10s and nothing republished for up to 5h/24h
-    /// after returning to Running. The Kad-availability guards must run BEFORE
+    /// (which, until the node started surviving `pause_for_seeding` on
+    /// 2026-08-09, always had `kad: None`) burned its whole due set at one
+    /// job per 10s and nothing republished for up to 5h/24h after returning
+    /// to Running. Kad-less passes still happen (before `start_kad`, after a
+    /// failed bind), so the Kad-availability guards must keep running BEFORE
     /// the cadence stamp and the refill.
     #[tokio::test]
     async fn a_publish_pass_without_kad_consumes_no_schedule_state() {
@@ -6696,7 +7098,12 @@ mod tests {
         assert_eq!(
             callback_drive_flags(
                 1,
-                &[(false, false), (false, false), (true, false), (false, true)]
+                &[
+                    (false, false, false),
+                    (false, false, false),
+                    (true, false, false),
+                    (false, true, false)
+                ]
             ),
             vec![true, false, false, false],
             "the second active row is past the cap and must not be driven"
@@ -6705,13 +7112,28 @@ mod tests {
         // SECOND row is the admitted one. An implementation that just took
         // the first row - or ignored the queued flags - fails here.
         assert_eq!(
-            callback_drive_flags(1, &[(true, false), (false, false), (false, false)]),
+            callback_drive_flags(
+                1,
+                &[
+                    (true, false, false),
+                    (false, false, false),
+                    (false, false, false)
+                ]
+            ),
             vec![false, true, false],
             "a paused row must neither be driven nor consume the slot"
         );
+        // RECEIVING discriminator (the 2026-08-09 rule): the younger row that
+        // is pulling bytes holds the one slot, so a dial-back may drive IT
+        // and not the older idle row - under plain add order this inverts.
+        assert_eq!(
+            callback_drive_flags(1, &[(false, false, false), (false, false, true)]),
+            vec![false, true],
+            "the receiving row keeps the slot; the older idle row is queued"
+        );
         // cap 0 = unlimited: every active row may be driven.
         assert_eq!(
-            callback_drive_flags(0, &[(false, false), (false, false)]),
+            callback_drive_flags(0, &[(false, false, false), (false, false, false)]),
             vec![true, true]
         );
     }
@@ -6800,6 +7222,73 @@ mod tests {
         assert!(
             d2.last_retry_at() > 0,
             "pausing the first admits the second - promotion by recompute"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE 2026-08-09 ON-GLASS DEFECT through the production retry sweep:
+    /// cap 1, the OLDER row (d1) resumed from pause must not preempt the
+    /// YOUNGER row (d2) that is actively receiving; once d2 goes STALE its
+    /// slot releases and d1 is admitted on the next recompute.
+    ///
+    /// Ordering trap, named: in BOTH discriminating sweeps the fair rotation
+    /// (least recently retried) AND plain add order want d1 - its retry
+    /// clock is 0 and it is first in the registry - so no assertion here can
+    /// go green by rotation or add order alone. A mutant that ignores
+    /// `receiving` hands d1 the slot in sweep 1 (first assertion red); a
+    /// mutant that ignores the STALENESS WINDOW (receiving = "ever received")
+    /// keeps d2 protected forever and refuses d1 in sweep 2 (last assertion
+    /// red).
+    #[tokio::test]
+    async fn a_receiving_row_keeps_its_slot_and_releases_it_when_stale() {
+        let dir = tmp("keep-slot");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+        engine.state = EngineState::Running;
+        let d1 = Download::new(
+            crate::part_store::PartStore::create(&dir, 1, [1; 16], 500, b"a.bin").unwrap(),
+        );
+        let d2 = Download::new(
+            crate::part_store::PartStore::create(&dir, 2, [2; 16], 500, b"b.bin").unwrap(),
+        );
+        engine.downloads.lock().await.push(Arc::clone(&d1));
+        engine.downloads.lock().await.push(Arc::clone(&d2));
+        engine.set_max_active_downloads(1);
+        // d1 (older) paused by the user; d2 promoted into the slot and
+        // RECEIVING - the stamp comes from the production commit path.
+        d1.set_paused(true).await;
+        d2.commit(0, &[0xAB; 8], None).await.unwrap();
+
+        let back_dated = || {
+            Instant::now()
+                .checked_sub(Duration::from_secs(60))
+                .expect("host uptime under 60s - rerun this test")
+        };
+        // RESUME the older row: it must NOT take the slot back.
+        d1.set_paused(false).await;
+        engine.last_resume_retry = back_dated();
+        engine.maintain_resume_fetches().await;
+        assert_eq!(
+            d1.last_retry_at(),
+            0,
+            "the resumed OLDER row must not preempt the receiving one"
+        );
+        assert!(
+            d2.last_retry_at() > 0,
+            "the receiving row holds the slot (and is the only retry candidate)"
+        );
+
+        // d2 goes STALE: no bytes for the whole window. Its slot releases on
+        // the next recompute and add order admits the older waiter.
+        d2.set_last_byte_at(
+            u64::from(now_secs()).saturating_sub(crate::multi_source::SLOT_KEEP_WINDOW_SECS + 1),
+        );
+        engine.last_resume_retry = back_dated();
+        engine.maintain_resume_fetches().await;
+        assert!(
+            d1.last_retry_at() > 0,
+            "a stale row releases its slot - the waiting row is admitted"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -8476,7 +8965,7 @@ mod tests {
             keyword: "x".into(),
             ..Default::default()
         };
-        let out = global_udp_search(&dir, &params, None, Duration::from_millis(200)).await;
+        let out = global_udp_search(&dir, &params, None, None, Duration::from_millis(200)).await;
         assert!(out.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -8619,14 +9108,10 @@ mod tests {
             "seeding dropped the inbound listener - peers cannot reach us, so \
              there is nothing to seed WITH"
         );
-        // ...and Kad IS dropped, deliberately: nothing about serving needs it
-        // (publishing pauses with the node and its records age out on their
-        // own clocks - see pause_for_seeding).
-        assert!(
-            engine.kad.is_none(),
-            "seeding kept the Kad node alive - serving does not need it, and \
-             the publish duty is built to idle without one"
-        );
+        // Kad now SURVIVES seeding (decided 2026-08-09). Not asserted here,
+        // where the offline start never built a node and `kad.is_some()`
+        // could only fail vacuously - the keep is pinned with a REAL node by
+        // `pause_for_seeding_keeps_the_kad_node_and_still_persists_its_table`.
 
         // Coming back is the small path, not the full resume: still one listener.
         engine.resume().await;
@@ -8677,6 +9162,239 @@ mod tests {
         // Paused -> no-op; a paused engine must not silently start serving.
         engine.pause_for_seeding().await;
         assert_eq!(engine.state(), EngineState::Paused);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE 2026-08-09 REVERSAL, decided by Anthony: `pause_for_seeding` KEEPS
+    /// the Kad node instead of dropping it. Since publishing shipped (row 8de)
+    /// a seeding session has real Kad work - republishing on the 5h/24h clocks
+    /// and answering the network so we are not aged out of its routing tables.
+    /// What `set_kad(None)` was ALSO doing - folding the live table into the
+    /// persisted one before jetsam can strike - must survive the reversal, so
+    /// BOTH halves are pinned: the node lives on, AND the routing state was
+    /// still absorbed and checkpointed.
+    ///
+    /// Mutation checks: restore `set_kad(None)` and the `is_some` assertion
+    /// fails; drop the `absorb_kad_routing` call and the `engine.routing`
+    /// assertion fails (the nodes.dat read-back alone cannot catch that -
+    /// `checkpoint` unions the live table itself, which is why both seams are
+    /// asserted).
+    #[tokio::test]
+    async fn pause_for_seeding_keeps_the_kad_node_and_still_persists_its_table() {
+        let dir = tmp("seed-keeps-kad");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+        engine.state = EngineState::Running;
+
+        // A live node holding one contact the persisted table has never seen.
+        let learned = KadContact {
+            id: Kad128::from_hash(&[0x6B; 16]),
+            ip: 0x0808_0404,
+            udp_port: 4672,
+            tcp_port: 4662,
+            version: 8,
+            udp_key: 0,
+            udp_key_ip: 0,
+            verified: true,
+        };
+        let node = KadNode::bind("127.0.0.1:0".parse().unwrap(), 4662)
+            .await
+            .unwrap();
+        node.with_routing(|t| t.load_nodes(std::slice::from_ref(&learned)));
+        engine.kad = Some(node);
+        assert!(
+            !engine.routing.contains(&learned.id),
+            "precondition: the contact is live-table-only"
+        );
+
+        engine.pause_for_seeding().await;
+        assert_eq!(engine.state(), EngineState::Seeding);
+        assert!(
+            engine.kad.is_some(),
+            "seeding dropped the Kad node - publishing idles for the whole \
+             session and the serve loop stops answering (decided 2026-08-09: \
+             keep it)"
+        );
+        assert!(
+            engine.routing.contains(&learned.id),
+            "the live table was not absorbed on the way in - a jetsam kill \
+             would forget what the session learned"
+        );
+        let nd = read_nodes_dat(&std::fs::read(dir.join("nodes.dat")).unwrap()).unwrap();
+        assert!(
+            nd.contacts.iter().any(|c| c.id == learned.id),
+            "the seeding boundary must still checkpoint nodes.dat - jetsam \
+             gives no warning"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Coming back from a seed whose Kad node SURVIVED must not start a second
+    /// one: `start_kad` binds a fresh socket and reseeds from one bootstrap, so
+    /// an unconditional call would either fail its bind (a spurious error
+    /// event) or replace a live table with a bootstrap-sized one. The engine
+    /// holds no routable contact here, so a `start_kad` that runs at all
+    /// announces itself with "no Kad contacts to bootstrap" - the seam both
+    /// arms assert on. Arm 2 proves the guard is `is_none`, not `state`: a
+    /// seed ENTERED without a node must still get one back on resume.
+    ///
+    /// Mutation checks: make `resume_from_seeding` call `start_kad`
+    /// unconditionally and arm 1 fails on the event; make it never call
+    /// `start_kad` and arm 2 fails.
+    #[tokio::test]
+    async fn resume_from_seeding_rebuilds_kad_only_when_the_node_is_gone() {
+        let dir = tmp("seed-resume-kad");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut engine, mut rx) = Engine::new(&dir).unwrap();
+        engine.state = EngineState::Running;
+        let node = KadNode::bind("127.0.0.1:0".parse().unwrap(), 4662)
+            .await
+            .unwrap();
+        engine.kad = Some(node);
+
+        engine.pause_for_seeding().await;
+        assert!(
+            engine.kad.is_some(),
+            "precondition: the node survived the seed"
+        );
+        let _ = drain(&mut rx).await;
+
+        engine.resume().await;
+        assert_eq!(engine.state(), EngineState::Running);
+        assert!(engine.kad.is_some(), "resume must keep the surviving node");
+        let evs = drain(&mut rx).await;
+        assert!(
+            !evs.iter().any(
+                |e| matches!(e, EngineEvent::Server(s) if s == "no Kad contacts to bootstrap")
+            ),
+            "resume ran start_kad against a LIVE node - that rebinds or \
+             replaces the socket; got {evs:?}"
+        );
+
+        // Arm 2: a seed entered WITHOUT a node still gets one back on resume.
+        engine.pause_for_seeding().await;
+        engine.kad = None; // as after a failed bind, or an offline entry
+        let _ = drain(&mut rx).await;
+        engine.resume().await;
+        let evs = drain(&mut rx).await;
+        assert!(
+            evs.iter().any(
+                |e| matches!(e, EngineEvent::Server(s) if s == "no Kad contacts to bootstrap")
+            ),
+            "with the node gone, resume must run start_kad (its empty-table \
+             complaint is the proof it ran); got {evs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Kad publishing ACTUALLY RUNS while seeding, now that the node survives
+    /// (the gate test above pins only admission). Reached through the REAL
+    /// boundary - `pause_for_seeding` - with a shared file due, a live node
+    /// holding one silent loopback contact, and the cadence back-dated: the
+    /// duty must get past the state gate, the sharing gate AND the
+    /// Kad-availability guard, and POP a real job. The popped job is observed
+    /// on the stats counter, which by its own rule advances only when a job
+    /// is consumed. The walk then sends one FIND_NODE at the silent peer and
+    /// gives up at its per-query deadline - offline, bounded, no egress.
+    ///
+    /// Mutation check: restore `set_kad(None)` in `pause_for_seeding` and this
+    /// fails on the jobs count (the availability guard idles the pass).
+    #[tokio::test]
+    async fn kad_publishing_pops_a_real_job_while_seeding() {
+        let dir = tmp("seed-publishes");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+        engine.state = EngineState::Running;
+        engine.set_sharing(true);
+        engine.shared.lock().await.push(SharedFile {
+            hash: [0xC4; 16],
+            size: 10,
+            name: b"ubuntu iso image.bin".to_vec(),
+            part_hashes: vec![],
+            path: dir.join("ubuntu iso image.bin"),
+            rating: 0,
+            comment: String::new(),
+            aich_root: None,
+        });
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let peer_ip = match peer_addr.ip() {
+            IpAddr::V4(v) => u32::from(v),
+            IpAddr::V6(_) => unreachable!("bound v4 above"),
+        };
+        let node = KadNode::bind("127.0.0.1:0".parse().unwrap(), 4662)
+            .await
+            .unwrap();
+        node.with_routing(|t| {
+            t.add(
+                Kad128::from_hash(&[0x21; 16]),
+                peer_ip,
+                peer_addr.port(),
+                4662,
+                8,
+                true,
+            )
+        });
+        engine.kad = Some(node);
+
+        engine.pause_for_seeding().await;
+        assert_eq!(engine.state(), EngineState::Seeding);
+
+        // Held across the measurement per STATS_TEST_LOCK's rule.
+        let _stats = crate::stats::STATS_TEST_LOCK.lock();
+        let (jobs0, _) = crate::stats::kad_publish_counts();
+        engine.last_kad_publish = Instant::now() - KAD_PUBLISH_EVERY * 2;
+        engine.maintain_kad_publish().await;
+        let (jobs1, _) = crate::stats::kad_publish_counts();
+        assert_eq!(
+            jobs1,
+            jobs0 + 1,
+            "while Seeding with a live node and due work, the duty must pop a \
+             real publish job - not idle at the availability guard"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE MAINTENANCE SPLIT WHILE SEEDING (decided 2026-08-09, reasoning at
+    /// the two gates): the liveness sweep KEEPS running - a node that serves
+    /// and publishes for hours is exactly the one that accumulates dead
+    /// contacts, and the sweep is the only thing that removes them - while
+    /// the growth refresh stays Running-only, because it buys search breadth
+    /// a seeding session never uses at the largest lock+battery cost of the
+    /// Kad duties. Both stamps sit past their state gates, so each arm is a
+    /// direct read on its gate.
+    ///
+    /// Mutation checks: make the sweep's gate Running-only again and arm 1
+    /// fails; admit Seeding in `maintain_kad`'s gate and arm 2 fails.
+    #[tokio::test]
+    async fn while_seeding_the_liveness_sweep_runs_and_the_growth_refresh_does_not() {
+        let dir = tmp("seed-maint-split");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+        engine.state = EngineState::Seeding;
+
+        let old = Instant::now() - KAD_SWEEP_EVERY * 2;
+        engine.last_kad_sweep = old;
+        engine.maintain_kad_liveness().await;
+        assert!(
+            engine.last_kad_sweep > old,
+            "the liveness sweep must keep running while Seeding - a node that \
+             serves and publishes for hours most needs to shed its dead"
+        );
+
+        let old = Instant::now() - KAD_REFRESH_EVERY * 2;
+        engine.last_kad_refresh = old;
+        engine.maintain_kad().await;
+        assert_eq!(
+            engine.last_kad_refresh, old,
+            "the growth refresh is Running-only on purpose: it buys search \
+             breadth a seeding session never uses, at the largest lock+battery \
+             cost of the Kad duties"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
