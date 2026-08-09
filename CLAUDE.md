@@ -90,9 +90,10 @@ Details: `docs/wiki/decisions-and-lessons.md`, `docs/wiki/ref-source-trees.md`,
   70-minute soak at a flat ~32MB. Background DOWNLOADING stays unbuilt on purpose.
   [CORRECTED 2026-08-09 (build-progress 8dh): Kad is NO LONGER dropped on the way
   in - the node survives a seed (liveness sweep runs; growth refresh stays
-  Running-only); the soak with Kad kept up is still owed, since the 32MB figure
-  was measured without a Kad node.] Clean pause/resume is still required, because
-  jetsam can end a seed at any moment.
+  Running-only); the soak with Kad kept up PASSED the same day (row 8dl):
+  72.5 minutes, 65/65 samples alive, a ~51MB plateau against the ~100MB jetsam
+  budget, publishing continuing through the seed.] Clean pause/resume is still
+  required, because jetsam can end a seed at any moment.
 - The engine/UI seam is in-process FFI (`crates/mule-ffi`); the EC protocol is
   deferred entirely.
 
