@@ -248,15 +248,14 @@ const KAD_MAINTENANCE_BUDGET: Duration = Duration::from_secs(3);
 /// converges, and a foreground-only client on a tablet should not keep paying
 /// UDP for contacts it will never use.
 ///
-/// NOTE what this guard does NOT do, corrected 2026-08-06: it used to claim
-/// "Refresh resumes if the table shrinks", and the table cannot shrink -
-/// `RoutingTable` has no removal path anywhere, because padMule implements
-/// eMule's `OnBigTimer` random lookup but not its `OnSmallTimer` contact expiry
-/// and liveness ping. So once a live table reaches this ceiling, maintenance is
-/// off for the rest of that session even if most of those contacts are dead.
-/// Tolerable only because the live table is rebuilt on every `start_kad` and a
-/// foreground session rarely gets there; it stops being tolerable the day
-/// contact expiry lands. [[kad-routing-lifecycle]].
+/// NOTE, re-corrected 2026-08-09: the 2026-08-06 note here said the table
+/// cannot shrink - `RoutingTable` had no removal path, so a table at this
+/// ceiling kept its dead contacts for the session. TRUE THEN, FALSE SINCE
+/// rows 8cw/8cx landed the `OnSmallTimer` half: `RoutingTable::remove` and
+/// `sweep` exist, and `maintain_kad_liveness` probes-and-evicts every 60s.
+/// "Refresh resumes if the table shrinks" is therefore real again: a live
+/// table that loses contacts to the sweep drops below this target and
+/// `maintain_kad` picks growth back up on its own. [[kad-routing-lifecycle]].
 const KAD_TABLE_TARGET: usize = 600;
 
 /// DIALABLE sources a server answer must carry before `find_sources` skips the
@@ -382,8 +381,11 @@ fn apply_search_filters(mut ranked: Vec<RankedFile>, filters: &SearchFilters) ->
 const SERVE_PEEK: Duration = Duration::from_secs(3);
 
 /// The most simultaneous uploads we grant. Modest by desktop standards (aMule
-/// floors at 20) because an iPad on a phone uplink is not a seedbox; a peer that
-/// finds us full is answered "no file" and moves on rather than swamping us.
+/// floors at 20) because an iPad on a phone uplink is not a seedbox. A peer
+/// that finds every slot taken is not refused: the `UploadGate` queues it by
+/// credit score and answers OP_QUEUERANKING, exactly the standard wait-line
+/// behaviour. The only true refusal is a FULL QUEUE (`UPLOAD_QUEUE_CAP`),
+/// which is dropped silently - no packet - matching upstream.
 const MAX_UPLOAD_SLOTS: usize = 8;
 /// How many peers may wait for a slot before we decline further requests. A
 /// small cap is honest for a foreground-only client (eMule's desktop default is
@@ -400,6 +402,22 @@ const MAX_INBOUND_CONNS: usize = 200;
 /// an honest peer opens only a handful of sockets to us, so this never cuts off a
 /// real client - and a rejected connection is retryable.
 const MAX_INBOUND_PER_IP: u32 = 16;
+
+/// Which registry rows a called-back source may DRIVE: the one admission rule
+/// (`multi_source::queued_flags`, same `(paused, complete)` rows in add order)
+/// composed with the paused/complete skip the sweeps already apply. The
+/// listener's `InboundKind::Source` arm used to iterate every registered
+/// download with neither check, so a row the UI reported as "Queued" (or
+/// paused) transferred whenever a LowID source dialed back - the callback path
+/// was a hole in the cap. Pinned by its own test because the listener seam
+/// (a real silent inbound connection) is not exercised offline.
+fn callback_drive_flags(cap: u32, rows: &[(bool, bool)]) -> Vec<bool> {
+    let queued = crate::multi_source::queued_flags(cap, rows);
+    rows.iter()
+        .zip(queued)
+        .map(|(&(paused, complete), q)| !paused && !complete && !q)
+        .collect()
+}
 /// Total wall-clock budget for the resume-fetch pass in `start()`, and the
 /// per-download cap on source-finding within it. Small so a batch of dead
 /// downloads cannot stall startup (which holds the FFI engine lock).
@@ -436,10 +454,13 @@ const ADD_SOURCES_BUDGET: Duration = Duration::from_secs(15);
 /// carries a 15s budget of its own - so Kad could NEVER contribute to a retry.
 /// A download whose sources dried up was getting a truncated 2s hunt.
 ///
-/// 8s lets the server arm finish and gives Kad a real chance, while staying
-/// under `ADD_SOURCES_BUDGET`. It is still bounded because `heartbeat()` does
-/// hold the engine lock, and `pause()` waits behind it - which on iPadOS must
-/// stay prompt.
+/// 6s lets the server arm finish and gives Kad a real chance, while staying
+/// under `ADD_SOURCES_BUDGET`. (This line said 8s while the constant shipped
+/// at 6 - reconciled 2026-08-09 to the constant, whose value the
+/// `RESUME_RETRY_DUTY` arithmetic below is derived from: a x4 floor is a 24s
+/// gap, ~25% occupancy, and a ~3.6-minute rotation at a queue of 9.) It is
+/// still bounded because `heartbeat()` does hold the engine lock, and
+/// `pause()` waits behind it - which on iPadOS must stay prompt.
 const RESUME_RETRY_BUDGET: Duration = Duration::from_secs(6);
 
 /// Base cadence, DIVIDED by how many downloads are idle (clamped), so a big
@@ -1567,7 +1588,7 @@ pub struct Engine {
     /// Status scalars mirrored for lock-free reads - see [`StatusPub`].
     status: StatusPub,
     /// Set when the shared library grows mid-session (a download finishing), so
-    /// the next downloads() poll re-announces it to the server (OP_OFFERFILES).
+    /// the next heartbeat() re-announces it to the server (OP_OFFERFILES).
     /// Cloned into each download's completion task, which has no path to `server`.
     shared_dirty: Arc<AtomicBool>,
     /// Servers a connected server advertised via OP_SERVERLIST, awaiting merge
@@ -2204,6 +2225,7 @@ impl Engine {
         let identity = Arc::clone(&self.identity.rsa);
         let credit_store = Arc::clone(&self.credit_store);
         let downloads = Arc::clone(&self.downloads);
+        let max_active = Arc::clone(&self.max_active);
         let shared = Arc::clone(&self.shared);
         let sharing = Arc::clone(&self.sharing);
         let gate = Arc::clone(&self.upload_gate);
@@ -2245,6 +2267,7 @@ impl Engine {
                 let identity = Arc::clone(&identity);
                 let credit_store = Arc::clone(&credit_store);
                 let downloads = Arc::clone(&downloads);
+                let max_active = Arc::clone(&max_active);
                 let shared = Arc::clone(&shared);
                 let sharing = Arc::clone(&sharing);
                 let gate = Arc::clone(&gate);
@@ -2387,13 +2410,33 @@ impl Engine {
                         // Do NOT hold the lock across the transfer.
                         InboundKind::Source => {
                             let pending: Vec<Arc<Download>> = downloads.lock().await.clone();
-                            for dl in pending {
+                            // The one admission rule, applied HERE too: a row
+                            // the UI reports as Queued (or paused) must not be
+                            // driven by a dial-back. This arm used to skip only
+                            // complete/banned rows, so a queued download
+                            // transferred while its row said "Queued" - the
+                            // callback path bypassed the max-active cap
+                            // entirely (multi_source.rs's contract: queued rows
+                            // are "NOT driven").
+                            let mut rows = Vec::with_capacity(pending.len());
+                            for d in &pending {
+                                rows.push((d.is_paused(), d.is_complete().await));
+                            }
+                            let cap = max_active.load(Ordering::Relaxed);
+                            let drive = callback_drive_flags(cap, &rows);
+                            for (dl, may_drive) in pending.iter().zip(drive) {
                                 // Skip a download this source is BANNED from (it
                                 // fed us a corrupt part before). Without this a LowID
                                 // poisoner - which only ever reaches us by callback -
                                 // could re-poison indefinitely; the outbound sweep's
                                 // guard alone never sees it.
                                 if dl.is_complete().await || dl.is_banned(&peer) {
+                                    continue;
+                                }
+                                // Queued/paused: not driven. (take_blocks would
+                                // starve a paused row anyway, but skipping here
+                                // is honest and saves the pointless session.)
+                                if !may_drive {
                                     continue;
                                 }
                                 // RECORD IT. Only the outbound sweep called
@@ -2442,7 +2485,7 @@ impl Engine {
                                 crate::stats::note_inbound();
                                 match timeout(
                                     Duration::from_secs(120),
-                                    download_from_peer_at(&mut fs, &dl, false, Some(peer), session),
+                                    download_from_peer_at(&mut fs, dl, false, Some(peer), session),
                                 )
                                 .await
                                 {
@@ -3102,11 +3145,15 @@ impl Engine {
             if asks.is_empty() {
                 break;
             }
-            // The ipfilter gates who we SEND to, not merely what we keep: a
-            // blocked address must receive nothing at all. HOST ORDER for the
-            // consult - the raw met u32 is byte-REVERSED relative to the
-            // ranges `is_blocked_u32` holds, so passing it straight through
-            // asked every blocklisted server anyway (the same trap
+            // THIS CRAWL's ipfilter stance: it gates who we SEND to, not
+            // merely what we keep - a blocked address gets no datagram from
+            // here. Stated for this path only, not as an engine-wide rule:
+            // probe_server_list and global_udp_search deliberately fan out
+            // unfiltered and vet at INGESTION instead (a recorded open
+            // decision, not an oversight). HOST ORDER for the consult - the
+            // raw met u32 is byte-REVERSED relative to the ranges
+            // `is_blocked_u32` holds, so passing it straight through asked
+            // every blocklisted server anyway (the same trap
             // `merge_discovered_servers` carried until 2026-08-08; this was
             // the third site).
             let targets: Vec<SocketAddr> = asks
@@ -3340,7 +3387,7 @@ impl Engine {
             .collect();
         // Bounded + best-effort: a stalled write must NOT hang connect/resume, and
         // a rejected offer is not fatal. 4s (not 10s) because this runs UNDER the
-        // shared engine lock via the 1s downloads() heartbeat, so it also caps how
+        // shared engine lock via the 1s heartbeat(), so it also caps how
         // long a re-offer can delay pause()'s socket teardown - iPadOS only grants
         // ~5s to background before it kills us.
         let _ = timeout(
@@ -3351,18 +3398,18 @@ impl Engine {
     }
 
     /// Re-announce the shared library to the server after a mid-session change.
-    /// A download finishing sets `shared_dirty`; the 1s downloads() poll calls
+    /// A download finishing sets `shared_dirty`; the 1s heartbeat() calls
     /// this, so a file that completes while we are connected becomes findable
     /// within about a second instead of only after the next reconnect.
     ///
     /// Cheap: a no-op unless the library actually changed. `swap` clears the flag
     /// up front, so a completion that lands DURING the offer re-arms it for the
-    /// next poll (no lost update). While offline nothing is lost either: a
+    /// next beat (no lost update). While offline nothing is lost either: a
     /// reconnect re-offers the whole current library via `connect_server`.
     pub async fn maintain_shares(&mut self) {
         // Peek WITHOUT clearing: if we cannot actually offer (no server, or the
         // link is paused/disconnected) the flag must stay raised so a later
-        // connected poll still announces the file. Clearing it here would strand
+        // connected beat still announces the file. Clearing it here would strand
         // the file for the session - resume()'s success fast-path does not
         // re-offer, only a full connect_server does.
         if !self.shared_dirty.load(Ordering::Relaxed) {
@@ -3883,13 +3930,18 @@ impl Engine {
         // discarded; without them a row with no bytes cannot say whether nothing
         // was found or plenty was found and none of it was reachable.
         dl.note_source_pool(reg.sources().len(), lowids.len());
-        self.request_callbacks(&lowids).await;
         if queued {
+            // Deliberately NO request_callbacks here: a callback poked now
+            // solicits LowID dial-backs for a row the listener will refuse to
+            // drive (callback_drive_flags), so it would only spend the
+            // server's goodwill and the peers' dials. The retry sweep re-runs
+            // source discovery - callbacks included - when a slot frees.
             let _ = self.events.send(EngineEvent::Status(format!(
                 "'{name}' queued - at the max-active download cap"
             )));
             return AddResult::Started;
         }
+        self.request_callbacks(&lowids).await;
         self.spawn_fetch(dl, hash, size, name, reg.sources().to_vec());
         AddResult::Started
     }
@@ -4457,9 +4509,12 @@ impl Engine {
     /// so a client that only ever takes is one every queue puts last.
     ///
     /// KAD IS DROPPED DELIBERATELY, not overlooked. Nothing about serving needs
-    /// it: peers find us through the server's index and through source exchange,
-    /// and padMule publishes nothing to Kad anyway. Keeping a UDP node alive to
-    /// answer nobody would spend battery for no one's benefit.
+    /// it: peers find us through the server's index and through source exchange.
+    /// Kad PUBLISHING (row 8de) pauses with the node - `maintain_kad_publish`
+    /// consumes nothing without a live Kad node - and the records already
+    /// published simply expire on eMule's own 5h/24h clocks at the storing
+    /// nodes, which is the honest foreground-publisher story. Keeping a UDP
+    /// node alive against that would spend battery for little benefit.
     ///
     /// THIS ONLY MEANS ANYTHING UNDER AN AUDIO KEEPALIVE. Without one iOS
     /// suspends the process seconds later and every socket here dies with it -
@@ -4831,27 +4886,9 @@ impl Engine {
         true
     }
 
-    /// Refresh the Kad routing table: one bounded lookup toward a RANDOM target,
-    /// which pulls in every contact the answering nodes name.
-    ///
-    /// This is the maintenance padMule never had. Without it the table was fed
-    /// only by the bootstrap and by whatever a source lookup or keyword search
-    /// happened to walk past, so it neither grew on purpose nor shed the dead -
-    /// and Kad keyword search, whose quality is a direct function of how broad
-    /// and well-spread that table is, stayed correspondingly thin. Both
-    /// authorities run the equivalent on a timer (eMule
-    /// `CRoutingZone::OnBigTimer`, aMule RoutingZone.cpp).
-    ///
-    /// A RANDOM target rather than our own ID on purpose: a self-lookup only
-    /// ever deepens the region we already know best, while the keyspace a
-    /// keyword search lands in is uniform. Successive random targets walk the
-    /// whole space, which is the same effect eMule gets by refreshing each bin
-    /// in turn.
-    ///
-    /// Returns contacts gained, for the caller's log and for tests.
     /// THE `OnSmallTimer` HALF of Kad maintenance, which padMule did not have
     /// until 2026-08-08: age contacts, probe the oldest due one in each bin,
-    /// and REMOVE whoever failed to answer. `maintain_kad` above is the
+    /// and REMOVE whoever failed to answer. `maintain_kad` below is the
     /// `OnBigTimer` half (a random-target lookup that GROWS the table); this is
     /// the half that shrinks it, and without it nothing was ever removed - a
     /// contact whose IP changed stayed as a lookup seed for the node's life and
@@ -4905,10 +4942,18 @@ impl Engine {
     /// decision to build a foreground-only publisher (records age out when we
     /// stop, so a publisher that vanishes leaves nothing stale for long).
     ///
-    /// Runs while RUNNING or SEEDING (seeding is exactly when we want peers to
-    /// find us) and only while SHARING is on. SOURCE records need a reachable
-    /// address, so they are gated on a known public identity (HighID);
-    /// KEYWORD records make no reachability claim and publish either way.
+    /// Runs while RUNNING or SEEDING and only while SHARING is on. The state
+    /// gate ADMITS Seeding, but today that arm idles: `pause_for_seeding`
+    /// drops the Kad node on the way in, so while seeding `self.kad` is None
+    /// and the availability guard below returns before anything is stamped or
+    /// consumed. That is the honest foreground-publisher story - publishing
+    /// pauses with Kad and the records age out on their own 5h/24h clocks at
+    /// the storing nodes. Seeding stays in the gate because it is harmless
+    /// and becomes correct the day Kad is kept up while seeding (an open
+    /// design question for the handoff, not decided here). SOURCE records
+    /// need a reachable address, so they are gated on a known public identity
+    /// (HighID); KEYWORD records make no reachability claim and publish
+    /// either way.
     ///
     /// Returns how many nodes stored this job's record (0 when nothing was due).
     pub async fn maintain_kad_publish(&mut self) -> usize {
@@ -4920,6 +4965,16 @@ impl Engine {
         }
         if self.last_kad_publish.elapsed() < KAD_PUBLISH_EVERY {
             return 0;
+        }
+        // KAD AVAILABILITY, checked BEFORE the cadence stamp and the refill.
+        // `refill` stamps the republish clocks AT ENQUEUE, so a pass that
+        // cannot publish must consume nothing: with these guards after the
+        // stamp/refill/pop (as first shipped), a seeding session - which
+        // always has `kad: None` - burned its whole due set at one job per
+        // 10s, marked "published", and nothing republished for up to 5h/24h
+        // after returning to Running.
+        if self.kad.as_ref().is_none_or(|k| k.contacts_known() == 0) {
+            return 0; // no node, or nothing to walk from - bootstrap first
         }
         self.last_kad_publish = Instant::now();
 
@@ -4948,16 +5003,20 @@ impl Engine {
         let Some(job) = self.publish_schedule.take_next() else {
             return 0;
         };
+        // A job is popped - schedule state is consumed whatever happens next -
+        // so THIS is the point that counts as a publish JOB on the Stats
+        // panel. The gated and idle passes above count nothing, so the panel's
+        // "0 jobs" reads "the duty never ran a job", which is the truth.
+        crate::stats::note_kad_publish_job();
 
         let our_kad_id = self.identity.kad_id;
         let tcp_port = self.advertised_port;
         let udp_port = self.kad_advertised_port;
+        // Availability was checked before the stamp; this re-borrow is only
+        // for the &mut the publish calls need (nothing between can drop it).
         let Some(kad) = self.kad.as_mut() else {
             return 0;
         };
-        if kad.contacts_known() == 0 {
-            return 0; // nothing to walk from - bootstrap has to land first
-        }
 
         let stored = match job {
             crate::kad_publish::PublishJob::Source(hash) => {
@@ -5003,9 +5062,30 @@ impl Engine {
         };
         // A timed-out publish is best-effort partial work, not an error; the
         // record republishes on its clock regardless.
-        stored.unwrap_or(Ok(0)).unwrap_or(0)
+        let stored = stored.unwrap_or(Ok(0)).unwrap_or(0);
+        crate::stats::note_kad_publish_stored(stored as u64);
+        stored
     }
 
+    /// Refresh the Kad routing table: one bounded lookup toward a RANDOM target,
+    /// which pulls in every contact the answering nodes name (the `OnBigTimer`
+    /// half; `maintain_kad_liveness` above is the half that shrinks).
+    ///
+    /// This is the maintenance padMule never had. Without it the table was fed
+    /// only by the bootstrap and by whatever a source lookup or keyword search
+    /// happened to walk past, so it neither grew on purpose nor shed the dead -
+    /// and Kad keyword search, whose quality is a direct function of how broad
+    /// and well-spread that table is, stayed correspondingly thin. Both
+    /// authorities run the equivalent on a timer (eMule
+    /// `CRoutingZone::OnBigTimer`, aMule RoutingZone.cpp).
+    ///
+    /// A RANDOM target rather than our own ID on purpose: a self-lookup only
+    /// ever deepens the region we already know best, while the keyspace a
+    /// keyword search lands in is uniform. Successive random targets walk the
+    /// whole space, which is the same effect eMule gets by refreshing each bin
+    /// in turn.
+    ///
+    /// Returns contacts gained, for the caller's log and for tests.
     pub async fn maintain_kad(&mut self) -> usize {
         if self.state != EngineState::Running || self.offline {
             return 0;
@@ -5076,7 +5156,7 @@ impl Engine {
     /// is actually delivered first. So the platform, not the protocol, is the
     /// reason - and nothing here touches the wire or the file FORMAT.
     ///
-    /// Driven by the same 1s `downloads()` heartbeat as the other background
+    /// Driven by the same 1s `heartbeat()` as the other background
     /// duties, and gated on elapsed time so all but one call in 300 is a clock
     /// comparison.
     pub async fn maintain_checkpoint(&mut self) {
@@ -5316,6 +5396,22 @@ mod tests {
             "a refresh pass can cost {structural:?} against a {KAD_MAINTENANCE_BUDGET:?} \
              deadline, so the heartbeat cuts maintenance off part-way every time - \
              REFRESH_DEADLINE_QUERIES / KAD_PER_QUERY grew past the budget"
+        );
+    }
+
+    /// The publish twin of the pin above, for the same inversion: the publish
+    /// walks shipped with `LOOKUP_DEADLINE_QUERIES` (16 x 750ms = 12s
+    /// structural) inside a 3s `KAD_PUBLISH_BUDGET`, so every publish ran to
+    /// the OUTER cancellation under the engine lock instead of terminating on
+    /// its own deadline. The walk's deadline must stay inside the budget.
+    #[test]
+    fn a_kad_publish_walk_fits_inside_its_budget() {
+        let structural = KAD_PER_QUERY * crate::kad_live::PUBLISH_DEADLINE_QUERIES;
+        assert!(
+            structural <= KAD_PUBLISH_BUDGET,
+            "a publish walk can cost {structural:?} against a {KAD_PUBLISH_BUDGET:?} \
+             budget, so the outer timeout cancels every publish part-way - \
+             PUBLISH_DEADLINE_QUERIES / KAD_PER_QUERY grew past the budget"
         );
     }
 
@@ -6429,21 +6525,24 @@ mod tests {
     /// refuses to record the client id in any user-visible text.
     /// The publish duty is GATED: it runs nothing while stopped, while paused,
     /// or while sharing is off - the same "only when we mean it" discipline the
-    /// seeding/VPN work follows. Offline (no Kad, no network), so a passing gate
-    /// returns 0 without doing I/O; the point is that the gate SHORT-CIRCUITS,
-    /// which we prove by watching `last_kad_publish` NOT advance when gated and
-    /// advance when open.
+    /// seeding/VPN work follows. The open arms give the engine a real (loopback)
+    /// Kad node holding one seeded contact, because Kad availability now gates
+    /// BEFORE the cadence stamp; with no shared files the duty then stamps,
+    /// finds nothing due and returns 0 without any I/O. The gate is proven by
+    /// watching `last_kad_publish` NOT advance when gated and advance when open.
     #[tokio::test]
     async fn the_publish_duty_runs_only_while_running_or_seeding_and_sharing() {
         let dir = tmp("kad-publish-gate");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let (mut engine, _rx) = Engine::new(&dir).unwrap();
-        // NOT offline: `offline` is its own gate (checked with the state), and
-        // setting it would make even the open case return early before the
-        // cadence stamp. The engine was never started, so there is no Kad node
-        // and no network - the duty reaches its scheduler and returns 0 at the
-        // `kad.as_mut()` guard, which is all this gate test needs.
+
+        // Every pass below is gated or idle (nothing is ever shared), so the
+        // publish JOBS counter must not move across the whole test - a job is
+        // counted only when one is actually popped. Held across the
+        // measurement per STATS_TEST_LOCK's rule.
+        let _stats = crate::stats::STATS_TEST_LOCK.lock();
+        let (jobs0, _) = crate::stats::kad_publish_counts();
 
         // Stopped: gated. Back-date the cadence so only the STATE gate can stop
         // it, and confirm the clock did not advance (the duty returned early).
@@ -6462,8 +6561,26 @@ mod tests {
         engine.maintain_kad_publish().await;
         assert_eq!(engine.last_kad_publish, old, "Leech Mode publishes nothing");
 
+        // A live node with one contact, so the availability guard passes and
+        // the open arms reach the cadence stamp. No shared files, so no job is
+        // ever built and nothing goes out the socket.
+        let mut node = KadNode::bind("127.0.0.1:0".parse().unwrap(), 4662)
+            .await
+            .unwrap();
+        node.seed_routing(&[KadContact {
+            id: Kad128::from_hash(&[0x42; 16]),
+            ip: 0x0808_0404, // routable public, so the gated insert keeps it
+            udp_port: 4672,
+            tcp_port: 4662,
+            version: 8,
+            udp_key: 0,
+            udp_key_ip: 0,
+            verified: true,
+        }]);
+        engine.kad = Some(node);
+
         // Running AND sharing: the gate opens (the cadence stamp advances even
-        // though offline means no actual store).
+        // though nothing is shared, so no actual store happens).
         engine.set_sharing(true);
         engine.last_kad_publish = old;
         engine.maintain_kad_publish().await;
@@ -6472,15 +6589,131 @@ mod tests {
             "running + sharing reaches the scheduler"
         );
 
-        // Seeding also counts (that is exactly when we want to be findable).
+        // Seeding is ADMITTED by the state gate. That is all this proves: in
+        // production `pause_for_seeding` drops the Kad node, so the duty idles
+        // while seeding (consuming nothing - see the no-kad test below); the
+        // admission is pinned so publishing works the day a seeding session
+        // keeps its Kad node up.
         engine.state = EngineState::Seeding;
         engine.last_kad_publish = old;
         engine.maintain_kad_publish().await;
         assert!(
             engine.last_kad_publish > old,
-            "seeding publishes too - the whole point of being a good neighbour"
+            "the state gate must admit Seeding (idle today only because \
+             seeding drops the Kad node)"
+        );
+
+        let (jobs1, _) = crate::stats::kad_publish_counts();
+        assert_eq!(
+            jobs0, jobs1,
+            "an idle pass (nothing due) counted a publish job - the panel \
+             would claim publish traffic that never existed"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A pass that CANNOT publish must CONSUME nothing. `refill` stamps the
+    /// 5h/24h republish clocks AT ENQUEUE (kad_publish.rs), so a pass that
+    /// refilled, popped a job and only then noticed there was no Kad node had
+    /// marked work "published" that never left the box - a seeding session
+    /// (which always has `kad: None`, see `pause_for_seeding`) burned its whole
+    /// due set at one job per 10s and nothing republished for up to 5h/24h
+    /// after returning to Running. The Kad-availability guards must run BEFORE
+    /// the cadence stamp and the refill.
+    #[tokio::test]
+    async fn a_publish_pass_without_kad_consumes_no_schedule_state() {
+        let dir = tmp("kad-publish-no-kad");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+        engine.state = EngineState::Running;
+        engine.set_sharing(true);
+        // A shared file whose name yields several keywords, so a burning pass
+        // (refill all, pop one) would leave pending() > 0 - discriminating.
+        engine.shared.lock().await.push(SharedFile {
+            hash: [0xAA; 16],
+            size: 10,
+            name: b"ubuntu iso image.bin".to_vec(),
+            part_hashes: vec![],
+            path: dir.join("ubuntu iso image.bin"),
+            rating: 0,
+            comment: String::new(),
+            aich_root: None,
+        });
+        let old = Instant::now() - KAD_PUBLISH_EVERY * 2;
+        engine.last_kad_publish = old;
+        assert!(engine.kad.is_none(), "precondition: no Kad node");
+        // The publish JOBS counter must not move either: this pass has DUE
+        // work but is gated, and counting a job here would let the Stats
+        // panel claim publish traffic that never left the box. Held across
+        // the measurement per STATS_TEST_LOCK's rule.
+        let _stats = crate::stats::STATS_TEST_LOCK.lock();
+        let (jobs0, _) = crate::stats::kad_publish_counts();
+        engine.maintain_kad_publish().await;
+        let (jobs1, _) = crate::stats::kad_publish_counts();
+        assert_eq!(
+            jobs0, jobs1,
+            "a gated pass (no Kad node) counted a publish job"
+        );
+        assert_eq!(
+            engine.last_kad_publish, old,
+            "no Kad node: the pass did nothing, so the cadence must not stamp"
+        );
+        assert_eq!(
+            engine.publish_schedule.pending(),
+            0,
+            "no Kad node: nothing may be enqueued (refill stamps the clocks)"
+        );
+        // And the republish clocks really were untouched: a refill NOW must
+        // still consider every keyword job due. A burned pass fails this
+        // either way - the queue still holds the un-popped jobs (refill is a
+        // no-op on a non-empty queue), and its clocks read freshly stamped.
+        let words = mule_kad::kad_keywords("ubuntu iso image.bin");
+        engine.publish_schedule.refill(
+            u64::from(now_secs()),
+            &[([0xAA; 16], words.clone())],
+            false,
+        );
+        assert_eq!(
+            engine.publish_schedule.pending(),
+            words.len(),
+            "the clocks were stamped by a pass that published nothing"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A called-back source must not drive a row the UI reports as Queued or
+    /// Paused - the admission decision the listener's `InboundKind::Source`
+    /// arm feeds. DISCLOSED LIMIT: the listener seam itself (a real silent
+    /// inbound connection classified as Source) is not driven offline; this
+    /// pins the decision function, and the arm's use of it is by reading.
+    /// The fixtures discriminate ORDER deliberately (the project's tautology
+    /// lesson): a paused first row must not consume the one slot.
+    #[test]
+    fn a_called_back_source_may_not_drive_queued_or_paused_rows() {
+        // cap 1, add order: active, active, paused, complete. Only the first
+        // active row is admitted; the second is queued and NOT driven.
+        assert_eq!(
+            callback_drive_flags(
+                1,
+                &[(false, false), (false, false), (true, false), (false, true)]
+            ),
+            vec![true, false, false, false],
+            "the second active row is past the cap and must not be driven"
+        );
+        // Ordering discriminator: a PAUSED first row consumes no slot, so the
+        // SECOND row is the admitted one. An implementation that just took
+        // the first row - or ignored the queued flags - fails here.
+        assert_eq!(
+            callback_drive_flags(1, &[(true, false), (false, false), (false, false)]),
+            vec![false, true, false],
+            "a paused row must neither be driven nor consume the slot"
+        );
+        // cap 0 = unlimited: every active row may be driven.
+        assert_eq!(
+            callback_drive_flags(0, &[(false, false), (false, false)]),
+            vec![true, true]
+        );
     }
 
     /// eMule 0.70b `PauseFile`/`ResumeFile` through the ENGINE API: the flag
@@ -8386,11 +8619,13 @@ mod tests {
             "seeding dropped the inbound listener - peers cannot reach us, so \
              there is nothing to seed WITH"
         );
-        // ...and Kad IS dropped, deliberately: nothing about serving needs it.
+        // ...and Kad IS dropped, deliberately: nothing about serving needs it
+        // (publishing pauses with the node and its records age out on their
+        // own clocks - see pause_for_seeding).
         assert!(
             engine.kad.is_none(),
-            "seeding kept the Kad node alive - that is battery spent answering \
-             nobody, since padMule publishes nothing to Kad"
+            "seeding kept the Kad node alive - serving does not need it, and \
+             the publish duty is built to idle without one"
         );
 
         // Coming back is the small path, not the full resume: still one listener.

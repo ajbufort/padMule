@@ -134,8 +134,8 @@ funnel! {
 /// was added to catch the second restart-clearable gate - a `fetching` flag that
 /// never clears - and it CANNOT: `note_fetch_busy` sits on `spawn_fetch`'s
 /// refusal branch, but every caller already filters `!is_fetching()` before it
-/// gets there (`resume_fetches` engine.rs:3641, `maintain_resume_fetches`
-/// :4133, and `add_download` only ever spawns a brand-new download). A download
+/// gets there (engine.rs `resume_fetches` and `maintain_resume_fetches`, and
+/// `add_download` only ever spawns a brand-new download). A download
 /// whose flag is stuck is EXCLUDED by those filters and never reaches the
 /// counter, so the line reads 0 in exactly the case it was built to name. What
 /// it does count is the rare genuine race between the filter and the spawn,
@@ -149,7 +149,7 @@ funnel! {
 /// moves on the Transfers screen is the stuck flag, visible at last.
 ///
 /// Note the standing expectation this is meant to TEST rather than assume:
-/// `FetchGuard` (engine.rs:716) releases the claim on any task exit including
+/// `FetchGuard` (engine.rs) releases the claim on any task exit including
 /// unwind, and `download_file` is bounded on every axis, so a stuck flag should
 /// be unreachable. That is an argument, not a measurement, and this is the
 /// measurement.
@@ -210,10 +210,12 @@ pub fn note_unexpected(opcode: u8) {
 ///
 /// IT ANSWERED THAT, AND IS NOW CENSORED BY ITS OWN ANSWER. The device reading
 /// (313 of 315 successful handshakes under 10s, one at 5-10s, two at 20-45s) set
-/// `fetch::CONNECT_TIMEOUT` to 10s - so no dial can now last longer than that,
-/// and every bucket above 10s is structurally dead. A future "20-45s: 0" is NOT
-/// evidence that a network has no slow tail; it is the cap talking. Re-measuring
-/// on a different path (another VPN exit, cellular) means raising the cap first.
+/// `fetch::CONNECT_TIMEOUT` to 10s - so no dial can now last longer than that.
+/// A dial that hits the cap reports ~10000ms, which is NOT `< 10_000`, so the
+/// 10-20s bucket is where every timed-out dial lands; only the two buckets
+/// above it are structurally dead. A future "20-45s: 0" is NOT evidence that a
+/// network has no slow tail; it is the cap talking. Re-measuring on a different
+/// path (another VPN exit, cellular) means raising the cap first.
 const DIAL_BUCKET_MS: [u64; 6] = [1_000, 2_000, 5_000, 10_000, 20_000, 45_000];
 static DIAL_OK: [AtomicU64; 7] = {
     #[allow(clippy::declare_interior_mutable_const)]
@@ -365,27 +367,51 @@ pub enum KadReqKind {
     Value,
 }
 
-static K_LOOKUPS: AtomicU64 = AtomicU64::new(0);
-static K_FIND_SENT: AtomicU64 = AtomicU64::new(0);
-static K_FIND_ANSWERED: AtomicU64 = AtomicU64::new(0);
-static K_FIND_TIMEOUT: AtomicU64 = AtomicU64::new(0);
-static K_VAL_SENT: AtomicU64 = AtomicU64::new(0);
-static K_VAL_ANSWERED: AtomicU64 = AtomicU64::new(0);
-static K_VAL_TIMEOUT: AtomicU64 = AtomicU64::new(0);
-/// Highest concurrent in-flight request count any lookup reached.
-static K_INFLIGHT_HWM: AtomicU64 = AtomicU64::new(0);
-/// Value lookups that produced at least one result / total ms to the first.
-static K_TTFR_N: AtomicU64 = AtomicU64::new(0);
-static K_TTFR_MS: AtomicU64 = AtomicU64::new(0);
-/// Value lookups that ran to completion / total ms they took.
-static K_DONE_N: AtomicU64 = AtomicU64::new(0);
-static K_DONE_MS: AtomicU64 = AtomicU64::new(0);
-/// THE LIVENESS SWEEP (eMule's `OnSmallTimer`, padMule row 8cw): probes sent,
-/// probes that got a HELLO_RES inside the wait, and contacts removed for
-/// failing their probe window.
-static K_PROBE_SENT: AtomicU64 = AtomicU64::new(0);
-static K_PROBE_ANSWERED: AtomicU64 = AtomicU64::new(0);
-static K_EVICTED: AtomicU64 = AtomicU64::new(0);
+/// Declare the scalar Kad counters AND generate the registry `reset_kad_stats`
+/// iterates from the SAME list - the funnel's macro guarantee (`FUNNEL_REFS`).
+/// The predecessor was a hand-kept `KAD_REFS` list guarded by a test that
+/// pinned its length against a literal, which stayed green in exactly the
+/// failure it named (a new counter declared but never listed). A counter
+/// declared through this macro cannot be forgotten by the reset; the RTT
+/// histogram is the one non-scalar and is chained into the reset as a whole
+/// array (`every_kad_counter_reaches_the_reset` guards the remaining loophole,
+/// a counter declared outside the macro).
+macro_rules! kad_counters {
+    ($($(#[$doc:meta])* $id:ident;)*) => {
+        $($(#[$doc])* static $id: AtomicU64 = AtomicU64::new(0);)*
+        /// Every scalar Kad counter - generated from the declarations above,
+        /// so the registry and the declarations cannot disagree.
+        static KAD_SCALAR_REFS: &[&AtomicU64] = &[$(&$id),*];
+    };
+}
+
+kad_counters! {
+    K_LOOKUPS;
+    K_FIND_SENT;
+    K_FIND_ANSWERED;
+    K_FIND_TIMEOUT;
+    K_VAL_SENT;
+    K_VAL_ANSWERED;
+    K_VAL_TIMEOUT;
+    /// Highest concurrent in-flight request count any lookup reached.
+    K_INFLIGHT_HWM;
+    /// Value lookups that produced at least one result / total ms to the first.
+    K_TTFR_N;
+    K_TTFR_MS;
+    /// Value lookups that ran to completion / total ms they took.
+    K_DONE_N;
+    K_DONE_MS;
+    /// THE LIVENESS SWEEP (eMule's `OnSmallTimer`, padMule row 8cw): probes sent,
+    /// probes that got a HELLO_RES inside the wait, and contacts removed for
+    /// failing their probe window.
+    K_PROBE_SENT;
+    K_PROBE_ANSWERED;
+    K_EVICTED;
+    /// PUBLISHING (the STORE half, row 8de): jobs `maintain_kad_publish`
+    /// actually popped and attempted, and the store acks those jobs earned.
+    K_PUB_JOBS;
+    K_PUB_STORES;
+}
 
 /// Reply-RTT histogram bucket upper bounds (ms); the 7th bucket is ">= last".
 /// Chosen around the deadlines in use (750ms on device, 1400ms in the CLI).
@@ -397,33 +423,6 @@ static K_RTT: [AtomicU64; 7] = {
     const Z: AtomicU64 = AtomicU64::new(0);
     [Z; 7]
 };
-
-/// Every Kad counter, so `reset_kad_stats` cannot miss one - the histogram
-/// buckets included, element by element.
-static KAD_REFS: &[&AtomicU64] = &[
-    &K_LOOKUPS,
-    &K_FIND_SENT,
-    &K_FIND_ANSWERED,
-    &K_FIND_TIMEOUT,
-    &K_VAL_SENT,
-    &K_VAL_ANSWERED,
-    &K_VAL_TIMEOUT,
-    &K_INFLIGHT_HWM,
-    &K_TTFR_N,
-    &K_TTFR_MS,
-    &K_DONE_N,
-    &K_DONE_MS,
-    &K_PROBE_SENT,
-    &K_PROBE_ANSWERED,
-    &K_EVICTED,
-    &K_RTT[0],
-    &K_RTT[1],
-    &K_RTT[2],
-    &K_RTT[3],
-    &K_RTT[4],
-    &K_RTT[5],
-    &K_RTT[6],
-];
 
 /// One liveness probe (a `KADEMLIA2_HELLO_REQ`) went out.
 pub fn note_kad_probe_sent() {
@@ -526,6 +525,17 @@ pub(crate) fn kad_liveness_counts() -> (u64, u64, u64) {
     )
 }
 
+/// Publish counters `(jobs, stores acked)`, for the CALLER tests in engine.rs:
+/// they prove a gated or idle `maintain_kad_publish` pass counts NO job. Read
+/// under `STATS_TEST_LOCK` - process-global, parallel suite.
+#[cfg(test)]
+pub(crate) fn kad_publish_counts() -> (u64, u64) {
+    (
+        K_PUB_JOBS.load(Ordering::Relaxed),
+        K_PUB_STORES.load(Ordering::Relaxed),
+    )
+}
+
 /// A value lookup (keyword / source) finished, `ms` after it started. Refresh
 /// lookups are deliberately not counted here - they have a fixed budget and
 /// would drown the number a search feels.
@@ -534,9 +544,30 @@ pub fn note_kad_value_lookup_done(ms: u64) {
     K_DONE_MS.fetch_add(ms, Ordering::Relaxed);
 }
 
-/// Zero the Kad lookup profile (same reset button as the fetch funnel).
+/// One publish job was actually POPPED from the schedule and attempted
+/// (`Engine::maintain_kad_publish`). Gated and idle passes - stopped, sharing
+/// off, no Kad node, nothing due - count nothing, so a moving number here is
+/// the Stats panel's proof that STORE traffic is being attempted at all,
+/// which is the observable the on-device verify pass reads.
+pub fn note_kad_publish_job() {
+    K_PUB_JOBS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// `n` nodes acked storing a publish job's record. Takes a COUNT because one
+/// job stores toward several nodes, and honestly adds 0 when a thin walk or a
+/// timed-out publish earned no ack.
+pub fn note_kad_publish_stored(n: u64) {
+    if n > 0 {
+        K_PUB_STORES.fetch_add(n, Ordering::Relaxed);
+    }
+}
+
+/// Zero the Kad lookup profile (same reset button as the fetch funnel). The
+/// scalar list is generated by `kad_counters!`, and the RTT histogram is
+/// chained in as a whole array - so neither a new scalar nor a resized
+/// histogram can be missed here.
 pub fn reset_kad_stats() {
-    for c in KAD_REFS {
+    for c in KAD_SCALAR_REFS.iter().copied().chain(K_RTT.iter()) {
         c.store(0, Ordering::Relaxed);
     }
 }
@@ -659,6 +690,20 @@ pub fn kad_report() -> String {
         "in-flight high-water mark",
         K_INFLIGHT_HWM.load(Ordering::Relaxed)
     ));
+    // PUBLISHING (the STORE half, row 8de) - the direct observable for
+    // "publishes are going out", which had none: only the generic value-ask
+    // counters moved. Jobs count only when the scheduler actually POPPED one,
+    // so "0 / 0" means the duty never ran a job (gated, or nothing due), not
+    // that stores are failing; jobs climbing while stores sit at 0 is the
+    // failing-stores reading.
+    let (pj, pst) = (
+        K_PUB_JOBS.load(Ordering::Relaxed),
+        K_PUB_STORES.load(Ordering::Relaxed),
+    );
+    s.push_str(&format!(
+        "    {:<32} {pj:>6} / {pst}\n",
+        "publish jobs / stores acked"
+    ));
     s
 }
 
@@ -716,6 +761,42 @@ mod tests {
         assert!(K_RTT[1].load(Ordering::Relaxed) > b0);
     }
 
+    /// The publish counters (row 8de) must move through their helpers, print
+    /// in the report, and be cleared by the reset - they are the on-device
+    /// observable for "publishes are going out", which had none. Holds the
+    /// lock because it resets and then asserts EXACT values; that is safe
+    /// only because no other test bumps the publish counters (the engine's
+    /// publish tests run gated or with nothing due, and hold this lock too).
+    #[test]
+    fn the_publish_counters_move_print_and_reset() {
+        let _guard = STATS_TEST_LOCK.lock();
+        reset_kad_stats();
+        note_kad_publish_job();
+        note_kad_publish_stored(3);
+        note_kad_publish_stored(0); // a job may honestly store to nobody
+        let (pj, pst) = kad_publish_counts();
+        assert_eq!(
+            (pj, pst),
+            (1, 3),
+            "the note_* helpers must move the counters"
+        );
+        let s = kad_report();
+        let line = s
+            .lines()
+            .find(|l| l.contains("publish jobs / stores acked"))
+            .expect("the publish line must print, or the counters are invisible");
+        assert!(
+            line.trim().ends_with("1 / 3"),
+            "expected 1 job / 3 stores acked, got: {line:?}"
+        );
+        reset_kad_stats();
+        assert_eq!(
+            kad_publish_counts(),
+            (0, 0),
+            "reset must clear the publish counters"
+        );
+    }
+
     /// The in-flight number is a HIGH-WATER MARK: a later, lower reading must
     /// not pull it down.
     #[test]
@@ -730,17 +811,27 @@ mod tests {
         );
     }
 
-    /// Every Kad counter must be in the reset list, or a stale value survives a
-    /// reset -> reproduce -> read cycle and is read as fresh. Same guarantee the
-    /// funnel gets from its macro, made explicit here because these are declared
-    /// by hand: 15 scalars + the 7 RTT buckets.
+    /// Every Kad counter must be cleared by `reset_kad_stats`, or a stale value
+    /// survives a reset -> reproduce -> read cycle and is read as fresh. The
+    /// scalars have that structurally now - `kad_counters!` generates the reset
+    /// registry from the same list as the declarations - and the RTT histogram
+    /// is chained in as a whole array, however long. The predecessor test
+    /// pinned a hand-kept list's length against a literal, which stayed GREEN
+    /// in exactly the failure it named (a new `K_*` static never listed). What
+    /// is left to guard is the macro's one loophole: a counter declared OUTSIDE
+    /// it, which no generated registry can know about. So scan this file's
+    /// source for hand-declared `K_*` statics and pin the count to the one
+    /// intentional case, `K_RTT`.
     #[test]
-    fn the_kad_reset_covers_every_kad_counter() {
+    fn every_kad_counter_reaches_the_reset() {
+        let src = include_str!("stats.rs");
+        // concat!, so the pattern does not count its own occurrence here.
+        let hand_declared = src.matches(concat!("static", " K_")).count();
         assert_eq!(
-            KAD_REFS.len(),
-            22,
-            "a Kad counter was added or removed without updating KAD_REFS, so \
-             reset_kad_stats no longer clears all of them"
+            hand_declared, 1,
+            "a Kad counter static was declared outside kad_counters!, where \
+             reset_kad_stats cannot see it - declare it through the macro (or \
+             chain it into the reset like K_RTT and update this count)"
         );
     }
 
