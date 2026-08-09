@@ -269,4 +269,42 @@ final class SettingsTests: XCTestCase {
             d.integer(forKey: SettingsKey.defaultPriority), 1,
             "new downloads must default to Normal priority")
     }
+
+    /// THE SERVERS LIST CANNOT OUTLIVE THE LOGIN IT REMEMBERS. The real rule
+    /// (`EngineModel.serverRowConnected`, the same call `serverRow` styles by,
+    /// not a copy - the sharingDecision lesson above), which keys the
+    /// connected treatment on the LIVE login instead of the row snapshot's
+    /// probe-time `connected` flag. On glass 2026-08-09: after toolbar
+    /// Stop -> Start the list kept the previous server green + checkmarked
+    /// while Status honestly read "Not connected". HONEST LIMIT: this pins
+    /// the rule, not the wiring - that `serverRow` feeds it `model.state` and
+    /// `model.server?.addr` is only checkable on glass.
+    func testServerRowConnectedDiscriminatesLiveLoginFromStaleSnapshot() {
+        // Genuinely connected: running, and the live login IS this row. The
+        // styling must survive the fix - green when true is as load-bearing
+        // as grey when stale.
+        XCTAssertTrue(
+            EngineModel.serverRowConnected(
+                rowAddr: "192.0.2.1:4661", state: .running, liveServerAddr: "192.0.2.1:4661"))
+        // The on-glass defect, as the helper sees it: Stop -> Start leaves the
+        // engine running with NO live login while the row snapshot still
+        // remembers one. No login, no connected styling - a rule reading the
+        // snapshot flag could not fail this case, because the flag is not an
+        // input at all.
+        XCTAssertFalse(
+            EngineModel.serverRowConnected(
+                rowAddr: "192.0.2.1:4661", state: .running, liveServerAddr: nil),
+            "a remembered identity must not style a row connected after Stop -> Start")
+        // Stopped outright: even a live-login address still lingering through
+        // the ~1s poll lag while shutdown lands must not read connected.
+        XCTAssertFalse(
+            EngineModel.serverRowConnected(
+                rowAddr: "192.0.2.1:4661", state: .stopped, liveServerAddr: "192.0.2.1:4661"),
+            "not Running-and-connected means no row is styled connected")
+        // A row OTHER than the live login stays unstyled - the match is an
+        // identity, not a boolean.
+        XCTAssertFalse(
+            EngineModel.serverRowConnected(
+                rowAddr: "198.51.100.7:4661", state: .running, liveServerAddr: "192.0.2.1:4661"))
+    }
 }

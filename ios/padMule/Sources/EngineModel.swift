@@ -150,12 +150,19 @@ final class EngineModel: ObservableObject {
     /// lock again it jumps to the length of the longest operation, and the number
     /// on screen names the fault instead of hinting at it.
     ///
-    /// SCOPE: it measures gaps between polls that were actually SCHEDULED.
-    /// While background-seeding the fast poll is deliberately skipped 4 ticks
-    /// in 5 (`shouldRunFastPoll`), and a skipped tick clears `lastUiPollAt` -
-    /// otherwise one seeding episode parked this max at ~5s forever, a number
-    /// that named the throttle rather than a fault and poisoned the 1.1s
-    /// device-pass regression bar.
+    /// SCOPE: it measures gaps between SCHEDULED FOREGROUND polls only.
+    /// Suspensions and throttled ticks are excluded BY DESIGN, because this
+    /// number exists to name engine-lock contention - a stall on our own
+    /// queue - not an absence the OS imposed. Two exclusions, each clearing
+    /// the `lastUiPollAt` baseline so the next measured gap starts fresh:
+    /// - a seeding-throttle skip (`shouldRunFastPoll` skips 4 ticks in 5);
+    ///   without its clear, one seeding episode parked this max at ~5s
+    ///   forever - the throttle's number, not a fault's - and poisoned the
+    ///   1.1s device-pass regression bar.
+    /// - the return to foreground (`leaveBackground()`); a suspended process
+    ///   fires no timer at all, so the first post-resume tick would otherwise
+    ///   book the entire suspension (52.0s from a ~52s suspension, on glass
+    ///   2026-08-09) - the same baseline pollution through a different path.
     @Published private(set) var uiPollMaxGapSecs: Double = 0
     private var lastUiPollAt: Date?
     /// How many IP-blocklist ranges are loaded (0 = no ipfilter placed).
@@ -393,6 +400,33 @@ final class EngineModel: ObservableObject {
                 : cmp == .orderedDescending
         }
         return xs
+    }
+
+    /// Should a Servers-list row wear the connected treatment RIGHT NOW?
+    ///
+    /// Keyed on the LIVE login, never on `ServerEntryFfi.connected`: the
+    /// engine stamps that flag when the list is PROBED (probe_server_list
+    /// reads its login once, at probe time), so it is a memory of the last
+    /// probe, not a fact about now - and Stop/Start never re-probe. On glass
+    /// (2026-08-09, build 0c846d1): after toolbar Stop -> Start the list kept
+    /// the previous server's green name + checkmark while the Status screen
+    /// honestly read "Not connected" - one fact in two voices, the drift
+    /// class `serverLabel` exists to prevent. `server` is polled every second
+    /// (refreshFast -> serverInfo, which the engine gates on being online),
+    /// so this answer and the Status screen's come from the SAME measurement
+    /// and cannot disagree. Both addr strings are `SocketAddr` renderings of
+    /// "ip:port", so equality is a real identity match.
+    ///
+    /// `.running` is required too: `.stopped`/`.paused` have no login to
+    /// claim (the engine returns no `serverInfo` then; the state check also
+    /// covers the ~1s poll lag while a shutdown lands), and `.seeding` only
+    /// exists while backgrounded, with no Servers screen on glass. Pure and
+    /// static so the rule is testable without an engine - the
+    /// `TransferRowState` seam pattern (see SettingsTests).
+    static func serverRowConnected(
+        rowAddr: String, state: EngineStateFfi, liveServerAddr: String?
+    ) -> Bool {
+        state == .running && liveServerAddr == rowAddr
     }
 
     @Published var downloadedSortKey: DownloadedSortKey = .date
@@ -1206,7 +1240,31 @@ final class EngineModel: ObservableObject {
 
     /// Returning to the foreground: drop the keepalive before resuming, so the
     /// audio session is not held any longer than the background actually lasted.
+    ///
+    /// This is also where the poll-gap baseline is cleared, because it is the
+    /// ONE point every return to foreground passes through - the scenePhase
+    /// .active arm calls it for the plain-pause path and the seeding path
+    /// alike, so both are covered once, not twice. A suspended process fires
+    /// no timer, so without this the first post-resume tick booked the whole
+    /// suspension into `uiPollMaxGapSecs` (52.0s from a ~52s suspension, on
+    /// glass 2026-08-09) - the seeding-throttle fix's baseline pollution
+    /// through a different path. See the field's SCOPE doc.
+    ///
+    /// NOT UNIT-REACHABLE, stated plainly (the same disclosure the throttle
+    /// clear carries): this is a side effect on private state driven by a
+    /// UIKit lifecycle transition; `PollCadenceTests` pins the pure cadence
+    /// rule, and this clear can only be watched on glass (suspend with
+    /// seeding off, resume, read "Longest poll gap"). KNOWN RESIDUAL RACE,
+    /// accepted: a booking closure already sitting on the main queue when the
+    /// process froze runs BEFORE the resumed scenePhase handler and could
+    /// still book the suspension; the window is one sub-millisecond
+    /// main-queue hop against the suspension instant, and closing it would
+    /// need per-tick schedule timestamps for a case wall-clock time cannot
+    /// distinguish.
     func leaveBackground() {
+        // Cleared BEFORE resume() queues any work, so the first post-resume
+        // poll finds no stale pre-suspension baseline to measure against.
+        lastUiPollAt = nil
         keepAlive.stop()
         resume()
     }

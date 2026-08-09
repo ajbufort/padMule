@@ -1048,8 +1048,18 @@ struct ContentView: View {
     /// One server row: name/address, live user/file counts, and connection state.
     /// A live (probe-answering) server is black + selectable to connect; a dead
     /// one is greyed out and disabled, matching eMule's server list.
+    ///
+    /// The connected treatment (green semibold name, checkmark, tinted row) is
+    /// keyed on the LIVE login via `EngineModel.serverRowConnected`, NEVER on
+    /// `srv.connected` - that flag is a snapshot stamped at probe time, and
+    /// after toolbar Stop it kept the previous server styled connected while
+    /// Status honestly read "Not connected" (on glass 2026-08-09). The tap
+    /// gate uses the same live answer: with the stale flag it also refused to
+    /// reconnect to that row until the next probe.
     private func serverRow(_ srv: ServerEntryFfi) -> some View {
-        HStack {
+        let connectedNow = EngineModel.serverRowConnected(
+            rowAddr: srv.addr, state: model.state, liveServerAddr: model.server?.addr)
+        return HStack {
             // Pin star: independently tappable even on an offline row (a pin
             // protects a temporarily-down favorite from Prune). Borderless so its
             // tap does not trigger the connect button beside it.
@@ -1063,14 +1073,14 @@ struct ContentView: View {
             .accessibilityLabel(srv.pinned ? "Unpin server" : "Pin server")
 
             Button {
-                if srv.alive && !srv.connected { model.connectServer(srv.addr) }
+                if srv.alive && !connectedNow { model.connectServer(srv.addr) }
             } label: {
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(srv.name.isEmpty ? srv.addr : srv.name)
                             .font(.callout)
-                            .fontWeight(srv.connected ? .semibold : .regular)
-                            .foregroundStyle(srv.connected ? .green : (srv.alive ? .primary : .secondary))
+                            .fontWeight(connectedNow ? .semibold : .regular)
+                            .foregroundStyle(connectedNow ? .green : (srv.alive ? .primary : .secondary))
                             .lineLimit(1)
                         if !srv.name.isEmpty {
                             Text(srv.addr).font(.caption2).foregroundStyle(.secondary)
@@ -1102,7 +1112,7 @@ struct ContentView: View {
                     }
                     if model.connectingTo == srv.addr {
                         ProgressView()
-                    } else if srv.connected {
+                    } else if connectedNow {
                         Image(systemName: "checkmark.circle.fill")
                             .foregroundStyle(.green)
                     }
@@ -1116,7 +1126,7 @@ struct ContentView: View {
             .disabled(model.connectingTo != nil)
             .foregroundStyle(.primary)
         }
-        .listRowBackground(srv.connected ? Color.green.opacity(0.08) : Color.clear)
+        .listRowBackground(connectedNow ? Color.green.opacity(0.08) : Color.clear)
     }
 
     // MARK: - Shared screen
