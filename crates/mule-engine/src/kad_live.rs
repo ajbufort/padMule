@@ -49,6 +49,20 @@ const LOCK_POISONED: &str = "kad lock poisoned";
 /// A KADEMLIA2_RES with more than this is a malicious over-long answer and is
 /// dropped (eMule caps the response at the requested count, Search.cpp:377).
 const KAD_REQUESTED_CONTACTS: usize = 11;
+/// The most SOURCES one search may accumulate, however many replies arrive or
+/// how much one reply carries. eMule's `SEARCHFINDSOURCE_TOTAL` = 20
+/// (Defines.h:68), enforced OUTSIDE the parser at Search.cpp:986
+/// (`m_uAnswers > SEARCHFINDSOURCE_TOTAL` -> `PrepareToStop`). padMule
+/// enforces the same total at ACCUMULATION, which also stops mid-datagram:
+/// `parse_search_res` reads up to 65535 results and the dedupe is a linear
+/// scan per result, so an uncapped ingest hands one hostile ~82KB inflated
+/// reply O(n^2) work and the whole result set. Stricter than eMule's periodic
+/// sweep in the same way the over-long FIND answer drop already is.
+const KAD_SEARCH_SOURCE_TOTAL: usize = 20;
+/// The keyword twin: eMule's `SEARCHKEYWORD_TOTAL` = 300 (Defines.h:61),
+/// enforced by `SearchManager::Process` on its sweep (SearchManager.cpp:347).
+/// NOT Search.cpp:819 - that is the STORE path's cap of ten.
+const KAD_SEARCH_KEYWORD_TOTAL: usize = 300;
 /// How long a liveness probe waits for its `HELLO_RES`. Short on purpose: the
 /// sweep runs under the engine lock, and a silent contact is not an error - it
 /// just does not get its lease renewed, and a later sweep removes it once its
@@ -1287,12 +1301,27 @@ impl KadNode {
         // REGISTERS a slot per request and awaits its oneshot. The matching
         // rules live in the loop, moved verbatim: exact address first, then the
         // first slot waiting on the same IP.
+        //
+        // Withdraw-on-drop covers BOTH exits: the normal tail AND cancellation.
+        // The 5s `start_kad` timeout CANCELS this future mid-wait (bootstrap's
+        // structural worst case is ~48s of inner waits, so cancellation is the
+        // NORMAL path there, not the edge), and a cancelled future never runs a
+        // trailing statement - a stale slot then sits at the FRONT of
+        // `pending`, wins the IP-fallback match, and swallows the next reply
+        // from that peer. Same guard, same reason as the lookup path. Every
+        // seq is tracked AT REGISTRATION, before any await: a cancellation
+        // while slot 1 is being awaited must still withdraw slots 2 and 3.
+        let mut guard = SlotGuard::new(Arc::clone(&self.pending));
         let mut slots: Vec<Result<(u64, tokio::sync::oneshot::Receiver<ReplyAnswer>), KadError>> =
             Vec::with_capacity(reqs.len());
         for (target_id, dest, frame) in reqs {
             // A send that fails is THIS request's failure, not the batch's - the
             // others are already on the wire and their answers are still coming.
-            slots.push(self.begin_request(target_id, *dest, frame, expect).await);
+            let slot = self.begin_request(target_id, *dest, frame, expect).await;
+            if let Ok((seq, _)) = &slot {
+                guard.track(*seq);
+            }
+            slots.push(slot);
         }
 
         // ONE deadline for the whole batch: each slot awaits only what remains
@@ -1300,12 +1329,10 @@ impl KadNode {
         // not one per peer.
         let deadline = Instant::now() + wait;
         let mut answers = Vec::with_capacity(slots.len());
-        let mut batch_seqs = Vec::with_capacity(slots.len());
         for slot in slots {
             match slot {
                 Err(e) => answers.push(Err(e)),
-                Ok((seq, rx)) => {
-                    batch_seqs.push(seq);
+                Ok((_seq, rx)) => {
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     answers.push(match timeout(remaining, rx).await {
                         Ok(Ok(answer)) => Ok(answer),
@@ -1315,14 +1342,6 @@ impl KadNode {
                 }
             }
         }
-        // Withdraw every slot this batch registered. Answered ones are already
-        // gone (the loop removes on delivery); the unanswered MUST go now, or a
-        // stale slot would swallow the next batch's reply from the same peer
-        // and feed it to a receiver nobody holds.
-        self.pending
-            .lock()
-            .expect(LOCK_POISONED)
-            .retain(|p| !batch_seqs.contains(&p.seq));
         answers
     }
 
@@ -1583,6 +1602,19 @@ impl KadNode {
             ValueAsk::None => 0,
             _ => LOOKUP_VALUE_BUDGET,
         };
+        // The SEARCH TOTAL. eMule stops a search at SEARCHKEYWORD_TOTAL /
+        // SEARCHFINDSOURCE_TOTAL however much was asked for
+        // (SearchManager.cpp:329/:347, Search.cpp:986); padMule additionally
+        // stops ACCUMULATING there, mid-reply, so one datagram cannot buy
+        // O(n^2) dedupe work past the cap. `stop` is what the termination
+        // check compares against - a caller wanting more than the network
+        // total would otherwise run every search to its full deadline.
+        let cap = match &value {
+            ValueAsk::Sources { .. } => KAD_SEARCH_SOURCE_TOTAL,
+            ValueAsk::Keyword { .. } => KAD_SEARCH_KEYWORD_TOTAL,
+            ValueAsk::None => usize::MAX,
+        };
+        let stop = want.min(cap);
         let mut cs = CSearch::new(target, seeds, find_budget, value_budget, K);
         let mut out = ResolveOutcome::default();
         let mut files: Vec<FileResult> = Vec::new();
@@ -1598,6 +1630,22 @@ impl KadNode {
         let mut need_progress = true;
 
         loop {
+            // Enough results? Checked BEFORE dispatching, so the response that
+            // satisfies the search does not buy one more harvest-and-refill.
+            // (2026-08-09 analysis, recorded because the handoff claimed
+            // otherwise: that trailing pass had nothing left to DISPATCH -
+            // every prior pass tops the pipeline up, and the walk stops at
+            // in-flight entries - so this reorder is hygiene and a bounded
+            // CPU saving; the "wasted datagrams on the success path" clause
+            // was refuted, not fixed.)
+            let results = match &value {
+                ValueAsk::Sources { .. } => out.sources.len(),
+                ValueAsk::Keyword { .. } => files.len(),
+                ValueAsk::None => 0,
+            };
+            if !matches!(value, ValueAsk::None) && results >= stop {
+                break; // enough results (the caller's want, or the search total)
+            }
             if need_progress {
                 need_progress = false;
                 // Value asks first - the JumpStart walk's consumption order.
@@ -1654,14 +1702,6 @@ impl KadNode {
                         cs.on_timeout(&c);
                     }
                 }
-            }
-            let results = match &value {
-                ValueAsk::Sources { .. } => out.sources.len(),
-                ValueAsk::Keyword { .. } => files.len(),
-                ValueAsk::None => 0,
-            };
-            if !matches!(value, ValueAsk::None) && results >= want {
-                break; // enough results
             }
             if inflight.is_empty() {
                 break; // candidates exhausted: nothing in flight, nothing to send
@@ -1748,6 +1788,13 @@ impl KadNode {
                                         match &value {
                                             ValueAsk::Sources { .. } => {
                                                 for s in res.results.iter().filter_map(|r| r.as_source()) {
+                                                    // The search total, applied at ACCUMULATION:
+                                                    // past it, stop scanning entirely - the
+                                                    // linear dedupe below is the O(n^2) an
+                                                    // uncapped hostile reply would buy.
+                                                    if out.sources.len() >= KAD_SEARCH_SOURCE_TOTAL {
+                                                        break;
+                                                    }
                                                     if !out.sources.iter().any(|e| e.client_hash == s.client_hash) {
                                                         out.sources.push(s);
                                                     }
@@ -1755,6 +1802,9 @@ impl KadNode {
                                             }
                                             ValueAsk::Keyword { keyword, .. } => {
                                                 for f in res.results.iter().filter_map(|r| r.as_file()) {
+                                                    if files.len() >= KAD_SEARCH_KEYWORD_TOTAL {
+                                                        break; // the search total (above)
+                                                    }
                                                     // The wire matched ONE word. Apply the rest
                                                     // locally, exactly as eMule does per result
                                                     // (Search.cpp:1379-1395) - without this, a
@@ -2584,6 +2634,240 @@ mod tests {
         assert!(
             crate::stats::kad_first_results() > ttfr0,
             "time to first result must move with a lookup that found something"
+        );
+    }
+
+    /// `request_batch` is CANCELLED in production - the 5s `start_kad` timeout
+    /// wraps `bootstrap_any`, whose structural worst case is ~48s, so the
+    /// cancellation is the NORMAL path there - and a cancelled future never
+    /// reaches a trailing withdraw statement. A stale slot is a misdirection,
+    /// not a leak: it sits at the FRONT of `pending`, wins the IP-fallback
+    /// match, and swallows the next reply from that peer into a receiver
+    /// nobody holds. The lookup path got `SlotGuard` for exactly this; this
+    /// pins the batch path's guard.
+    #[tokio::test]
+    async fn a_cancelled_request_batch_withdraws_its_pending_slots() {
+        let node = KadNode::bind_with_identity(
+            "127.0.0.1:0".parse().unwrap(),
+            4662,
+            Kad128::from_words([6, 6, 6, 6]),
+            0x6666,
+        )
+        .await
+        .unwrap();
+        // A bound socket nobody reads: the sends land somewhere real and are
+        // never answered, so the batch sits in its wait window until cancelled.
+        let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dest = silent.local_addr().unwrap();
+        let (op, payload) = mule_kad::build_ping();
+        let reqs: Vec<(Kad128, SocketAddr, Vec<u8>)> = (0..3u32)
+            .map(|i| {
+                (
+                    Kad128::from_words([9, 9, 9, i]),
+                    dest,
+                    pack_kad(op, payload.clone()),
+                )
+            })
+            .collect();
+        // Cancel mid-window, exactly as the start_kad timeout does. The 300ms
+        // is generous: the batch only needs microseconds to REGISTER its slots
+        // on loopback, and the window it would otherwise wait is 5s.
+        tokio::select! {
+            _ = node.request_batch(&reqs, mule_kad::OP_PONG, Duration::from_secs(5)) => {
+                panic!("three silent peers cannot complete the batch inside the test");
+            }
+            () = tokio::time::sleep(Duration::from_millis(300)) => {}
+        }
+        assert!(
+            node.pending.lock().expect(LOCK_POISONED).is_empty(),
+            "a cancelled batch must withdraw its pending slots on drop"
+        );
+    }
+
+    /// ONE datagram must not dominate a source search: `parse_search_res`
+    /// reads up to 65535 results and the dedupe is a linear scan per result,
+    /// so an uncapped ingest hands a single hostile reply O(n^2) work and the
+    /// whole result set. eMule caps by SEARCH TOTAL, outside the parser:
+    /// `SEARCHFINDSOURCE_TOTAL` = 20 (Defines.h:68), enforced at
+    /// Search.cpp:986 (`m_uAnswers > SEARCHFINDSOURCE_TOTAL` ->
+    /// `PrepareToStop`). padMule enforces the same total at ACCUMULATION,
+    /// which also stops mid-datagram - stricter than eMule's periodic sweep,
+    /// the same stricter stance the over-long FIND answer already gets.
+    #[tokio::test]
+    async fn one_datagram_cannot_push_a_source_search_past_the_search_total() {
+        let our_id = Kad128::from_words([5, 5, 5, 5]);
+        let our_ip = 0x0A00_0001u32;
+        let mut node =
+            KadNode::bind_with_identity("127.0.0.1:0".parse().unwrap(), 4662, our_id, 0x7777)
+                .await
+                .unwrap();
+        node.set_public_ip(our_ip);
+        let target = Kad128::from_hash(&[0x55; 16]);
+        let w = target.words();
+        let peer_id = Kad128::from_words([w[0], w[1] ^ 1, w[2], w[3]]);
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        node.with_routing(|t| t.add(peer_id, ip_u32(&peer_addr), peer_addr.port(), 4662, 8, true));
+        let mock = tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            loop {
+                let Ok((n, from)) = peer.recv_from(&mut buf).await else {
+                    return;
+                };
+                let Some(dec) = kad_deobfuscate(&buf[..n], &peer_id, 0, ip_u32(&from)) else {
+                    continue;
+                };
+                let Ok((op, _)) = unpack_kad(&dec.payload) else {
+                    continue;
+                };
+                let (rop, rpayload) = if op == mule_kad::OP_KAD2_REQ {
+                    mule_kad::build_kad2_res(&target, &[])
+                } else if op == mule_kad::OP_SEARCH_SOURCE_REQ {
+                    // 25 DISTINCT sources in one reply - five past the total.
+                    let results: Vec<mule_kad::SearchResult> = (0..25u32)
+                        .map(|i| mule_kad::SearchResult {
+                            answer: Kad128::from_words([0x77, 0, 0, i]),
+                            tags: vec![
+                                mule_kad::KadTag {
+                                    name: mule_kad::TAG_SOURCETYPE,
+                                    value: mule_kad::KadTagValue::Int(1),
+                                },
+                                mule_kad::KadTag {
+                                    name: mule_kad::TAG_SOURCEPORT,
+                                    value: mule_kad::KadTagValue::Int(4662),
+                                },
+                            ],
+                        })
+                        .collect();
+                    mule_kad::build_search_res(&peer_id, &target, &results)
+                } else {
+                    continue;
+                };
+                let dg = kad_obfuscate_response(
+                    &pack_kad(rop, rpayload),
+                    0x2468,
+                    dec.sender_vk,
+                    MOCK_SENDER_VK,
+                    0x80,
+                );
+                let _ = peer.send_to(&dg, from).await;
+            }
+        });
+        let out = node
+            .resolve_sources(&target, 1000, 1000, Duration::from_millis(300))
+            .await
+            .unwrap();
+        mock.abort();
+        assert_eq!(
+            out.sources.len(),
+            KAD_SEARCH_SOURCE_TOTAL,
+            "the search total caps what one reply can contribute"
+        );
+    }
+
+    /// The keyword twin: `SEARCHKEYWORD_TOTAL` = 300 (Defines.h:61), enforced
+    /// by `SearchManager::Process` comparing `GetAnswers() >=
+    /// SEARCHKEYWORD_TOTAL` on its sweep (SearchManager.cpp:347). NOT
+    /// Search.cpp:819 - that is the STORE path's cap of ten; the citation this
+    /// project once got wrong.
+    ///
+    /// FIVE storing nodes of 70 results each (350 > 300) rather than one giant
+    /// reply, because THIS BOX drops loopback UDP datagrams past ~1472 bytes:
+    /// WSL2 mirrored networking discards fragmented loopback UDP while `lo`
+    /// claims MTU 65536 (measured 2026-08-09 - 1400B delivered, 1473B gone).
+    /// The cap under test is per SEARCH, not per datagram, so several sub-MTU
+    /// replies exercise exactly the eMule shape.
+    #[tokio::test]
+    async fn replies_cannot_push_a_keyword_search_past_the_search_total() {
+        let our_id = Kad128::from_words([5, 5, 5, 6]);
+        let our_ip = 0x0A00_0001u32;
+        let mut node =
+            KadNode::bind_with_identity("127.0.0.1:0".parse().unwrap(), 4662, our_id, 0x8888)
+                .await
+                .unwrap();
+        node.set_public_ip(our_ip);
+        let target = kad_keyword_target("minister");
+        let w = target.words();
+        let mut mocks = Vec::new();
+        for m in 0..5u32 {
+            let peer_id = Kad128::from_words([w[0], w[1] ^ 1, w[2], w[3] ^ m]);
+            let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let peer_addr = peer.local_addr().unwrap();
+            node.with_routing(|t| {
+                t.add(peer_id, ip_u32(&peer_addr), peer_addr.port(), 4662, 8, true)
+            });
+            mocks.push(tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                loop {
+                    let Ok((n, from)) = peer.recv_from(&mut buf).await else {
+                        return;
+                    };
+                    let Some(dec) = kad_deobfuscate(&buf[..n], &peer_id, 0, ip_u32(&from)) else {
+                        continue;
+                    };
+                    let Ok((op, _)) = unpack_kad(&dec.payload) else {
+                        continue;
+                    };
+                    let (rop, rpayload) = if op == mule_kad::OP_KAD2_REQ {
+                        mule_kad::build_kad2_res(&target, &[])
+                    } else if op == mule_kad::OP_SEARCH_KEY_REQ {
+                        // 70 DISTINCT files per node, distinct ACROSS nodes.
+                        // HIGH-entropy hashes on purpose: an all-zeros pattern
+                        // compresses past the receiver's zlib-bomb bound
+                        // (`frame.len() * 10 + 300`) and the whole reply is
+                        // legitimately dropped; ~1.1KB of incompressible hash
+                        // bytes keeps the ratio under 10x while the datagram
+                        // stays under the loopback ceiling above.
+                        let r = |k: u32| k.wrapping_mul(0x9E37_79B9).rotate_left(13) ^ 0xA5A5_5A5A;
+                        let base = m * 0x0100_0000;
+                        let results: Vec<mule_kad::SearchResult> = (0..70u32)
+                            .map(|i| mule_kad::SearchResult {
+                                answer: Kad128::from_words([
+                                    r(base + i),
+                                    r((base + i) ^ 0x1111),
+                                    r((base + i) ^ 0x2222),
+                                    r((base + i) ^ 0x3333),
+                                ]),
+                                tags: vec![
+                                    mule_kad::KadTag {
+                                        name: mule_kad::TAG_FILENAME,
+                                        value: mule_kad::KadTagValue::Str(
+                                            "minister sample.avi".into(),
+                                        ),
+                                    },
+                                    mule_kad::KadTag {
+                                        name: mule_kad::TAG_FILESIZE,
+                                        value: mule_kad::KadTagValue::Int(1024),
+                                    },
+                                ],
+                            })
+                            .collect();
+                        mule_kad::build_search_res(&peer_id, &target, &results)
+                    } else {
+                        continue;
+                    };
+                    let dg = kad_obfuscate_response(
+                        &pack_kad(rop, rpayload),
+                        0x2468,
+                        dec.sender_vk,
+                        MOCK_SENDER_VK,
+                        0x80,
+                    );
+                    let _ = peer.send_to(&dg, from).await;
+                }
+            }));
+        }
+        let files = node
+            .resolve_keyword("minister", 1000, Duration::from_millis(300))
+            .await
+            .unwrap();
+        for m in &mocks {
+            m.abort();
+        }
+        assert_eq!(
+            files.len(),
+            KAD_SEARCH_KEYWORD_TOTAL,
+            "the search total caps what the replies can contribute"
         );
     }
 
