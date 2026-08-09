@@ -49,6 +49,9 @@ enum SettingsKey {
     /// packet, and without it the discovered-servers feature is inert.
     static let askServersForServers = "padMule.askServersForServers"
     static let defaultPriority = "padMule.defaultDownloadPriority"
+    /// Max simultaneously-active downloads; 0 = unlimited. The rest queue in
+    /// add order (padMule's own policy - eMule has no such cap).
+    static let maxActiveDownloads = "padMule.maxActiveDownloads"
     static let rememberSearchFilters = "padMule.rememberSearchFilters"
     // Persisted wire-filter values (only read back when the flag above is on).
     static let wireCompleteOnly = "padMule.wire.completeOnly"
@@ -103,6 +106,7 @@ enum SettingsDefaults {
             SettingsKey.updateServerListAtLaunch: false,
             SettingsKey.askServersForServers: true,
             SettingsKey.defaultPriority: 1, // Normal
+            SettingsKey.maxActiveDownloads: 0, // unlimited - the shipped behaviour
             SettingsKey.rememberSearchFilters: true,
             // 5999 for all three: the port Anthony reserved on AirVPN,
             // forwarded same-port with TCP+UDP. eD2k's 4662/4672 remain the

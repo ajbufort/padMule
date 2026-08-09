@@ -543,7 +543,7 @@ pub async fn download_file(
                 pool.push(ps);
             }
         }
-        if dl.is_complete().await || dl.is_cancelled() || pool.is_empty() {
+        if dl.is_complete().await || dl.is_cancelled() || dl.is_paused() || pool.is_empty() {
             break;
         }
         round += 1;
@@ -570,7 +570,7 @@ pub async fn download_file(
                 let mut tried = 0usize;
                 let mut connected = 0usize;
                 loop {
-                    if dl.is_complete().await || dl.is_cancelled() {
+                    if dl.is_complete().await || dl.is_cancelled() || dl.is_paused() {
                         break;
                     }
                     let Some(src) = queue.lock().await.pop_front() else {

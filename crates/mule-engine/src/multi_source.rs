@@ -201,6 +201,13 @@ pub struct Download {
     /// Set when the user cancels. The fetch workers check it and stop; a
     /// lock-free atomic so cancelling never has to wait on the transfer lock.
     cancelled: AtomicBool,
+    /// Set while the USER has this download paused (eMule `m_paused`,
+    /// PauseFile/ResumeFile). The fetch workers check it at the same sites as
+    /// `cancelled` and wind down; unlike cancelled the entry and its bytes
+    /// stay, and the flag persists via part.met FT_STATUS so a restart comes
+    /// back PAUSED, exactly as eMule 0.70b does. Lock-free for the same
+    /// reason as `cancelled`.
+    paused: AtomicBool,
     /// The user's download priority (PR_LOW/PR_NORMAL/PR_HIGH). A lock-free
     /// atomic so the fetch manager can read it every round without touching the
     /// transfer lock; the canonical copy is persisted in the PartStore.
@@ -314,10 +321,38 @@ struct Inner {
 /// re-requests only touch the tail of the download.
 const ENDGAME_LIMIT: u64 = 4 * crate::transfer::EMBLOCKSIZE;
 
+/// Which registry rows are QUEUED under a max-active cap. Input rows are
+/// `(user_paused, complete)` in REGISTRY (add) order; `true` out means: not
+/// paused, not complete, but past the cap - reported as Queued and NOT driven.
+/// `cap == 0` means unlimited. Paused and complete rows consume no slot.
+///
+/// THE ONE DEFINITION of the admission rule, used by the engine's sweeps and
+/// by the FFI's row builder - a re-implementation on either side is exactly
+/// the "test restates the rule" drift this project keeps finding. The cap is
+/// padMule's own wire-neutral policy (Anthony, 2026-08-09); eMule 0.70b has
+/// no max-active cap, so its row vocabulary is only REUSED here ("Queued" is
+/// padMule's word - eMule's "Waiting" means active-but-nothing-transferring).
+pub fn queued_flags(cap: u32, rows: &[(bool, bool)]) -> Vec<bool> {
+    let mut admitted = 0u32;
+    rows.iter()
+        .map(|&(paused, complete)| {
+            if paused || complete {
+                return false;
+            }
+            if cap != 0 && admitted >= cap {
+                return true;
+            }
+            admitted += 1;
+            false
+        })
+        .collect()
+}
+
 impl Download {
     pub fn new(store: PartStore) -> Arc<Self> {
         let parts = data_part_count(store.pf.size) as usize;
         let priority = AtomicU8::new(store.priority);
+        let paused = AtomicBool::new(store.paused);
         Arc::new(Download {
             inner: Mutex::new(Inner {
                 store,
@@ -326,6 +361,7 @@ impl Download {
             }),
             sources: Mutex::new(Vec::new()),
             cancelled: AtomicBool::new(false),
+            paused,
             priority,
             preview: AtomicBool::new(false),
             finalizing: AtomicBool::new(false),
@@ -559,6 +595,23 @@ impl Download {
         self.cancelled.load(Ordering::Relaxed)
     }
 
+    /// eMule PauseFile / ResumeFile, the engine half: flip the flag the
+    /// workers poll (they stop within a block, like cancel - eMule sends
+    /// OP_CANCELTRANSFER at the same moment), and persist it via FT_STATUS so
+    /// a restart comes back paused. The entry, its bytes and its sources
+    /// stay; resuming is a flag flip and the next sweep re-drives the fetch.
+    pub async fn set_paused(&self, on: bool) {
+        self.paused.store(on, Ordering::Relaxed);
+        let mut g = self.inner.lock().await;
+        g.store.paused = on;
+        let _ = g.store.save_met();
+    }
+
+    /// Whether the USER has paused this download.
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Relaxed)
+    }
+
     /// The current download priority (PR_LOW/PR_NORMAL/PR_HIGH). Read lock-free
     /// by the fetch manager every round, so a live change biases the ongoing
     /// sweep, not just the next spawn.
@@ -739,9 +792,11 @@ impl Download {
     /// nothing fresh is left but the file is nearly done, enter endgame and race
     /// the final reserved blocks.
     async fn take_blocks(&self, status: &FileStatus, max: usize) -> Vec<(u64, u64)> {
-        // Cancelled: hand out nothing, so the peer session ends and the worker
-        // loop falls through to its cancellation check.
-        if self.is_cancelled() {
+        // Cancelled or paused: hand out nothing, so the peer session ends and
+        // the worker loop falls through to its stop check. Pausing mid-block
+        // is eMule's shape too - PauseFile cancels in-flight transfers rather
+        // than letting them run out.
+        if self.is_cancelled() || self.is_paused() {
             return Vec::new();
         }
         let preview = self.preview.load(Ordering::Relaxed);
@@ -1961,6 +2016,65 @@ mod tests {
     use mule_proto::{ed2k_hash, md4, PARTSIZE};
     use std::path::PathBuf;
     use tokio::net::TcpListener;
+
+    /// The admission rule, exhaustively at small sizes: cap 0 = unlimited;
+    /// paused and complete rows consume no slot; the queue is add-order.
+    #[test]
+    fn queued_flags_admit_in_add_order_and_skip_paused_and_complete() {
+        // cap 0: nothing queues, whatever the mix.
+        assert_eq!(
+            queued_flags(0, &[(false, false), (true, false), (false, true)]),
+            vec![false, false, false]
+        );
+        // cap 1 over three drivable rows: first admitted, rest queued.
+        assert_eq!(
+            queued_flags(1, &[(false, false), (false, false), (false, false)]),
+            vec![false, true, true]
+        );
+        // A PAUSED first row consumes no slot: the second is admitted instead
+        // - which is also the promotion rule (pausing an active download
+        // admits the next queued one on the very next recompute).
+        assert_eq!(
+            queued_flags(1, &[(true, false), (false, false), (false, false)]),
+            vec![false, false, true]
+        );
+        // A COMPLETE row consumes no slot either.
+        assert_eq!(
+            queued_flags(1, &[(false, true), (false, false)]),
+            vec![false, false]
+        );
+    }
+
+    /// Pausing stops the block spigot exactly like cancelling: take_blocks
+    /// hands out nothing, so every worker session winds down within a block.
+    #[tokio::test]
+    async fn a_paused_download_hands_out_no_blocks() {
+        let dir = std::env::temp_dir().join(format!("padmule-pause-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = PartStore::create(&dir, 1, [0x77; 16], 400_000, b"p.bin").unwrap();
+        let dl = Download::new(store);
+        let status = FileStatus {
+            hash: [0x77; 16],
+            complete: true,
+            parts: Vec::new(),
+        };
+        assert!(
+            !dl.take_blocks(&status, 3).await.is_empty(),
+            "an active download hands out blocks (the control)"
+        );
+        dl.set_paused(true).await;
+        assert!(
+            dl.take_blocks(&status, 3).await.is_empty(),
+            "a paused download hands out nothing"
+        );
+        dl.set_paused(false).await;
+        assert!(
+            !dl.take_blocks(&status, 3).await.is_empty(),
+            "resume reopens the spigot"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[tokio::test]
     async fn we_ask_a_peer_for_sources_and_collect_its_answer() {

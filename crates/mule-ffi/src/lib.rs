@@ -215,6 +215,14 @@ pub struct DownloadInfo {
     /// beside the percentage, because "which channel is feeding this" is
     /// otherwise invisible and it is the first thing you want to know when one
     /// file flies and another crawls.
+    /// USER-paused (eMule 0.70b PauseFile): not driven until resumed, and the
+    /// flag survives a restart. The row says "Paused".
+    pub paused: bool,
+    /// Past the max-active cap: registered, not paused, not driven YET -
+    /// admitted in add order when a slot frees. The row says "Queued".
+    /// padMule's own policy (eMule has no such cap); derived by the same
+    /// `queued_flags` rule the engine's sweeps enforce.
+    pub queued: bool,
     /// True if bytes landed in the last few seconds - "actually receiving right
     /// now", as opposed to merely registered and hopeful. A TIME window, not an
     /// instantaneous rate: at a block boundary the rate legitimately reads zero,
@@ -774,7 +782,16 @@ impl MuleEngine {
         self.rt.block_on(async {
             let mut out = Vec::new();
             let now = u64::from(mule_engine::credit_store::now_secs());
-            for dl in self.handles.downloads().await {
+            let dls = self.handles.downloads().await;
+            // Queued is derived by THE one admission rule the sweeps enforce
+            // (mule_engine::multi_source::queued_flags) over the same ordered
+            // rows and the same shared cap - not re-implemented here.
+            let mut rows = Vec::with_capacity(dls.len());
+            for dl in &dls {
+                rows.push((dl.is_paused(), dl.is_complete().await));
+            }
+            let queued = mule_engine::multi_source::queued_flags(self.handles.max_active(), &rows);
+            for (i, dl) in dls.iter().enumerate() {
                 let size = dl.size().await;
                 // `size` and `missing()` are read under separate locks, so the
                 // pair is not an atomic snapshot; `saturating_sub` keeps a
@@ -790,7 +807,9 @@ impl MuleEngine {
                     name: dl.name().await,
                     size,
                     have,
-                    complete: dl.is_complete().await,
+                    complete: rows[i].1,
+                    paused: rows[i].0,
+                    queued: queued[i],
                     rating,
                     has_comment,
                     priority: dl.priority(),
@@ -1077,6 +1096,35 @@ impl MuleEngine {
             .block_on(async { self.inner.lock().await.cancel_download(h).await })
     }
 
+    /// Pause ONE download (eMule 0.70b PauseFile): its workers stop within a
+    /// block, the entry and bytes stay, and the pause persists across
+    /// restarts (part.met FT_STATUS). Returns false for an unknown hash.
+    pub fn pause_download(&self, hash: String) -> bool {
+        let Some(h) = parse_hash16(&hash) else {
+            return false;
+        };
+        self.rt
+            .block_on(async { self.inner.lock().await.pause_download(h).await })
+    }
+
+    /// Resume a paused download (eMule 0.70b ResumeFile). The next retry
+    /// sweep re-drives it, subject to the max-active admission.
+    pub fn resume_download(&self, hash: String) -> bool {
+        let Some(h) = parse_hash16(&hash) else {
+            return false;
+        };
+        self.rt
+            .block_on(async { self.inner.lock().await.resume_download(h).await })
+    }
+
+    /// Set the max-active download cap (0 = unlimited): how many incomplete,
+    /// unpaused downloads the fetch pipeline drives at once; the rest report
+    /// `queued` and are admitted in add order as slots free.
+    pub fn set_max_active_downloads(&self, n: u32) {
+        self.rt
+            .block_on(async { self.inner.lock().await.set_max_active_downloads(n) });
+    }
+
     /// THE FETCH FUNNEL, as a printable block: how far down the eD2k request
     /// sequence each peer session got, every opcode read out of turn, and the
     /// dial-duration histogram. See `mule_engine::stats`.
@@ -1251,6 +1299,25 @@ mod tests {
         assert_eq!(h.file_type, "Audio");
         assert_eq!(h.rating, 4);
         assert_eq!(h.status, HitStatusFfi::New);
+    }
+
+    /// The per-file pause/resume and max-active surface (row 8dd): unknown and
+    /// malformed hashes answer false through the whole stack, the cap setter
+    /// reaches the engine's shared atomic. Behaviour is engine-tested.
+    #[test]
+    fn pause_resume_and_the_max_active_cap_surface_through_the_facade() {
+        let dir = tmp("pause-facade");
+        let _ = std::fs::remove_dir_all(&dir);
+        let eng = offline_engine(&dir, &format!("{dir}-dl"));
+        // Unknown hashes answer a clean false through the whole stack.
+        assert!(!eng.pause_download("00".repeat(16)));
+        assert!(!eng.resume_download("ff".repeat(16)));
+        assert!(!eng.pause_download("not-hex".into()), "malformed hash");
+        // The cap setter reaches the engine's shared atomic (the same value
+        // the rows and sweeps read; behaviour is engine-tested).
+        eng.set_max_active_downloads(3);
+        assert!(eng.downloads().is_empty(), "no rows registered offline");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The "Share uploads" / Leech-Mode setting round-trips through the facade.

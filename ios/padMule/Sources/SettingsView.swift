@@ -25,6 +25,8 @@ struct SettingsView: View {
     @AppStorage(SettingsKey.updateServerListAtLaunch) private var updateAtLaunch = false
     @AppStorage(SettingsKey.askServersForServers) private var askServers = true
     @AppStorage(SettingsKey.defaultPriority) private var defaultPriority = 1
+    // Must agree with SettingsDefaults.register() (0 = unlimited).
+    @AppStorage(SettingsKey.maxActiveDownloads) private var maxActiveDownloads = 0
     @AppStorage(SettingsKey.rememberSearchFilters) private var rememberFilters = true
     // Must agree with the registered default in Settings.register (false):
     // this initializer is what SwiftUI uses when no default is registered, and
@@ -293,11 +295,20 @@ struct SettingsView: View {
                 Text("Normal").tag(1)
                 Text("High").tag(2)
             }
+            Stepper(
+                maxActiveDownloads == 0
+                    ? "Active downloads: unlimited"
+                    : "Active downloads: at most \(maxActiveDownloads)",
+                value: $maxActiveDownloads, in: 0...20
+            )
+            .onChange(of: maxActiveDownloads) { _ in
+                model.pushMaxActiveDownloads()
+            }
             Toggle("Remember search filters", isOn: $rememberFilters)
         } header: {
             Text("Downloads and search")
         } footer: {
-            Text("New downloads start at this priority; you can still change any download individually. Remembering filters keeps your size and type choices between launches - useful because iPadOS suspends and relaunches padMule often.")
+            Text("New downloads start at this priority; you can still change any download individually. With an active-downloads cap, extra downloads wait as Queued and start automatically when a slot frees. Remembering filters keeps your size and type choices between launches - useful because iPadOS suspends and relaunches padMule often.")
         }
     }
 

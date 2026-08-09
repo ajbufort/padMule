@@ -550,6 +550,8 @@ final class EngineModel: ObservableObject {
                     kad: storedPort(SettingsKey.kadPort, 5999),
                     kadAdvertised: storedPort(SettingsKey.kadAdvertisedPort, 5999))
                 e.setUpnpEnabled(on: d.bool(forKey: SettingsKey.upnpEnabled))
+                e.setMaxActiveDownloads(
+                    n: UInt32(clamping: d.integer(forKey: SettingsKey.maxActiveDownloads)))
                 e.start()
                 engineLog.notice("boot OK; engine started")
                 DispatchQueue.main.async {
@@ -1057,6 +1059,36 @@ final class EngineModel: ObservableObject {
             _ = e.setDownloadPriority(hash: hash, priority: priority)
             DispatchQueue.main.async { self?.refreshAll() }
         }
+    }
+
+    /// Per-file pause (eMule 0.70b PauseFile): the engine stops that
+    /// download's workers within a block and persists the flag via part.met
+    /// FT_STATUS, so a paused row survives a restart.
+    func pauseDownload(_ hash: String) {
+        guard let e = engine else { return }
+        work.async { [weak self] in
+            _ = e.pauseDownload(hash: hash)
+            DispatchQueue.main.async { self?.refreshAll() }
+        }
+    }
+
+    /// Per-file resume (0.70b ResumeFile). The engine's retry sweep re-drives
+    /// it within a few seconds, subject to the max-active admission.
+    func resumeDownload(_ hash: String) {
+        guard let e = engine else { return }
+        work.async { [weak self] in
+            _ = e.resumeDownload(hash: hash)
+            DispatchQueue.main.async { self?.refreshAll() }
+        }
+    }
+
+    /// Push the max-active cap (0 = unlimited) from UserDefaults into the
+    /// engine. Called at boot and whenever the Settings stepper changes.
+    func pushMaxActiveDownloads() {
+        guard let e = engine else { return }
+        let n = UInt32(
+            clamping: UserDefaults.standard.integer(forKey: SettingsKey.maxActiveDownloads))
+        work.async { e.setMaxActiveDownloads(n: n) }
     }
 
     // MARK: - Downloaded

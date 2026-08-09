@@ -738,6 +738,23 @@ struct ContentView: View {
                                         Label("Preview", systemImage: "play.rectangle")
                                     }
                                 }
+                                // eMule 0.70b's per-file Pause/Resume, one
+                                // slot: which one shows follows the flag.
+                                if !dl.complete {
+                                    if dl.paused {
+                                        Button {
+                                            model.resumeDownload(dl.hash)
+                                        } label: {
+                                            Label("Resume", systemImage: "play.fill")
+                                        }
+                                    } else {
+                                        Button {
+                                            model.pauseDownload(dl.hash)
+                                        } label: {
+                                            Label("Pause", systemImage: "pause.fill")
+                                        }
+                                    }
+                                }
                                 Divider()
                                 priorityMenu(for: dl)
                                 categoryMenu(for: dl.hash)
@@ -1502,19 +1519,28 @@ struct ContentView: View {
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
-                if dl.complete {
-                    Text("Done").font(.caption).foregroundStyle(.green)
-                } else if model.state == .paused || model.state == .seeding {
-                    // Per-transfer Paused badge (requirement 3). Seeding counts:
-                    // downloads are stopped in that state too - only uploads
-                    // continue - and a badge keyed on .paused alone would show
-                    // an active-looking row in the app switcher snapshot.
-                    Text("Paused")
-                        .font(.caption2)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(Color.secondary.opacity(0.2))
-                        .clipShape(Capsule())
+                if let badge = TransferRowState.badge(
+                    complete: dl.complete,
+                    engineStopped: model.state == .paused || model.state == .seeding,
+                    filePaused: dl.paused,
+                    queued: dl.queued)
+                {
+                    // Per-transfer state badge (requirement 3, eMule 0.70b's
+                    // row vocabulary + padMule's Queued). The precedence lives
+                    // in TransferRowState - pinned by its tests, and the row
+                    // calls THAT, so rule and caller cannot drift. Seeding
+                    // counts as stopped: downloads halt there, only uploads
+                    // continue.
+                    if badge == "Done" {
+                        Text(badge).font(.caption).foregroundStyle(.green)
+                    } else {
+                        Text(badge)
+                            .font(.caption2)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.secondary.opacity(0.2))
+                            .clipShape(Capsule())
+                    }
                 }
             }
             ProgressView(value: fraction(dl))

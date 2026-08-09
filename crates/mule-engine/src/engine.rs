@@ -1341,6 +1341,9 @@ pub struct EngineHandles {
     shared: Arc<Mutex<Vec<SharedFile>>>,
     sharing: Arc<AtomicBool>,
     public_ip: Arc<std::sync::Mutex<Option<Ipv4Addr>>>,
+    /// The engine's max-active cap, shared so the FFI's queued computation
+    /// reads the SAME value the sweeps enforce.
+    max_active: Arc<std::sync::atomic::AtomicU32>,
     status: StatusPub,
 }
 
@@ -1348,6 +1351,11 @@ impl EngineHandles {
     /// The in-progress downloads. Clones `Arc`s, not files.
     pub async fn downloads(&self) -> Vec<Arc<Download>> {
         self.downloads.lock().await.clone()
+    }
+
+    /// The max-active cap (0 = unlimited) - lock-free, for the row builder.
+    pub fn max_active(&self) -> u32 {
+        self.max_active.load(Ordering::Relaxed)
     }
 
     /// The shared library, in the same shape `Engine::shared_files` returns.
@@ -1510,6 +1518,11 @@ pub struct Engine {
     last_checkpoint: Instant,
     last_share_verify: Instant,
     last_resume_retry: Instant,
+    /// Max simultaneously-DRIVEN downloads (0 = unlimited); the rest report
+    /// QUEUED and are admitted in add order as slots free. Shared with
+    /// `EngineHandles` so the FFI row builder reads the same value the sweeps
+    /// enforce; the one admission rule is `multi_source::queued_flags`.
+    max_active: Arc<std::sync::atomic::AtomicU32>,
     /// When `maintain_kad` last refreshed the routing table.
     last_kad_refresh: Instant,
     /// When the liveness sweep (`OnSmallTimer`) last ran.
@@ -1664,6 +1677,7 @@ impl Engine {
             last_checkpoint: Instant::now(),
             last_share_verify: Instant::now(),
             last_resume_retry: Instant::now(),
+            max_active: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             last_kad_refresh: Instant::now(),
             last_kad_sweep: Instant::now(),
             events: tx,
@@ -1839,6 +1853,7 @@ impl Engine {
             shared: Arc::clone(&self.shared),
             sharing: Arc::clone(&self.sharing),
             public_ip: Arc::clone(&self.public_ip),
+            max_active: Arc::clone(&self.max_active),
         }
     }
 
@@ -3824,15 +3839,93 @@ impl Engine {
             Err(e) => return AddResult::Failed(e.to_string()),
         };
         let dl = Download::new(store);
-        self.downloads.lock().await.push(Arc::clone(&dl));
+        let queued = {
+            let mut guard = self.downloads.lock().await;
+            guard.push(Arc::clone(&dl));
+            // Admission for the NEW row, by the one rule. Registered either
+            // way - a queued download is a real entry that the sweep drives
+            // the moment a slot frees.
+            let mut rows = Vec::with_capacity(guard.len());
+            for d in guard.iter() {
+                rows.push((d.is_paused(), d.is_complete().await));
+            }
+            let cap = self.max_active.load(Ordering::Relaxed);
+            *crate::multi_source::queued_flags(cap, &rows)
+                .last()
+                .unwrap_or(&false)
+        };
 
         // Keep what the lookup produced. Both numbers are right here and were
         // discarded; without them a row with no bytes cannot say whether nothing
         // was found or plenty was found and none of it was reachable.
         dl.note_source_pool(reg.sources().len(), lowids.len());
         self.request_callbacks(&lowids).await;
+        if queued {
+            let _ = self.events.send(EngineEvent::Status(format!(
+                "'{name}' queued - at the max-active download cap"
+            )));
+            return AddResult::Started;
+        }
         self.spawn_fetch(dl, hash, size, name, reg.sources().to_vec());
         AddResult::Started
+    }
+
+    /// Pause ONE download (eMule 0.70b `PauseFile`): its workers stop within a
+    /// block, the entry and its bytes stay, and FT_STATUS persists the flag so
+    /// a restart comes back paused. Returns false if no active download
+    /// carries that hash.
+    pub async fn pause_download(&mut self, hash: [u8; 16]) -> bool {
+        let dl = {
+            let guard = self.downloads.lock().await;
+            let mut found = None;
+            for d in guard.iter() {
+                if d.hash().await == hash {
+                    found = Some(Arc::clone(d));
+                    break;
+                }
+            }
+            found
+        };
+        match dl {
+            Some(dl) => {
+                dl.set_paused(true).await;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Resume ONE download (eMule 0.70b `ResumeFile`): flag off; the next
+    /// resume sweep re-drives the fetch, subject to the max-active admission.
+    /// Deliberately not an immediate spawn - the sweep already owns admission
+    /// and source-finding, and a second spawn path would drift from it.
+    pub async fn resume_download(&mut self, hash: [u8; 16]) -> bool {
+        let dl = {
+            let guard = self.downloads.lock().await;
+            let mut found = None;
+            for d in guard.iter() {
+                if d.hash().await == hash {
+                    found = Some(Arc::clone(d));
+                    break;
+                }
+            }
+            found
+        };
+        match dl {
+            Some(dl) => {
+                dl.set_paused(false).await;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Set the max-active download cap (0 = unlimited). Takes effect on the
+    /// next sweep: rows past the cap stop being driven and report QUEUED;
+    /// raising it admits queued rows in add order. See
+    /// `multi_source::queued_flags` - the one admission rule.
+    pub fn set_max_active_downloads(&mut self, n: u32) {
+        self.max_active.store(n, Ordering::Relaxed);
     }
 
     /// Discover who has `hash`: the connected server (get_sources) AND Kad
@@ -4093,15 +4186,26 @@ impl Engine {
     /// same pipeline `add_download` uses. Best-effort: a resumed download with no
     /// sources right now stays registered and idle (a later run may find some).
     async fn resume_fetches(&mut self) {
+        let cap = self.max_active.load(Ordering::Relaxed);
         let pending: Vec<Arc<Download>> = {
             let guard = self.downloads.lock().await;
-            let mut v = Vec::new();
+            // The ONE admission rule (multi_source::queued_flags): user-paused
+            // rows are never driven, and past the max-active cap the rest are
+            // QUEUED - reported, not driven; a freed slot admits the next in
+            // add order on this very sweep, no event needed.
+            let mut rows = Vec::with_capacity(guard.len());
             for dl in guard.iter() {
+                rows.push((dl.is_paused(), dl.is_complete().await));
+            }
+            let queued = crate::multi_source::queued_flags(cap, &rows);
+            let mut v = Vec::new();
+            for (i, dl) in guard.iter().enumerate() {
+                let (paused, complete) = rows[i];
                 // Skip ones already being fetched: pause() does not abort in-flight
                 // tasks, so a still-running fetch must not be re-driven (spawn_fetch
                 // would bail anyway, but this also avoids wasted source-finding under
                 // the engine lock).
-                if !dl.is_complete().await && !dl.is_cancelled() && !dl.is_fetching() {
+                if !complete && !paused && !queued[i] && !dl.is_cancelled() && !dl.is_fetching() {
                     v.push(Arc::clone(dl));
                 }
             }
@@ -4631,7 +4735,7 @@ impl Engine {
             let guard = self.downloads.lock().await;
             guard
                 .iter()
-                .filter(|dl| !dl.is_cancelled() && !dl.is_fetching())
+                .filter(|dl| !dl.is_cancelled() && !dl.is_fetching() && !dl.is_paused())
                 .count() as u32
         };
         if idle_count == 0 {
@@ -4654,11 +4758,24 @@ impl Engine {
         // retried longest ago. Priority still wins, but it can no longer starve
         // its own tier.
         let now = u64::from(now_secs());
+        let cap = self.max_active.load(Ordering::Relaxed);
         let candidate: Option<Arc<Download>> = {
             let guard = self.downloads.lock().await;
+            // Same admission rule as resume_fetches: paused and past-the-cap
+            // rows are not retried (a queued row's turn comes when a slot
+            // frees and queued_flags recomputes).
+            let mut rows = Vec::with_capacity(guard.len());
+            for dl in guard.iter() {
+                rows.push((dl.is_paused(), dl.is_complete().await));
+            }
+            let queued = crate::multi_source::queued_flags(cap, &rows);
             guard
                 .iter()
-                .filter(|dl| !dl.is_cancelled() && !dl.is_fetching())
+                .enumerate()
+                .filter(|(i, dl)| {
+                    !rows[*i].0 && !queued[*i] && !dl.is_cancelled() && !dl.is_fetching()
+                })
+                .map(|(_, dl)| dl)
                 .min_by_key(|dl| (std::cmp::Reverse(dl.priority()), dl.last_retry_at()))
                 .map(Arc::clone)
         };
@@ -6178,6 +6295,94 @@ mod tests {
     /// PRIVACY: the address is compared internally and NEVER emitted - the
     /// event carries no payload at all, for the same reason `connect_to_server`
     /// refuses to record the client id in any user-visible text.
+    /// eMule 0.70b `PauseFile`/`ResumeFile` through the ENGINE API: the flag
+    /// flips, persists via FT_STATUS, and a store re-opened from disk comes
+    /// back paused - the restart behaviour a 0.70b user expects.
+    #[tokio::test]
+    async fn pause_download_persists_and_a_reopened_store_comes_back_paused() {
+        let dir = tmp("pause-persist");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+        let hash = [0x42u8; 16];
+        let store = crate::part_store::PartStore::create(&dir, 1, hash, 500, b"x.bin").unwrap();
+        let dl = Download::new(store);
+        engine.downloads.lock().await.push(Arc::clone(&dl));
+
+        assert!(engine.pause_download(hash).await, "the download is found");
+        assert!(dl.is_paused());
+        let reopened = crate::part_store::PartStore::open(&dir, 1).unwrap();
+        assert!(reopened.paused, "FT_STATUS persisted the pause");
+        assert!(
+            Download::new(reopened).is_paused(),
+            "a restart's Download comes back paused"
+        );
+        assert!(engine.resume_download(hash).await);
+        assert!(!dl.is_paused());
+        assert!(
+            !engine.pause_download([0xEE; 16]).await,
+            "an unknown hash reports false"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The max-active cap through the PRODUCTION retry sweep: with cap 1 and
+    /// two registered downloads, the sweep picks only the FIRST (stamps its
+    /// retry clock); pausing the first ADMITS the second on the next pass.
+    /// Promotion is a recompute, not an event - `queued_flags` in add order.
+    #[tokio::test]
+    async fn the_max_active_cap_gates_the_retry_sweep_and_pausing_promotes() {
+        let dir = tmp("max-active");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+        engine.state = EngineState::Running;
+        let d1 = Download::new(
+            crate::part_store::PartStore::create(&dir, 1, [1; 16], 500, b"a.bin").unwrap(),
+        );
+        let d2 = Download::new(
+            crate::part_store::PartStore::create(&dir, 2, [2; 16], 500, b"b.bin").unwrap(),
+        );
+        engine.downloads.lock().await.push(Arc::clone(&d1));
+        engine.downloads.lock().await.push(Arc::clone(&d2));
+        engine.set_max_active_downloads(1);
+
+        // Back-date the cadence gate. The monotonic clock cannot be
+        // back-dated on a host up under a minute - PANIC rather than let the
+        // gate false-pass the test silently (that would be a fake green).
+        let back_dated = || {
+            Instant::now()
+                .checked_sub(Duration::from_secs(60))
+                .expect("host uptime under 60s - rerun this test")
+        };
+        engine.last_resume_retry = back_dated();
+        engine.maintain_resume_fetches().await;
+        assert!(d1.last_retry_at() > 0, "the first drivable row is retried");
+        assert_eq!(d2.last_retry_at(), 0, "past the cap: queued, not retried");
+
+        // The SECOND sweep is the discriminating one, and the first draft of
+        // this test did not have it: sweep 1 picks d1 by the fair-rotation
+        // order whether or not the cap gate exists, so a mutant that ignored
+        // `queued` still passed. Rotation now WANTS d2 (least recently
+        // retried); only the cap gate keeps refusing it.
+        engine.last_resume_retry = back_dated();
+        engine.maintain_resume_fetches().await;
+        assert_eq!(
+            d2.last_retry_at(),
+            0,
+            "rotation would pick d2 next - only the cap gate refuses it"
+        );
+
+        d1.set_paused(true).await;
+        engine.last_resume_retry = back_dated();
+        engine.maintain_resume_fetches().await;
+        assert!(
+            d2.last_retry_at() > 0,
+            "pausing the first admits the second - promotion by recompute"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_changed_public_address_pauses_sharing_and_warns() {
         let dir = tmp("ip-change");

@@ -43,6 +43,13 @@ pub const FT_CORRUPTEDPARTS: u8 = 0x24;
 /// -> CFileDataIO::WriteTag). We match that.
 pub const FT_DLPRIORITY: u8 = 0x18;
 pub const FT_OLDDLPRIORITY: u8 = 0x13;
+/// Paused flag (eMule `FT_STATUS`, opcodes.h:354, `<uint32>`). The FORMAT
+/// authority writes it ONLY while paused (0.50a PartFile.cpp:1435-1439:
+/// `if (paused) CTag(FT_STATUS, 1)`); aMule always writes `m_paused?1:0`
+/// (PartFile.cpp:926) - a known divergence padMule does not copy. Read side:
+/// any nonzero int means paused; absent or zero means not (both authorities
+/// read it that way).
+pub const FT_STATUS: u8 = 0x14;
 
 /// Priority levels (eMule `Constants.h`): the three padMule honors, plus the
 /// AUTO sentinel it maps in. padMule does not implement Auto tuning, so on read
@@ -64,6 +71,10 @@ pub struct PartStore {
     /// The user's download priority (PR_LOW/PR_NORMAL/PR_HIGH). Persisted in
     /// part.met, read on resume; biases source-finding effort (see fetch.rs).
     pub priority: u8,
+    /// USER-paused (eMule `m_paused`, persisted as FT_STATUS). A paused
+    /// download keeps its entry and bytes and is skipped by every fetch path
+    /// until the user resumes it - across restarts, like eMule 0.70b.
+    pub paused: bool,
 }
 
 /// The previous generation of a `.part.met`, kept so a lost or unreadable live
@@ -149,6 +160,7 @@ impl PartStore {
             pf: PartFile::new(hash, size),
             name: name.to_vec(),
             priority: PR_NORMAL,
+            paused: false,
         };
         s.save_met()?;
         Ok(s)
@@ -227,6 +239,21 @@ impl PartStore {
             })
             .unwrap_or(PR_NORMAL);
 
+        // Paused (FT_STATUS): nonzero = the user paused this download. Absent
+        // is eMule's unpaused write shape; zero is aMule's.
+        let paused = met
+            .tags
+            .iter()
+            .find(|t| t.name == mule_proto::TagName::Id(FT_STATUS))
+            .and_then(|t| match &t.value {
+                TagValue::U8(v) => Some(*v as u64),
+                TagValue::U16(v) => Some(*v as u64),
+                TagValue::U32(v) => Some(*v as u64),
+                _ => None,
+            })
+            .map(|v| v != 0)
+            .unwrap_or(false);
+
         let mut pf = PartFile::resume(met.file_hash, size, met_gaps(&met), corrupted);
         pf.part_hashes = met.part_hashes.clone();
 
@@ -238,6 +265,7 @@ impl PartStore {
             pf,
             name,
             priority,
+            paused,
         })
     }
 
@@ -333,6 +361,11 @@ impl PartStore {
             FT_OLDDLPRIORITY,
             TagValue::U32(self.priority as u32),
         ));
+        // FT_STATUS only while paused - the format authority's write shape
+        // (eMule 0.50a PartFile.cpp:1435-1439); aMule tolerates the absence.
+        if self.paused {
+            tags.push(Tag::id(FT_STATUS, TagValue::U32(1)));
+        }
         tags.extend(gap_tags(self.pf.gaps(), large));
 
         let met = PartMet {
@@ -589,6 +622,33 @@ mod tests {
         assert_eq!(s.read_part(0).unwrap(), data);
         assert_eq!(s.verify_part(0).unwrap(), Some(true));
 
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn paused_persists_via_ft_status_and_only_when_paused() {
+        let dir = tmpdir("paused");
+        let mut s = PartStore::create(&dir, 1, [0x5A; 16], 500, b"p.bin").unwrap();
+        assert!(!s.paused, "new downloads are not paused");
+        // eMule's write shape: NO FT_STATUS tag at all while unpaused (0.50a
+        // PartFile.cpp:1435-1439 writes it only inside `if (paused)`); aMule
+        // always writes it, a divergence deliberately not copied.
+        let tag = [0x03u8, 0x01, 0x00, FT_STATUS, 0x01, 0x00, 0x00, 0x00];
+        let met = fs::read(dir.join("001.part.met")).unwrap();
+        assert!(
+            !met.windows(8).any(|w| w == tag),
+            "an unpaused met carries no FT_STATUS tag"
+        );
+
+        s.paused = true;
+        s.save_met().unwrap();
+        let met = fs::read(dir.join("001.part.met")).unwrap();
+        assert!(
+            met.windows(8).any(|w| w == tag),
+            "paused writes FT_STATUS(0x14) as UINT32 = 1"
+        );
+        let reopened = PartStore::open(&dir, 1).unwrap();
+        assert!(reopened.paused, "the pause survives a restart");
         fs::remove_dir_all(&dir).ok();
     }
 
