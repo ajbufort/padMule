@@ -153,18 +153,32 @@ final class EngineModel: ObservableObject {
     /// SCOPE: it measures gaps between SCHEDULED FOREGROUND polls only.
     /// Suspensions and throttled ticks are excluded BY DESIGN, because this
     /// number exists to name engine-lock contention - a stall on our own
-    /// queue - not an absence the OS imposed. Two exclusions, each clearing
-    /// the `lastUiPollAt` baseline so the next measured gap starts fresh:
-    /// - a seeding-throttle skip (`shouldRunFastPoll` skips 4 ticks in 5);
-    ///   without its clear, one seeding episode parked this max at ~5s
+    /// queue - not an absence the OS imposed. Two exclusions:
+    /// - a seeding-throttle skip (`shouldRunFastPoll` skips 4 ticks in 5)
+    ///   clears the `lastUiPollAt` baseline so the next measured gap starts
+    ///   fresh; without that, one seeding episode parked this max at ~5s
     ///   forever - the throttle's number, not a fault's - and poisoned the
     ///   1.1s device-pass regression bar.
-    /// - the return to foreground (`leaveBackground()`); a suspended process
-    ///   fires no timer at all, so the first post-resume tick would otherwise
-    ///   book the entire suspension (52.0s from a ~52s suspension, on glass
-    ///   2026-08-09) - the same baseline pollution through a different path.
+    /// - a background episode: `sceneInBackground` goes up in
+    ///   `enterBackground()` and down in `leaveBackground()`, and the pure
+    ///   booking rule (`bookPollGap`) discards every interval while it is up,
+    ///   nilling the baseline as it does. The flag is armed on the way OUT,
+    ///   BEFORE the freeze - the load-bearing detail. The first attempt
+    ///   cleared the baseline on the way back IN instead, and on glass
+    ///   (2026-08-09, build 4bf04b1) it failed on 2 of 2 suspensions (booked
+    ///   10.0s of a ~10.6s suspension, 84.8s of 85.7s): work queued before
+    ///   the freeze drains on thaw BEFORE scenePhase delivers .active, so a
+    ///   way-in clear runs after the damage, every time. Only a way-out
+    ///   signal can precede every post-thaw booking.
     @Published private(set) var uiPollMaxGapSecs: Double = 0
     private var lastUiPollAt: Date?
+    /// True between the scenePhase .background and .active transitions - set
+    /// first thing in `enterBackground()`, cleared in `leaveBackground()`.
+    /// Read by `bookPollGap` to discard poll-gap intervals that overlap a
+    /// background episode; see the `uiPollMaxGapSecs` SCOPE doc for why the
+    /// signal must be armed on the way out. Main-thread only, like the rest
+    /// of the poll-gap state.
+    private var sceneInBackground = false
     /// How many IP-blocklist ranges are loaded (0 = no ipfilter placed).
     @Published private(set) var ipFilterRanges: UInt32 = 0
     @Published private(set) var identity: IdentityInfo?
@@ -417,16 +431,79 @@ final class EngineModel: ObservableObject {
     /// and cannot disagree. Both addr strings are `SocketAddr` renderings of
     /// "ip:port", so equality is a real identity match.
     ///
-    /// `.running` is required too: `.stopped`/`.paused` have no login to
-    /// claim (the engine returns no `serverInfo` then; the state check also
-    /// covers the ~1s poll lag while a shutdown lands), and `.seeding` only
-    /// exists while backgrounded, with no Servers screen on glass. Pure and
-    /// static so the rule is testable without an engine - the
-    /// `TransferRowState` seam pattern (see SettingsTests).
+    /// `.running` is required too - but NOT for the reason first written
+    /// here. The old doc claimed `.stopped`/`.paused` have no login to claim
+    /// because the engine returns no `serverInfo` then; glass falsified that
+    /// (2026-08-09, build 4bf04b1): `Engine::connect_to_server` guards only
+    /// `offline`, never state, so a row tap while stopped logged in and left
+    /// state stopped WITH serverInfo present - this rule then rendered the
+    /// row unstyled while the app was genuinely logged in, the mirror image
+    /// of the stale styling above (`serverInfo` is gated on the live server
+    /// LINK, `is_online`, not on state). The pairing is now guaranteed BY
+    /// CONSTRUCTION on the app side instead: `connectServer` - the only path
+    /// to `connect_to_server` - runs `start()` before every dial in the same
+    /// serial work item (see `serverTapAction`), so no app path can hand a
+    /// stopped engine a login, and "stopped implies no live login" is
+    /// enforced rather than assumed. The state check still covers the ~1s
+    /// poll lag while a shutdown lands, and `.seeding` only exists while
+    /// backgrounded, with no Servers screen on glass. Pure and static so the
+    /// rule is testable without an engine - the `TransferRowState` seam
+    /// pattern (see SettingsTests).
     static func serverRowConnected(
         rowAddr: String, state: EngineStateFfi, liveServerAddr: String?
     ) -> Bool {
         state == .running && liveServerAddr == rowAddr
+    }
+
+    /// What a Servers-row tap should DO - the pure decision, engine-free and
+    /// static like `serverRowConnected` above (tested from
+    /// ServerTapActionTests).
+    enum ServerTapAction: Equatable {
+        /// The engine is up: dial this row.
+        case connect
+        /// The engine is not running: bring it up FIRST - listener bound,
+        /// port mapped - then dial, atomically (see `connectServer`).
+        ///
+        /// Why start rather than refuse: a tap on a server is an unambiguous
+        /// "connect me". eMule 0.70b connects unconditionally on a server-row
+        /// double-click (ServerListCtrl.cpp OnNmDblClk ->
+        /// ConnectToServer) and can afford to, because its listen socket is
+        /// bound at app startup (EmuleDlg.cpp:717) and lives for the whole
+        /// process - "connect implies the listener is up" is an invariant it
+        /// keeps structurally, to the point of restarting the listener
+        /// rather than proceeding without it ("if you don't, you will get a
+        /// low ID on all servers", ListenSocket.cpp:2073). padMule's Stop is
+        /// an iOS-ism with no 0.70b counterpart (the closest is Exit, after
+        /// which there is no list to click), so the faithful translation is
+        /// to restore eMule's invariant before honoring the tap - not to
+        /// refuse it; this codebase already treats an inert control as its
+        /// own defect.
+        case startThenConnect
+        /// This row already holds the live login - nothing to do.
+        case ignore
+    }
+
+    /// The rule: the already-connected row (per `serverRowConnected` - the
+    /// SAME live measurement the row styles by, composed rather than copied,
+    /// so the two cannot drift) is ignored; a running or seeding engine
+    /// dials directly (seeding HOLDS the listener and login - that is its
+    /// point - though the Servers screen is never on glass while
+    /// backgrounded); a stopped or paused engine starts first, because both
+    /// have released the listener and a login without one is a guaranteed
+    /// LowID. Note where the on-glass split-brain input lands (state
+    /// stopped, liveServerAddr PRESENT, tap on that very row):
+    /// startThenConnect, not ignore - the tap REPAIRS the incoherence with a
+    /// proper start + fresh login instead of being swallowed.
+    static func serverTapAction(
+        rowAddr: String, state: EngineStateFfi, liveServerAddr: String?
+    ) -> ServerTapAction {
+        if serverRowConnected(rowAddr: rowAddr, state: state, liveServerAddr: liveServerAddr) {
+            return .ignore
+        }
+        switch state {
+        case .running, .seeding: return .connect
+        case .stopped, .paused: return .startThenConnect
+        }
     }
 
     @Published var downloadedSortKey: DownloadedSortKey = .date
@@ -1211,6 +1288,17 @@ final class EngineModel: ObservableObject {
     /// actually on (seeding with uploads off would burn battery to serve
     /// nothing), and the keepalive actually started.
     func enterBackground() {
+        // ARM THE POLL-GAP EXCLUSION FIRST, before anything below can queue
+        // work. This is the way-OUT half of the background episode (see
+        // `sceneInBackground`), and it must precede pause(): pause()'s
+        // completion runs refreshAll(), whose booking would otherwise re-arm
+        // the gap baseline INSIDE the background grace window. On glass the
+        // 85.7s suspension booked 84.8s - a shortfall that says the baseline
+        // DID move ~1s after backgrounding. That grace-window booking is also
+        // why a one-shot skip flag armed here would fail: it would be
+        // consumed pre-freeze, and the thaw booking would book the
+        // suspension anyway. A state flag has no shots to consume.
+        sceneInBackground = true
         let wanted = UserDefaults.standard.bool(forKey: SettingsKey.backgroundSeeding)
         guard wanted, sharing, keepAlive.start() else {
             if wanted && !sharing {
@@ -1241,29 +1329,34 @@ final class EngineModel: ObservableObject {
     /// Returning to the foreground: drop the keepalive before resuming, so the
     /// audio session is not held any longer than the background actually lasted.
     ///
-    /// This is also where the poll-gap baseline is cleared, because it is the
-    /// ONE point every return to foreground passes through - the scenePhase
-    /// .active arm calls it for the plain-pause path and the seeding path
-    /// alike, so both are covered once, not twice. A suspended process fires
-    /// no timer, so without this the first post-resume tick booked the whole
-    /// suspension into `uiPollMaxGapSecs` (52.0s from a ~52s suspension, on
-    /// glass 2026-08-09) - the seeding-throttle fix's baseline pollution
-    /// through a different path. See the field's SCOPE doc.
+    /// This is also where the poll-gap BACKGROUND EPISODE ends, because it is
+    /// the ONE point every return to foreground passes through - the
+    /// scenePhase .active arm calls it for the plain-pause path and the
+    /// seeding path alike. Every booking between `enterBackground()` and here
+    /// was discarded by `bookPollGap` with its baseline nil'd; the explicit
+    /// clear below covers the one remaining case - NO booking drained during
+    /// the episode (a short hop) - so a pre-background baseline cannot
+    /// survive into the foreground by either route.
+    ///
+    /// ORDERING, because the first fix died on it: clearing the baseline here
+    /// used to be the whole mechanism, described then as leaving only a
+    /// "sub-millisecond residual race". Glass falsified that on 2 of 2
+    /// suspensions (2026-08-09, build 4bf04b1): work queued before the freeze
+    /// drains on thaw BEFORE this runs - the normal ordering, not an edge -
+    /// so the way-in clear was always too late. The exclusion is therefore
+    /// armed on the way OUT (`sceneInBackground` in `enterBackground()`), and
+    /// this function only closes the episode. Both orderings of {thaw-drained
+    /// booking, this call} are now correct: a booking before it sees the flag
+    /// up and discards; a booking after it finds a nil baseline and only
+    /// re-arms.
     ///
     /// NOT UNIT-REACHABLE, stated plainly (the same disclosure the throttle
-    /// clear carries): this is a side effect on private state driven by a
-    /// UIKit lifecycle transition; `PollCadenceTests` pins the pure cadence
-    /// rule, and this clear can only be watched on glass (suspend with
-    /// seeding off, resume, read "Longest poll gap"). KNOWN RESIDUAL RACE,
-    /// accepted: a booking closure already sitting on the main queue when the
-    /// process froze runs BEFORE the resumed scenePhase handler and could
-    /// still book the suspension; the window is one sub-millisecond
-    /// main-queue hop against the suspension instant, and closing it would
-    /// need per-tick schedule timestamps for a case wall-clock time cannot
-    /// distinguish.
+    /// clear carries): the flag raise/drop rides a UIKit lifecycle
+    /// transition; `PollGapBookingTests` pins the pure rule, and the wiring
+    /// can only be watched on glass (suspend with seeding off, resume, read
+    /// "Longest poll gap").
     func leaveBackground() {
-        // Cleared BEFORE resume() queues any work, so the first post-resume
-        // poll finds no stale pre-suspension baseline to measure against.
+        sceneInBackground = false
         lastUiPollAt = nil
         keepAlive.stop()
         resume()
@@ -1407,6 +1500,28 @@ final class EngineModel: ObservableObject {
         return tick % seedingPollDivisor == 0
     }
 
+    /// PURE: the poll-gap booking rule, in one testable place (the same seam
+    /// shape as `shouldRunFastPoll` and `serverRowConnected`). Returns the new
+    /// running max and the new `lastUiPollAt` baseline.
+    ///
+    /// While `backgrounded` (between the scenePhase .background and .active
+    /// transitions) it books NOTHING and returns a nil baseline - so an
+    /// interval that overlaps a background episode cannot be measured by this
+    /// booking (discarded) OR by the next one (its baseline is gone).
+    ///
+    /// There is deliberately NO magnitude threshold ("ignore gaps over N
+    /// seconds"): a multi-second FOREGROUND stall is the one thing this
+    /// instrument exists to catch, and a threshold would discard the signal
+    /// along with the noise. The discriminator is lifecycle state, which
+    /// separates the two exactly.
+    nonisolated static func bookPollGap(
+        now: Date, last: Date?, backgrounded: Bool, maxGap: Double
+    ) -> (maxGap: Double, baseline: Date?) {
+        if backgrounded { return (maxGap, nil) }
+        guard let last else { return (maxGap, now) }
+        return (max(maxGap, now.timeIntervalSince(last)), now)
+    }
+
     private var pollTick = 0
 
     private func startPolling() {
@@ -1532,12 +1647,19 @@ final class EngineModel: ObservableObject {
                 self.sampleStats(stats)
                 self.applyKeepAwake()
                 self.uiPollTicks &+= 1
-                let now = Date()
-                if let last = self.lastUiPollAt {
-                    self.uiPollMaxGapSecs = max(
-                        self.uiPollMaxGapSecs, now.timeIntervalSince(last))
-                }
-                self.lastUiPollAt = now
+                // The booking rule is pure (`bookPollGap`); what this site
+                // supplies is the ordering guarantee: `sceneInBackground` was
+                // armed in enterBackground(), BEFORE any freeze, on the same
+                // main thread this closure runs on - so a closure thawing out
+                // of a suspension reads the flag as up no matter when it was
+                // queued, and the suspension cannot book. See the
+                // `uiPollMaxGapSecs` SCOPE doc.
+                let booked = Self.bookPollGap(
+                    now: Date(), last: self.lastUiPollAt,
+                    backgrounded: self.sceneInBackground,
+                    maxGap: self.uiPollMaxGapSecs)
+                self.uiPollMaxGapSecs = booked.maxGap
+                self.lastUiPollAt = booked.baseline
             }
         }
     }
@@ -1898,11 +2020,54 @@ final class EngineModel: ObservableObject {
     private var keepAwakeWindow: Int { 5 }
 
     /// Connect to a chosen (live) server, then refresh the list + status.
+    ///
+    /// THE DIAL NEVER RUNS AGAINST A DOWN ENGINE. On glass (2026-08-09, build
+    /// 4bf04b1) a row tap while the engine was STOPPED logged in anyway -
+    /// `Engine::connect_to_server` guards only `offline`, never state - and
+    /// with the listener down (shutdown had released it) the server's
+    /// connect-back test failed, so the login was a LowID that then STUCK
+    /// across the next Start (start() does not re-dial an established
+    /// session). Status read "Stopped" beside "eD2k Connected, LowID": one
+    /// engine, two stories.
+    ///
+    /// So the tap decision is the pure `serverTapAction`, and the dial is
+    /// ALWAYS preceded by `e.start()` INSIDE THE SAME work item:
+    /// - `Engine::start()` awaits the listener bind and the port mapping
+    ///   BEFORE returning ("the inbound listener must exist BEFORE we log
+    ///   in" - engine.rs, its own ordering comment), and it is an idempotent
+    ///   no-op when already Running, so on an up engine it costs one lock
+    ///   take on the queue about to hold that same lock for the dial anyway.
+    /// - ONE work item, not two: `work` is serial, so start-then-dial as a
+    ///   single closure admits no interleaving. Dispatched as two items, a
+    ///   Stop tapped in between would queue shutdown BETWEEN start and dial
+    ///   and reproduce the defect. As one item, a Stop lands wholly before
+    ///   it (start revives, dial connects - the later intent wins) or wholly
+    ///   after (stopped, no login). Every ordering ends coherent.
+    /// A consequence worth stating: the `state` snapshot read here picks only
+    /// the MESSAGE - a stale read cannot un-guard the dial.
+    ///
+    /// `stopping` is deliberately NOT raised for the bring-up:
+    /// `connectionSummary` infers direction from `state`, which flips to
+    /// running mid-item and would relabel the op "Stopping...". The row's
+    /// spinner (`connectingTo`) and the notice carry the feedback instead.
     func connectServer(_ addr: String) {
         guard let e = engine else { return }
-        engineLog.notice("connecting to \(addr, privacy: .public)")
+        switch Self.serverTapAction(rowAddr: addr, state: state, liveServerAddr: server?.addr) {
+        case .ignore:
+            return
+        case .startThenConnect:
+            // Reversing an explicit Stop must be said out loud, not done
+            // silently - the user is told the tap is starting the engine.
+            notice = "Starting padMule to connect."
+            engineLog.notice(
+                "connecting to \(addr, privacy: .public) - engine not running, starting it first")
+        case .connect:
+            engineLog.notice("connecting to \(addr, privacy: .public)")
+        }
         connectingTo = addr
         work.async { [weak self] in
+            // Ensure-running, atomically with the dial (see the doc above).
+            e.start()
             // The boolean was previously DISCARDED, so a failed dial produced only
             // a lowercase blue "could not connect to ..." notice that reads like
             // information. Report it as the failure it is.
@@ -2011,8 +2176,18 @@ final class EngineModel: ObservableObject {
 
     /// Zero the funnel counters AND the Kad profile, so the next reading
     /// describes one experiment rather than everything since launch.
+    ///
+    /// The UI-side "Longest poll gap" high-water mark resets here too
+    /// (2026-08-09): it is the same kind of since-launch diagnostic, and it
+    /// previously had NO reset at all - so a single historic pollution (any
+    /// suspension on a build before the way-out exclusion) sat on screen as a
+    /// permanently wrong number with nothing but a relaunch to clear it. The
+    /// baseline clears with it so the first post-reset booking re-arms
+    /// instead of measuring across the reset.
     func resetFetchStats() {
         engine?.resetFetchStats()
+        uiPollMaxGapSecs = 0
+        lastUiPollAt = nil
         notice = "Diagnostic counters reset - reproduce the problem, then read them."
     }
 

@@ -1054,8 +1054,12 @@ struct ContentView: View {
     /// `srv.connected` - that flag is a snapshot stamped at probe time, and
     /// after toolbar Stop it kept the previous server styled connected while
     /// Status honestly read "Not connected" (on glass 2026-08-09). The tap
-    /// gate uses the same live answer: with the stale flag it also refused to
-    /// reconnect to that row until the next probe.
+    /// DECISION lives in `EngineModel.connectServer` (the pure
+    /// `serverTapAction`), which composes that same live answer: the
+    /// already-connected row's tap is swallowed there, and a tap while the
+    /// engine is stopped STARTS it before dialing - on glass the same day, a
+    /// bare dial while stopped logged in with the listener down, earning a
+    /// stuck LowID under a Status screen that read Stopped.
     private func serverRow(_ srv: ServerEntryFfi) -> some View {
         let connectedNow = EngineModel.serverRowConnected(
             rowAddr: srv.addr, state: model.state, liveServerAddr: model.server?.addr)
@@ -1073,7 +1077,14 @@ struct ContentView: View {
             .accessibilityLabel(srv.pinned ? "Unpin server" : "Pin server")
 
             Button {
-                if srv.alive && !connectedNow { model.connectServer(srv.addr) }
+                // The lifecycle decision (already connected? engine stopped?)
+                // is connectServer's, in ONE place. PRE-EXISTING AND KNOWN:
+                // this `srv.alive` gate leaves a no-reply row's tap inert,
+                // although the SELECTABLE comment below intends a TCP attempt
+                // (44ba972 enabled the rows but left this gate). Kept
+                // unchanged by the stopped-engine fix, which is about the
+                // engine half of the tap, not the row half.
+                if srv.alive { model.connectServer(srv.addr) }
             } label: {
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {

@@ -295,8 +295,16 @@ final class SettingsTests: XCTestCase {
             EngineModel.serverRowConnected(
                 rowAddr: "192.0.2.1:4661", state: .running, liveServerAddr: nil),
             "a remembered identity must not style a row connected after Stop -> Start")
-        // Stopped outright: even a live-login address still lingering through
-        // the ~1s poll lag while shutdown lands must not read connected.
+        // Stopped outright with the login address still present. TWO real
+        // routes into this input, not one: the ~1s poll lag while shutdown
+        // lands, and - found on glass 2026-08-09, build 4bf04b1 - a login the
+        // then-guardless connect-while-stopped path established (state
+        // stopped, serverInfo present, STABLE). The second route is now
+        // unreachable by construction: serverTapAction starts the engine
+        // before every dial (see ServerTapActionTests, which pins that this
+        // very input gets startThenConnect, not a swallowed tap). Either way
+        // the row must not read connected - the treatment follows the
+        // coherent whole, never one half of a split brain.
         XCTAssertFalse(
             EngineModel.serverRowConnected(
                 rowAddr: "192.0.2.1:4661", state: .stopped, liveServerAddr: "192.0.2.1:4661"),
