@@ -112,7 +112,7 @@ Details and what is portable from them: `docs/wiki/ref-ecosystem.md`.
 source "$HOME/.cargo/env"              # cargo is NOT on the default PATH
 
 cargo build --workspace
-cargo test --workspace                 # the unit gate (786 tests, offline)
+cargo test --workspace                 # the unit gate (787 tests at 2026-08-09, offline; the handoff carries the current count)
 cargo clippy --workspace --all-targets # must be warning-free
 cargo fmt --all -- --check
 
