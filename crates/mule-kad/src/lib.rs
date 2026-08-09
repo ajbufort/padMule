@@ -12,7 +12,9 @@ pub mod routing;
 pub mod udp_obf;
 
 pub use frame::{pack_kad, unpack_kad, KAD_PACK_THRESHOLD};
-pub use hardening::{is_acceptable_contact, is_acceptable_contact_ip, FloodTracker, FloodVerdict};
+pub use hardening::{
+    is_acceptable_contact, is_acceptable_contact_ip, FloodTracker, FloodVerdict, MAX_TRACKED_IPS,
+};
 pub use lookup::{CSearch, ALPHA_QUERY};
 pub use message::{
     build_bootstrap_req, build_bootstrap_res, build_hello_req, build_hello_res,

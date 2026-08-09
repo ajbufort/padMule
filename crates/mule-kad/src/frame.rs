@@ -7,25 +7,46 @@
 //! [0] = 0xE4 (OP_KADEMLIAHEADER)   |  [1] = opcode  |  [2..] = payload
 //! ```
 //!
-//! If the PAYLOAD exceeds 200 bytes (opcode and header excluded - a 199-byte
-//! payload, i.e. a 201-byte frame, stays plain) it is zlib-packed: the header
-//! becomes 0xE5 (OP_KADEMLIAPACKEDPROT) and ONLY the payload after the opcode
-//! is compressed (the opcode byte is copied verbatim). eMule
-//! `KademliaUDPListener.cpp:2050-2090`; receive path `ClientUDPSocket.cpp:103`.
+//! If the PAYLOAD exceeds 200 bytes (opcode and header excluded) it is
+//! zlib-packed: the header becomes 0xE5 (OP_KADEMLIAPACKEDPROT) and ONLY the
+//! payload after the opcode is compressed (the opcode byte is copied
+//! verbatim). Send path: eMule `CKademliaUDPListener::SendPacket`
+//! (KademliaUDPListener.cpp:2043-2092; see [`KAD_PACK_THRESHOLD`] for the
+//! overloads and a known 2-byte divergence); receive path
+//! `ClientUDPSocket.cpp:103` (case OP_KADEMLIAPACKEDPROT).
 
 use mule_proto::{compress, decompress, IoError, Packet, PROT_KAD, PROT_KAD_PACKED};
 
-/// eMule/aMule packs a Kad datagram only when the PAYLOAD (the bytes after the
-/// 0xE4/opcode header) exceeds this. `CKademliaUDPListener::SendPacket` tests
-/// `packet->GetPacketSize() > 200`, and `GetPacketSize()` is the CMemFile payload
-/// length - the opcode and header byte are NOT counted (`Packet.cpp:96-98`,
-/// `KademliaUDPListener.cpp:1610`). Below it the frame is always sent plain.
+/// padMule packs a Kad datagram only when the PAYLOAD (the bytes after the
+/// 0xE4/opcode header) exceeds this; below it the frame is always sent plain.
+///
+/// The authorities, as actually read:
+/// - eMule 0.50a `CKademliaUDPListener::SendPacket` has a CSafeMemFile
+///   overload testing `pPacket->size > 200` (KademliaUDPListener.cpp:2084),
+///   where `size` is the memfile length - payload only, header and opcode
+///   excluded (`Packet::Packet(CMemFile*, ...)`, packets.cpp:107-112). Most
+///   Kad sends go this way, and padMule matches it exactly.
+/// - eMule 0.50a also has a raw-byte-array overload whose buffer INCLUDES the
+///   2-byte header and which tests `uLenData > 200` on that whole length
+///   (KademliaUDPListener.cpp:2043-2055), i.e. it packs from payload >= 199.
+///   `SendMyDetails` (:151-157) and `SendPublishSourcePacket` (:230-233) use
+///   it, so eMule packs ITS hello/publish-source sends two bytes sooner.
+/// - aMule master has one CMemFile overload testing
+///   `packet->GetPacketSize() > 200` (src/kademlia/net/
+///   KademliaUDPListener.cpp:1849), and `GetPacketSize()` returns the payload
+///   `size` (src/Packet.h:70) - payload-only for every send.
+///
+/// KNOWN, DELIBERATE DIVERGENCE: padMule applies the payload-only rule to all
+/// sends, so a 199- or 200-byte payload that eMule's raw-array paths would
+/// pack goes out plain here. Interop-safe by construction - every receiver
+/// handles 0xE4 and 0xE5 alike (eMule ClientUDPSocket.cpp:103), packing is a
+/// size optimization, not a protocol requirement.
 pub const KAD_PACK_THRESHOLD: usize = 200;
 
 /// Build a plaintext Kad frame `0xE4|opcode|payload`, zlib-packing to
 /// `0xE5|opcode|compressed` when the payload exceeds [`KAD_PACK_THRESHOLD`] and
-/// compression actually shrinks it (matching eMule `CPacket::PackPacket`, which
-/// reverts to the raw form when `size <= newsize`).
+/// compression actually shrinks it (matching eMule `Packet::PackPacket`, which
+/// reverts to the raw form when `size <= newsize`, packets.cpp:199-206).
 pub fn pack_kad(opcode: u8, payload: Vec<u8>) -> Vec<u8> {
     let p = Packet::new(PROT_KAD, opcode, payload);
     // Only attempt compression above the threshold; `compress` keeps the
@@ -134,9 +155,13 @@ mod tests {
 
     #[test]
     fn threshold_is_payload_length_not_frame_length() {
-        // aMule tests `GetPacketSize() > 200` where GetPacketSize is the payload
-        // alone (opcode/header excluded). So a 200-byte payload - even a highly
-        // compressible one - is sent PLAIN (200 is not > 200); 201 packs.
+        // The payload-only rule padMule follows: aMule tests
+        // `GetPacketSize() > 200` (KademliaUDPListener.cpp:1849), the payload
+        // alone (Packet.h:70), and eMule's CSafeMemFile overload agrees - see
+        // KAD_PACK_THRESHOLD for eMule's raw-array paths, which count the
+        // 2-byte header (a recorded, interop-safe divergence). So a 200-byte
+        // payload - even a highly compressible one - is sent PLAIN (200 is
+        // not > 200); 201 packs.
         let plain = pack_kad(0x11, vec![0u8; 200]);
         assert_eq!(plain[0], PROT_KAD, "payload == 200 must not pack");
         assert_eq!(plain.len(), 202); // 2 header + 200 payload

@@ -41,11 +41,19 @@ pub enum PublishJob {
     Keyword { file: [u8; 16], word: String },
 }
 
+/// Both fields are WALL-CLOCK Unix seconds - the caller
+/// (`Engine::maintain_kad_publish`) passes `now_secs()`, SystemTime since the
+/// epoch, not engine uptime. A backward clock jump therefore FREEZES republish
+/// until real time catches back up (`due` uses `saturating_sub`, so the
+/// elapsed reads 0, never underflows); a forward jump republishes early. Both
+/// are benign - an early publish is a wasted walk, a frozen one is caught up
+/// on the next due pass - and the clocks are in-memory only, so a restart
+/// resets them and republishes everything anyway.
 #[derive(Default, Clone)]
 struct FileClocks {
-    /// Engine-uptime seconds the source record was last (re)published.
+    /// Unix seconds the source record was last (re)published.
     source: Option<u64>,
-    /// Engine-uptime seconds the keyword records were last (re)published.
+    /// Unix seconds the keyword records were last (re)published.
     keyword: Option<u64>,
 }
 

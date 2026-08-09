@@ -61,8 +61,9 @@ struct Entry {
 /// prevent - and a banned entry pins itself for the whole ban, making the
 /// busiest attacker the most persistent. eMule prunes on a desktop timer;
 /// padMule has a ~100MB jetsam budget and no such timer, so it prunes on insert
-/// and then refuses to grow. Same value and same reasoning as the out-track
-/// list bound in `kad_live`.
+/// and then refuses to grow. THE ONE DEFINITION: `kad_live`'s out-track list
+/// imports this (via the crate root) for the same reasoning, rather than
+/// mirroring the number.
 pub const MAX_TRACKED_IPS: usize = 4096;
 
 /// Per-IP request-rate limiter with ignore-then-ban escalation (eMule 0.70b:

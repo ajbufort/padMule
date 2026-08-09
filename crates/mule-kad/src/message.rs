@@ -34,11 +34,13 @@ pub const OP_PUBLISH_KEY_REQ: u8 = 0x43;
 /// PUBLISH a source record for a file (KADEMLIA2_PUBLISH_SOURCE_REQ, :598):
 /// `file_target 16 | our_client_hash 16 | taglist`.
 pub const OP_PUBLISH_SOURCE_REQ: u8 = 0x44;
-/// The storing node's answer to either publish (KADEMLIA2_PUBLISH_RES, :603):
+/// The storing node's answer to either publish (KADEMLIA2_PUBLISH_RES, :604):
 /// `file 16 | load u8 | [ options u8 ]`.
 pub const OP_PUBLISH_RES: u8 = 0x4B;
 /// Ack the storing node solicits with option bit 0 (KADEMLIA2_PUBLISH_RES_ACK,
-/// :604): a null packet.
+/// :605): a null packet. padMule deliberately never sends it - stock eMule
+/// 0.50a never sets the soliciting bit in its own PUBLISH_RES sends (see the
+/// PUBLISH_RES handling in `kad_live` for the citations).
 pub const OP_PUBLISH_RES_ACK: u8 = 0x4C;
 /// Liveness ping.
 pub const OP_PING: u8 = 0x60;
@@ -953,7 +955,7 @@ impl KeywordEntry {
 }
 
 /// The most files eMule packs into ONE keyword-publish datagram
-/// (Search.cpp:844, `iPacketCount < 50`).
+/// (Search.cpp:845, `iPacketCount < 50`).
 pub const PUBLISH_KEY_FILES_PER_PACKET: usize = 50;
 
 /// Build a KADEMLIA2_PUBLISH_KEY_REQ: `keyword_target 16 | count u16 |

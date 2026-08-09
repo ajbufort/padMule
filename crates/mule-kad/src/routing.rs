@@ -492,7 +492,11 @@ impl RoutingTable {
     /// A contact walks eMule's exact death march: stamped by one sweep, probed
     /// by the next (type -> 4, two minutes to answer), removed by the first
     /// sweep past that. A nodes.dat seed starts at type 3, so a dead one is
-    /// gone ~3-4 minutes into a session.
+    /// gone ~3-4 minutes into a session - PER CONTACT, and only once its turn
+    /// comes: the engine caps probes at 2 per 60s sweep (KAD_SWEEP_MAX_PROBES),
+    /// so the whole-table eviction ceiling is ~2 contacts a minute and a large
+    /// mostly-stale table drains over hours, not minutes (the same divergence
+    /// in DEGREE `closest_to_serving` records below).
     ///
     /// NO `InUse` REFCOUNT, deliberately. eMule needs one (Search.cpp:183 takes
     /// seeds `bInUse = true`, released in `~CSearch` :148-150) because

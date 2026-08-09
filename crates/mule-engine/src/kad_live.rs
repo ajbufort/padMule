@@ -26,7 +26,7 @@ use mule_kad::{
     kad_keyword_target, kad_obfuscate_request, kad_obfuscate_response, pack_kad,
     parse_bootstrap_res, parse_hello, parse_kad2_res, parse_publish_res, parse_search_res,
     unpack_kad, BootstrapRes, CSearch, FileResult, FloodTracker, FloodVerdict, Hello, KeywordEntry,
-    RoutingTable, Source, SourceEntry, WireContact, ALPHA_QUERY, K, KAD_FIND_NODE,
+    RoutingTable, Source, SourceEntry, WireContact, ALPHA_QUERY, K, KAD_FIND_NODE, MAX_TRACKED_IPS,
     OP_BOOTSTRAP_RES, OP_HELLO_RES, OP_KAD2_RES, OP_PUBLISH_RES, OP_SEARCH_RES,
 };
 use mule_proto::Kad128;
@@ -94,6 +94,21 @@ pub(crate) const REFRESH_DEADLINE_QUERIES: u32 = 4;
 /// finishes far inside it; this is the "overall deadline" leg of its
 /// termination (the others: enough results, candidates exhausted).
 const LOOKUP_DEADLINE_QUERIES: u32 = 16;
+
+/// A PUBLISH walk's overall deadline, in `per_query` units - the refresh's 4,
+/// not a real lookup's 16, and for the same reason: a publish runs on the
+/// heartbeat under the engine lock, wrapped in `KAD_PUBLISH_BUDGET` (3s), so
+/// its own deadline MUST fit inside that budget (equality is fine, same caveat
+/// as the maintenance pin) or the outer cancellation ends every walk instead
+/// of the walk terminating itself - the inverted relationship the maintenance
+/// path already fixed. With `LOOKUP_DEADLINE_QUERIES` here, 16 x 750ms = 12s
+/// structural against a 3s budget meant exactly that. Pinned by
+/// `a_kad_publish_walk_fits_inside_its_budget`. Early termination on results
+/// is RARE either way: the walk stops at `KAD_PUBLISH_STORE_TOTAL` = 10 acks,
+/// which equals `LOOKUP_VALUE_BUDGET` = K = 10, so it must hear back from
+/// every value ask it is ever allowed to send - disclosed, not changed,
+/// because the store total is eMule's (Defines.h:63-64).
+pub(crate) const PUBLISH_DEADLINE_QUERIES: u32 = 4;
 
 /// FIND_NODE spend cap per value lookup - the pre-rewrite structural maximum
 /// (12 rounds x ALPHA_QUERY). The rewrite changes WHEN requests go out, not
@@ -516,10 +531,11 @@ enum ValueAsk<'a> {
     /// (KADEMLIA2_PUBLISH_KEY_REQ). Same iterative FIND_NODE walk, but each
     /// closest responded in-tolerance node gets a STORE, not a SEARCH, and we
     /// count PUBLISH_RES rather than accumulating results - eMule's STOREKEYWORD
-    /// flavor of `CSearch` (Search.cpp:814).
+    /// flavor of `CSearch` (Search.cpp:815).
     PublishKeyword { entries: &'a [KeywordEntry] },
-    /// STORE our source record for a file (KADEMLIA2_PUBLISH_SOURCE_REQ,
-    /// eMule STORESOURCE, Search.cpp:730).
+    /// STORE our source record for a file (KADEMLIA2_PUBLISH_SOURCE_REQ) -
+    /// eMule's STOREFILE flavor, its name for storing OURSELVES as a source
+    /// of a file ("Try to store yourself as a source", Search.cpp:705).
     PublishSource {
         our_hash: Kad128,
         entry: SourceEntry,
@@ -597,24 +613,22 @@ struct ReadLoop {
 /// and the consumption stops one solicitation being replayed.
 const ACK_SOLICITED_WINDOW: Duration = Duration::from_secs(180);
 
-/// Cap on tracked IPs, for the out-track list and each flood tracker alike.
-///
-/// NOT in either authority, and it is a padMule-specific necessity rather than
-/// an improvement: these maps are keyed by an ATTACKER-CONTROLLED value (a UDP
-/// source address, trivially spoofed), so an unbounded map is a memory-exhaustion
-/// vector on a device with a jetsam budget around 100 MB. eMule runs on a desktop
-/// and prunes on a timer; padMule prunes on insert and then refuses to grow.
-/// Refusing to GROW is deliberately fail-open for a NEW ip - dropping every
-/// unknown source under a spray would be a self-inflicted outage, and the
-/// entries already held keep protecting against the floods that actually cost
-/// us (a real peer sends from one address).
-const MAX_TRACKED_IPS: usize = 4096;
+// Cap on tracked IPs, for the out-track list here and each flood tracker
+// alike: ONE definition, `mule_kad::MAX_TRACKED_IPS` (hardening.rs), imported
+// above - this file used to mirror the number with a "same value as" comment
+// on each side, which is the drift the one-definition rule exists to prevent.
+// The reasoning lives with the definition. Worth restating here: the map is
+// keyed by an ATTACKER-CONTROLLED value (a UDP source address, trivially
+// spoofed), so it prunes on insert and then refuses to grow - deliberately
+// fail-open for a NEW ip, because dropping every unknown source under a spray
+// would be a self-inflicted outage, and the entries already held keep
+// protecting against the floods that actually cost us.
 
 /// The inbound request budget for one IP, per minute, per opcode - eMule's
-/// exact numbers from `InTrackListIsAllowedPacket` (PacketTracking.cpp:161-176):
+/// exact numbers from `InTrackListIsAllowedPacket` (PacketTracking.cpp:110-149):
 /// BOOTSTRAP_REQ 2, HELLO_REQ 3, KADEMLIA2_REQ 10, PING 2. Over the budget the
 /// request is IGNORED; over five times it the IP is BANNED, which is that
-/// function's own two-tier shape (:196-205).
+/// function's own two-tier shape (:197-204).
 ///
 /// `None` means "not a request we serve" - no tracking, because we drop it
 /// anyway. eMule returns true for anything outside its switch, and notably
@@ -1250,8 +1264,19 @@ impl KadNode {
     /// fast) cannot arrive while its slot does not exist yet. A failed send
     /// withdraws the slot at once: no reply is coming, and a dead slot must
     /// not swallow another request's IP-fallback match.
+    ///
+    /// The caller's `guard` tracks the seq HERE, between the push and the send
+    /// await. Callers used to track only after this returned, so a
+    /// cancellation landing while `send_to` was Pending left a slot no guard
+    /// knew about - parked in `pending` for the node's life, eating one
+    /// IP-fallback match. No deterministic test exists for that window: a
+    /// loopback `send_to` virtually never returns Pending, so the fix is
+    /// argued by construction (track precedes the only await) rather than
+    /// witnessed red-first. The existing cancellation tests cover the guard's
+    /// withdraw-on-drop itself.
     async fn begin_request(
         &self,
+        guard: &mut SlotGuard,
         target_id: &Kad128,
         dest: SocketAddr,
         frame: &[u8],
@@ -1285,6 +1310,10 @@ impl KadNode {
             expect,
             tx,
         });
+        // Track BEFORE the send await (see the doc above). On a send error the
+        // slot is withdrawn below as before; the guard's later retain of a
+        // seq already gone is a documented no-op.
+        guard.track(seq);
         match self.socket.send_to(&datagram, dest).await {
             Ok(_) => Ok((seq, rx)),
             Err(e) => {
@@ -1339,18 +1368,19 @@ impl KadNode {
         // trailing statement - a stale slot then sits at the FRONT of
         // `pending`, wins the IP-fallback match, and swallows the next reply
         // from that peer. Same guard, same reason as the lookup path. Every
-        // seq is tracked AT REGISTRATION, before any await: a cancellation
-        // while slot 1 is being awaited must still withdraw slots 2 and 3.
+        // seq is tracked AT REGISTRATION, inside `begin_request` before its
+        // send await: a cancellation while slot 1 is being awaited must still
+        // withdraw slots 2 and 3 - and one landing mid-send must withdraw the
+        // slot that send had already registered.
         let mut guard = SlotGuard::new(Arc::clone(&self.pending));
         let mut slots: Vec<Result<(u64, tokio::sync::oneshot::Receiver<ReplyAnswer>), KadError>> =
             Vec::with_capacity(reqs.len());
         for (target_id, dest, frame) in reqs {
             // A send that fails is THIS request's failure, not the batch's - the
             // others are already on the wire and their answers are still coming.
-            let slot = self.begin_request(target_id, *dest, frame, expect).await;
-            if let Ok((seq, _)) = &slot {
-                guard.track(*seq);
-            }
+            let slot = self
+                .begin_request(&mut guard, target_id, *dest, frame, expect)
+                .await;
             slots.push(slot);
         }
 
@@ -1564,9 +1594,11 @@ impl KadNode {
         per_query: Duration,
     ) -> bool {
         let dest = contact_addr(contact.ip, contact.udp_port);
-        match self.begin_request(&contact.id, dest, &frame, expect).await {
+        match self
+            .begin_request(guard, &contact.id, dest, &frame, expect)
+            .await
+        {
             Ok((seq, rx)) => {
-                guard.track(seq);
                 crate::stats::note_kad_request(kind.stats());
                 let started = Instant::now();
                 inflight.spawn(async move {
@@ -1826,6 +1858,26 @@ impl KadNode {
                                     // like any other reply. eMule reads the
                                     // load factor for backoff; padMule keeps it
                                     // only as a diagnostic today.
+                                    //
+                                    // TWO DELIBERATE DIVERGENCES, documented
+                                    // not changed. (1) padMule never sends
+                                    // OP_PUBLISH_RES_ACK: eMule sends it only
+                                    // when the reply carries an options byte
+                                    // with bit 0 set and the sender key is
+                                    // non-empty (KademliaUDPListener.cpp:
+                                    // 1579-1588), and stock eMule never SETS
+                                    // that bit - all three of its PUBLISH_RES
+                                    // senders write only file + load
+                                    // (:1379-1384, :1526-1531, :1727-1732).
+                                    // (2) `published_to` counts any parseable
+                                    // PUBLISH_RES from a slot-matched peer
+                                    // without checking the returned file id
+                                    // against the published target; eMule
+                                    // routes the id to its search
+                                    // (`ProcessPublishResult`, :1577-1578).
+                                    // The slot match already binds the reply
+                                    // to OUR outstanding request, so a wrong
+                                    // id could only miscount, not misroute.
                                     if parse_publish_res(&payload).is_ok() {
                                         out.published_to += 1;
                                         self.note_responder(
@@ -2066,7 +2118,7 @@ impl KadNode {
                 ValueAsk::PublishKeyword { entries },
                 KAD_PUBLISH_STORE_TOTAL,
                 per_query,
-                LOOKUP_DEADLINE_QUERIES,
+                PUBLISH_DEADLINE_QUERIES,
                 LOOKUP_FIND_BUDGET,
             )
             .await?;
@@ -2075,7 +2127,8 @@ impl KadNode {
 
     /// PUBLISH our source record for `file_hash`: the FIND_NODE walk toward the
     /// file hash, then a KADEMLIA2_PUBLISH_SOURCE_REQ STORE to each closest
-    /// responded in-tolerance node (eMule STORESOURCE). Returns the ack count.
+    /// responded in-tolerance node (eMule STOREFILE, Search.cpp:705). Returns
+    /// the ack count.
     pub async fn publish_source(
         &mut self,
         file_hash: &Kad128,
@@ -2090,7 +2143,7 @@ impl KadNode {
                 ValueAsk::PublishSource { our_hash, entry },
                 KAD_PUBLISH_STORE_TOTAL,
                 per_query,
-                LOOKUP_DEADLINE_QUERIES,
+                PUBLISH_DEADLINE_QUERIES,
                 LOOKUP_FIND_BUDGET,
             )
             .await?;
@@ -4008,7 +4061,7 @@ mod tests {
     }
 
     /// THE FLOOD LIMITER'S FIRST PRODUCTION CALL SITE. eMule allows 2 PINGs per
-    /// minute per IP (`InTrackListIsAllowedPacket`, PacketTracking.cpp:161-176)
+    /// minute per IP (`InTrackListIsAllowedPacket`, PacketTracking.cpp:148-149)
     /// and IGNORES the rest. A serve loop without this answers every packet a
     /// stranger sends, which is both a CPU drain and, for BOOTSTRAP, an
     /// amplification arm.
