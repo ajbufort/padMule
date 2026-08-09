@@ -300,10 +300,12 @@ echo "   pymobiledevice3 developer dvt launch $BUNDLE"
 #   2. the entry the change belongs to (kad-routing-lifecycle, security-model...)
 #   3. docs/wiki/index.md            - if an entry was created or changed subject
 #   4. docs/wiki/log.md              - append, always
-#   5. docs/wiki/handoff-next-session.md - REPLACE WHOLESALE: state of the tree,
-#      what is installed, what is measured vs assumed, and the top next action.
-#      This is what a session after an auto-compact reads FIRST, so it must be
-#      true rather than aspirational.
+#   5. docs/wiki/handoff-for-fable.md - update IN PLACE (there is exactly ONE
+#      handoff since the 2026-08-08 merge; handoff-next-session.md is a retired
+#      stub - do not write there): state of the tree, what is installed, what is
+#      measured vs assumed, and the top next action. This is what a session
+#      after an auto-compact reads FIRST, so it must be true, and RE-READ THE
+#      WHOLE FILE after editing - its worst failures are self-contradictions.
 #   6. cross-session memory under ~/.claude/projects/.../memory/
 #
 # AND AFTER A COMPACT: run the `reanalyze` skill before touching code. A
