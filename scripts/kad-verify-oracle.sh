@@ -79,16 +79,23 @@ mkdir -p "$CFG/Incoming" "$CFG/Temp"
 cleanup() { local j; j=$(jobs -p); [ -n "$j" ] && kill $j 2>/dev/null; rm -rf "$WORK"; }
 trap cleanup EXIT
 
-ip link set lo up
-ip link add name d0 type dummy 2>/dev/null
-ip addr add "$PAD_IP/24" dev d0        # padMule IP first (interface primary)
-ip addr add "$CTRL_IP/24" dev d0
-ip addr add "$AM_IP/24"  dev d0
-ip link set d0 up
+# ENVIRONMENT PREFLIGHT: every ip command must succeed, or the run burns the
+# whole ${WATCH_SECS}s watch and ends in a PROTOCOL-shaped FAIL/INCOMPLETE for
+# what was a namespace-setup failure (e.g. no dummy module). Abort immediately,
+# labeled as environment - never as a verdict. The namespace is fresh, so d0
+# cannot pre-exist and `ip link add` needs no error suppression.
+net() { "$@" || { echo "ENVIRONMENT FAIL (not a protocol verdict): '$*' failed" \
+  "- the namespace/dummy-interface setup did not come up (see stderr above)"; exit 1; }; }
+net ip link set lo up
+net ip link add name d0 type dummy
+net ip addr add "$PAD_IP/24" dev d0    # padMule IP first (interface primary)
+net ip addr add "$CTRL_IP/24" dev d0
+net ip addr add "$AM_IP/24"  dev d0
+net ip link set d0 up
 # Force an UNSPECIFIED-bound socket to source from PAD_IP when it dials amuled
 # (both mule-cli invocations pass an explicit bind IP, which pins the source
 # anyway; this keeps the old belt-and-braces behaviour).
-ip route add "$AM_IP/32" dev d0 src "$PAD_IP"
+net ip route add "$AM_IP/32" dev d0 src "$PAD_IP"
 
 # 1) amuled: generate a default config, then tune it for an isolated Kad-only run.
 timeout 6 "$AMULED" -c "$CFG" -o -i >/dev/null 2>&1
@@ -161,7 +168,15 @@ CUDP="$(LOGS | grep -oE 'Client UDP-Socket at port [0-9]+' | tail -1)"
 echo "== ${CUDP:-<no client UDP socket line>} (need port $AM_UDP)"
 case "$CUDP" in
   *" $AM_UDP") : ;;
-  *) echo "WARN: client/Kad UDP is NOT on $AM_UDP - padMule cannot reach it"; ;;
+  # No line at all stays a WARN: the 2026-08-02 flakiness was exactly a log line
+  # this harness could not see, and aborting on absent WORDING would recreate it.
+  "") echo "WARN: no client-UDP-socket line found - cannot confirm the Kad port"; ;;
+  # A line POSITIVELY naming the wrong port is fatal: padMule can never reach
+  # Kad, so the ${WATCH_SECS}s watch could only end in a false FAIL/INCOMPLETE.
+  *) echo "ENVIRONMENT FAIL (not a protocol verdict): client/Kad UDP is NOT on" \
+       "$AM_UDP - a port collision forced an ephemeral fallback; padMule cannot" \
+       "reach it, so watching would only produce a false protocol FAIL"
+     exit 1 ;;
 esac
 
 # 5) SERVE node: kad-serve stays up for the whole run, its read loop answering.

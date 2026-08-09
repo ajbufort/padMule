@@ -59,7 +59,18 @@ rm -f ctl; mkfifo ctl
 "$BIN" < ctl > eserver.log 2>&1 &
 ESRV=$!
 exec 9> ctl # hold stdin open so eserver does not EOF-exit
-for i in $(seq 1 30); do ss -ltn 2>/dev/null | grep -q ":$PORT " && break; sleep 0.2; done
+# Wait until eserver is actually listening - and say so if it never does,
+# instead of falling through after 6s to a mule-cli run that cannot connect
+# (the LISTENING-flag pattern from differential-test.sh).
+LISTENING=0
+for i in $(seq 1 30); do
+  if ss -ltn 2>/dev/null | grep -q ":$PORT "; then LISTENING=1; break; fi
+  if ! kill -0 "$ESRV" 2>/dev/null; then break; fi
+  sleep 0.2
+done
+if [ "$LISTENING" != 1 ]; then
+  echo "eserver never listened on $PORT; log tail:"; tail -25 "$ORACLE/eserver.log"; exit 1
+fi
 
 echo "== eserver 17.15 (lugdunum) listening on 127.0.0.1:$PORT - isolated, no internet egress =="
 if [ "$#" -gt 0 ]; then

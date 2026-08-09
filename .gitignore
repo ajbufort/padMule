@@ -10,6 +10,13 @@ refs/
 # Windows "mark of the web" alternate-data-stream remnants (WSL)
 *:Zone.Identifier
 
+# ios-test.yml diagnostics: the rendered-attachment export and the xcodebuild
+# result bundle. Running those steps locally must not dirty the tree - ship.sh
+# hard-aborts on a dirty tree. The rest of the CI staging output (gen/, libs/,
+# libs-sim/, build/, the xcodegen project) is already covered by ios/.gitignore.
+/ios/rendered/
+/ios/TestResults.xcresult
+
 # Upstream source archives + protocol-archaeology material Anthony keeps
 # alongside the tree. NOT vendored, deliberately: the SANS paper is no-repost
 # and the MetaMachine binaries are proprietary (see docs/wiki/log.md 2026-07-20,

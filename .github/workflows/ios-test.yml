@@ -125,12 +125,16 @@ jobs:
         if: always()
         run: |
           mkdir -p ios/rendered
-          # xcresulttool's legacy reader is what exposes attachments by name; the
-          # flag is required on Xcode 16+ and harmless before it.
-          xcrun xcresulttool export attachments \
+          # Pull the PNGs out of the result bundle so they can be looked at
+          # without Xcode. If xcresulttool cannot (an older tool without this
+          # subcommand, a missing bundle, a changed CLI), the REAL error is
+          # printed rather than swallowed - but the step still passes: the
+          # renders are diagnostics, and the uploaded .xcresult keeps them.
+          if ! xcrun xcresulttool export attachments \
             --path ios/TestResults.xcresult \
-            --output-path ios/rendered 2>/dev/null \
-            || echo "no attachments exported (older xcresulttool) - the .xcresult still has them"
+            --output-path ios/rendered; then
+            echo "attachment export FAILED (real error above) - the .xcresult artifact still has them"
+          fi
           ls -la ios/rendered || true
 
       - name: Upload rendered views + test results

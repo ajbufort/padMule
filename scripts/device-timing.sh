@@ -47,7 +47,9 @@ WDA=localhost:8100
 # talking to it regardless, so asking is both private and more truthful than a
 # literal: if a differently-signed build is installed, this drives THAT one
 # instead of failing to find a bundle nobody has. Override with
-# PADMULE_BUNDLE_ID.
+# PADMULE_BUNDLE_ID. (ship.sh's guard 4 makes the OPPOSITE choice - exact id
+# only - because reading a VERSION back off a substring match could answer with
+# another app's; here driving whichever padMule is present is the goal.)
 BUNDLE="${PADMULE_BUNDLE_ID:-$(pymobiledevice3 apps list 2>/dev/null | python3 -c "
 import sys, json
 try:
@@ -99,12 +101,20 @@ print("\n".join(out))
 '
 }
 
-# Element ids for a locator, space separated.
+# Element ids for a locator, space separated. A FAILED query prints the
+# __WDA_ERROR__ sentinel instead of nothing: curl exits 0 on an error BODY
+# (header rule + the 2026-08-08 postmortem), and an error that prints nothing
+# is indistinguishable from a legitimate zero-element answer downstream.
 els() {
   api -X POST "$WDA/session/$SID/elements" -H 'Content-Type: application/json' -d "$1" |
     python3 -c 'import json,sys
-v=json.load(sys.stdin).get("value") or []
-print(" ".join(e["ELEMENT"] for e in v))'
+try:
+    v = json.load(sys.stdin).get("value")
+    if not isinstance(v, list):
+        raise ValueError("error body, not an element list")
+    print(" ".join(e["ELEMENT"] for e in v))
+except Exception:
+    print("__WDA_ERROR__")'
 }
 first_by_label() { els "{\"using\":\"link text\",\"value\":\"label=$1\"}" | awk '{print $1}'; }
 tap() { api -X POST "$WDA/session/$SID/element/$1/click" -d '{}' >/dev/null; }
@@ -112,7 +122,18 @@ tap() { api -X POST "$WDA/session/$SID/element/$1/click" -d '{}' >/dev/null; }
 # Result rows. Marker is `Get` - ONE BUTTON PER ROW - never `srcs`: a
 # single-source row reads "1 src", so an `srcs` matcher cannot fire on a thin
 # result set, which is exactly what an unpopular query returns.
-count_rows() { els '{"using":"partial link text","value":"label=Get"}' | wc -w; }
+count_rows() {
+  local out
+  out=$(els '{"using":"partial link text","value":"label=Get"}')
+  if [ "$out" = "__WDA_ERROR__" ]; then
+    echo "ABORT: the WDA elements query FAILED (error body or no response)." >&2
+    echo "       A dead WDA used to count as ZERO ROWS here, and every timing" >&2
+    echo "       printed after that is fiction. Nothing below is trustworthy." >&2
+    kill -s TERM $$ # count_rows runs inside $( ), so a plain exit cannot stop the script
+    exit 1
+  fi
+  echo "$out" | wc -w
+}
 
 need
 SID=$(session)

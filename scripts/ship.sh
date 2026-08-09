@@ -42,8 +42,13 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-KIT=/home/ajbufort/padmule-resign
-KEY=/mnt/c/Users/ajbuf/AppData/Roaming/Sideloadly/key.pem
+# These three are MACHINE-LOCAL paths (the resign kit, the Sideloadly key, the
+# Windows Downloads drop) - env-overridable so this public script does not hard-
+# require one person's disk layout, in the same spirit as deriving the bundle id
+# below. Behaviour is unchanged when the variables are unset.
+KIT="${PADMULE_RESIGN_KIT:-/home/ajbufort/padmule-resign}"
+KEY="${PADMULE_SIGN_KEY:-/mnt/c/Users/ajbuf/AppData/Roaming/Sideloadly/key.pem}"
+IPA_DROP="${PADMULE_IPA_DROP:-/mnt/c/Users/ajbuf/Downloads}"
 # THE BUNDLE ID COMES FROM THE PROVISIONING PROFILE, never from a literal here.
 #
 # Two reasons, and the second is the better one. (1) PRIVACY: the id embeds the
@@ -178,7 +183,7 @@ GOT=$(python3 -c "import plistlib;print(plistlib.load(open('$WORK/x/Payload/padM
 [ "$GOT" = "$SHORT" ] || { echo "ABORT: artifact says '$GOT', expected '$SHORT'" >&2; exit 1; }
 echo "-- artifact verified as $SHORT"
 
-cp "$WORK/padMule-ipa/padMule.ipa" "/mnt/c/Users/ajbuf/Downloads/padMule-INSTALL-THIS-unsigned-$SHORT.ipa"
+cp "$WORK/padMule-ipa/padMule.ipa" "$IPA_DROP/padMule-INSTALL-THIS-unsigned-$SHORT.ipa"
 cp "$WORK/padMule-ipa/padMule.ipa" "$KIT/padmule-unsigned-$SHORT.ipa"
 
 echo "-- signing"

@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/home/ajbufort/claude-projects/padMule/.claude/hooks/kb-reflect-check.sh",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/kb-reflect-check.sh",
             "timeout": 15
           }
         ]
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/home/ajbufort/claude-projects/padMule/.claude/hooks/precompact-handoff.sh",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/precompact-handoff.sh",
             "timeout": 15,
             "statusMessage": "Updating the handoff before compaction..."
           }
@@ -28,7 +28,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/home/ajbufort/claude-projects/padMule/.claude/hooks/session-start-handoff.sh",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/session-start-handoff.sh",
             "timeout": 15
           }
         ]

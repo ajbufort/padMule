@@ -39,6 +39,11 @@ fi
 # ---- inside the isolated namespace (loopback only) ----
 ip link set lo up
 WORK="$(mktemp -d)"
+# set -e means any mid-run failure exits right here in the namespaced run, which
+# is where $WORK and the background jobs live - so cleanup is a trap, not the
+# tail of the happy path (same pattern as the sibling oracle scripts).
+cleanup() { local j; j=$(jobs -p); [ -n "$j" ] && kill $j 2>/dev/null; rm -rf "$WORK"; }
+trap cleanup EXIT
 ORACLE="$WORK/eserver"; CFG="$WORK/config"; DL="$WORK/downloads"
 mkdir -p "$ORACLE" "$CFG" "$DL"
 cat > "$ORACLE/donkey.ini" <<EOF
@@ -53,7 +58,18 @@ rm -f ctl; mkfifo ctl
 "$BIN" < ctl > eserver.log 2>&1 &
 ESRV=$!
 exec 9> ctl
-for _ in $(seq 1 30); do ss -ltn 2>/dev/null | grep -q ":$PORT " && break; sleep 0.2; done
+# Wait until the eserver is actually listening - and say so if it never does,
+# instead of falling through after 6s to a run that cannot connect (the
+# LISTENING-flag pattern from differential-test.sh).
+LISTENING=0
+for _ in $(seq 1 30); do
+  if ss -ltn 2>/dev/null | grep -q ":$PORT "; then LISTENING=1; break; fi
+  if ! kill -0 "$ESRV" 2>/dev/null; then break; fi
+  sleep 0.2
+done
+if [ "$LISTENING" != 1 ]; then
+  echo "eserver never listened on $PORT; log tail:"; tail -25 "$ORACLE/eserver.log"; exit 1
+fi
 
 # A minimal server.met so the engine's connect_server dials the local eserver
 # (0xE0 header, 1 server, ip 127.0.0.1 low-byte-first, port 4661, no tags).
@@ -79,6 +95,14 @@ SEED_LIB="$KEYWORD sample video.avi|$KEYWORD music track.mp3|$KEYWORD readme not
 "$CLI" offer-hold 127.0.0.1 "$PORT" "$SEED_LIB" 300 &
 SEED_PID=$!
 sleep 2 # let the seeder log in + offer before the search runs
+# The seeder must still be ALIVE to claim the index is seeded - a dead seeder
+# here means every search below runs against an EMPTY index and the simulation
+# "passes" while validating nothing.
+if ! kill -0 "$SEED_PID" 2>/dev/null; then
+  echo "ABORT: the index seeder (offer-hold) died before the simulation started."
+  echo "--- eserver.log tail ---"; tail -12 "$ORACLE/eserver.log"
+  exit 1
+fi
 echo "== seeded the eserver index (keyword '$KEYWORD'); running the app simulation =="
 "$SIM" "$CFG" "$DL" "$KEYWORD"
 

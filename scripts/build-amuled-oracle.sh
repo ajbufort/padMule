@@ -35,5 +35,12 @@ echo "== upstream unit tests (independent cross-check of our codecs) =="
 ctest --test-dir "$BUILD" --output-on-failure || true
 
 echo
-echo "amuled binary:"
-find "$BUILD" -name 'amuled' -type f -printf '  %p\n' || echo "  (not found - check the build log)"
+# `find` exits 0 even on zero matches, so it cannot gate this. Check the binary
+# exists explicitly (same pattern as build-amuled-kad-oracle.sh) - a build that
+# produced no amuled must not exit 0 silently.
+AMULED="$BUILD/src/amuled"
+if [ -x "$AMULED" ]; then
+  echo "amuled binary: $AMULED"
+else
+  echo "BUILD FAILED - amuled not found at $AMULED"; exit 1
+fi

@@ -61,8 +61,20 @@ maxclients=100
 EOF
 cd "$ESRVDIR"; rm -f ctl; mkfifo ctl
 "$ESERVER" < ctl > eserver.log 2>&1 &
+ESRV=$!
 exec 9> ctl
-for _ in $(seq 1 30); do ss -ltn 2>/dev/null | grep -q ":$ESRV_PORT " && break; sleep 0.2; done
+# Wait until eserver is actually listening - and say so if it never does,
+# instead of falling through after 6s to a run where nothing can connect
+# (the LISTENING-flag pattern from differential-test.sh).
+LISTENING=0
+for _ in $(seq 1 30); do
+  if ss -ltn 2>/dev/null | grep -q ":$ESRV_PORT "; then LISTENING=1; break; fi
+  if ! kill -0 "$ESRV" 2>/dev/null; then break; fi
+  sleep 0.2
+done
+if [ "$LISTENING" != 1 ]; then
+  echo "eserver never listened on $ESRV_PORT; log tail:"; tail -25 "$ESRVDIR/eserver.log"; exit 1
+fi
 echo "== eserver 17.15 up on $ESRV_IP:$ESRV_PORT (isolated)"
 
 # 2) padMule: serve a real file AND offer it to the eserver (earns HighID; the
