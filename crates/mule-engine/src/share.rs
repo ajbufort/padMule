@@ -654,18 +654,6 @@ fn read_range(path: &Path, start: u64, end: u64) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Serve whatever `library` file a peer asks for, over an already-handshaked
-/// connection. `first` is the packet the caller already read to classify this
-/// peer as a leecher (fed back in before reading more); pass `None` to read the
-/// first packet here. Returns when the peer disconnects.
-///
-/// A request for a hash we do not hold is answered with OP_FILEREQANSNOFIL, so
-/// the peer moves on cleanly rather than hanging. Block ranges outside the file
-/// are dropped rather than trusted - the request came from the network.
-///
-/// `credit` is `Some((store, peer_userhash))` on the live engine path, so the
-/// bytes we upload are accrued against this peer's credit record.
-#[allow(clippy::too_many_arguments)]
 /// The optional extras one SERVE connection carries, bundled to keep the arity
 /// readable (the mirror of `PeerSession` on the download side).
 #[derive(Default)]
@@ -713,6 +701,18 @@ impl Drop for ServedGuard {
     }
 }
 
+/// Serve whatever `library` file a peer asks for, over an already-handshaked
+/// connection. `first` is the packet the caller already read to classify this
+/// peer as a leecher (fed back in before reading more); pass `None` to read the
+/// first packet here. Returns when the peer disconnects.
+///
+/// A request for a hash we do not hold is answered with OP_FILEREQANSNOFIL, so
+/// the peer moves on cleanly rather than hanging. Block ranges outside the file
+/// are dropped rather than trusted - the request came from the network.
+///
+/// `session.credit` is `Some((store, peer_userhash))` on the live engine path,
+/// so the bytes we upload are accrued against this peer's credit record.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_shared<S>(
     fs: &mut FramedStream<S>,
     library: &[SharedFile],

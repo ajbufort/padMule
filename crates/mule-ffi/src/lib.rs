@@ -210,11 +210,6 @@ pub struct DownloadInfo {
     /// Bytes available CONTIGUOUSLY from offset 0 - how much of the file a media
     /// player can read right now (see `preview_snapshot`).
     pub contiguous_prefix: u64,
-    /// Connected sources by DISCOVERY CHANNEL: how many came from the eD2k
-    /// server, from Kad, and from a source exchange with another peer. Shown
-    /// beside the percentage, because "which channel is feeding this" is
-    /// otherwise invisible and it is the first thing you want to know when one
-    /// file flies and another crawls.
     /// USER-paused (eMule 0.70b PauseFile): not driven until resumed, and the
     /// flag survives a restart. The row says "Paused".
     pub paused: bool,
@@ -421,10 +416,6 @@ async fn search_outcome_to_ffi(g: &Engine, outcome: EngineSearchOutcome) -> Sear
     }
 }
 
-/// Map engine `RankedFile`s to FFI `SearchHit`s, tagging each with its
-/// have/fetching/new status. Shared by `search` and `related_search`. `g` is
-/// borrowed immutably, so call it AFTER the `&mut self` search has returned its
-/// owned Vec - the borrows never overlap.
 /// Render the ORIGIN_* bitset as something a person can read. Both bits set is
 /// the common case for a popular file and is worth saying explicitly - it means
 /// two independent networks agree the file exists.
@@ -439,6 +430,10 @@ fn origin_label(bits: u8) -> String {
     }
 }
 
+/// Map engine `RankedFile`s to FFI `SearchHit`s, tagging each with its
+/// have/fetching/new status. Shared by `search` and `related_search`. `g` is
+/// borrowed immutably, so call it AFTER the `&mut self` search has returned its
+/// owned Vec - the borrows never overlap.
 async fn ranked_to_hits(g: &Engine, ranked: Vec<RankedFile>) -> Vec<SearchHit> {
     let mut out = Vec::with_capacity(ranked.len());
     for r in ranked {
@@ -509,7 +504,7 @@ impl MuleEngine {
         // hypothesis until someone measures it - but the next person to measure
         // "padMule handles many downloads badly" should start here:
         //
-        //   `Download::add_block` (multi_source.rs) takes the download's inner
+        //   `Download::commit` (multi_source.rs) takes the download's inner
         //   lock and calls `PartStore::write_block`, which is a SYNCHRONOUS
         //   `File::write_all` with no `spawn_blocking` - the one uninsulated
         //   blocking call in an engine that otherwise wraps hashing, part
@@ -517,11 +512,13 @@ impl MuleEngine {
         //   concurrent ~180KB writes can occupy BOTH, stalling the server link,
         //   the Kad loop and the UI poll for the duration.
         //
-        // There is no cap on concurrent downloads either, and each gets up to ~4
-        // peer workers (`parallel_for_priority`), so the offered load scales
-        // with the number of downloads while the runtime does not. Raising this
-        // number is the cheap experiment; moving the write off the reactor is
-        // the real fix, and it needs care because the lock is held across it.
+        // The max-active cap (`set_max_active_downloads`) defaults to 0 =
+        // unlimited, and each active download gets up to ~4 peer workers
+        // (`parallel_for_priority`), so at the default the offered load still
+        // scales with the number of downloads while the runtime does not.
+        // Raising this number is the cheap experiment; moving the write off the
+        // reactor is the real fix, and it needs care because the lock is held
+        // across it.
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -886,9 +883,9 @@ impl MuleEngine {
             // pass, bounded at KAD_PUBLISH_BUDGET. DUTY TEN - if you add
             // another, update the count in the doc above AND in
             // `EngineModel.refresh()`'s comment (NOT startPolling - the count
-            // lives beside the `e.heartbeat()` call). This count drifted three
-            // times before it was pinned in both languages (7->8->9); keep all
-            // three sites in sync so it does not drift a fourth.
+            // lives beside the `e.heartbeat()` call). This count drifted four
+            // times before it was pinned in both languages (7->8->9->10); keep
+            // all three sites in sync so it does not drift a fifth.
             self.inner.lock().await.maintain_kad_publish().await;
             // Refresh the derived status values LAST, so what the lock-free
             // readers see reflects everything this beat just did.
@@ -1308,8 +1305,13 @@ mod tests {
     }
 
     /// The per-file pause/resume and max-active surface (row 8dd): unknown and
-    /// malformed hashes answer false through the whole stack, the cap setter
-    /// reaches the engine's shared atomic. Behaviour is engine-tested.
+    /// malformed hashes answer false through the whole stack, and the cap
+    /// setter provably writes the engine's shared atomic - read back through
+    /// `handles.max_active()`, the SAME value `downloads()` feeds to
+    /// `queued_flags`. What the cap DOES to rows is engine-tested
+    /// (`the_max_active_cap_gates_the_retry_sweep_and_pausing_promotes`, the
+    /// two-sweep test); rows cannot be registered here, because the offline
+    /// engine's `add_download` refuses with `NotConnected` before creating one.
     #[test]
     fn pause_resume_and_the_max_active_cap_surface_through_the_facade() {
         let dir = tmp("pause-facade");
@@ -1319,10 +1321,15 @@ mod tests {
         assert!(!eng.pause_download("00".repeat(16)));
         assert!(!eng.resume_download("ff".repeat(16)));
         assert!(!eng.pause_download("not-hex".into()), "malformed hash");
-        // The cap setter reaches the engine's shared atomic (the same value
-        // the rows and sweeps read; behaviour is engine-tested).
+        // Default first, so the 3 below is provably WRITTEN by the setter
+        // rather than a lucky initial value.
+        assert_eq!(eng.handles.max_active(), 0, "the default is 0 = unlimited");
         eng.set_max_active_downloads(3);
-        assert!(eng.downloads().is_empty(), "no rows registered offline");
+        assert_eq!(
+            eng.handles.max_active(),
+            3,
+            "the FFI setter must reach the engine's shared cap atomic"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

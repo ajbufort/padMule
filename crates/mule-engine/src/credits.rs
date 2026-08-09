@@ -116,8 +116,9 @@ mod tests {
     fn a_peer_we_have_barely_downloaded_from_gets_no_bonus() {
         assert_eq!(score_ratio(0, 0), 1.0);
         assert_eq!(score_ratio(0, CREDIT_MIN_DOWNLOADED - 1), 1.0);
-        // The threshold is the DECIMAL megabyte, so 1 MiB is comfortably over it
-        // but 999_999 bytes is not.
+        // The gate is `downloaded < CREDIT_MIN_DOWNLOADED`, so exactly the
+        // DECIMAL megabyte (1_000_000 bytes, not 1 MiB) is the first value
+        // that earns a bonus - the line above pins one byte under it.
         assert!(score_ratio(0, CREDIT_MIN_DOWNLOADED) > 1.0);
     }
 

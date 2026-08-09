@@ -882,7 +882,8 @@ impl Download {
         // BLOCKING I/O, ON THE REACTOR, UNDER THE LOCK - the known cost of this
         // path, recorded rather than quietly carried (2026-08-08 reanalysis).
         // Every other slow operation in this file goes through `spawn_blocking`
-        // (part MD4 at :886, the hashset at :1134, whole-file verify at :1246);
+        // (the part MD4 in `localize_corruption`, the AICH block SHA-1 in
+        // `apply_aich_recovery`, and the `verify_whole_file*` rehashes);
         // this one does not, and it runs on a runtime built with 2 worker
         // threads (`MuleEngine::new`). Not changed here because the guard is
         // held across the call, so moving the write off the reactor is a
@@ -1301,8 +1302,11 @@ impl Download {
         // Snapshot the backing path under a BRIEF lock, then rehash off the lock
         // AND off the async reactor via spawn_blocking: a multi-GB MD4 is slow and
         // CPU-bound. Holding the download lock across it would stall the 1s
-        // downloads() heartbeat - which runs under the shared engine lock - and so
-        // pause()/every FFI call. Mirrors the preview snapshot's off-lock read.
+        // status poll (`downloads()` skips the engine lock but reads each
+        // download's own lock) and any `heartbeat()` duty that touches this
+        // download - and those duties hold the shared engine lock, so
+        // pause()/every FFI call would queue behind the hash. Mirrors the
+        // preview snapshot's off-lock read.
         let path = {
             let g = self.inner.lock().await;
             g.store.part_path().to_path_buf()
