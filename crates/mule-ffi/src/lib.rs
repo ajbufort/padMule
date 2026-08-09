@@ -836,17 +836,18 @@ impl MuleEngine {
     /// outside a fetch task, detects a server drop/kick, runs the periodic
     /// checkpoint, unshares files deleted in the Files app, re-drives idle
     /// downloads, merges gossip-harvested servers into server.met, refreshes the
-    /// Kad routing table, and runs the Kad LIVENESS SWEEP (eMule's
-    /// `OnSmallTimer`: probe the oldest due contact per bin, remove whoever
-    /// failed to answer). That is NINE: the sentence said seven for as long as
-    /// `maintain_kad` had existed, because it was added to the BODY without
-    /// being added to the list that enumerates it - the same shape as a test
-    /// that pins "these callers" and names all but one. It then drifted AGAIN
-    /// across the language boundary (the Swift caller still said seven after
-    /// this was corrected to eight), which is why the count is now stated in
-    /// both places and in the wiring comment below.
+    /// Kad routing table, runs the Kad LIVENESS SWEEP (eMule's `OnSmallTimer`:
+    /// probe the oldest due contact per bin, remove whoever failed to answer),
+    /// and PUBLISHES one due shared file/keyword to the Kad DHT. That is TEN:
+    /// the sentence said seven for as long as `maintain_kad` had existed,
+    /// because it was added to the BODY without being added to the list that
+    /// enumerates it - the same shape as a test that pins "these callers" and
+    /// names all but one. It then drifted AGAIN across the language boundary
+    /// (the Swift caller still said seven after this was corrected to eight),
+    /// which is why the count is stated in both places and in the wiring
+    /// comment below.
     ///
-    /// IF THIS STOPS BEING CALLED, all NINE stop SILENTLY - nothing errors and
+    /// IF THIS STOPS BEING CALLED, all TEN stop SILENTLY - nothing errors and
     /// nothing on screen changes; downloads simply stall, finished files are
     /// never shared, and a kick goes unnoticed. It used to be a side effect of
     /// `downloads()`, which made it impossible to forget but also forced every
@@ -878,12 +879,17 @@ impl MuleEngine {
             self.inner.lock().await.maintain_kad().await;
             // The OTHER half of Kad maintenance (eMule's OnSmallTimer): age
             // contacts, probe the oldest due one per bin, remove whoever failed
-            // to answer. Rate-limited to KAD_SWEEP_EVERY inside. DUTY NINE -
-            // if you add another, update the count in the doc above AND in
-            // `EngineModel.refresh()`'s comment (NOT startPolling - the count
-            // lives beside the `e.heartbeat()` call); that number has drifted
-            // three times already, the third in the handoff task list.
+            // to answer. Rate-limited to KAD_SWEEP_EVERY inside.
             self.inner.lock().await.maintain_kad_liveness().await;
+            // PUBLISH one due shared file/keyword to the Kad DHT (eMule's STORE
+            // half). Rate-limited to KAD_PUBLISH_EVERY inside, one job per
+            // pass, bounded at KAD_PUBLISH_BUDGET. DUTY TEN - if you add
+            // another, update the count in the doc above AND in
+            // `EngineModel.refresh()`'s comment (NOT startPolling - the count
+            // lives beside the `e.heartbeat()` call). This count drifted three
+            // times before it was pinned in both languages (7->8->9); keep all
+            // three sites in sync so it does not drift a fourth.
+            self.inner.lock().await.maintain_kad_publish().await;
             // Refresh the derived status values LAST, so what the lock-free
             // readers see reflects everything this beat just did.
             self.inner.lock().await.publish_status();

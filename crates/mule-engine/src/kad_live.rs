@@ -21,12 +21,13 @@ use crate::stats::KadReqKind;
 use mule_files::{IpFilter, KadContact};
 use mule_kad::{
     build_bootstrap_req, build_hello_req, build_hello_res_ack, build_kad2_req,
-    build_search_key_req_restrictive, build_search_source_req, is_acceptable_contact,
-    is_acceptable_contact_ip, kad_deobfuscate, kad_keyword_target, kad_obfuscate_request,
-    kad_obfuscate_response, pack_kad, parse_bootstrap_res, parse_hello, parse_kad2_res,
-    parse_search_res, unpack_kad, BootstrapRes, CSearch, FileResult, FloodTracker, FloodVerdict,
-    Hello, RoutingTable, Source, WireContact, ALPHA_QUERY, K, KAD_FIND_NODE, OP_BOOTSTRAP_RES,
-    OP_HELLO_RES, OP_KAD2_RES, OP_SEARCH_RES,
+    build_publish_key_req, build_publish_source_req, build_search_key_req_restrictive,
+    build_search_source_req, is_acceptable_contact, is_acceptable_contact_ip, kad_deobfuscate,
+    kad_keyword_target, kad_obfuscate_request, kad_obfuscate_response, pack_kad,
+    parse_bootstrap_res, parse_hello, parse_kad2_res, parse_publish_res, parse_search_res,
+    unpack_kad, BootstrapRes, CSearch, FileResult, FloodTracker, FloodVerdict, Hello, KeywordEntry,
+    RoutingTable, Source, SourceEntry, WireContact, ALPHA_QUERY, K, KAD_FIND_NODE,
+    OP_BOOTSTRAP_RES, OP_HELLO_RES, OP_KAD2_RES, OP_PUBLISH_RES, OP_SEARCH_RES,
 };
 use mule_proto::Kad128;
 use std::collections::HashMap;
@@ -63,6 +64,12 @@ const KAD_SEARCH_SOURCE_TOTAL: usize = 20;
 /// enforced by `SearchManager::Process` on its sweep (SearchManager.cpp:347).
 /// NOT Search.cpp:819 - that is the STORE path's cap of ten.
 const KAD_SEARCH_KEYWORD_TOTAL: usize = 300;
+/// How many nodes ONE publish stores to before it stops - eMule's
+/// `SEARCHSTOREKEYWORD_TOTAL` / `SEARCHSTOREFILE_TOTAL` = 10 (Defines.h:63-64),
+/// enforced the same way the search totals are: as the store target, so a
+/// publish walk stops once ten nodes have acknowledged rather than running to
+/// the overall deadline. Ten replicas is eMule's whole redundancy for a key.
+const KAD_PUBLISH_STORE_TOTAL: usize = 10;
 /// How long a liveness probe waits for its `HELLO_RES`. Short on purpose: the
 /// sweep runs under the engine lock, and a silent contact is not an error - it
 /// just does not get its lease renewed, and a later sweep removes it once its
@@ -505,6 +512,29 @@ enum ValueAsk<'a> {
         keyword: &'a str,
         words: &'a [String],
     },
+    /// STORE the keyword->file index at the closest nodes
+    /// (KADEMLIA2_PUBLISH_KEY_REQ). Same iterative FIND_NODE walk, but each
+    /// closest responded in-tolerance node gets a STORE, not a SEARCH, and we
+    /// count PUBLISH_RES rather than accumulating results - eMule's STOREKEYWORD
+    /// flavor of `CSearch` (Search.cpp:814).
+    PublishKeyword { entries: &'a [KeywordEntry] },
+    /// STORE our source record for a file (KADEMLIA2_PUBLISH_SOURCE_REQ,
+    /// eMule STORESOURCE, Search.cpp:730).
+    PublishSource {
+        our_hash: Kad128,
+        entry: SourceEntry,
+    },
+}
+
+impl ValueAsk<'_> {
+    /// True for the two STORE flavors - which count PUBLISH_RES instead of
+    /// accumulating SEARCH results, and whose reply opcode is OP_PUBLISH_RES.
+    fn is_publish(&self) -> bool {
+        matches!(
+            self,
+            ValueAsk::PublishKeyword { .. } | ValueAsk::PublishSource { .. }
+        )
+    }
 }
 
 /// What the owning read loop needs. Copies of the immutable identity, and the
@@ -1612,6 +1642,9 @@ impl KadNode {
         let cap = match &value {
             ValueAsk::Sources { .. } => KAD_SEARCH_SOURCE_TOTAL,
             ValueAsk::Keyword { .. } => KAD_SEARCH_KEYWORD_TOTAL,
+            ValueAsk::PublishKeyword { .. } | ValueAsk::PublishSource { .. } => {
+                KAD_PUBLISH_STORE_TOTAL
+            }
             ValueAsk::None => usize::MAX,
         };
         let stop = want.min(cap);
@@ -1641,6 +1674,9 @@ impl KadNode {
             let results = match &value {
                 ValueAsk::Sources { .. } => out.sources.len(),
                 ValueAsk::Keyword { .. } => files.len(),
+                ValueAsk::PublishKeyword { .. } | ValueAsk::PublishSource { .. } => {
+                    out.published_to
+                }
                 ValueAsk::None => 0,
             };
             if !matches!(value, ValueAsk::None) && results >= stop {
@@ -1650,14 +1686,22 @@ impl KadNode {
                 need_progress = false;
                 // Value asks first - the JumpStart walk's consumption order.
                 for c in cs.harvest() {
-                    let frame = match &value {
+                    let (frame, expect) = match &value {
                         ValueAsk::Sources { file_size } => {
                             let (op, p) = build_search_source_req(&target, 0, *file_size);
-                            pack_kad(op, p)
+                            (pack_kad(op, p), OP_SEARCH_RES)
                         }
                         ValueAsk::Keyword { words, .. } => {
                             let (op, p) = build_search_key_req_restrictive(&target, 0, words);
-                            pack_kad(op, p)
+                            (pack_kad(op, p), OP_SEARCH_RES)
+                        }
+                        ValueAsk::PublishKeyword { entries } => {
+                            let (op, p) = build_publish_key_req(&target, entries);
+                            (pack_kad(op, p), OP_PUBLISH_RES)
+                        }
+                        ValueAsk::PublishSource { our_hash, entry } => {
+                            let (op, p) = build_publish_source_req(&target, our_hash, entry);
+                            (pack_kad(op, p), OP_PUBLISH_RES)
                         }
                         // `harvest` gates on a non-zero value budget, which
                         // `ValueAsk::None` never has, so this arm is not
@@ -1673,7 +1717,7 @@ impl KadNode {
                             ReqKind::Value,
                             c,
                             frame,
-                            OP_SEARCH_RES,
+                            expect,
                             per_query,
                         )
                         .await
@@ -1775,6 +1819,23 @@ impl KadNode {
                                     // for the frontier is the same as silence.
                                     _ => cs.on_timeout(&ev.contact),
                                 },
+                                ReqKind::Value if value.is_publish() => {
+                                    // A STORE ack: the node accepted our index
+                                    // entry. Count it (that IS the publish
+                                    // result), and record the responder's key
+                                    // like any other reply. eMule reads the
+                                    // load factor for backoff; padMule keeps it
+                                    // only as a diagnostic today.
+                                    if parse_publish_res(&payload).is_ok() {
+                                        out.published_to += 1;
+                                        self.note_responder(
+                                            &ev.contact,
+                                            verified,
+                                            sender_vk,
+                                            /*proven_alive=*/ false,
+                                        );
+                                    }
+                                }
                                 ReqKind::Value => {
                                     if let Ok(res) = parse_search_res(&payload) {
                                         out.search_responses += 1;
@@ -1818,7 +1879,13 @@ impl KadNode {
                                                     }
                                                 }
                                             }
-                                            ValueAsk::None => {}
+                                            // Unreachable: this arm is the
+                                            // `ReqKind::Value if !is_publish()`
+                                            // branch, so a publish value never
+                                            // parses a SEARCH_RES here.
+                                            ValueAsk::None
+                                            | ValueAsk::PublishKeyword { .. }
+                                            | ValueAsk::PublishSource { .. } => {}
                                         }
                                         let have = match &value {
                                             ValueAsk::Sources { .. } => out.sources.len(),
@@ -1979,6 +2046,56 @@ impl KadNode {
             .await?;
         Ok(files)
     }
+
+    /// PUBLISH `entries` under ONE keyword hash: the same event-driven FIND_NODE
+    /// walk toward the keyword's hash, then a KADEMLIA2_PUBLISH_KEY_REQ STORE to
+    /// each closest responded in-tolerance node, counting acks until
+    /// [`KAD_PUBLISH_STORE_TOTAL`] nodes hold the entry (eMule STOREKEYWORD).
+    /// Returns how many nodes acknowledged. The caller hashes the word and
+    /// batches at [`mule_kad::PUBLISH_KEY_FILES_PER_PACKET`].
+    pub async fn publish_keyword(
+        &mut self,
+        keyword_target: &Kad128,
+        entries: &[KeywordEntry],
+        per_query: Duration,
+    ) -> Result<usize, KadError> {
+        crate::stats::note_kad_lookup();
+        let (out, _) = self
+            .drive_lookup(
+                *keyword_target,
+                ValueAsk::PublishKeyword { entries },
+                KAD_PUBLISH_STORE_TOTAL,
+                per_query,
+                LOOKUP_DEADLINE_QUERIES,
+                LOOKUP_FIND_BUDGET,
+            )
+            .await?;
+        Ok(out.published_to)
+    }
+
+    /// PUBLISH our source record for `file_hash`: the FIND_NODE walk toward the
+    /// file hash, then a KADEMLIA2_PUBLISH_SOURCE_REQ STORE to each closest
+    /// responded in-tolerance node (eMule STORESOURCE). Returns the ack count.
+    pub async fn publish_source(
+        &mut self,
+        file_hash: &Kad128,
+        our_hash: Kad128,
+        entry: SourceEntry,
+        per_query: Duration,
+    ) -> Result<usize, KadError> {
+        crate::stats::note_kad_lookup();
+        let (out, _) = self
+            .drive_lookup(
+                *file_hash,
+                ValueAsk::PublishSource { our_hash, entry },
+                KAD_PUBLISH_STORE_TOTAL,
+                per_query,
+                LOOKUP_DEADLINE_QUERIES,
+                LOOKUP_FIND_BUDGET,
+            )
+            .await?;
+        Ok(out.published_to)
+    }
 }
 
 /// Leading zero bits of a 128-bit distance (the shared-prefix length with the
@@ -2009,6 +2126,10 @@ pub struct ResolveOutcome {
     pub search_responses: usize,
     /// Shared-prefix bits between the hash and the closest node the lookup found.
     pub closest_prefix_bits: u32,
+    /// For a PUBLISH walk: how many nodes acknowledged the STORE (a
+    /// KADEMLIA2_PUBLISH_RES). This IS the publish's result - "stored at N
+    /// nodes" - and drives its termination at [`KAD_PUBLISH_STORE_TOTAL`].
+    pub published_to: usize,
 }
 
 #[cfg(test)]
@@ -2398,6 +2519,150 @@ mod tests {
             MOCK_SENDER_VK,
             "resolve_sources stored the searched node's sender key"
         );
+    }
+
+    /// A storing-node mock for the PUBLISH driver: answers FIND_NODE with an
+    /// empty contact list (so the walk value-asks it, like the search mocks),
+    /// then answers a PUBLISH_KEY_REQ / PUBLISH_SOURCE_REQ with a PUBLISH_RES
+    /// carrying a load byte. Records the opcode it stored so the test can prove
+    /// the RIGHT store went out, not just that something did.
+    fn spawn_publish_mock(
+        peer: UdpSocket,
+        peer_id: Kad128,
+        target: Kad128,
+        got_key: Arc<std::sync::atomic::AtomicBool>,
+        got_source: Arc<std::sync::atomic::AtomicBool>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            loop {
+                let Ok((n, from)) = peer.recv_from(&mut buf).await else {
+                    return;
+                };
+                let Some(dec) = kad_deobfuscate(&buf[..n], &peer_id, 0, ip_u32(&from)) else {
+                    continue;
+                };
+                let Ok((op, body)) = unpack_kad(&dec.payload) else {
+                    continue;
+                };
+                let (rop, rpayload) = if op == mule_kad::OP_KAD2_REQ {
+                    mule_kad::build_kad2_res(&target, &[])
+                } else if op == mule_kad::OP_PUBLISH_KEY_REQ
+                    || op == mule_kad::OP_PUBLISH_SOURCE_REQ
+                {
+                    if op == mule_kad::OP_PUBLISH_KEY_REQ {
+                        got_key.store(true, Ordering::Relaxed);
+                    } else {
+                        got_source.store(true, Ordering::Relaxed);
+                    }
+                    // PUBLISH_RES: file 16 | load u8. The file id is the first
+                    // 16 bytes of the request body for either publish shape.
+                    let mut res = body[..16.min(body.len())].to_vec();
+                    res.resize(16, 0);
+                    res.push(40); // load factor
+                    (mule_kad::OP_PUBLISH_RES, res)
+                } else {
+                    continue;
+                };
+                let dg = kad_obfuscate_response(
+                    &pack_kad(rop, rpayload),
+                    0x2468,
+                    dec.sender_vk,
+                    MOCK_SENDER_VK,
+                    0x80,
+                );
+                let _ = peer.send_to(&dg, from).await;
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn publish_keyword_stores_at_a_node_and_counts_the_ack() {
+        let our_id = Kad128::from_words([5, 5, 5, 7]);
+        let our_ip = 0x0A00_0001u32;
+        let mut node =
+            KadNode::bind_with_identity("127.0.0.1:0".parse().unwrap(), 4662, our_id, 0x9999)
+                .await
+                .unwrap();
+        node.set_public_ip(our_ip);
+        let target = kad_keyword_target("ubuntu");
+        let w = target.words();
+        let peer_id = Kad128::from_words([w[0], w[1] ^ 1, w[2], w[3]]);
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        node.with_routing(|t| t.add(peer_id, ip_u32(&peer_addr), peer_addr.port(), 4662, 8, true));
+        let got_key = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let got_source = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mock = spawn_publish_mock(
+            peer,
+            peer_id,
+            target,
+            Arc::clone(&got_key),
+            Arc::clone(&got_source),
+        );
+        let entries = vec![KeywordEntry {
+            file_id: Kad128::from_hash(&[0xBB; 16]),
+            name: "ubuntu.iso".to_string(),
+            size: 1000,
+            complete_sources: 1,
+            file_type: "Iso".to_string(),
+        }];
+        let stored = node
+            .publish_keyword(&target, &entries, Duration::from_millis(300))
+            .await
+            .unwrap();
+        mock.abort();
+        assert!(
+            got_key.load(Ordering::Relaxed),
+            "a PUBLISH_KEY_REQ went out"
+        );
+        assert_eq!(stored, 1, "the storing node's ack was counted");
+    }
+
+    #[tokio::test]
+    async fn publish_source_stores_at_a_node_and_counts_the_ack() {
+        let our_id = Kad128::from_words([5, 5, 5, 8]);
+        let our_ip = 0x0A00_0001u32;
+        let mut node =
+            KadNode::bind_with_identity("127.0.0.1:0".parse().unwrap(), 4662, our_id, 0xAAAA)
+                .await
+                .unwrap();
+        node.set_public_ip(our_ip);
+        let target = Kad128::from_hash(&[0x77; 16]);
+        let w = target.words();
+        let peer_id = Kad128::from_words([w[0], w[1] ^ 1, w[2], w[3]]);
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        node.with_routing(|t| t.add(peer_id, ip_u32(&peer_addr), peer_addr.port(), 4662, 8, true));
+        let got_key = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let got_source = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mock = spawn_publish_mock(
+            peer,
+            peer_id,
+            target,
+            Arc::clone(&got_key),
+            Arc::clone(&got_source),
+        );
+        let stored = node
+            .publish_source(
+                &target,
+                our_id,
+                SourceEntry {
+                    size: 1000,
+                    tcp_port: 4662,
+                    udp_port: Some(4672),
+                    crypt: 0,
+                },
+                Duration::from_millis(300),
+            )
+            .await
+            .unwrap();
+        mock.abort();
+        assert!(
+            got_source.load(Ordering::Relaxed),
+            "a PUBLISH_SOURCE_REQ went out"
+        );
+        assert_eq!(stored, 1, "the storing node's ack was counted");
     }
 
     #[tokio::test]

@@ -28,6 +28,18 @@ pub const OP_SEARCH_KEY_REQ: u8 = 0x33;
 pub const OP_SEARCH_SOURCE_REQ: u8 = 0x34;
 /// Keyword/source search response (Wave 6d).
 pub const OP_SEARCH_RES: u8 = 0x3B;
+/// PUBLISH a keyword->file index entry (eMule KADEMLIA2_PUBLISH_KEY_REQ,
+/// opcodes.h:597): `keyword_target 16 | count u16 | [ fileID 16 | taglist ]`.
+pub const OP_PUBLISH_KEY_REQ: u8 = 0x43;
+/// PUBLISH a source record for a file (KADEMLIA2_PUBLISH_SOURCE_REQ, :598):
+/// `file_target 16 | our_client_hash 16 | taglist`.
+pub const OP_PUBLISH_SOURCE_REQ: u8 = 0x44;
+/// The storing node's answer to either publish (KADEMLIA2_PUBLISH_RES, :603):
+/// `file 16 | load u8 | [ options u8 ]`.
+pub const OP_PUBLISH_RES: u8 = 0x4B;
+/// Ack the storing node solicits with option bit 0 (KADEMLIA2_PUBLISH_RES_ACK,
+/// :604): a null packet.
+pub const OP_PUBLISH_RES_ACK: u8 = 0x4C;
 /// Liveness ping.
 pub const OP_PING: u8 = 0x60;
 /// Liveness pong.
@@ -78,6 +90,9 @@ pub const TAG_SOURCEPORT: u8 = 0xFD;
 pub const TAG_ENCRYPTION: u8 = 0xF3;
 /// Keyword-result file tags. Filename (string).
 pub const TAG_FILENAME: u8 = 0x01;
+/// eD2k file-type search term (Audio/Video/...), a string (eMule `TAG_FILETYPE`
+/// "\x03", opcodes.h:329). Published so a storing node can filter by type.
+pub const TAG_FILETYPE: u8 = 0x03;
 /// File size (u32, or a BSOB u64 for >4GB).
 pub const TAG_FILESIZE: u8 = 0x02;
 /// Advertised source/availability count (u32).
@@ -888,6 +903,158 @@ fn write_kad_taglist(w: &mut Writer, tags: &[KadTag]) {
     }
 }
 
+/// What we publish about ONE shared file under a keyword. The storing node
+/// indexes these tags against the keyword hash so a searcher's expression tree
+/// can filter (eMule `PreparePacketForTags`, Search.cpp:1579). Size chooses
+/// its tag width the same way the search parser reads it back: <=4GB as a
+/// UINT, above as an 8-byte BSOB.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeywordEntry {
+    pub file_id: Kad128,
+    pub name: String,
+    pub size: u64,
+    /// Complete-source count we advertise (eMule `m_nCompleteSourcesCount`).
+    pub complete_sources: u32,
+    /// eD2k file-type search term ("Audio"/"Video"/...), empty to omit.
+    pub file_type: String,
+}
+
+impl KeywordEntry {
+    fn tags(&self) -> Vec<KadTag> {
+        let mut tags = vec![KadTag {
+            name: TAG_FILENAME,
+            value: KadTagValue::Str(self.name.as_bytes().to_vec()),
+        }];
+        // Size: BSOB-8 above the 32-bit ceiling, UINT below - exactly the two
+        // shapes `SearchResult::as_file` reads (Search.cpp:1589-1597).
+        if self.size > 0xFFFF_FFFF {
+            tags.push(KadTag {
+                name: TAG_FILESIZE,
+                value: KadTagValue::Bsob(self.size.to_le_bytes().to_vec()),
+            });
+        } else {
+            tags.push(KadTag {
+                name: TAG_FILESIZE,
+                value: KadTagValue::Int(self.size),
+            });
+        }
+        tags.push(KadTag {
+            name: TAG_SOURCES,
+            value: KadTagValue::Int(self.complete_sources as u64),
+        });
+        if !self.file_type.is_empty() {
+            tags.push(KadTag {
+                name: TAG_FILETYPE,
+                value: KadTagValue::Str(self.file_type.as_bytes().to_vec()),
+            });
+        }
+        tags
+    }
+}
+
+/// The most files eMule packs into ONE keyword-publish datagram
+/// (Search.cpp:844, `iPacketCount < 50`).
+pub const PUBLISH_KEY_FILES_PER_PACKET: usize = 50;
+
+/// Build a KADEMLIA2_PUBLISH_KEY_REQ: `keyword_target 16 | count u16 |
+/// [ fileID 16 | taglist ] x count`. The caller batches at
+/// [`PUBLISH_KEY_FILES_PER_PACKET`]; this refuses to emit more than that in one
+/// packet (eMule's own `byPacket[1024*50]` bound made concrete), truncating and
+/// correcting the count so the u16 and the records always agree.
+pub fn build_publish_key_req(keyword_target: &Kad128, entries: &[KeywordEntry]) -> (u8, Vec<u8>) {
+    let entries = &entries[..entries.len().min(PUBLISH_KEY_FILES_PER_PACKET)];
+    let mut w = Writer::new();
+    w.write_bytes(&keyword_target.to_wire());
+    w.write_u16(entries.len() as u16);
+    for e in entries {
+        w.write_bytes(&e.file_id.to_wire());
+        write_kad_taglist(&mut w, &e.tags());
+    }
+    (OP_PUBLISH_KEY_REQ, w.into_inner())
+}
+
+/// What we publish about OURSELVES as a source for a file. HighID only for
+/// now (`TAG_SOURCETYPE` 1, or 4 for a file above 4GB); padMule does not
+/// publish a firewalled buddy record (types 3/5), matching its no-buddy
+/// posture. `crypt` is our connect-options byte (eMule `TAG_ENCRYPTION`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceEntry {
+    pub size: u64,
+    pub tcp_port: u16,
+    /// Our internal Kad UDP port, if we advertise it (eMule omits it when a
+    /// user forces an external port). `None` to omit `TAG_SOURCEUPORT`.
+    pub udp_port: Option<u16>,
+    pub crypt: u8,
+}
+
+/// Build a KADEMLIA2_PUBLISH_SOURCE_REQ: `file_target 16 | our_client_hash 16 |
+/// taglist`. The taglist mirrors what `SearchResult::as_source` parses back:
+/// TAG_SOURCETYPE, TAG_SOURCEPORT (TCP), optional TAG_SOURCEUPORT, TAG_FILESIZE,
+/// TAG_ENCRYPTION (eMule Search.cpp:783-798).
+pub fn build_publish_source_req(
+    file_target: &Kad128,
+    our_client_hash: &Kad128,
+    src: &SourceEntry,
+) -> (u8, Vec<u8>) {
+    let source_type = if src.size > 0xFFFF_FFFF { 4 } else { 1 };
+    let mut tags = vec![
+        KadTag {
+            name: TAG_SOURCETYPE,
+            value: KadTagValue::Int(source_type),
+        },
+        KadTag {
+            name: TAG_SOURCEPORT,
+            value: KadTagValue::Int(src.tcp_port as u64),
+        },
+    ];
+    if let Some(uport) = src.udp_port {
+        tags.push(KadTag {
+            name: TAG_SOURCEUPORT,
+            value: KadTagValue::Int(uport as u64),
+        });
+    }
+    tags.push(KadTag {
+        name: TAG_FILESIZE,
+        value: KadTagValue::Int(src.size),
+    });
+    tags.push(KadTag {
+        name: TAG_ENCRYPTION,
+        value: KadTagValue::Int(src.crypt as u64),
+    });
+    let mut w = Writer::new();
+    w.write_bytes(&file_target.to_wire());
+    w.write_bytes(&our_client_hash.to_wire());
+    write_kad_taglist(&mut w, &tags);
+    (OP_PUBLISH_SOURCE_REQ, w.into_inner())
+}
+
+/// A storing node's answer to a publish (KADEMLIA2_PUBLISH_RES): which file it
+/// stored, and its LOAD 0..100 - how full its index is for that target, the
+/// number eMule uses to back off republishing to a saturated node. The
+/// trailing option byte (bit 0 = it wants an ACK) is parsed when present.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishRes {
+    pub file_id: Kad128,
+    pub load: u8,
+    pub wants_ack: bool,
+}
+
+/// Parse a KADEMLIA2_PUBLISH_RES: `file 16 | load u8 | [ options u8 ]`
+/// (eMule `Process_KADEMLIA2_PUBLISH_RES`, KademliaUDPListener.cpp).
+pub fn parse_publish_res(payload: &[u8]) -> Result<PublishRes, IoError> {
+    let mut r = Reader::new(payload);
+    let file_id = read_id(&mut r)?;
+    let load = r.read_u8()?;
+    // The options byte is optional (eMule guards on remaining length); absent
+    // means no ACK solicited.
+    let wants_ack = r.read_u8().map(|o| o & 0x01 != 0).unwrap_or(false);
+    Ok(PublishRes {
+        file_id,
+        load,
+        wants_ack,
+    })
+}
+
 /// Build a KADEMLIA2_SEARCH_RES (a responder role / tests): `responderID 16 |
 /// target 16 | count 2 | count x { answer 16 | taglist }`.
 pub fn build_search_res(
@@ -1483,5 +1650,129 @@ mod tests {
             one, plain,
             "a single-word query must not change on the wire"
         );
+    }
+
+    /// A keyword publish must be READABLE by the search-result parser: the tags
+    /// we write under a fileID are exactly the ones `SearchResult::as_file`
+    /// reads back. Assert the header layout AND round-trip one entry's tags
+    /// through the parser (the entry body after `fileID` is a taglist, the same
+    /// shape a SEARCH_RES record carries).
+    #[test]
+    fn a_published_keyword_entry_reads_back_through_the_search_parser() {
+        let kw = Kad128::from_hash(&[0xAA; 16]);
+        let entry = KeywordEntry {
+            file_id: Kad128::from_hash(&[0xBB; 16]),
+            name: "ubuntu.iso".to_string(),
+            size: 1_500_000,
+            complete_sources: 7,
+            file_type: "Iso".to_string(),
+        };
+        let (op, p) = build_publish_key_req(&kw, std::slice::from_ref(&entry));
+        assert_eq!(op, OP_PUBLISH_KEY_REQ);
+        assert_eq!(&p[..16], &kw.to_wire()[..], "keyword target first");
+        assert_eq!(u16::from_le_bytes([p[16], p[17]]), 1, "count = 1");
+        assert_eq!(&p[18..34], &entry.file_id.to_wire()[..], "then the fileID");
+        // The tag list after the fileID parses, and `as_file` recovers the
+        // name and size a searcher would see.
+        let mut r = Reader::new(&p[34..]);
+        let tags = read_kad_taglist(&mut r).unwrap();
+        let sr = SearchResult {
+            answer: entry.file_id,
+            tags,
+        };
+        let f = sr
+            .as_file()
+            .expect("a published keyword entry is a file result");
+        assert_eq!(f.name, "ubuntu.iso");
+        assert_eq!(f.size, 1_500_000);
+        assert_eq!(f.sources, 7);
+    }
+
+    /// A >4GB file publishes its size as an 8-byte BSOB, which `as_file` reads
+    /// via its BSOB-8 arm - the large-file path both sides must agree on.
+    #[test]
+    fn a_large_file_keyword_entry_uses_a_bsob_size() {
+        let big = 5_000_000_000u64;
+        let entry = KeywordEntry {
+            file_id: Kad128::from_hash(&[0x01; 16]),
+            name: "big.bin".to_string(),
+            size: big,
+            complete_sources: 1,
+            file_type: String::new(),
+        };
+        let (_, p) =
+            build_publish_key_req(&Kad128::from_hash(&[0; 16]), std::slice::from_ref(&entry));
+        let mut r = Reader::new(&p[34..]);
+        let tags = read_kad_taglist(&mut r).unwrap();
+        let f = SearchResult {
+            answer: entry.file_id,
+            tags,
+        }
+        .as_file()
+        .unwrap();
+        assert_eq!(f.size, big, "the BSOB size survives the round trip");
+    }
+
+    /// A source publish must be READABLE by the source-result parser: the tags
+    /// are exactly what `SearchResult::as_source` reads.
+    #[test]
+    fn a_published_source_reads_back_through_the_source_parser() {
+        let file = Kad128::from_hash(&[0xCC; 16]);
+        let me = Kad128::from_hash(&[0xDD; 16]);
+        let src = SourceEntry {
+            size: 900_000,
+            tcp_port: 4662,
+            udp_port: Some(4672),
+            crypt: 0x03,
+        };
+        let (op, p) = build_publish_source_req(&file, &me, &src);
+        assert_eq!(op, OP_PUBLISH_SOURCE_REQ);
+        assert_eq!(&p[..16], &file.to_wire()[..], "file target first");
+        assert_eq!(&p[16..32], &me.to_wire()[..], "then our client hash");
+        let mut r = Reader::new(&p[32..]);
+        let tags = read_kad_taglist(&mut r).unwrap();
+        let source = SearchResult { answer: me, tags }
+            .as_source()
+            .expect("a published source is a source result");
+        assert_eq!(source.tcp_port, Some(4662));
+        assert_eq!(source.udp_port, Some(4672));
+        assert_eq!(source.crypt, Some(0x03));
+    }
+
+    #[test]
+    fn a_publish_key_req_is_capped_at_fifty_files_per_packet() {
+        let entries: Vec<KeywordEntry> = (0..60u32)
+            .map(|i| KeywordEntry {
+                file_id: Kad128::from_words([i, 0, 0, 0]),
+                name: "x".to_string(),
+                size: 1,
+                complete_sources: 0,
+                file_type: String::new(),
+            })
+            .collect();
+        let (_, p) = build_publish_key_req(&Kad128::from_hash(&[0; 16]), &entries);
+        assert_eq!(
+            u16::from_le_bytes([p[16], p[17]]),
+            PUBLISH_KEY_FILES_PER_PACKET as u16,
+            "one packet never carries more than 50 files"
+        );
+    }
+
+    #[test]
+    fn parse_publish_res_reads_the_load_and_the_optional_ack_bit() {
+        let file = Kad128::from_hash(&[0x42; 16]);
+        // No option byte: load only.
+        let mut p = file.to_wire().to_vec();
+        p.push(37);
+        let res = parse_publish_res(&p).unwrap();
+        assert_eq!(res.file_id, file);
+        assert_eq!(res.load, 37);
+        assert!(!res.wants_ack, "absent option byte means no ACK solicited");
+
+        // Option byte with bit 0 set: ACK wanted.
+        let mut p2 = file.to_wire().to_vec();
+        p2.push(90);
+        p2.push(0x01);
+        assert!(parse_publish_res(&p2).unwrap().wants_ack);
     }
 }

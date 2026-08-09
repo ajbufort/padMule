@@ -55,7 +55,7 @@ use mule_files::{
     merge_server_met, read_nodes_dat, read_pins, read_server_met, write_nodes_dat, write_pins,
     write_server_met, IpFilter, KadContact, NodesDat, Server, ServerMet, DEFAULT_IPFILTER_LEVEL,
 };
-use mule_kad::RoutingTable;
+use mule_kad::{kad_keyword_target, KeywordEntry, RoutingTable, SourceEntry};
 use mule_proto::{Kad128, Packet, Tag, TagName, TagValue, PROT_EDONKEY};
 use std::collections::HashMap;
 use std::io;
@@ -163,6 +163,22 @@ fn gate_loaded_nodes(contacts: &[KadContact], filter: Option<&IpFilter>) -> Vec<
 /// How often the Kad liveness sweep runs - eMule's `OnSmallTimer` cadence
 /// (`Kademlia.cpp:274-278`, `MIN2S(1)`).
 const KAD_SWEEP_EVERY: Duration = Duration::from_secs(60);
+/// How often the publish scheduler runs ONE job. A drip, not a flood: the
+/// republish clocks are 5h/24h, so there is never any hurry, and one job per
+/// 10s keeps the per-beat lock hold rare. A file with W words takes W+1 jobs,
+/// so a 20-file library republishes fully in a few minutes and then idles for
+/// hours. `maintain_kad_publish`.
+const KAD_PUBLISH_EVERY: Duration = Duration::from_secs(10);
+/// Wall-clock cap on ONE publish job's FIND_NODE walk under the engine lock -
+/// the same net `maintain_kad` uses (a publish is best-effort; storing to
+/// fewer nodes inside the budget is fine, and the record republishes anyway).
+const KAD_PUBLISH_BUDGET: Duration = Duration::from_secs(3);
+/// The connect-options byte padMule publishes in a source record: crypt
+/// SUPPORTED, never REQUIRED (bit 0x01), matching exactly what its HELLO
+/// advertises ([[obfuscation-posture]] / [[security-model]]). A publisher that
+/// claimed to REQUIRE crypt while accepting plaintext would misdescribe itself
+/// to every searcher.
+const KAD_PUBLISH_CRYPT_OPTIONS: u8 = 0x01;
 /// Probes emitted per sweep. eMule probes one contact per LEAF ZONE per minute
 /// and gets its stagger from per-zone timers (`RoutingZone.cpp:124`); padMule
 /// sweeps the whole tree in one pass, so this cap is the stagger. Small because
@@ -1527,6 +1543,12 @@ pub struct Engine {
     last_kad_refresh: Instant,
     /// When the liveness sweep (`OnSmallTimer`) last ran.
     last_kad_sweep: Instant,
+    /// When the publish scheduler last ran a job.
+    last_kad_publish: Instant,
+    /// The Kad publish SCHEDULE: which shared file / keyword is due to be
+    /// (re)announced to the DHT, and when each was last done. Pure policy in
+    /// [`crate::kad_publish`]; `maintain_kad_publish` drives the I/O.
+    publish_schedule: crate::kad_publish::PublishSchedule,
     events: mpsc::UnboundedSender<EngineEvent>,
     /// Persisted Kad contacts (loaded from / saved to `nodes.dat`).
     routing: RoutingTable,
@@ -1680,6 +1702,8 @@ impl Engine {
             max_active: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             last_kad_refresh: Instant::now(),
             last_kad_sweep: Instant::now(),
+            last_kad_publish: Instant::now(),
+            publish_schedule: crate::kad_publish::PublishSchedule::new(),
             events: tx,
             routing,
             downloads: Arc::new(Mutex::new(Vec::new())),
@@ -4874,6 +4898,114 @@ impl Engine {
         (sent, removed)
     }
 
+    /// PUBLISH one due shared file / keyword to the Kad DHT (eMule's STORE half
+    /// of Kad, which padMule never had - its shares were findable only through
+    /// a connected server's index and source exchange). One job per pass, hours
+    /// between republishes; see [`crate::kad_publish`] for the schedule and the
+    /// decision to build a foreground-only publisher (records age out when we
+    /// stop, so a publisher that vanishes leaves nothing stale for long).
+    ///
+    /// Runs while RUNNING or SEEDING (seeding is exactly when we want peers to
+    /// find us) and only while SHARING is on. SOURCE records need a reachable
+    /// address, so they are gated on a known public identity (HighID);
+    /// KEYWORD records make no reachability claim and publish either way.
+    ///
+    /// Returns how many nodes stored this job's record (0 when nothing was due).
+    pub async fn maintain_kad_publish(&mut self) -> usize {
+        if !matches!(self.state, EngineState::Running | EngineState::Seeding) || self.offline {
+            return 0;
+        }
+        if !self.is_sharing() {
+            return 0;
+        }
+        if self.last_kad_publish.elapsed() < KAD_PUBLISH_EVERY {
+            return 0;
+        }
+        self.last_kad_publish = Instant::now();
+
+        // Refill the schedule from the current library when it is idle. A
+        // firewalled node (no public id) publishes keywords but not sources.
+        let can_publish_source = self.last_public_id.is_some();
+        let now = u64::from(now_secs());
+        // (hash, size, name, keywords) for each shared file.
+        let files: Vec<([u8; 16], u64, String, Vec<String>)> = {
+            let shared = self.shared.lock().await;
+            shared
+                .iter()
+                .map(|s| {
+                    let name = String::from_utf8_lossy(&s.name).into_owned();
+                    let words = mule_kad::kad_keywords(&name);
+                    (s.hash, s.size, name, words)
+                })
+                .collect()
+        };
+        let schedule_input: Vec<([u8; 16], Vec<String>)> = files
+            .iter()
+            .map(|(h, _, _, words)| (*h, words.clone()))
+            .collect();
+        self.publish_schedule
+            .refill(now, &schedule_input, can_publish_source);
+        let Some(job) = self.publish_schedule.take_next() else {
+            return 0;
+        };
+
+        let our_kad_id = self.identity.kad_id;
+        let tcp_port = self.advertised_port;
+        let udp_port = self.kad_advertised_port;
+        let Some(kad) = self.kad.as_mut() else {
+            return 0;
+        };
+        if kad.contacts_known() == 0 {
+            return 0; // nothing to walk from - bootstrap has to land first
+        }
+
+        let stored = match job {
+            crate::kad_publish::PublishJob::Source(hash) => {
+                let Some((_, size, _, _)) = files.iter().find(|(h, ..)| *h == hash) else {
+                    return 0; // unshared between refill and now
+                };
+                let target = Kad128::from_hash(&hash);
+                let entry = SourceEntry {
+                    size: *size,
+                    tcp_port,
+                    udp_port: Some(udp_port),
+                    crypt: KAD_PUBLISH_CRYPT_OPTIONS,
+                };
+                timeout(
+                    KAD_PUBLISH_BUDGET,
+                    kad.publish_source(&target, our_kad_id, entry, KAD_PER_QUERY),
+                )
+                .await
+            }
+            crate::kad_publish::PublishJob::Keyword { file, word } => {
+                let Some((_, size, name, _)) = files.iter().find(|(h, ..)| *h == file) else {
+                    return 0;
+                };
+                let target = kad_keyword_target(&word);
+                let entry = KeywordEntry {
+                    file_id: Kad128::from_hash(&file),
+                    name: name.clone(),
+                    size: *size,
+                    // We are one complete source of our own shared file.
+                    complete_sources: 1,
+                    // eD2k file-type search term is optional; padMule does not
+                    // publish it (the type is derivable from the extension in
+                    // the filename, which IS published). Faithful to eMule's
+                    // note that the format tag is no longer sent (Search.cpp).
+                    file_type: String::new(),
+                };
+                timeout(
+                    KAD_PUBLISH_BUDGET,
+                    kad.publish_keyword(&target, &[entry], KAD_PER_QUERY),
+                )
+                .await
+            }
+        };
+        // A timed-out publish is best-effort partial work, not an error; the
+        // record republishes on its clock regardless.
+        stored.unwrap_or(Ok(0)).unwrap_or(0)
+    }
+
     pub async fn maintain_kad(&mut self) -> usize {
         if self.state != EngineState::Running || self.offline {
             return 0;
@@ -6295,6 +6427,62 @@ mod tests {
     /// PRIVACY: the address is compared internally and NEVER emitted - the
     /// event carries no payload at all, for the same reason `connect_to_server`
     /// refuses to record the client id in any user-visible text.
+    /// The publish duty is GATED: it runs nothing while stopped, while paused,
+    /// or while sharing is off - the same "only when we mean it" discipline the
+    /// seeding/VPN work follows. Offline (no Kad, no network), so a passing gate
+    /// returns 0 without doing I/O; the point is that the gate SHORT-CIRCUITS,
+    /// which we prove by watching `last_kad_publish` NOT advance when gated and
+    /// advance when open.
+    #[tokio::test]
+    async fn the_publish_duty_runs_only_while_running_or_seeding_and_sharing() {
+        let dir = tmp("kad-publish-gate");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+        // NOT offline: `offline` is its own gate (checked with the state), and
+        // setting it would make even the open case return early before the
+        // cadence stamp. The engine was never started, so there is no Kad node
+        // and no network - the duty reaches its scheduler and returns 0 at the
+        // `kad.as_mut()` guard, which is all this gate test needs.
+
+        // Stopped: gated. Back-date the cadence so only the STATE gate can stop
+        // it, and confirm the clock did not advance (the duty returned early).
+        let old = Instant::now() - KAD_PUBLISH_EVERY * 2;
+        engine.last_kad_publish = old;
+        engine.maintain_kad_publish().await;
+        assert_eq!(
+            engine.last_kad_publish, old,
+            "a stopped engine does not even reach the cadence stamp"
+        );
+
+        // Running but sharing OFF: still gated.
+        engine.state = EngineState::Running;
+        engine.set_sharing(false);
+        engine.last_kad_publish = old;
+        engine.maintain_kad_publish().await;
+        assert_eq!(engine.last_kad_publish, old, "Leech Mode publishes nothing");
+
+        // Running AND sharing: the gate opens (the cadence stamp advances even
+        // though offline means no actual store).
+        engine.set_sharing(true);
+        engine.last_kad_publish = old;
+        engine.maintain_kad_publish().await;
+        assert!(
+            engine.last_kad_publish > old,
+            "running + sharing reaches the scheduler"
+        );
+
+        // Seeding also counts (that is exactly when we want to be findable).
+        engine.state = EngineState::Seeding;
+        engine.last_kad_publish = old;
+        engine.maintain_kad_publish().await;
+        assert!(
+            engine.last_kad_publish > old,
+            "seeding publishes too - the whole point of being a good neighbour"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// eMule 0.70b `PauseFile`/`ResumeFile` through the ENGINE API: the flag
     /// flips, persists via FT_STATUS, and a store re-opened from disk comes
     /// back paused - the restart behaviour a 0.70b user expects.
