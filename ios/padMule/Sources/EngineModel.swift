@@ -31,7 +31,15 @@ import UIKit  // UIApplication.isIdleTimerDisabled (keep-screen-awake setting)
 /// public IP or client ID (`server_state_label` and `ServerInfo` exist precisely
 /// to keep those out of user-visible text), server addresses are public
 /// infrastructure, and the only local addresses that appear are RFC1918.
-let engineLog = Logger(subsystem: "us.ajbconsulting.padMule", category: "padMule.engine")
+/// Single source for the engine log's identity. `LoggingTests` pins these
+/// strings to the runbook; construct any engine-side Logger from them, never
+/// from a fresh literal, or the test cannot see the rename it exists to catch.
+enum EngineLogIdentity {
+    static let subsystem = "us.ajbconsulting.padMule"
+    static let category = "padMule.engine"
+}
+
+let engineLog = Logger(subsystem: EngineLogIdentity.subsystem, category: EngineLogIdentity.category)
 
 // File-scope, NOT static members: a stored-property initializer cannot reference
 // `Self.` (covariant Self), so the recents key/cap live here where the

@@ -861,8 +861,9 @@ impl MuleEngine {
             // contacts, probe the oldest due one per bin, remove whoever failed
             // to answer. Rate-limited to KAD_SWEEP_EVERY inside. DUTY NINE -
             // if you add another, update the count in the doc above AND in
-            // `EngineModel.startPolling`'s comment; that number has drifted
-            // twice already.
+            // `EngineModel.refresh()`'s comment (NOT startPolling - the count
+            // lives beside the `e.heartbeat()` call); that number has drifted
+            // three times already, the third in the handoff task list.
             self.inner.lock().await.maintain_kad_liveness().await;
             // Refresh the derived status values LAST, so what the lock-free
             // readers see reflects everything this beat just did.

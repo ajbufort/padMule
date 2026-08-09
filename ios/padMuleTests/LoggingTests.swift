@@ -8,18 +8,33 @@ import XCTest
 /// machine, and it is documented that way in docs/wiki/ipad-usb-tooling.md.
 /// Renaming the subsystem or category silently breaks the one window into the
 /// engine on a device with no debugger, so pin both.
+///
+/// HISTORY (2026-08-09): the original assertion here compared
+/// `String(describing: type(of: engineLog))` against the same expression on a
+/// freshly built Logger - both sides read "Logger" whatever the strings say, so
+/// the test could not fail and neither string was pinned. OSLog's Logger
+/// exposes no accessors, so the strings are single-sourced in
+/// `EngineLogIdentity` (the only spelling of them in the app target;
+/// `engineLog` is constructed from it) and THOSE are pinned here. Residual
+/// gap, stated: a Logger built from fresh literals would evade this test -
+/// the guard is that no such literal exists outside `EngineLogIdentity`.
 final class LoggingTests: XCTestCase {
-    func testEngineLogIsAddressableFromIdevicesyslog() {
-        // Reachable at all (the symbol exists and is shared, not per-instance).
-        XCTAssertNotNil(engineLog)
-
-        // The bundle id doubles as the subsystem, so a filter by app and a filter
-        // by subsystem agree. Assert the CATEGORY string that the runbook tells a
-        // reader to grep for.
-        let expected = Logger(subsystem: "us.ajbconsulting.padMule", category: "padMule.engine")
+    func testEngineLogIdentityMatchesTheRunbook() {
         XCTAssertEqual(
-            String(describing: type(of: engineLog)), String(describing: type(of: expected)),
-            "engineLog must be an OSLog Logger so os_log carries it off-device")
+            EngineLogIdentity.subsystem, "us.ajbconsulting.padMule",
+            "the runbook filters `idevicesyslog -p padMule` by this subsystem; renaming it breaks the only window into the engine on a device with no debugger")
+        XCTAssertEqual(
+            EngineLogIdentity.category, "padMule.engine",
+            "the runbook greps `-m padMule.engine`; renaming the category breaks the documented filter")
+    }
+
+    /// The subsystem doubles as the app's bundle id, so a filter by app and a
+    /// filter by subsystem agree. CI's simulator test host IS the padMule app
+    /// (TEST_HOST), so this reads the real bundle id, not a fixture.
+    func testSubsystemIsTheAppBundleId() {
+        XCTAssertEqual(
+            Bundle.main.bundleIdentifier, EngineLogIdentity.subsystem,
+            "filter-by-app and filter-by-subsystem must agree, or the two documented idevicesyslog commands return different lines")
     }
 
     /// Logging must never crash on the values the engine actually emits - a MOTD

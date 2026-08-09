@@ -4,6 +4,12 @@
 //! the iPad shell is a thin layer over exactly these FFI calls, so exercising them
 //! against a live server/oracle reproduces what a user would see and do.
 //!
+//! That sequence includes the 1s HEARTBEAT: `EngineModel`'s clock calls
+//! `heartbeat()` every second, so this sim beats at every 1s sleep. Restored
+//! 2026-08-09 - when the heartbeat was split out of `downloads()` this harness
+//! was not updated (stress.rs was), so it ran with all nine maintenance duties
+//! dead while its header still claimed EngineModel's exact sequence.
+//!
 //! Usage:
 //!   cargo run -p mule-ffi --example simulate -- <config_dir> <downloads_dir> <keyword>
 //!
@@ -177,6 +183,10 @@ fn main() {
     engine.start();
     for tick in 1..=4 {
         sleep(Duration::from_secs(1));
+        // The heartbeat is a caller obligation since the downloads() split
+        // (mule-ffi lib.rs documents it); beat before draining so events a
+        // duty emits show up on this tick's screen, not the next one's.
+        engine.heartbeat();
         drain(&engine);
         if tick == 4 {
             render_status(&engine);
@@ -204,6 +214,7 @@ fn main() {
         println!("-> connecting to the live server {} ...", live.addr);
         let ok = engine.connect_to_server(live.addr.clone());
         sleep(Duration::from_secs(1));
+        engine.heartbeat();
         drain(&engine);
         println!("connect_to_server={ok}");
         render_status(&engine);
@@ -347,6 +358,7 @@ fn main() {
         engine.set_preview(h.hash.clone(), true);
         for tick in 1..=18 {
             sleep(Duration::from_secs(1));
+            engine.heartbeat();
             drain(&engine);
             if tick % 6 == 0 {
                 println!("-- tick {tick} --");
@@ -391,6 +403,7 @@ fn main() {
         screen("CANCEL (remove the download, verify it is gone)");
         let ok = engine.cancel_download(h.hash.clone());
         sleep(Duration::from_secs(1));
+        engine.heartbeat();
         drain(&engine);
         println!(
             "cancel_download={ok}; {} active download(s) now",
@@ -417,6 +430,7 @@ fn main() {
     engine.resume();
     for _ in 0..3 {
         sleep(Duration::from_secs(1));
+        engine.heartbeat();
         drain(&engine);
     }
     println!("after resume(): state = {}", state_str(engine.state()));

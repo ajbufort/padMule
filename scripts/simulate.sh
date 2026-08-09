@@ -30,7 +30,10 @@ if [ "${SIM_IN_NS:-}" != "1" ]; then
   [ -x "$SIM" ] || { echo "simulate example missing at $SIM"; exit 1; }
   [ -x "$CLI" ] || { echo "mule-cli missing at $CLI"; exit 1; }
   export SIM_IN_NS=1 REPO BIN SIM CLI PORT KEYWORD
-  exec unshare -rn bash "$0"
+  # "$@" is load-bearing: without it the namespace re-run sees no $1 and line 19
+  # re-derives KEYWORD as "test", overwriting the export (found 2026-08-09 -
+  # every run had searched "test" whatever the caller asked for).
+  exec unshare -rn bash "$0" "$@"
 fi
 
 # ---- inside the isolated namespace (loopback only) ----
