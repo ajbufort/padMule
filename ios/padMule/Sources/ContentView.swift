@@ -1314,17 +1314,37 @@ struct ContentView: View {
         return (.green, "Connected - \(serverLabel(srv)), HighID")
     }
 
-    /// "Kad network" row content: stopped when the engine itself is not
-    /// running, else red/amber/green by contact count. The amber
-    /// "Bootstrapping" band exists because a freshly-started Kad table climbs
-    /// from 0 over tens of seconds - "Not connected" would read as broken
-    /// during a normal warm-up.
+    /// "Kad network" row content. The rule lives in `kadRowHealth` (pinned by
+    /// `KadHealthTests`); the row calls THAT, so rule and row cannot drift.
     private var kadHealth: (color: Color, text: String) {
-        guard model.state == .running else { return (.secondary, "Stopped") }
-        let n = model.kadContacts
-        if n == 0 { return (.red, "Not connected") }
-        if n < 10 { return (.orange, "Bootstrapping (\(n) contacts)") }
-        return (.green, "OK (\(n) contacts)")
+        ContentView.kadRowHealth(state: model.state, contacts: model.kadContacts)
+    }
+
+    /// The rule alone: "Stopped" only when the Kad node is actually down,
+    /// else red/amber/green by contact count.
+    ///
+    /// `.seeding` counts as UP, same as `.running` - the 2026-08-09 engine
+    /// change keeps the Kad node alive while background seeding: it still
+    /// answers inbound requests, publishes, and runs the liveness sweep; only
+    /// the growth refresh is suspended. This row said "Stopped" there, which
+    /// was honest before that change and dishonest status after it (lifecycle
+    /// requirement 1). Any FUTURE engine state stays "Stopped" - the direction
+    /// that never overclaims.
+    ///
+    /// The amber band exists because a freshly-started Kad table climbs from 0
+    /// over tens of seconds - "Not connected" would read as broken during a
+    /// normal warm-up. Its copy is "Low contacts (n)", a plain count, not the
+    /// old "Bootstrapping": a seeding node with its growth refresh suspended
+    /// is not bootstrapping, and the count is true in both states.
+    static func kadRowHealth(
+        state: EngineStateFfi, contacts: UInt32
+    ) -> (color: Color, text: String) {
+        guard state == .running || state == .seeding else {
+            return (.secondary, "Stopped")
+        }
+        if contacts == 0 { return (.red, "Not connected") }
+        if contacts < 10 { return (.orange, "Low contacts (\(contacts))") }
+        return (.green, "OK (\(contacts) contacts)")
     }
 
     /// One network-health row: a small colored dot (echoing `statusDot`'s
@@ -1542,7 +1562,8 @@ struct ContentView: View {
                     // in TransferRowState - pinned by its tests, and the row
                     // calls THAT, so rule and caller cannot drift. Any
                     // non-running engine state counts as stopped - seeding
-                    // included: downloads halt there, only uploads continue.
+                    // included: downloads halt there; uploads and the Kad
+                    // node keep going.
                     if badge == .done {
                         Text(badge.label).font(.caption).foregroundStyle(.green)
                     } else {

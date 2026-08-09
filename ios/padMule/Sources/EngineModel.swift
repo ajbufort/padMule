@@ -1560,9 +1560,15 @@ final class EngineModel: ObservableObject {
         refreshInFlight = true
         work.async { [weak self] in
             // HEARTBEAT ONLY. It genuinely needs the engine lock - it drives
-            // ten background duties that fail SILENTLY if it stops (the tenth
-            // is Kad publishing, added 2026-08-09) - so it stays on the serial
-            // `work` queue and is allowed to be slow.
+            // the engine's background maintenance duties, all of which fail
+            // SILENTLY if it stops - so it stays on the serial `work` queue
+            // and is allowed to be slow. How many duties and which ones is
+            // stated in ONE place: the doc on `MuleEngine::heartbeat()` in
+            // crates/mule-ffi/src/lib.rs, where a source-scan test pins the
+            // count to the body. This comment used to state the number itself
+            // and lagged the Rust side (it still said seven after the roster
+            // grew to eight); a count no Rust test can reach does not get a
+            // copy here.
             //
             // What it must NOT do any more is carry the status reads with it.
             // They used to follow it in this same closure, which meant every
