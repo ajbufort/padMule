@@ -1860,11 +1860,12 @@ struct ContentView: View {
     /// .onChange resets) - dismissing means "I have read this", not "pretend it
     /// never happened".
     ///
-    /// Its own @ViewBuilder rather than inline in the body: five conditional
-    /// banners, each with a trailing closure, pushed the enclosing VStack past
-    /// what Swift's type-checker will solve, and CI failed with "unable to
-    /// type-check this expression in reasonable time". Splitting a view is the
-    /// standard cure, and it costs nothing at runtime.
+    /// Its own @ViewBuilder rather than inline in the body: the conditional
+    /// banners (five when this split was made; six now), each with a trailing
+    /// closure, pushed the enclosing VStack past what Swift's type-checker
+    /// will solve, and CI failed with "unable to type-check this expression
+    /// in reasonable time". Splitting a view is the standard cure, and it
+    /// costs nothing at runtime.
     @ViewBuilder private var statusBanners: some View {
         if model.reconnecting && !hidReconnecting {
             banner("Reconnecting...", systemImage: "arrow.clockwise", tint: .orange) {
@@ -1902,6 +1903,23 @@ struct ContentView: View {
         if let notice = model.notice {
             banner(notice, systemImage: "info.circle", tint: .bannerBlue) {
                 model.notice = nil
+            }
+        }
+        // The started-download feedback, BOUND to the row's live state rather
+        // than captured as a string - a captured "Downloading X" kept asserting
+        // the download was running after it was paused (on glass 2026-08-09;
+        // the an-event-is-not-state shape). The model stores only WHICH row;
+        // the words come from the row's current badge, so pause, cancel,
+        // completion, engine stop, and queue demotion all take the claim down
+        // without anyone remembering to clear it. Dismiss drops the pointer;
+        // the next Get re-arms it.
+        if let text = EngineModel.downloadBannerText(
+            hash: model.downloadNoticeHash,
+            downloads: model.downloads,
+            engineStopped: TransferRowState.engineStopped(model.state))
+        {
+            banner(text, systemImage: "arrow.down.circle", tint: .bannerBlue) {
+                model.downloadNoticeHash = nil
             }
         }
     }

@@ -379,6 +379,16 @@ final class EngineModel: ObservableObject {
     @Published private(set) var adding: Set<String> = []
     /// A transient line reporting what just happened.
     @Published var notice: String?
+    /// The download the started-download feedback banner points at. Only this
+    /// POINTER is durable; the banner TEXT is derived from the row's live
+    /// state on every render (`downloadBannerText`), so the banner cannot
+    /// outlive its truth - pausing, queueing, finishing, cancelling, or
+    /// stopping the engine takes the claim down with it. The old shape (a
+    /// captured "Downloading ..." string in `notice`) kept asserting the
+    /// download was running after it was paused - seen on glass 2026-08-09,
+    /// the an-event-is-not-state bug family. nil = dismissed or never shown;
+    /// not `private(set)` so the banner's dismiss button can clear it.
+    @Published var downloadNoticeHash: String?
     /// The last port-mapping (UPnP) result - durable, so the "Connected" line
     /// can't clobber it. This is our only window into why HighID did or didn't
     /// happen on a device with no debugger.
@@ -1076,6 +1086,37 @@ final class EngineModel: ObservableObject {
         !active && sawVpnBefore
     }
 
+    /// The live-state text for the started-download feedback banner, or nil
+    /// when no banner should show. PURE so the honesty rule is testable
+    /// without an engine.
+    ///
+    /// The rule: the banner says "Downloading" only while the row it names
+    /// would carry NO badge - judged by the same `TransferRowState.badge`
+    /// precedence the Transfers row renders, so the banner and the row cannot
+    /// tell different stories. A paused or finished row shows nothing (the
+    /// row's own badge already says so), and a missing row (cancelled) shows
+    /// nothing. A queued row gets its own honest line rather than silence,
+    /// because with the max-active cap full a fresh Get lands queued AT BIRTH
+    /// and the user still deserves feedback for the tap.
+    static func downloadBannerText(
+        hash: String?, downloads: [DownloadInfo], engineStopped: Bool
+    ) -> String? {
+        guard let hash, let row = downloads.first(where: { $0.hash == hash }) else {
+            return nil
+        }
+        let badge = TransferRowState.badge(
+            complete: row.complete, engineStopped: engineStopped,
+            filePaused: row.paused, queued: row.queued)
+        switch badge {
+        case nil:
+            return "Downloading \"\(row.name)\"."
+        case .queued?:
+            return "\"\(row.name)\" is queued - it starts when a download slot frees."
+        case .paused?, .done?:
+            return nil
+        }
+    }
+
     /// Start downloading a hit. Blocks briefly (asking the server for sources),
     /// so it too goes through the work queue.
     func download(_ hit: SearchHit) {
@@ -1093,9 +1134,14 @@ final class EngineModel: ObservableObject {
                     // honored without a new engine argument.
                     let pri = UserDefaults.standard.integer(forKey: SettingsKey.defaultPriority)
                     if pri != 1 { self.setPriority(hit.hash, priority: UInt8(pri)) }
-                    self.notice = "Downloading \"\(hit.name)\"."
+                    // POINT the banner at the row; the text is derived live
+                    // (`downloadBannerText`), never captured as a string here.
+                    self.downloadNoticeHash = hit.hash
                 case .alreadyAdded:
-                    self.notice = "\"\(hit.name)\" is already downloading."
+                    // A positional fact, not an activity claim: the old "is
+                    // already downloading" was false at birth for a row sitting
+                    // paused or queued, and stayed on screen either way.
+                    self.notice = "\"\(hit.name)\" is already in your downloads."
                 case .noSources:
                     // Not an error: nobody who is online right now has it. Only
                     // reachable when we HAD a way to ask - the engine returns
