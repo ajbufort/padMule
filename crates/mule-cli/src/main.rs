@@ -1167,6 +1167,37 @@ async fn cmd_serve_file(port: u16, path: &str, eserver: Option<(String, u16)>) {
 }
 
 /// Download `hash` (`size` bytes) from a single peer at `addr` into `out`, driving
+/// RESUME `<index>.part` in `dir` when its `.part.met` describes EXACTLY this
+/// file, else start a fresh one. Returns the store and whether it resumed.
+///
+/// Without this the CLI always called `PartStore::create`, which truncates, so
+/// every invocation restarted at zero and discarded whatever the previous run
+/// had committed. A transfer slower than one invocation could then never be
+/// finished AT ALL: the 156MB Acer arm reset every window instead of
+/// accumulating (docs/wiki/build-progress.md row 8dr). The engine has carried
+/// full resume support the whole time (`PartStore::open` rebuilds the gap list
+/// from part.met); only this harness never used it.
+///
+/// The hash AND the size must both match. `<index>.part` is a FIXED slot, so
+/// the file sitting there may belong to a completely different download, and
+/// resuming onto it would splice two files together and produce a plausible
+/// part that fails its hash much later. On any mismatch - or no part present,
+/// or an unreadable met - fall through to a fresh create.
+fn open_or_create_part(
+    dir: &Path,
+    index: u32,
+    hash: [u8; 16],
+    size: u64,
+    name: &[u8],
+) -> std::io::Result<(PartStore, bool)> {
+    if let Ok(s) = PartStore::open(dir, index) {
+        if s.pf.hash == hash && s.pf.size == size {
+            return Ok((s, true));
+        }
+    }
+    Ok((PartStore::create(dir, index, hash, size, name)?, false))
+}
+
 /// the real multi-source path (disk-backed PartStore, hashset exchange, block
 /// receive incl. compressed parts, and verification against the peer's hashset).
 /// This is the padMule side of the amuled differential test.
@@ -1221,8 +1252,17 @@ async fn cmd_peer_download(
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "download.bin".into());
-    let store = match PartStore::create(dir, 1, hash, size, name.as_bytes()) {
-        Ok(s) => s,
+    let store = match open_or_create_part(dir, 1, hash, size, name.as_bytes()) {
+        Ok((s, resumed)) => {
+            if resumed {
+                println!(
+                    "resuming {} ({} of {size} bytes still missing)",
+                    s.part_path().display(),
+                    s.pf.missing()
+                );
+            }
+            s
+        }
         Err(e) => {
             eprintln!("cannot create .part in {}: {e}", dir.display());
             return;
@@ -3155,6 +3195,58 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `open_or_create_part` must RESUME a matching part and REFUSE a
+    /// mismatched one. The refusal is the load-bearing half: `1.part` is a
+    /// fixed slot, so resuming onto a different file's part would splice two
+    /// downloads together. Written after row 8dr found the CLI discarding
+    /// every previous window's bytes by always calling `create`.
+    #[test]
+    fn part_resumes_only_when_hash_and_size_both_match() {
+        let dir = std::env::temp_dir().join(format!("padmule-resume-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let hash = [0xAAu8; 16];
+        let size = 40_000u64;
+
+        // First call: nothing on disk -> fresh, and it did NOT claim a resume.
+        let (mut s, resumed) = open_or_create_part(&dir, 1, hash, size, b"a.bin").unwrap();
+        assert!(!resumed, "an empty directory cannot be a resume");
+        assert_eq!(s.pf.missing(), size);
+
+        // Commit a block and persist the gap state, as a real run would.
+        s.write_block(0, &[7u8; 10_000]).unwrap();
+        s.save_met().unwrap();
+        drop(s);
+
+        // Same hash + size -> RESUME, and the committed bytes survive.
+        let (s, resumed) = open_or_create_part(&dir, 1, hash, size, b"a.bin").unwrap();
+        assert!(resumed, "a matching part.met must resume");
+        assert_eq!(
+            s.pf.missing(),
+            size - 10_000,
+            "resume must preserve the closed gap, not restart at zero"
+        );
+        drop(s);
+
+        // DIFFERENT hash, same size -> must NOT resume onto another file's part.
+        let (s, resumed) = open_or_create_part(&dir, 1, [0xBBu8; 16], size, b"b.bin").unwrap();
+        assert!(!resumed, "a different file must never resume this slot");
+        assert_eq!(s.pf.missing(), size, "the mismatched part must start fresh");
+        drop(s);
+
+        // Same hash, DIFFERENT size -> also a mismatch.
+        let (mut s, _) = open_or_create_part(&dir, 1, hash, size, b"a.bin").unwrap();
+        s.write_block(0, &[7u8; 10_000]).unwrap();
+        s.save_met().unwrap();
+        drop(s);
+        let (s, resumed) = open_or_create_part(&dir, 1, hash, size + 1, b"a.bin").unwrap();
+        assert!(!resumed, "a size change must not resume");
+        assert_eq!(s.pf.missing(), size + 1);
+        drop(s);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// RFC 1320 vector: MD4("abc") = a448017aaf21d8525fc10ae87aa6729d. The
     /// keyword path lowercases first, so "ABC" shares that target, and the
