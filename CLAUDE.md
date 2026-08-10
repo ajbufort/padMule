@@ -222,3 +222,16 @@ Bias toward caution over speed; use judgment on trivial tasks.
 4. **Goal-driven execution.** Turn tasks into verifiable goals ("port module X"
    -> "module X compiles for the target and its tests pass") and loop until
    verified. State a brief plan with a check per step for multi-step work.
+5. **A brief is a hypothesis** (padMule's own rule, BINDING since 2026-08-09).
+   Verify the premises you were handed - the design, the handoff claim, the
+   prior measurement, a line in your own brief - against the code, the
+   authority tree, or the artifact BEFORE acting on them. Where the brief and
+   the files disagree, THE FILES WIN - say so explicitly. Never implement a
+   design whose premise you have refuted; report the refutation and what you
+   would do instead. Every report names "what I verified" separately from
+   "what I found different", even when everything held. Read each command's
+   OWN exit status, never a pipeline's tail. And when DISPATCHING: a brief
+   that says "do X" without "verify X still holds, and tell me if it does
+   not" is INCOMPLETE - the dispatcher is frequently wrong. The day that
+   earned this rule (three refuted premises, one of which would have shipped
+   silent data corruption): `docs/wiki/decisions-and-lessons.md`, 2026-08-09.
