@@ -61,6 +61,11 @@ struct SourcesView: View {
                 if s.rating > 0 { ratingPill(s.rating) }
             }
             Text(s.addr).font(.caption).foregroundStyle(.secondary)
+            if let queue = SourcesView.queueRankLabel(
+                rank: s.queueRank, ageSecs: s.queueRankAgeSecs)
+            {
+                Text(queue).font(.caption).foregroundStyle(.secondary)
+            }
             if !s.comment.isEmpty {
                 Text("\u{201C}\(s.comment)\u{201D}")
                     .font(.caption)
@@ -68,6 +73,29 @@ struct SourcesView: View {
                     .foregroundStyle(.secondary)
             }
         }
+    }
+
+    /// The queue-position line for one source, or nil when there is nothing
+    /// honest to say. PURE (pinned by `QueueRankLabelTests`) so the rule and
+    /// the row cannot drift.
+    ///
+    /// eMule 0.70b shows "QR: n" beside a source while we sit on its queue
+    /// (DownloadListCtrl.cpp:513-518), and can say it PRESENT-TENSE because it
+    /// separately guarantees the number is fresh: every on-queue source is
+    /// re-asked at FILEREASKTIME = 29 minutes (Opcodes.h:64) or dropped from
+    /// the list. padMule's fetch sweep makes no such promise - a rank can be
+    /// captured at bail time and never refreshed - so the invariant crosses
+    /// over instead of the surface: the label names the snapshot's age, and
+    /// past eMule's own freshness horizon it says nothing at all, because by
+    /// then eMule would have refreshed the number or given up on the source,
+    /// and showing it would claim knowledge we no longer have.
+    ///
+    /// Rank 0 is "never told / cleared" - eMule's own unknown encoding, which
+    /// it also renders as nothing.
+    static func queueRankLabel(rank: UInt16, ageSecs: UInt32) -> String? {
+        guard rank > 0, ageSecs < 29 * 60 else { return nil }
+        let when = ageSecs < 60 ? "just now" : "\(ageSecs / 60)m ago"
+        return "In queue: #\(rank) (\(when))"
     }
 
     private func ratingPill(_ rating: UInt8) -> some View {

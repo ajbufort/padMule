@@ -39,9 +39,9 @@ use crate::transfer::{
     build_aich_file_hash_req, build_aich_request, build_hashset_request,
     build_request_filename_ext, build_request_parts, build_set_req_file_id, build_start_upload_req,
     parse_aich_answer, parse_aich_file_hash_ans, parse_file_desc, parse_file_status,
-    parse_hashset_answer, AichAnswer, BlockReceiver, FileStatus, EMBLOCKSIZE, OP_ACCEPTUPLOADREQ,
-    OP_AICHANSWER, OP_AICHFILEHASHANS, OP_FILEDESC, OP_FILEREQANSNOFIL, OP_FILESTATUS,
-    OP_HASHSETANSWER, OP_OUTOFPARTREQS, OP_QUEUERANKING, STANDARD_BLOCKS_REQUEST,
+    parse_hashset_answer, parse_queue_ranking, AichAnswer, BlockReceiver, FileStatus, EMBLOCKSIZE,
+    OP_ACCEPTUPLOADREQ, OP_AICHANSWER, OP_AICHFILEHASHANS, OP_FILEDESC, OP_FILEREQANSNOFIL,
+    OP_FILESTATUS, OP_HASHSETANSWER, OP_OUTOFPARTREQS, OP_QUEUERANKING, STANDARD_BLOCKS_REQUEST,
 };
 use crate::transfer_session::TransferError;
 use mule_proto::{AichTree, Packet, PARTSIZE};
@@ -189,6 +189,23 @@ pub struct SourceInfo {
     /// (`fetch::PeerSource::origin`); it just was not carried this far, so the
     /// UI could show which discovery channel is actually feeding a download.
     pub origin: crate::fetch::SourceOrigin,
+    /// Our 1-based place in THIS source's upload queue, from its last
+    /// OP_QUEUERANKING (eMule `m_nRemoteQueueRank`). `None` = it never told us,
+    /// or the fact stopped being true: cleared when it grants us a slot
+    /// (eMule zeroes the rank on entering DS_DOWNLOADING, DownloadClient.cpp:
+    /// 702-706) and when a reconnect re-asks for the file (eMule resets to
+    /// unknown as it sends the request, DownloadClient.cpp:307-309/:381-384).
+    /// NOT cleared when the session merely ends: eMule keeps the rank across
+    /// disconnects - a queued client is EXPECTED to drop the link and re-ask
+    /// later, and the rank stays on display the whole time.
+    pub queue_rank: Option<u16>,
+    /// Wall-clock second `queue_rank` was last reported; meaningful only while
+    /// `queue_rank` is `Some`. eMule never shows a rank without also holding
+    /// the invariant that keeps it fresh (every on-queue source is re-asked at
+    /// FILEREASKTIME = 29 min, Opcodes.h:64, or dropped). padMule cannot
+    /// promise that refresh cadence, so the timestamp travels WITH the rank
+    /// and the display ages it honestly instead.
+    pub queue_rank_at: u64,
 }
 
 /// One file being pulled from many peers.
@@ -527,6 +544,10 @@ impl Download {
     /// Record (or refresh) the base facts about a source we connected to:
     /// software, obfuscation, and LowID. Keyed by address; a reconnect updates
     /// those fields but preserves any rating/comment/verified already learned.
+    /// The QUEUE RANK does not survive the re-note: a reconnect is followed by
+    /// a fresh file request, and eMule resets the remote rank to unknown as it
+    /// sends that request (DownloadClient.cpp:307-309/:381-384) - the answer
+    /// (a grant, or a fresh ranking) supplies the new truth within seconds.
     pub async fn note_source(
         &self,
         software: String,
@@ -542,6 +563,8 @@ impl Download {
             s.low_id = low_id;
             s.origin = origin;
             s.last_seen = crate::credit_store::now_secs() as u64;
+            s.queue_rank = None;
+            s.queue_rank_at = 0;
         } else {
             g.push(SourceInfo {
                 addr,
@@ -553,6 +576,8 @@ impl Download {
                 comment: String::new(),
                 last_seen: crate::credit_store::now_secs() as u64,
                 origin,
+                queue_rank: None,
+                queue_rank_at: 0,
             });
         }
     }
@@ -620,6 +645,36 @@ impl Download {
         let mut g = self.sources.lock().await;
         if let Some(s) = g.iter_mut().find(|s| s.addr == addr) {
             s.verified = true;
+        }
+    }
+
+    /// Record the 1-based place this source's OP_QUEUERANKING just gave us
+    /// (eMule ProcessEmuleQueueRank -> SetRemoteQueueRank, DownloadClient.cpp:
+    /// 1985-1995). Rank 0 means "not queued / unknown" on the wire - never
+    /// sent by a conforming uploader (see `build_queue_ranking`) and displayed
+    /// as nothing by eMule (DownloadListCtrl.cpp:516-517) - so it CLEARS the
+    /// stored rank rather than storing a zero. No-op if we have no record of
+    /// that address yet (the base note comes first on connect).
+    pub async fn note_source_queue_rank(&self, addr: SocketAddr, rank: u16) {
+        let mut g = self.sources.lock().await;
+        if let Some(s) = g.iter_mut().find(|s| s.addr == addr) {
+            s.queue_rank = (rank > 0).then_some(rank);
+            s.queue_rank_at = if rank > 0 {
+                crate::credit_store::now_secs() as u64
+            } else {
+                0
+            };
+        }
+    }
+
+    /// The source granted us an upload slot: our place in its queue stopped
+    /// being a fact (eMule zeroes the remote rank on entering DS_DOWNLOADING,
+    /// DownloadClient.cpp:702-706).
+    pub async fn note_source_slot_granted(&self, addr: SocketAddr) {
+        let mut g = self.sources.lock().await;
+        if let Some(s) = g.iter_mut().find(|s| s.addr == addr) {
+            s.queue_rank = None;
+            s.queue_rank_at = 0;
         }
     }
 
@@ -1613,6 +1668,22 @@ async fn note_comment_if_desc(pkt: &Packet, dl: &Download, peer: Option<SocketAd
     }
 }
 
+/// If `pkt` is OP_QUEUERANKING, record our place in `peer`'s upload queue on
+/// its per-source record (eMule ProcessEmuleQueueRank -> SetRemoteQueueRank,
+/// DownloadClient.cpp:1985-1995). A malformed payload is dropped, never fatal
+/// (eMule size-checks the same way). Safe to call from any loop; the wait-in-
+/// queue path sees fresh rankings arrive on the held connection and each one
+/// overwrites the last, so the record tracks the queue as it moves.
+async fn note_rank_if_ranking(pkt: &Packet, dl: &Download, peer: Option<SocketAddr>) {
+    if pkt.opcode == OP_QUEUERANKING {
+        if let Ok(rank) = parse_queue_ranking(&pkt.payload) {
+            if let Some(addr) = peer {
+                dl.note_source_queue_rank(addr, rank).await;
+            }
+        }
+    }
+}
+
 /// Handle a packet that is NOT the one a read loop is waiting for: a source's
 /// rating/comment (OP_FILEDESC), and the secure-ident exchange (OP_SECIDENTSTATE
 /// / OP_PUBLICKEY / OP_SIGNATURE). Secure-ident is best-effort and NEVER blocks
@@ -1631,6 +1702,10 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     note_comment_if_desc(pkt, dl, peer).await;
+    // A ranking read out of turn - the wait-in-queue path, or one arriving
+    // during the status/hashset waits - still names our place in the peer's
+    // queue; record it against the source.
+    note_rank_if_ranking(pkt, dl, peer).await;
     // A peer's answer to our source request. Unsolicited answers are fine to
     // accept too (aMule likewise just processes what arrives); every source is
     // re-validated by the fetch manager before it is ever dialed, so a hostile
@@ -1776,13 +1851,26 @@ where
         let pkt = fs.read_packet_unpacked().await?;
         match pkt.opcode {
             OP_ACCEPTUPLOADREQ => {
+                // Our place in its queue stopped being a fact (eMule zeroes
+                // the remote rank on DS_DOWNLOADING, DownloadClient.cpp:702-706).
+                if let Some(addr) = peer {
+                    dl.note_source_slot_granted(addr).await;
+                }
                 crate::stats::note_accepted();
                 return Ok(());
             }
             OP_QUEUERANKING if bail_on_queue => {
+                // KEEP the rank before moving on: "you are #8 at this source"
+                // is the answer to "is this download progressing or hopeless",
+                // and this arm used to throw it away unread (handoff pending
+                // #26 - a real eMule was seen ranking us #8 -> #11 -> #9 over
+                // the hour before it granted).
+                note_rank_if_ranking(&pkt, dl, peer).await;
                 crate::stats::note_queued();
                 return Err(TransferError::Queued);
             }
+            // When waiting our turn (bail_on_queue = false), OP_QUEUERANKING
+            // lands in the aux handler below, which records it the same way.
             _ => {
                 crate::stats::note_unexpected(pkt.opcode);
                 handle_aux_packet(&pkt, sec, fs, dl, peer, aich).await?
@@ -4134,6 +4222,317 @@ mod tests {
         let sb = srcs.iter().find(|s| s.addr == b).unwrap();
         assert!(!sb.obfuscated && sb.low_id && sb.rating == 0 && !sb.verified);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The queue-rank record's whole lifecycle at the unit level: set by a
+    /// ranking, overwritten by a fresh one, cleared by a grant, cleared by a
+    /// wire rank of 0 (= "unknown", the value eMule displays as nothing), and
+    /// reset to unknown by a reconnect re-note (eMule zeroes the remote rank
+    /// as it re-sends the file request, DownloadClient.cpp:307-309/:381-384).
+    #[tokio::test]
+    async fn queue_rank_set_refresh_grant_and_renote_lifecycle() {
+        let dir = tmpdir("qr-lifecycle");
+        let store = PartStore::create(&dir, 1, [0x22; 16], 400_000, b"q.bin").unwrap();
+        let dl = Download::new(store);
+        let a: SocketAddr = "1.2.3.4:4662".parse().unwrap();
+        let note_a = || {
+            dl.note_source(
+                "eMule 0.70b".into(),
+                a,
+                false,
+                false,
+                crate::fetch::SourceOrigin::Server,
+            )
+        };
+        let rank_of = |srcs: Vec<SourceInfo>| srcs.iter().find(|s| s.addr == a).unwrap().clone();
+
+        // Unknown until told.
+        note_a().await;
+        assert_eq!(rank_of(dl.sources().await).queue_rank, None);
+
+        // A ranking sets rank + timestamp; a fresh one overwrites (the acer
+        // run watched a real eMule move us #8 -> #11 -> #9).
+        dl.note_source_queue_rank(a, 8).await;
+        let s = rank_of(dl.sources().await);
+        assert_eq!(s.queue_rank, Some(8));
+        assert!(s.queue_rank_at > 0, "a rank carries the second it was said");
+        dl.note_source_queue_rank(a, 11).await;
+        assert_eq!(rank_of(dl.sources().await).queue_rank, Some(11));
+
+        // A grant clears it (eMule DS_DOWNLOADING, DownloadClient.cpp:702-706).
+        dl.note_source_slot_granted(a).await;
+        let s = rank_of(dl.sources().await);
+        assert_eq!(s.queue_rank, None, "a granted slot ends the queue fact");
+        assert_eq!(s.queue_rank_at, 0);
+
+        // Rank 0 on the wire = unknown, never a display of "#0".
+        dl.note_source_queue_rank(a, 9).await;
+        dl.note_source_queue_rank(a, 0).await;
+        assert_eq!(rank_of(dl.sources().await).queue_rank, None);
+
+        // A reconnect re-note resets to unknown pending the new answer.
+        dl.note_source_queue_rank(a, 5).await;
+        note_a().await;
+        assert_eq!(rank_of(dl.sources().await).queue_rank, None);
+
+        // An address we never connected to records nothing (base note first).
+        let b: SocketAddr = "5.6.7.8:4662".parse().unwrap();
+        dl.note_source_queue_rank(b, 3).await;
+        assert!(dl.sources().await.iter().all(|s| s.addr != b));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// THE DEFECT (handoff pending #26): on the multi-source hunt path
+    /// (bail_on_queue = true, the app's fetch path) OP_QUEUERANKING carried our
+    /// place in the peer's queue and `await_slot` returned `Queued` without
+    /// reading it. The rank must land on the per-source record BEFORE the bail.
+    /// MUTATION-CHECK by deleting the `note_source_queue_rank` call in the
+    /// bail arm of `await_slot` - this goes red.
+    #[tokio::test]
+    async fn queue_rank_recorded_when_bailing_on_queue() {
+        use crate::transfer::build_queue_ranking;
+
+        let size = 400_000u64;
+        let name = b"ranked.bin";
+        let hash = [0x77; 16];
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let up = tokio::spawn(async move {
+            let me = HelloInfo::baseline([0xD1; 16], 0, 4662, 4672, "up");
+            let (_p, mut fs) = accept_peer(&listener, &me).await.unwrap();
+            while let Ok(pkt) = fs.read_packet_unpacked().await {
+                match pkt.opcode {
+                    crate::transfer::OP_REQUESTFILENAME => {
+                        let _ = fs
+                            .write_packet(&crate::transfer::build_req_filename_answer(&hash, name))
+                            .await;
+                    }
+                    crate::transfer::OP_SETREQFILEID => {
+                        let _ = fs
+                            .write_packet(&crate::transfer::build_file_status_complete(&hash))
+                            .await;
+                    }
+                    // Busy: queue the asker at #8 instead of granting.
+                    crate::transfer::OP_STARTUPLOADREQ => {
+                        let _ = fs.write_packet(&build_queue_ranking(8)).await;
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let dir = tmpdir("qr-bail");
+        let store = PartStore::create(&dir, 1, hash, size, name).unwrap();
+        let dl = Download::new(store);
+        let me = HelloInfo::baseline([0xD2; 16], 0x0A00_0001, 4663, 4673, "dl");
+        let (_p, mut fs) = connect_peer(addr, &me).await.unwrap();
+        // The base record, exactly as fetch_one lays it down before the session.
+        dl.note_source(
+            "up".into(),
+            addr,
+            false,
+            false,
+            crate::fetch::SourceOrigin::Server,
+        )
+        .await;
+
+        let got = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            download_from_peer_at(&mut fs, &dl, true, Some(addr), PeerSession::default()),
+        )
+        .await
+        .expect("a queueing peer must end the hunt session promptly");
+        assert!(
+            matches!(got, Err(TransferError::Queued)),
+            "the hunt path still bails on a ranking"
+        );
+
+        let srcs = dl.sources().await;
+        let s = srcs.iter().find(|s| s.addr == addr).expect("record exists");
+        assert_eq!(
+            s.queue_rank,
+            Some(8),
+            "the rank the peer sent must survive the bail - this is the defect"
+        );
+        drop(fs);
+        up.abort();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The wait-in-queue path (bail_on_queue = false, the inbound-callback
+    /// path): rankings arriving while we hold the line must update the record,
+    /// and the eventual grant must clear it. MUTATION-CHECK twice: deleting
+    /// `note_rank_if_ranking` from `handle_aux_packet` reds the Some(11)
+    /// assert; deleting the grant-clear in `await_slot` reds the None assert.
+    #[tokio::test]
+    async fn queue_rank_updates_while_waiting_and_clears_on_grant() {
+        use crate::transfer::build_queue_ranking;
+
+        let size = (2 * mule_proto::EMBLOCKSIZE) as usize;
+        let data: Vec<u8> = (0..size as u32)
+            .map(|i| (i.wrapping_mul(7)) as u8)
+            .collect();
+        let hash = ed2k_hash(&data);
+        let name = b"waited.bin";
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let served = data.clone();
+        let up = tokio::spawn(async move {
+            use crate::transfer::{
+                build_sending_part, parse_request_parts, OP_REQUESTPARTS, OP_REQUESTPARTS_I64,
+            };
+            let me = HelloInfo::baseline([0xD3; 16], 0, 4662, 4672, "up");
+            let (_p, mut fs) = accept_peer(&listener, &me).await.unwrap();
+            while let Ok(pkt) = fs.read_packet_unpacked().await {
+                match pkt.opcode {
+                    crate::transfer::OP_REQUESTFILENAME => {
+                        let _ = fs
+                            .write_packet(&crate::transfer::build_req_filename_answer(&hash, name))
+                            .await;
+                    }
+                    crate::transfer::OP_SETREQFILEID => {
+                        let _ = fs
+                            .write_packet(&crate::transfer::build_file_status_complete(&hash))
+                            .await;
+                    }
+                    // Two rankings first - the queue moved - then the grant, on
+                    // the SAME held connection, as a waiting client sees it.
+                    crate::transfer::OP_STARTUPLOADREQ => {
+                        let _ = fs.write_packet(&build_queue_ranking(8)).await;
+                        let _ = fs.write_packet(&build_queue_ranking(11)).await;
+                        let _ = fs
+                            .write_packet(&crate::transfer::build_accept_upload())
+                            .await;
+                    }
+                    OP_REQUESTPARTS | OP_REQUESTPARTS_I64 => {
+                        let (_h, blocks) =
+                            parse_request_parts(&pkt.payload, pkt.opcode == OP_REQUESTPARTS_I64)
+                                .unwrap();
+                        for (s, e) in blocks {
+                            let _ = fs
+                                .write_packet(&build_sending_part(
+                                    &hash,
+                                    s,
+                                    e,
+                                    &served[s as usize..e as usize],
+                                ))
+                                .await;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let dir = tmpdir("qr-wait");
+        let store = PartStore::create(&dir, 1, hash, size as u64, name).unwrap();
+        let dl = Download::new(store);
+        let me = HelloInfo::baseline([0xD4; 16], 0x0A00_0001, 4663, 4673, "dl");
+        let (_p, mut fs) = connect_peer(addr, &me).await.unwrap();
+        dl.note_source(
+            "up".into(),
+            addr,
+            false,
+            false,
+            crate::fetch::SourceOrigin::Server,
+        )
+        .await;
+
+        let got = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            download_from_peer_at(&mut fs, &dl, false, Some(addr), PeerSession::default()),
+        )
+        .await
+        .expect("the granted session must finish");
+        assert_eq!(got.expect("clean session"), size as u64, "whole file");
+
+        // AFTER the grant: rank cleared. The intermediate Some(11) is asserted
+        // via a second run below where the peer stops BEFORE granting - here
+        // the grant landed last, so a surviving rank means the clear is missing.
+        let srcs = dl.sources().await;
+        let s = srcs.iter().find(|s| s.addr == addr).expect("record exists");
+        assert_eq!(
+            s.queue_rank, None,
+            "a granted slot must clear the queue rank"
+        );
+        drop(fs);
+        up.abort();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The wait path's RECORDING alone: the peer ranks us twice and goes
+    /// silent, never granting; the last ranking must be on the record when the
+    /// session dies. Split from the grant test so each mutation reds a test
+    /// that says its name.
+    #[tokio::test]
+    async fn queue_rank_latest_ranking_wins_while_waiting() {
+        use crate::transfer::build_queue_ranking;
+
+        let hash = [0x78; 16];
+        let name = b"silent.bin";
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let up = tokio::spawn(async move {
+            let me = HelloInfo::baseline([0xD5; 16], 0, 4662, 4672, "up");
+            let (_p, mut fs) = accept_peer(&listener, &me).await.unwrap();
+            while let Ok(pkt) = fs.read_packet_unpacked().await {
+                match pkt.opcode {
+                    crate::transfer::OP_REQUESTFILENAME => {
+                        let _ = fs
+                            .write_packet(&crate::transfer::build_req_filename_answer(&hash, name))
+                            .await;
+                    }
+                    crate::transfer::OP_SETREQFILEID => {
+                        let _ = fs
+                            .write_packet(&crate::transfer::build_file_status_complete(&hash))
+                            .await;
+                    }
+                    crate::transfer::OP_STARTUPLOADREQ => {
+                        let _ = fs.write_packet(&build_queue_ranking(8)).await;
+                        let _ = fs.write_packet(&build_queue_ranking(11)).await;
+                        // ...and never grant: the downloader waits in queue.
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let dir = tmpdir("qr-wait-silent");
+        let store = PartStore::create(&dir, 1, hash, 400_000, name).unwrap();
+        let dl = Download::new(store);
+        let me = HelloInfo::baseline([0xD6; 16], 0x0A00_0001, 4663, 4673, "dl");
+        let (_p, mut fs) = connect_peer(addr, &me).await.unwrap();
+        dl.note_source(
+            "up".into(),
+            addr,
+            false,
+            false,
+            crate::fetch::SourceOrigin::Server,
+        )
+        .await;
+
+        // The peer hangs up after the second ranking, so the session errors out
+        // (connection reset) - the point is what is on the record afterwards.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            download_from_peer_at(&mut fs, &dl, false, Some(addr), PeerSession::default()),
+        )
+        .await
+        .expect("a hung-up peer must not hang the session");
+
+        let srcs = dl.sources().await;
+        let s = srcs.iter().find(|s| s.addr == addr).expect("record exists");
+        assert_eq!(
+            s.queue_rank,
+            Some(11),
+            "the LATEST ranking read on the wait path must be the one kept"
+        );
+        drop(fs);
+        let _ = up.await;
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

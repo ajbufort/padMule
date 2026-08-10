@@ -282,6 +282,14 @@ pub struct SourceInfoFfi {
     /// 0 = unrated, else 1-5 (1 = Fake .. 5 = Excellent).
     pub rating: u8,
     pub comment: String,
+    /// Our 1-based place in this source's upload queue, from its last
+    /// OP_QUEUERANKING; 0 = it never told us, or a granted slot / reconnect
+    /// cleared it (eMule's own "unknown" encoding, shown as nothing).
+    pub queue_rank: u16,
+    /// Seconds since the rank was reported; meaningful only when
+    /// `queue_rank > 0`. The rank is a SNAPSHOT from that peer, not a live
+    /// value - the UI ages it rather than presenting it as current.
+    pub queue_rank_age_secs: u32,
 }
 
 /// Pre-search filters pushed onto the server query. A `0` field means "unset".
@@ -925,6 +933,18 @@ impl MuleEngine {
                     verified: s.verified,
                     rating: s.rating,
                     comment: s.comment,
+                    queue_rank: s.queue_rank.unwrap_or(0),
+                    // Age with the same clock the engine stamped it with
+                    // (credit_store::now_secs), so the number cannot drift
+                    // across clock domains. Saturating: a clock step backwards
+                    // reads as "just now", never as garbage.
+                    queue_rank_age_secs: if s.queue_rank.is_some() {
+                        (mule_engine::credit_store::now_secs() as u64)
+                            .saturating_sub(s.queue_rank_at)
+                            .min(u32::MAX as u64) as u32
+                    } else {
+                        0
+                    },
                 })
                 .collect()
         })
