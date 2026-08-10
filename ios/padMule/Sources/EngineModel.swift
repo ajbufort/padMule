@@ -717,6 +717,13 @@ final class EngineModel: ObservableObject {
                 e.setUpnpEnabled(on: d.bool(forKey: SettingsKey.upnpEnabled))
                 e.setMaxActiveDownloads(
                     n: UInt32(clamping: d.integer(forKey: SettingsKey.maxActiveDownloads)))
+                // BEFORE start(), for the same reason the ports are: the
+                // inbound listener builds its HELLO once, when it binds, so a
+                // nickname pushed afterwards would not reach a peer that dials
+                // us until the next Stop -> Start.
+                e.setNickname(
+                    nick: EngineModel.nicknameToPush(
+                        stored: d.string(forKey: SettingsKey.nickname)))
                 e.start()
                 engineLog.notice("boot OK; engine started")
                 DispatchQueue.main.async {
@@ -2282,6 +2289,40 @@ final class EngineModel: ObservableObject {
     /// The canonical public server-list URL (plain http; the engine fetches over a
     /// raw socket, so no ATS exemption is needed).
     nonisolated static let defaultServerListUrl = "http://upd.emule-security.org/server.met"
+
+    /// The name padMule announces when the user has not chosen one. Must equal
+    /// `mule_engine::DEFAULT_NICK`, which is the value the engine falls back to;
+    /// they are the same string on both sides of the seam so a fresh install
+    /// announces what every build before the setting announced.
+    nonisolated static let defaultNickname = "padMule"
+
+    /// What to push into the engine at boot for a stored nickname.
+    ///
+    /// The trap this exists for: `UserDefaults.string(forKey:)` returns nil for
+    /// an absent key, and an absent key is the FIRST LAUNCH - so a naive
+    /// `?? ""` would push an empty nickname on exactly the install that has
+    /// never configured anything. Same shape as the ports' "a stored 0 means
+    /// never set". The engine would repair an empty value anyway (it falls back
+    /// to the same default), but a caller that relies on the far side to fix its
+    /// input is a caller that is wrong; the fallback belongs here too.
+    nonisolated static func nicknameToPush(stored: String?) -> String {
+        let trimmed = (stored ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? defaultNickname : trimmed
+    }
+
+    /// Push the stored nickname into the engine. Called at boot (before
+    /// `start()`, alongside the ports) and whenever the Settings field commits.
+    ///
+    /// It takes effect on the next server login and the next outbound fetch;
+    /// peers that dial US keep seeing the previous name until the listener is
+    /// rebuilt by Stop then Start. The Settings footer says exactly that rather
+    /// than implying the change is instant everywhere.
+    func pushNickname() {
+        guard let e = engine else { return }
+        let nick = EngineModel.nicknameToPush(
+            stored: UserDefaults.standard.string(forKey: SettingsKey.nickname))
+        work.async { e.setNickname(nick: nick) }
+    }
 
     /// Fetch a server.met from `url` and merge it into the on-disk list, then
     /// re-probe. Reports the outcome via the notice banner.

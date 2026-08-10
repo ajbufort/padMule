@@ -74,6 +74,12 @@ enum SettingsKey {
     /// the provider does the forwarding and a LAN-router mapping is a no-op the
     /// tunnel bypasses anyway.
     static let upnpEnabled = "padMule.upnpEnabled"
+    /// The name padMule announces to peers (the HELLO's CT_NAME) and to servers
+    /// (the login's CT_NAME). eMule's Options -> General "Nick"
+    /// (0.70b PPgGeneral.cpp:88/187), stored the same way: a plain string,
+    /// defaulted rather than left absent, so a fresh install is not nameless.
+    /// Default "padMule" - the literal every build before this one announced.
+    static let nickname = "padMule.nickname"
     /// Dark Mode. padMule pins its own appearance rather than following the
     /// system: it starts LIGHT unless this is on, so the look is a padMule
     /// setting rather than an inherited one, and it never changes underneath the
@@ -124,6 +130,11 @@ enum SettingsDefaults {
             // padMule" status line names the setting, so a user NOT behind a
             // VPN can find and enable it.
             SettingsKey.upnpEnabled: false,
+            // The nickname every padMule build announced before it became a
+            // setting. Registering it (rather than leaning on nil for an absent
+            // key) means the Settings field shows the name actually in force on
+            // a fresh install instead of an empty box.
+            SettingsKey.nickname: EngineModel.defaultNickname,
             // LIGHT unless the user says otherwise (Anthony, 2026-08-05).
             // Registering it explicitly rather than leaning on bool(forKey:)
             // returning false for an absent key: the two behave identically

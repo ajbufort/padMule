@@ -76,6 +76,59 @@ use tokio::time::timeout;
 const TCP_PORT: u16 = 4662;
 const KAD_UDP_PORT: u16 = 4672;
 
+/// The nickname padMule announces when the user has not chosen one. It is what
+/// every peer HELLO and every server login carried unconditionally until this
+/// became a setting, so it stays the default: an install nobody touches behaves
+/// exactly as before.
+pub const DEFAULT_NICK: &str = "padMule";
+
+/// The nickname length cap, in characters. eMule's own number, and BOTH
+/// authorities agree on it: `CPreferences::GetMaxUserNickLength() {return 50;}`
+/// (eMule 0.70b Preferences.h:690, eMule 0.50a Preferences.h:661). eMule applies
+/// it at the edit control (`SetLimitText`, 0.70b PPgGeneral.cpp:115) and again
+/// when a nickname arrives from elsewhere (AddFriend.cpp:143-144 truncates).
+pub const MAX_NICK_LEN: usize = 50;
+
+/// Clean a user-entered nickname into the string that may go on the wire.
+///
+/// eMule's rule, at `CPPgGeneral::OnApply` (0.70b PPgGeneral.cpp:187-191):
+/// `GetDlgItemText(IDC_NICK, strNick); if (!IsValidEd2kString(strNick.Trim()) ||
+/// strNick.IsEmpty()) strNick = DEFAULT_NICK;` - so it TRIMS (CString::Trim
+/// mutates in place, which is why the emptiness test sees the trimmed value),
+/// falls back to the default on empty, and caps the length at the control.
+/// padMule keeps all three.
+///
+/// The one DELIBERATE divergence is `IsValidEd2kString` (StringConversion.h:21),
+/// which rejects a nickname containing `?`. Its own comment says why: "'?' is the
+/// character which is returned by windows if user entered a Unicode string into
+/// an edit control when application runs in ANSI mode" - a Windows ANSI-mode
+/// artifact. padMule has no ANSI mode; it writes UTF-8 bytes into a
+/// length-prefixed string tag, where `?` is an ordinary character. Throwing away
+/// the whole nickname because it contains a question mark would be a surprise
+/// with no benefit here, so `?` is kept. What that check is FOR - keeping junk
+/// off the wire - is honoured by the platform-appropriate rule instead: control
+/// characters are stripped. A newline or a NUL in a nickname is never intended
+/// from a single-line field, and both are the kind of thing that mangles another
+/// client's log or C-string handling.
+///
+/// The length cap counts CHARACTERS, not bytes, like eMule's control does. At
+/// most 50 chars is at most 200 UTF-8 bytes, far inside the u16 length prefix a
+/// string tag carries, so no cap on bytes is needed.
+///
+/// The Swift Settings field applies the same rule so a rejected entry snaps
+/// visibly (`SettingsView.sanitizedNickname`); THIS is the enforcing copy, since
+/// the engine is what writes the bytes.
+pub fn sanitize_nick(input: &str) -> String {
+    let cleaned: String = input.chars().filter(|c| !c.is_control()).collect();
+    let capped: String = cleaned.trim().chars().take(MAX_NICK_LEN).collect();
+    let nick = capped.trim();
+    if nick.is_empty() {
+        DEFAULT_NICK.to_string()
+    } else {
+        nick.to_string()
+    }
+}
+
 // `ip_from_met_u32` is now THE one definition in mule-files (2026-08-09); this
 // crate re-imports it rather than keeping the copy that let three byte-order
 // bugs breed at three different call sites.
@@ -1690,6 +1743,11 @@ pub struct Engine {
     /// misleading - when a VPN tunnel is carrying the traffic, because the
     /// mapping would be made on the LAN router the tunnel bypasses.
     upnp_enabled: bool,
+    /// The name we announce to peers (CT_NAME in the HELLO) and to servers
+    /// (CT_NAME in the login). Always the sanitized form - `set_nickname` is the
+    /// only writer and it never stores anything `sanitize_nick` would reject, so
+    /// every reader gets a value that is safe to put on the wire as-is.
+    nick: String,
     /// Our public IPv4, as UPnP/SSDP reported it (`theApp.GetPublicIP`). Learned
     /// in `map_port`, fed to the Kad node so it can echo a peer's UDP verify key
     /// (bound to THIS ip) and be verified faster. `None` until a mapping succeeds;
@@ -1809,6 +1867,7 @@ impl Engine {
             kad_port: KAD_UDP_PORT,
             kad_advertised_port: KAD_UDP_PORT,
             upnp_enabled: true,
+            nick: DEFAULT_NICK.to_string(),
             public_ip: Arc::new(std::sync::Mutex::new(None)),
             listener: None,
             server_tx: None,
@@ -2032,6 +2091,57 @@ impl Engine {
     /// the provider and a LAN-router mapping accomplishes nothing.
     pub fn set_upnp_enabled(&mut self, on: bool) {
         self.upnp_enabled = on;
+    }
+
+    /// The name peers and servers are told. Always sanitized, never empty.
+    pub fn nickname(&self) -> &str {
+        &self.nick
+    }
+
+    /// Set the name peers and servers are told, applying eMule's nickname rules
+    /// (see [`sanitize_nick`] - trimmed, no control characters, at most
+    /// [`MAX_NICK_LEN`] characters, empty falls back to [`DEFAULT_NICK`]).
+    ///
+    /// WHEN IT REACHES THE WIRE, precisely: a server login builds its
+    /// `LoginRequest` at connect time and a fetch builds its HELLO at fetch
+    /// time, so both pick this up on the NEXT connection with no restart. The
+    /// INBOUND listener is the exception - `start_listener` builds one
+    /// `HelloInfo` and hands it to the accept task, so peers that dial US keep
+    /// seeing the old name until the listener is rebuilt. VERIFIED, not assumed:
+    /// `pause()` aborts the listener and `resume()` calls `start_listener()`
+    /// again, so a plain background/foreground cycle picks the new name up too -
+    /// but `pause_for_seeding` deliberately leaves the listener UP, so a user
+    /// with background seeding on does not get that for free. Stop then Start is
+    /// the one action that always works, which is what the Settings footer says.
+    pub fn set_nickname(&mut self, nick: &str) {
+        self.nick = sanitize_nick(nick);
+    }
+
+    /// The HELLO we present to a peer, before any per-site capability flags.
+    /// ONE constructor for both HELLO sites (the inbound listener and an
+    /// outbound fetch) so a peer can never be told a different name - or a
+    /// different port - depending on who dialled whom.
+    fn hello_baseline(&self) -> HelloInfo {
+        HelloInfo::baseline(
+            self.identity.userhash,
+            0,
+            self.advertised_port,
+            self.kad_advertised_port,
+            &self.nick,
+        )
+    }
+
+    /// The login we present to an eD2k server. Same reason as
+    /// [`Engine::hello_baseline`]: the nickname a server publishes about us and
+    /// the one a peer sees must be the same string, so they come from one place.
+    fn login_request(&self) -> LoginRequest {
+        LoginRequest {
+            user_hash: self.identity.userhash,
+            client_id: 0,
+            tcp_port: self.advertised_port,
+            nick: self.nick.clone(),
+            server_flags: DEFAULT_SERVER_FLAGS,
+        }
     }
 
     pub fn set_downloads_dir(&mut self, dir: impl AsRef<Path>) {
@@ -2287,15 +2397,7 @@ impl Engine {
         // secure-ident so a leecher challenges us (the precondition for verifying
         // IT - the exchange is mutual). The accept loop wires the matching inbound
         // obf-accept and the secure-ident drain (all halves land together).
-        let me = HelloInfo::baseline(
-            self.identity.userhash,
-            0,
-            self.advertised_port,
-            self.kad_advertised_port,
-            "padMule",
-        )
-        .with_crypt_supported()
-        .with_secident();
+        let me = self.hello_baseline().with_crypt_supported().with_secident();
         let identity = Arc::clone(&self.identity.rsa);
         let credit_store = Arc::clone(&self.credit_store);
         let downloads = Arc::clone(&self.downloads);
@@ -2687,13 +2789,7 @@ impl Engine {
         // A new connection means the server no longer holds our last query, so any
         // "load more" session is stale even if we reconnect to the SAME address.
         self.search_session = None;
-        let login = LoginRequest {
-            user_hash: self.identity.userhash,
-            client_id: 0,
-            tcp_port: self.advertised_port,
-            nick: "padMule".to_string(),
-            server_flags: DEFAULT_SERVER_FLAGS,
-        };
+        let login = self.login_request();
         let tx = self.server_sender();
         let mut link = ServerLink::new(addr, login, tx);
         if let Ok(Ok(ServerState::Connected {
@@ -4321,14 +4417,7 @@ impl Engine {
         }
         // Advertise SecureIdent v1 in the fetch HELLO so a source will initiate
         // the exchange toward us; pass our RSA identity so we can respond + verify.
-        let me = HelloInfo::baseline(
-            self.identity.userhash,
-            0,
-            self.advertised_port,
-            self.kad_advertised_port,
-            "padMule",
-        )
-        .with_secident();
+        let me = self.hello_baseline().with_secident();
         let identity = Arc::clone(&self.identity.rsa);
         let credit_store = Arc::clone(&self.credit_store);
         // Sources learned mid-sweep via source exchange are filtered too.
@@ -9589,6 +9678,162 @@ mod tests {
             mule_files::read_preferences_dat(&std::fs::read(dir.join("preferences.dat")).unwrap())
                 .unwrap();
         assert_eq!(re, uh);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- nickname -------------------------------------------------------
+
+    /// CT_NAME, the tag both wire paths carry the nickname in. Declared here
+    /// rather than imported because `peer.rs` and `server_messages.rs` each keep
+    /// their own private copy of the number (eD2k CT_NAME = 0x01); a test that
+    /// re-derived it from one of them would prove less, not more.
+    const CT_NAME_TAG: u8 = 0x01;
+
+    /// Pull the CT_NAME string out of a parsed HELLO.
+    fn hello_nick(p: &crate::peer::ParsedHello) -> Option<String> {
+        p.tags.iter().find_map(|t| match (&t.name, &t.value) {
+            (TagName::Id(i), TagValue::Str(v)) if *i == CT_NAME_TAG => {
+                Some(String::from_utf8_lossy(v).into_owned())
+            }
+            _ => None,
+        })
+    }
+
+    /// The CT_NAME tag as it appears in a login packet's payload: tag header
+    /// (type 0x02 = string, name length 1, name byte CT_NAME), then the u16
+    /// length and the bytes. Same encoding the golden login test pins
+    /// (`server_messages::tests::login_request_golden_payload`).
+    fn ct_name_tag_bytes(nick: &str) -> Vec<u8> {
+        let mut v = vec![0x02, 0x01, 0x00, CT_NAME_TAG];
+        v.extend_from_slice(&(nick.len() as u16).to_le_bytes());
+        v.extend_from_slice(nick.as_bytes());
+        v
+    }
+
+    /// AN UNTOUCHED INSTALL STILL SAYS "padMule". The nickname became a setting;
+    /// the DEFAULT is the behaviour every build before it had, so a user who
+    /// never opens Settings must be indistinguishable from one running the old
+    /// build.
+    #[test]
+    fn the_default_nickname_is_padmule() {
+        let dir = tmp("nick-default");
+        let _ = std::fs::remove_dir_all(&dir);
+        let (engine, _rx) = Engine::new(&dir).unwrap();
+        assert_eq!(engine.nickname(), "padMule");
+        assert_eq!(DEFAULT_NICK, "padMule");
+        // And it is what both wire paths would carry, not merely what the
+        // getter reports.
+        assert_eq!(engine.hello_baseline().nick, "padMule");
+        assert_eq!(engine.login_request().nick, "padMule");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE SET NAME REACHES BOTH WIRE PATHS, AS BYTES.
+    ///
+    /// Not "the field round-trips" - that would pass with the HELLO and the
+    /// login still holding their old literals. This builds the actual packets
+    /// the peer path and the server path send and reads CT_NAME back out of
+    /// each, which is the only claim that matters: a peer and a server see the
+    /// same name, and it is the one the user chose.
+    #[test]
+    fn a_set_nickname_reaches_the_peer_hello_and_the_server_login() {
+        let dir = tmp("nick-wire");
+        let _ = std::fs::remove_dir_all(&dir);
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+        engine.set_nickname("Tony's iPad");
+
+        // The peer HELLO. `hello_baseline` is the ONE constructor both the
+        // inbound listener and an outbound fetch use, so proving it here proves
+        // both sites; the flags they add (.with_secident, .with_crypt_supported)
+        // do not touch the name.
+        let hello = crate::peer::build_hello(&engine.hello_baseline());
+        let parsed = crate::peer::parse_hello(&hello.payload, true).unwrap();
+        assert_eq!(
+            hello_nick(&parsed).as_deref(),
+            Some("Tony's iPad"),
+            "the peer HELLO must carry the user's name in CT_NAME"
+        );
+
+        // The server login, the same name, as bytes inside the packet.
+        let login = crate::server_messages::build_login_request(&engine.login_request());
+        let want = ct_name_tag_bytes("Tony's iPad");
+        assert!(
+            login.payload.windows(want.len()).any(|w| w == want),
+            "the server login must carry the SAME name in CT_NAME"
+        );
+        // Nothing anywhere still announces the hardcoded default.
+        assert!(
+            !login.payload.windows(7).any(|w| w == b"padMule".as_slice()),
+            "the old hardcoded nickname must be gone from the login"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// EMPTY FALLS BACK, LONG IS CUT, JUNK IS STRIPPED - eMule's rules.
+    ///
+    /// eMule 0.70b `CPPgGeneral::OnApply` (PPgGeneral.cpp:187-191) trims, then
+    /// substitutes the default for an empty nickname; the 50-character cap is
+    /// `GetMaxUserNickLength()` (Preferences.h:690, and 0.50a Preferences.h:661
+    /// agrees). The control-character strip is padMule's stated divergence from
+    /// `IsValidEd2kString`, whose '?' rule is a Windows ANSI artifact - see
+    /// `sanitize_nick`. Asserted through the ENGINE, so it pins what goes on the
+    /// wire and not merely the helper.
+    #[test]
+    fn an_empty_or_oversized_or_control_laden_nickname_is_repaired() {
+        let dir = tmp("nick-sanitize");
+        let _ = std::fs::remove_dir_all(&dir);
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+
+        // Empty, and whitespace-only, both fall back to the default rather than
+        // announcing a nameless client.
+        engine.set_nickname("");
+        assert_eq!(engine.nickname(), DEFAULT_NICK);
+        engine.set_nickname("Tony");
+        engine.set_nickname("   \t  ");
+        assert_eq!(
+            engine.nickname(),
+            DEFAULT_NICK,
+            "whitespace-only is empty once trimmed, like CString::Trim makes it"
+        );
+
+        // Trimmed, not rejected.
+        engine.set_nickname("  Tony  ");
+        assert_eq!(engine.nickname(), "Tony");
+
+        // Capped at eMule's 50 CHARACTERS. The LITERAL 50 leads on purpose:
+        // `chars().count() == MAX_NICK_LEN` moves with the constant and so
+        // cannot catch the constant changing, which is the regression that
+        // matters (verified - a 50 -> 60 mutant survives that line and dies on
+        // these two).
+        let long = "N".repeat(120);
+        engine.set_nickname(&long);
+        assert_eq!(engine.nickname(), "N".repeat(50));
+        assert_eq!(MAX_NICK_LEN, 50, "eMule's GetMaxUserNickLength");
+        assert_eq!(engine.nickname().chars().count(), MAX_NICK_LEN);
+
+        // Control characters never reach the wire. A newline is the realistic
+        // one (paste from a text field) and is exactly what mangles another
+        // client's log line.
+        engine.set_nickname("Tony\r\n\u{0}iPad");
+        assert_eq!(engine.nickname(), "TonyiPad");
+        let login = crate::server_messages::build_login_request(&engine.login_request());
+        assert!(
+            !login.payload.contains(&b'\n'),
+            "no newline may reach the login packet"
+        );
+
+        // '?' is KEPT - the deliberate divergence from IsValidEd2kString, whose
+        // own comment says the character is a Windows ANSI-mode artifact. On a
+        // UTF-8 client it is an ordinary character, and discarding the whole
+        // nickname over it would be a surprise with no benefit.
+        engine.set_nickname("who? me");
+        assert_eq!(engine.nickname(), "who? me");
+
+        // Multi-byte input is counted in characters, not bytes, so a name in a
+        // non-Latin script gets the same 50 as an ASCII one.
+        let cyrillic = "\u{044f}".repeat(60);
+        engine.set_nickname(&cyrillic);
+        assert_eq!(engine.nickname().chars().count(), MAX_NICK_LEN);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

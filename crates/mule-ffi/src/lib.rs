@@ -731,6 +731,27 @@ impl MuleEngine {
             .block_on(async { self.inner.lock().await.set_sharing(on) });
     }
 
+    /// The name peers and servers are told (CT_NAME). Never empty: an install
+    /// that has never set one reports "padMule", which is what every build
+    /// before the setting existed announced.
+    pub fn nickname(&self) -> String {
+        self.rt
+            .block_on(async { self.inner.lock().await.nickname().to_string() })
+    }
+
+    /// Set the name peers and servers are told. The engine sanitizes it
+    /// (trimmed, no control characters, at most 50 characters, empty falls back
+    /// to "padMule") - it is the side that writes the bytes, so it is the side
+    /// that decides what is sendable.
+    ///
+    /// Takes effect on the next server login and the next outbound fetch. Peers
+    /// that dial US keep seeing the previous name until the listener is rebuilt
+    /// (Stop then Start); the Settings footer says so.
+    pub fn set_nickname(&self, nick: String) {
+        self.rt
+            .block_on(async { self.inner.lock().await.set_nickname(&nick) });
+    }
+
     /// True while sharing is off BECAUSE the public address changed under us
     /// (a dropped VPN tunnel, a network switch). The UI keeps saying why until
     /// the user turns sharing back on, which clears it. Persists across
@@ -1377,6 +1398,33 @@ mod tests {
         assert!(!eng.is_sharing(), "Leech Mode: sharing OFF");
         eng.set_sharing(true);
         assert!(eng.is_sharing(), "back ON");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The nickname round-trips through the facade, and the facade does NOT get
+    /// to invent its own rules: the sanitisation the engine applies is what the
+    /// getter reports back. The default is the pre-setting behaviour, checked
+    /// first so a later assertion cannot pass on a lucky initial value.
+    #[test]
+    fn nickname_round_trips_via_the_facade_and_is_sanitized_by_the_engine() {
+        let dir = tmp("nickname");
+        let _ = std::fs::remove_dir_all(&dir);
+        let eng = offline_engine(&dir, &format!("{dir}-dl"));
+        assert_eq!(eng.nickname(), "padMule", "an untouched install is padMule");
+        eng.set_nickname("  Tony  ".to_string());
+        assert_eq!(eng.nickname(), "Tony", "trimmed on the way in");
+        eng.set_nickname("".to_string());
+        assert_eq!(
+            eng.nickname(),
+            "padMule",
+            "an empty name falls back to the default rather than announcing nothing"
+        );
+        eng.set_nickname("N".repeat(120));
+        assert_eq!(
+            eng.nickname().chars().count(),
+            50,
+            "eMule's GetMaxUserNickLength, enforced at the seam the UI calls"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

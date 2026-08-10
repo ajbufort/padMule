@@ -47,6 +47,12 @@ struct SettingsView: View {
     @State private var kadAdvertisedText = ""
     @FocusState private var focusedPort: PortField?
 
+    // The nickname edits a LOCAL buffer for the same reason the ports do: a
+    // write-through field would substitute the default the moment you cleared
+    // it to type a new name. Committed on focus loss and on the way out.
+    @State private var nicknameText = ""
+    @FocusState private var nicknameFocused: Bool
+
     var body: some View {
         NavigationStack {
             Form {
@@ -60,18 +66,34 @@ struct SettingsView: View {
             }
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
-            .onAppear { loadPortText() }
+            .onAppear {
+                loadPortText()
+                nicknameText = storedNickname
+            }
             // Commit whenever focus LEAVES a port field, and once more on the
             // way out: .numberPad has no Return key, so there is no onSubmit.
             .onChange(of: focusedPort) { _ in commitPorts() }
-            .onDisappear { commitPorts() }
+            .onChange(of: nicknameFocused) { focused in
+                if !focused { commitNickname() }
+            }
+            .onDisappear {
+                commitPorts()
+                commitNickname()
+            }
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") { dismiss() }
                 }
                 ToolbarItemGroup(placement: .keyboard) {
                     Spacer()
-                    Button("Done") { focusedPort = nil }
+                    // Clears whichever field is up. The nickname's keyboard has
+                    // a Return key (so .onSubmit covers it too), but this bar
+                    // shows for it as well and a Done that dismissed nothing
+                    // would read as a stuck keyboard.
+                    Button("Done") {
+                        focusedPort = nil
+                        nicknameFocused = false
+                    }
                 }
             }
         }
@@ -334,10 +356,74 @@ struct SettingsView: View {
         }
     }
 
-    // MARK: - Identity (read-only)
+    // MARK: - Identity
+
+    /// eMule's nickname length cap, and the same number the engine enforces:
+    /// `CPreferences::GetMaxUserNickLength() {return 50;}` (eMule 0.70b
+    /// Preferences.h:690; 0.50a Preferences.h:661 agrees). eMule applies it AT
+    /// THE EDIT CONTROL (`SetLimitText`, PPgGeneral.cpp:115) so an over-long
+    /// name cannot be typed in the first place, which is what the cap in
+    /// `sanitizedNickname` reproduces.
+    static let maxNicknameLength = 50
+
+    /// The nickname currently stored, as the field should show it.
+    private var storedNickname: String {
+        EngineModel.nicknameToPush(
+            stored: UserDefaults.standard.string(forKey: SettingsKey.nickname))
+    }
+
+    /// Clean a typed nickname for STORAGE and DISPLAY.
+    ///
+    /// Deliberately a copy of `mule_engine::sanitize_nick`, not a call into it.
+    /// The engine's copy is the enforcing one - it writes the bytes, and it runs
+    /// whatever this produces through the same rules again - but the field needs
+    /// the answer synchronously so a rejected entry SNAPS to what will actually
+    /// be announced instead of showing something else (the `commitPorts`
+    /// pattern). The two are kept in step by asserting the same table on both
+    /// sides: `engine::tests::an_empty_or_oversized_or_control_laden_nickname_is_repaired`
+    /// and `NicknameTests` here.
+    ///
+    /// DISCLOSED LIMIT: this counts Characters (grapheme clusters) and the
+    /// engine counts Unicode scalars, so a name built from multi-scalar
+    /// graphemes (an emoji with a skin-tone modifier, say) can be trimmed
+    /// slightly further by the engine than by this field. Both caps are 50 and
+    /// the engine's is the one on the wire.
+    static func sanitizedNickname(_ text: String) -> String {
+        // `.controlCharacters` is Unicode category Cc - the same set Rust's
+        // `char::is_control()` covers, which is what the engine filters on.
+        let cleaned = text.components(separatedBy: .controlCharacters).joined()
+        let capped = String(
+            cleaned.trimmingCharacters(in: .whitespacesAndNewlines).prefix(maxNicknameLength))
+        let nick = capped.trimmingCharacters(in: .whitespacesAndNewlines)
+        return nick.isEmpty ? EngineModel.defaultNickname : nick
+    }
+
+    /// Store the cleaned name, push it to the engine, and write back what was
+    /// ACTUALLY stored - so an entry the rules changed visibly snaps to the name
+    /// in force rather than lying about it (same rule as `commitPorts`).
+    private func commitNickname() {
+        let clean = Self.sanitizedNickname(nicknameText)
+        UserDefaults.standard.set(clean, forKey: SettingsKey.nickname)
+        nicknameText = clean
+        model.pushNickname()
+    }
 
     private var identitySection: some View {
         Section {
+            // "Nickname" is eMule's own word for it (Options -> General, the
+            // IDC_NICK field), and it is what Anthony asked for. Autocorrect off
+            // - a nickname is not a word and correcting it would be silent
+            // vandalism - but capitalization left on, because most people type a
+            // name here.
+            HStack {
+                Text("Nickname")
+                Spacer()
+                TextField(EngineModel.defaultNickname, text: $nicknameText)
+                    .multilineTextAlignment(.trailing)
+                    .autocorrectionDisabled()
+                    .focused($nicknameFocused)
+                    .onSubmit { commitNickname() }
+            }
             if let id = model.identity {
                 LabeledContent("User hash", value: String(id.userhash.prefix(16)) + "...")
                     .font(.caption)
@@ -352,7 +438,13 @@ struct SettingsView: View {
         } header: {
             Text("This device")
         } footer: {
-            Text("Your identity is generated on first launch and kept on device. It is never shown to peers as-is and never leaves the iPad.")
+            // Blunt about WHEN it applies. The server login and any download
+            // padMule starts pick the name up on their next connection, but the
+            // inbound listener builds its greeting once when it binds - so a
+            // peer that dials US sees the old name until the engine is
+            // restarted. Saying "changes apply immediately" would be the kind of
+            // small lie that reads as a broken setting.
+            Text("Your nickname is the name other peers and servers see - up to 50 characters, the same limit eMule uses. Leave it empty to go back to \"padMule\". Servers and your own downloads pick up a new nickname the next time they connect; peers connecting TO you see it after you Stop and Start padMule.\n\nYour identity is generated on first launch and kept on device. It is never shown to peers as-is and never leaves the iPad.")
         }
     }
 
