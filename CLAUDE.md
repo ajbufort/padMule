@@ -92,7 +92,9 @@ Details: `docs/wiki/decisions-and-lessons.md`, `docs/wiki/ref-source-trees.md`,
   in - the node survives a seed (liveness sweep runs; growth refresh stays
   Running-only); the soak with Kad kept up PASSED the same day (row 8dl):
   72.5 minutes, 65/65 samples alive, a ~51MB plateau against the ~100MB jetsam
-  budget, publishing continuing through the seed.] Clean pause/resume is still
+  budget, publishing continuing through the seed. QUALIFIED (row 8dm): that
+  soak seeded to NOBODY, so 43-51MB is a no-serving-load FLOOR, not a
+  full-load figure.] Clean pause/resume is still
   required, because jetsam can end a seed at any moment.
 - The engine/UI seam is in-process FFI (`crates/mule-ffi`); the EC protocol is
   deferred entirely.
