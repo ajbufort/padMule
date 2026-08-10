@@ -21,6 +21,7 @@ import XCTest
 ///   has not yet arrived in `downloads` (the banner shows nothing until the
 ///   refresh lands - honest, but only a device pass can judge the feel).
 /// A device pass must pause a downloading row and confirm the banner drops.
+@MainActor
 final class DownloadBannerTests: XCTestCase {
     /// A `DownloadInfo` with sensible defaults, overriding only what a test
     /// cares about (the PresentationTests `hit(...)` convention).
