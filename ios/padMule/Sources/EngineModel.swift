@@ -132,8 +132,23 @@ final class EngineModel: ObservableObject {
     /// which is blocked, in the same reading. Built 2026-08-07 to close Track 1,
     /// because every probe available from outside the app needs the engine lock
     /// itself and so cannot observe this.
+    ///
+    /// WHILE BACKGROUNDED, `heartbeatTicks` is a FROZEN MIRROR of the private
+    /// `heartbeatCount` and is flushed current by `leaveBackground()`. The
+    /// heartbeat itself never stops - only the publish does. Publishing this
+    /// counter once a second was what re-rendered the whole hidden view
+    /// hierarchy through the 2026-08-09 72-minute seeding soak (build
+    /// d5fadb8): ~55 CoreFoundation localization lines plus one denied
+    /// UIAccessibility post attempt (57 syslog lines) EVERY second, at
+    /// exactly this counter's cadence, with a second render on each 5th
+    /// tick - refreshFast's batch.
+    /// See `coalescedCounterPublish` for the rule.
     @Published private(set) var uiPollTicks: UInt64 = 0
     @Published private(set) var heartbeatTicks: UInt64 = 0
+    /// The TRUE heartbeat-completion count, kept even while the published
+    /// mirror above is frozen - a diagnostic that loses ticks while
+    /// backgrounded would misreport the very episode it exists to describe.
+    private var heartbeatCount: UInt64 = 0
     /// THE LONGEST GAP between two consecutive status-poll publishes, in seconds.
     ///
     /// THE COUNTS ALONE CANNOT ANSWER THE QUESTION THEY WERE BUILT FOR, which the
@@ -239,9 +254,12 @@ final class EngineModel: ObservableObject {
     private var sampleIndex = 0
     private var statsPrimed = false
     /// Samples kept, and therefore the chart's fixed X span: 60 SAMPLES -
-    /// about 60 seconds in the foreground. While background-seeding the fast
-    /// poll is throttled (`shouldRunFastPoll`), so samples arrive ~5s apart
-    /// and the same 60 points span proportionally more wall time.
+    /// about 60 seconds in the foreground. While BACKGROUNDED no samples fold
+    /// at all (the snapshot is gated off - see `shouldPublishUi`; before
+    /// 2026-08-09 it merely ran throttled to ~5s). The sampling baseline
+    /// survives the episode, so the first foreground sample after a
+    /// background stretch is one point carrying the episode's true AVERAGE
+    /// rate, and the window's remaining points still read in ~1s steps.
     static let rateWindow = 60
     private let rateHistoryCap = EngineModel.rateWindow
 
@@ -1378,8 +1396,25 @@ final class EngineModel: ObservableObject {
     func leaveBackground() {
         sceneInBackground = false
         lastUiPollAt = nil
+        // Flush the heartbeats the episode counted but did not publish
+        // (`coalescedCounterPublish` froze the mirror while backgrounded), so
+        // the Stats pair is current from the first foreground frame.
+        if let v = Self.coalescedCounterPublish(
+            trueCount: heartbeatCount, published: heartbeatTicks, backgrounded: false)
+        {
+            heartbeatTicks = v
+        }
         keepAlive.stop()
         resume()
+        // Repaint from LIVE engine values NOW, not when the machinery gets
+        // around to it: resume()'s own refreshAll lands only after e.resume()
+        // clears the serial work queue (a reconnect can take seconds), and
+        // the next timer tick may be throttled while `state` still reads
+        // .seeding. refreshFast is lock-free and rides its own queue, so this
+        // is the honest half of the background gate - suppressing publishes
+        // while hidden is only acceptable because THIS makes the screen
+        // correct and current the moment it is visible again.
+        refreshFast()
     }
 
     func pause() {
@@ -1515,6 +1550,15 @@ final class EngineModel: ObservableObject {
     /// needs the engine lock and drives duties that must keep running while
     /// seeding (re-offer, finalize, server-drop detection), and an experiment
     /// with two variables answers neither.
+    ///
+    /// SINCE 2026-08-09 the background publish gate (`shouldPublishUi`, in
+    /// `refreshFast` itself) sits AHEAD of this rule: while the scene is
+    /// backgrounded the snapshot does not run at all, throttled or otherwise.
+    /// This rule still governs the on-glass ticks where `state` reads
+    /// .seeding - the brief return-to-foreground window before the engine
+    /// flips back to running. The experiment it was built for is answered:
+    /// the 2026-08-09 soak's syslog volume was FLAT (~4,100 lines/min) across
+    /// both CPU regimes, so the poll was not what alternated.
     static func shouldRunFastPoll(state: EngineStateFfi, tick: Int) -> Bool {
         guard state == .seeding else { return true }
         return tick % seedingPollDivisor == 0
@@ -1540,6 +1584,46 @@ final class EngineModel: ObservableObject {
         if backgrounded { return (maxGap, nil) }
         guard let last else { return (maxGap, now) }
         return (max(maxGap, now.timeIntervalSince(last)), now)
+    }
+
+    /// THE BACKGROUND PUBLISH GATE: may the poll write to `@Published`
+    /// properties right now? Pure, in the seam pattern of `shouldRunFastPoll`
+    /// and `bookPollGap`, and shared by BOTH periodic publishers -
+    /// `refreshFast`'s snapshot batch and the heartbeat counter - so the two
+    /// cannot come to different answers about the same episode.
+    ///
+    /// WHY IT EXISTS (2026-08-09, the 72-minute background-seeding soak on
+    /// build d5fadb8): a publish is a render. Every `@Published` set fires
+    /// `objectWillChange` - on SET, not on change - and SwiftUI re-renders
+    /// the observing hierarchy even when nothing is on glass. The heartbeat
+    /// counter alone re-rendered the hidden app once per second for the whole
+    /// soak: ~55 CoreFoundation localization lookups plus one DENIED
+    /// UIAccessibility post attempt every second, ~4,100 syslog lines a
+    /// minute, in exactly the mode built to be frugal. The engine duties are
+    /// untouched by this gate - `heartbeat()` runs every tick regardless, and
+    /// events still drain and apply (they are rare, real changes, and how
+    /// `state` stays current). Only the view-facing publish stops.
+    ///
+    /// The other half of the bargain lives in `leaveBackground()`: gating is
+    /// honest only because the return path repaints from live engine values
+    /// immediately - a stale screen after resume would be the worse bug.
+    nonisolated static func shouldPublishUi(backgrounded: Bool) -> Bool {
+        !backgrounded
+    }
+
+    /// What a tick counter's `@Published` mirror should be set to - or nil,
+    /// meaning DO NOT TOUCH THE PROPERTY. The nil is the entire point:
+    /// assigning even an unchanged value to a plain `@Published` still fires
+    /// `objectWillChange`, so "publish the same number again" and "stay
+    /// silent" are different render behaviours, and only an untouched
+    /// property is silent. Backgrounded: always nil (the mirror freezes; the
+    /// caller keeps the true count). Foreground: the true count, or nil when
+    /// the mirror already shows it (the flush-with-nothing-to-flush case).
+    nonisolated static func coalescedCounterPublish(
+        trueCount: UInt64, published: UInt64, backgrounded: Bool
+    ) -> UInt64? {
+        guard shouldPublishUi(backgrounded: backgrounded) else { return nil }
+        return trueCount == published ? nil : trueCount
     }
 
     private var pollTick = 0
@@ -1623,6 +1707,22 @@ final class EngineModel: ObservableObject {
     /// removes. No in-flight guard needed - these calls cannot block.
     private func refreshFast() {
         guard let e = engine else { return }
+        // THE BACKGROUND GATE (see `shouldPublishUi`). Nothing is on glass,
+        // so neither the FFI marshalling (the whole downloads list + shared
+        // library) nor the publish batch below - thirteen `@Published` sets,
+        // each a render of a hidden hierarchy - should run at all. Gated at
+        // the single choke point every caller funnels through (the tick, the
+        // action-completion refreshAll()s, boot), and checked HERE on the
+        // main thread rather than only at the tick site, so a completion
+        // firing mid-episode is covered too. The baseline clears exactly as a
+        // throttle-skipped tick's does; `bookPollGap` additionally discards
+        // any interval booked by a closure already in flight when the flag
+        // went up. On return, `leaveBackground()` calls this directly for the
+        // immediate repaint.
+        guard Self.shouldPublishUi(backgrounded: sceneInBackground) else {
+            lastUiPollAt = nil
+            return
+        }
         eventQueue.async { [weak self] in
             let dls = e.downloads()
             let shf = e.sharedFiles()
@@ -1716,12 +1816,28 @@ final class EngineModel: ObservableObject {
             // They used to follow it in this same closure, which meant every
             // status row on screen froze for the length of whatever held the
             // lock (a search: up to 20s). They now ride refreshFast() on the
-            // lock-free queue. Nothing here publishes to the UI, so a slow
-            // heartbeat costs background timeliness and nothing visible.
+            // lock-free queue. Nothing here publishes to the UI except the
+            // gated counter below, so a slow heartbeat costs background
+            // timeliness and nothing visible.
             e.heartbeat()
             DispatchQueue.main.async {
-                self?.refreshInFlight = false
-                self?.heartbeatTicks &+= 1
+                guard let self else { return }
+                self.refreshInFlight = false
+                // The true count always advances; the @Published mirror is
+                // written only when `coalescedCounterPublish` says so. This
+                // increment was THE once-per-second re-render of the hidden
+                // hierarchy during background seeding (2026-08-09 soak) - the
+                // one @Published write on the every-tick path. The gate is
+                // read HERE, at publish time on the main thread, the ordering
+                // `bookPollGap`'s way-out flag already proved on glass: a
+                // closure queued before the episode still sees the flag up.
+                self.heartbeatCount &+= 1
+                if let v = Self.coalescedCounterPublish(
+                    trueCount: self.heartbeatCount, published: self.heartbeatTicks,
+                    backgrounded: self.sceneInBackground)
+                {
+                    self.heartbeatTicks = v
+                }
             }
         }
     }
