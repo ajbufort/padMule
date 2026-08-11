@@ -10712,6 +10712,85 @@ mod tests {
     /// Mutation check: delete the accept-time gate in `start_listener` (the
     /// post-handshake one still stands) and the blocked arm goes red while the
     /// control stays green.
+    /// BROWSE THROUGH THE REAL LISTENER, not through `serve_shared` directly.
+    ///
+    /// This exists because the unit test in `share::tests` passed while the
+    /// feature was DEAD ON A REAL CONNECTION. That test called `serve_shared`
+    /// itself and so skipped `classify_inbound`, which did not recognise
+    /// OP_ASKSHAREDFILES as a session opener - so a browsing peer was dropped
+    /// before the handler could ever run, and Anthony's eMule got silence.
+    /// A test that bypasses the dispatcher cannot see a dispatcher bug.
+    ///
+    /// Asserted on the ANSWER ARRIVING at all: the refusal shape (count = 0) is
+    /// already covered; what was broken, and what this pins, is that anything
+    /// comes back.
+    #[tokio::test]
+    async fn a_browse_reaches_the_handler_through_the_listener() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = tmp("browse-e2e");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+        let port = free_local_port();
+        engine.set_ports(port, port, 0, 4672);
+        engine.set_sharing(true);
+        engine.start_listener().await;
+        assert!(engine.listener.is_some(), "precondition: a listener exists");
+
+        let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect to our own listener");
+
+        // OP_HELLO, then the browse as the FIRST packet after it - which is
+        // exactly what eMule does (BaseClient.cpp:1745-1751).
+        let mut body = vec![16u8];
+        body.extend_from_slice(&[0x55u8; 16]);
+        body.extend_from_slice(&0u32.to_le_bytes()); // client id
+        body.extend_from_slice(&4662u16.to_le_bytes()); // tcp port
+        body.extend_from_slice(&0u32.to_le_bytes()); // tag count
+        body.extend_from_slice(&0u32.to_le_bytes()); // server ip
+        body.extend_from_slice(&0u16.to_le_bytes()); // server port
+        let mut hello = vec![0xE3u8];
+        hello.extend_from_slice(&((body.len() + 1) as u32).to_le_bytes());
+        hello.push(0x01);
+        hello.extend_from_slice(&body);
+        sock.write_all(&hello).await.unwrap();
+
+        // Drain the hello answer.
+        let mut hdr = [0u8; 6];
+        tokio::time::timeout(std::time::Duration::from_secs(5), sock.read_exact(&mut hdr))
+            .await
+            .expect("no hello answer")
+            .unwrap();
+        let len = u32::from_le_bytes(hdr[1..5].try_into().unwrap()) as usize;
+        let mut rest = vec![0u8; len - 1];
+        sock.read_exact(&mut rest).await.unwrap();
+
+        let ask = [0xE3u8, 1, 0, 0, 0, crate::transfer::OP_ASKSHAREDFILES];
+        sock.write_all(&ask).await.unwrap();
+
+        let mut ahdr = [0u8; 6];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            sock.read_exact(&mut ahdr),
+        )
+        .await
+        .expect(
+            "THE BROWSE WAS NEVER ANSWERED - the classifier dropped the \
+                 connection before the handler ran, which is the whole defect \
+                 this test exists for",
+        )
+        .unwrap();
+        assert_eq!(
+            ahdr[5],
+            crate::transfer::OP_ASKSHAREDFILESANSWER,
+            "wrong opcode in the browse answer"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[tokio::test]
     async fn a_blocklisted_peer_never_gets_our_hello() {
         let dir = tmp("inbound-blocked");

@@ -392,6 +392,18 @@ pub fn is_upload_request(op: u8) -> bool {
             | OP_STARTUPLOADREQ
             | OP_MULTIPACKET
             | OP_MULTIPACKET_EXT
+            // A BROWSE opens a session too, for the same reason the AICH asks
+            // below do: eMule dials the client and sends it immediately on
+            // connection establishment (`m_iFileListRequested == 1` ->
+            // OP_ASKSHAREDFILES, BaseClient.cpp:1745-1751), so 0x4A is the
+            // FIRST packet after the hello on a brand-new connection.
+            //
+            // Without this the browse handler is unreachable: the classifier
+            // does not recognise the opener, the connection is dropped, and the
+            // asker gets silence - which is what Anthony saw from his own eMule
+            // and what the unit test could NOT see, because it called
+            // `serve_shared` directly and skipped classification entirely.
+            | crate::transfer::OP_ASKSHAREDFILES
             // The AICH asks OPEN a session too, because eMule dials us to make
             // them. `SendAICHRequest` hands the packet to
             // `SafeConnectAndSendPacket`, which - when no socket is connected -
