@@ -5,8 +5,11 @@ rewrite** (`crates/`), the UI is **SwiftUI** (`ios/`) over a **UniFFI** seam
 (`crates/mule-ffi`). The upstream C++ tree (`amule-3.0.1/`) is a vendored,
 read-only REFERENCE ORACLE for differential testing - never linked or shipped.
 The app runs on the device today: search (server + Kad merged), hash-verified
-downloads saved to Files, uploads with a Leech-Mode toggle, cancel, and HighID
-earned by its own unicast-SSDP UPnP.
+downloads saved to Files that RESUME after a crash or restart, per-file
+pause/stop/remove, uploads with a Leech-Mode toggle, browsable shares (off by
+default), an Incognito mode that stops padMule declaring itself on the wire, and
+HighID earned by its own unicast-SSDP UPnP. Byte correctness with a REAL eMule
+is proven in BOTH directions, multi-part, independently verified.
 
 This file is the **schema layer** for the project: it defines the conventions,
 the knowledge-base pattern, and the coding rules. Design decisions live in the
@@ -123,7 +126,7 @@ Details and what is portable from them: `docs/wiki/ref-ecosystem.md`.
 source "$HOME/.cargo/env"              # cargo is NOT on the default PATH
 
 cargo build --workspace
-cargo test --workspace                 # the unit gate (831 tests at 2026-08-11, offline; the handoff carries the current count)
+cargo test --workspace                 # the unit gate (838 tests at 2026-08-11, offline; the handoff carries the current count)
 cargo clippy --workspace --all-targets # must be warning-free
 cargo fmt --all -- --check
 
