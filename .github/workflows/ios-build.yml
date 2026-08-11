@@ -123,9 +123,97 @@ jobs:
           zip -qry padMule.ipa Payload
           ls -la padMule.ipa
 
+      # THE DIGEST. padMule is sideloaded as an UNSIGNED .ipa, so nothing about
+      # the file on a user's disk connects it to the source they can read. This
+      # publishes the one fact CI is in a position to state: this exact byte
+      # sequence is what this run produced from this commit.
+      #
+      # WHAT IT PROVES: the .ipa you hold is byte-for-byte the file this run
+      # built. WHAT IT DOES NOT PROVE: that the build is reproducible, that the
+      # runner behaved honestly, or that the toolchain was uncompromised. The
+      # digest is published BY THE SAME SYSTEM that produced the artifact, so it
+      # is a CONSISTENCY check, not an independent attestation - the wording in
+      # the summary below says so, and must keep saying so.
+      #
+      # NOT REPRODUCIBLE, and deliberately unclaimed: re-running this workflow on
+      # the SAME commit yields a DIFFERENT digest. `cp -R` into Payload/ stamps
+      # every file with the copy time and `zip` stores those mtimes, so two runs
+      # differ before you even reach a runner image that floats the Rust and
+      # Xcode versions. Two users comparing digests from two different runs
+      # should EXPECT a mismatch. A digest is only ever compared against the one
+      # its own run published.
+      #
+      # PUBLISHED IN TWO PLACES, on purpose:
+      #   - $GITHUB_STEP_SUMMARY, readable on the run page without downloading
+      #     anything, which is where somebody deciding whether to trust a build
+      #     actually looks;
+      #   - padMule.ipa.sha256 inside the artifact, so the digest TRAVELS with
+      #     the .ipa to whatever disk it ends up on.
+      # The job log is deliberately not the answer: it is the copy that rots.
+      # GitHub does compute a digest of its own, but that covers the ZIP wrapper
+      # it puts around an artifact - bytes no user ever handles, since both the
+      # browser and `gh run download` hand back the unwrapped padMule.ipa.
+      #
+      # shasum, not sha256sum: the macOS runner has no sha256sum. The output
+      # format is identical, so `sha256sum -c padMule.ipa.sha256` on Linux reads
+      # the file `shasum -a 256` wrote here.
+      #
+      # `git rev-parse HEAD` rather than github.sha: it names the tree that was
+      # actually checked out and built, and it is the same expression the
+      # CFBundleVersion stamp above uses - so the digest and the stamp cannot
+      # disagree about which commit this is.
+      - name: Digest the .ipa
+        run: |
+          cd ios/build/Build/Products/Release-iphoneos
+          shasum -a 256 padMule.ipa > padMule.ipa.sha256
+          cat padMule.ipa.sha256
+          DIGEST=$(cut -d ' ' -f 1 padMule.ipa.sha256)
+          BYTES=$(wc -c < padMule.ipa | tr -d ' ')
+          SHA=$(git rev-parse HEAD)
+          SHORT=$(git rev-parse --short HEAD)
+          {
+            printf '## Unsigned .ipa\n\n'
+            printf '| | |\n'
+            printf '|---|---|\n'
+            printf '| commit | `%s` |\n' "$SHA"
+            printf '| CFBundleVersion stamped inside the app | `%s` |\n' "$SHORT"
+            printf '| size | %s bytes |\n' "$BYTES"
+            printf '| SHA-256 | `%s` |\n\n' "$DIGEST"
+            printf '%s\n' \
+              'Check what you downloaded, from the directory that holds `padMule.ipa`:' \
+              '' \
+              '    shasum -a 256 -c padMule.ipa.sha256   # macOS' \
+              '    sha256sum -c padMule.ipa.sha256       # Linux' \
+              '' \
+              'That `padMule.ipa.sha256` file is uploaded in the `padMule-ipa` artifact' \
+              'next to the .ipa. The commit is stamped INSIDE the app as well, as' \
+              '`CFBundleVersion` in `Payload/padMule.app/Info.plist`, so an .ipa names its' \
+              'own source commit even offline.' \
+              '' \
+              '**What this proves:** the .ipa you hold is byte-for-byte the file this run' \
+              'produced from the commit above.' \
+              '' \
+              '**What this does NOT prove:** that the build is reproducible - it is not,' \
+              'and re-running this workflow on the same commit produces a DIFFERENT digest' \
+              '(the zip container stores per-run file mtimes, and the runner image floats' \
+              'the toolchain versions); that the runner behaved honestly; or that the' \
+              'toolchain was uncompromised. This digest is published by the same system' \
+              'that built the artifact, so it is a CONSISTENCY check - it catches a' \
+              'swapped, truncated or' \
+              'edited download - and NOT an independent attestation. It is worth exactly' \
+              'as much as your trust in this workflow.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # BOTH FILES IN ONE ARTIFACT so the digest cannot get separated from what
+      # it describes. They are siblings in one directory, so upload-artifact
+      # roots the artifact at that directory and both land at the top level -
+      # `padMule-ipa/padMule.ipa` is exactly where it has always been, which
+      # scripts/ship.sh depends on.
       - name: Upload the .ipa
         uses: actions/upload-artifact@v4
         with:
           name: padMule-ipa
-          path: ios/build/Build/Products/Release-iphoneos/padMule.ipa
+          path: |
+            ios/build/Build/Products/Release-iphoneos/padMule.ipa
+            ios/build/Build/Products/Release-iphoneos/padMule.ipa.sha256
           if-no-files-found: error

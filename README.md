@@ -37,7 +37,7 @@ already uses for something else, so padMule keeps eMule's meaning. Current aMule
 also raises the in-flight block-request ceiling well past what eMule requests,
 citing eMule as precedent for a number eMule does not actually use - so padMule
 adopts the part that is genuinely eMule's and treats the rest as aMule's own
-choice. Divergences like these are recorded in `docs/wiki/` with citations on
+choice. Divergences like these are recorded in the local-only `docs/wiki/` with citations on
 both sides rather than settled from memory.
 
 The point is not that one project is better. They answer different questions,
@@ -84,8 +84,10 @@ gateway forwards the listening port. padMule asks the gateway to do that over
 UPnP (multicast on desktop, unicast on iOS, where multicast is unavailable); this
 only earns HighID on a gateway that has UPnP enabled.
 
-The design, protocol notes, and every decision are written up in `docs/wiki/`
-(start at `docs/wiki/index.md`).
+The design, protocol notes, and decision history are kept in `docs/wiki/`,
+which is a LOCAL-ONLY knowledge base and is deliberately not published - a
+clone of this repository will not contain it. The code, its comments, and the
+citations in them are the public record.
 
 ## Architecture
 
@@ -128,7 +130,41 @@ Xcode project with XcodeGen, builds the Rust static library and its Swift
 bindings, and produces an **unsigned** `.ipa` as a build artifact. That artifact
 is re-signed and installed on-device with a free Apple ID using **Sideloadly**
 (the proven path; AltStore/AltServer failed here with error -22411). The setup
-is documented in `docs/wiki/mac-toolchain-setup.md`.
+is documented in the local-only `docs/wiki/` knowledge base, which is not part
+of this repository.
+
+### Checking that an .ipa matches this source
+
+The build publishes a **SHA-256 digest of the `.ipa`** in two places: the run
+summary on the workflow run page, which is readable without downloading
+anything, and a `padMule.ipa.sha256` file uploaded next to the `.ipa` in the
+build artifact. From the directory holding the downloaded `.ipa`:
+
+```bash
+shasum -a 256 -c padMule.ipa.sha256   # macOS
+sha256sum -c padMule.ipa.sha256       # Linux
+```
+
+The commit is stamped inside the app as well, as `CFBundleVersion` in
+`Payload/padMule.app/Info.plist`, so an `.ipa` names its own source commit even
+offline.
+
+**What this proves:** the `.ipa` you hold is byte-for-byte the file that run
+produced from that commit.
+
+**What it does not prove:** that the build is reproducible - it is not, and
+re-running the workflow on the same commit produces a *different* digest (the
+zip container stores per-run file mtimes, and the runner image floats the
+toolchain versions); that the runner behaved honestly; or that the toolchain was
+uncompromised. The digest
+is published by the same system that built the artifact, so it is a consistency
+check - it catches a swapped, truncated or edited download - and not an
+independent attestation. It is worth exactly as much as your trust in that
+workflow.
+
+One practical limit: re-signing **rewrites** the `.ipa`. Sideloadly and `zsign`
+both produce a new file with a new digest, so the check has to happen on the
+unsigned artifact, before it is signed.
 
 ## License
 
