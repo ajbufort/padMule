@@ -750,6 +750,15 @@ impl MuleEngine {
             .block_on(async { self.inner.lock().await.nickname().to_string() })
     }
 
+    /// The nickname other clients actually SEE. Differs from `nickname()` only
+    /// when INCOGNITO is substituting an untouched default - and that is exactly
+    /// when the UI must say so, or it tells the user one thing while every peer
+    /// sees another.
+    pub fn wire_nickname(&self) -> String {
+        self.rt
+            .block_on(async { self.inner.lock().await.wire_nickname().to_string() })
+    }
+
     /// Set the name peers and servers are told. The engine sanitizes it
     /// (trimmed, no control characters, at most 50 characters, empty falls back
     /// to "padMule") - it is the side that writes the bytes, so it is the side

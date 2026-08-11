@@ -198,6 +198,10 @@ final class EngineModel: ObservableObject {
     /// How many IP-blocklist ranges are loaded (0 = no ipfilter placed).
     @Published private(set) var ipFilterRanges: UInt32 = 0
     @Published private(set) var identity: IdentityInfo?
+    /// The nickname other clients actually SEE. Equals the stored one unless
+    /// Incognito is substituting an untouched default - and Settings shows the
+    /// difference only when there IS one, because the mismatch is the message.
+    @Published private(set) var wireNickname: String = ""
     @Published private(set) var bootError: String?
     /// The live login. Polled as a SNAPSHOT rather than tracked from events:
     /// start() emits Server(...) then Status(...) into the same drain, so an
@@ -1183,7 +1187,14 @@ final class EngineModel: ObservableObject {
     /// use - so it can never be on for inbound and off for outbound.
     func setIncognito(_ on: Bool) {
         guard let e = engine else { return }
-        work.async { e.setIncognito(on: on) }
+        work.async { [weak self] in
+            e.setIncognito(on: on)
+            // Incognito is exactly what makes the wire name differ from the
+            // stored one, so re-read it here or Settings keeps showing the
+            // previous answer.
+            let wire = e.wireNickname()
+            DispatchQueue.main.async { self?.wireNickname = wire }
+        }
     }
 
     /// Allow or refuse library BROWSING (eMule `CanSeeShares`).
@@ -2240,7 +2251,11 @@ final class EngineModel: ObservableObject {
     func applyIncognito() {
         guard let e = engine else { return }
         let on = UserDefaults.standard.bool(forKey: SettingsKey.incognito)
-        work.async { e.setIncognito(on: on) }
+        work.async { [weak self] in
+            e.setIncognito(on: on)
+            let wire = e.wireNickname()
+            DispatchQueue.main.async { self?.wireNickname = wire }
+        }
     }
 
     /// Push the browse permission into the engine at boot, for the same reason
@@ -2421,7 +2436,15 @@ final class EngineModel: ObservableObject {
         guard let e = engine else { return }
         let nick = EngineModel.nicknameToPush(
             stored: UserDefaults.standard.string(forKey: SettingsKey.nickname))
-        work.async { e.setNickname(nick: nick) }
+        work.async { [weak self] in
+            e.setNickname(nick: nick)
+            // Setting your OWN nickname is the other way the wire name can
+            // change - incognito only substitutes an untouched default, so a
+            // user-chosen name makes the two agree and the Settings note goes
+            // away. Re-read rather than infer.
+            let wire = e.wireNickname()
+            DispatchQueue.main.async { self?.wireNickname = wire }
+        }
     }
 
     /// Fetch a server.met from `url` and merge it into the on-disk list, then

@@ -182,6 +182,23 @@ struct SettingsView: View {
         }
     }
 
+    /// A full identity value, wrapped and selectable rather than elided.
+    ///
+    /// It used to render `String(value.prefix(16)) + "..."`, which defeated the
+    /// purpose: an identifier exists to be COMPARED, and half of one compares
+    /// nothing. Anthony asked for the complete IDs.
+    private func identityRow(_ title: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+            Text(value)
+                .font(.caption.monospaced())
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
+                .lineLimit(2)
+                .minimumScaleFactor(0.7)
+        }
+    }
+
     // MARK: - Privacy
 
     /// The footer text, as ONE literal.
@@ -482,11 +499,27 @@ struct SettingsView: View {
                     .focused($nicknameFocused)
                     .onSubmit { commitNickname() }
             }
+            // WHAT PEERS ACTUALLY SEE. With Incognito on and the nickname left
+            // at its default, the wire carries aMule's default instead - so this
+            // field alone said "padMule" while every peer saw something else.
+            // Anthony hit exactly that, hunting for his own client in eMule's
+            // list and not finding it. Shown only when the two DIFFER: an
+            // always-on row would be noise, and the whole point is the mismatch.
+            if !model.wireNickname.isEmpty && model.wireNickname != nicknameText {
+                Text("Other clients see \"\(model.wireNickname)\" - Incognito is "
+                    + "replacing your default nickname. Set your own above to "
+                    + "use it instead.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             if let id = model.identity {
-                LabeledContent("User hash", value: String(id.userhash.prefix(16)) + "...")
-                    .font(.caption)
-                LabeledContent("Kad ID", value: String(id.kadId.prefix(16)) + "...")
-                    .font(.caption)
+                // IN FULL, and selectable. These are 32 hex characters - the
+                // truncated form was unusable for the one thing they are for:
+                // telling this client apart from another, which needs the WHOLE
+                // value. `.textSelection` lets them be copied out; monospaced
+                // digits so a mistyped character is visible.
+                identityRow("User hash", id.userhash)
+                identityRow("Kad ID", id.kadId)
             }
             LabeledContent("Kad contacts", value: "\(model.kadContacts)")
             LabeledContent("IP filter", value: model.ipFilterRanges == 0

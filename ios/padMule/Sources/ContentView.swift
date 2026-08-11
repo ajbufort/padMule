@@ -1332,8 +1332,12 @@ struct ContentView: View {
                     ? "off"
                     : "\(model.ipFilterRanges) ranges blocked")
                 if let id = model.identity {
-                    row("User hash", String(id.userhash.prefix(16)) + "...")
-                    row("Kad ID", String(id.kadId.prefix(16)) + "...")
+                    // IN FULL: an identifier exists to be COMPARED, and half
+                    // of one compares nothing. Stacked rather than in the
+                    // key/value row, which would cram 32 hex characters against
+                    // a label; selectable so it can be copied out.
+                    idRow("User hash", id.userhash)
+                    idRow("Kad ID", id.kadId)
                 }
             }
 
@@ -1809,6 +1813,19 @@ struct ContentView: View {
             .padding(.horizontal, 5).padding(.vertical, 1)
             .background(color.opacity(0.2)).foregroundStyle(color)
             .clipShape(Capsule())
+    }
+
+    /// A full identity value: stacked, monospaced and selectable.
+    private func idRow(_ k: String, _ v: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(k).foregroundStyle(.secondary)
+            Text(v)
+                .font(.caption.monospaced())
+                .textSelection(.enabled)
+                .lineLimit(2)
+                .minimumScaleFactor(0.7)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private func row(_ k: String, _ v: String) -> some View {

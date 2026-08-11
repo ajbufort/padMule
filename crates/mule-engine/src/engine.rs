@@ -2213,6 +2213,17 @@ impl Engine {
     /// its user list and in search results, where anyone can read it. A
     /// disguise worn on one of two channels is not a disguise; it is a
     /// correlation handle.
+    /// The nickname other clients actually SEE, for the UI to display.
+    ///
+    /// Settings showed the STORED nickname ("padMule") while Incognito was
+    /// presenting aMule's default on the wire - so the screen told the user one
+    /// thing and every peer saw another. Anthony hit this looking for his own
+    /// client in eMule's list and not finding it. A privacy feature that lies
+    /// to its own user about what it is doing is the wrong kind of quiet.
+    pub fn wire_nickname(&self) -> &str {
+        self.effective_nick()
+    }
+
     fn effective_nick(&self) -> &str {
         if self.incognito && self.nick == DEFAULT_NICK {
             INCOGNITO_NICK
