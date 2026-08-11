@@ -1,0 +1,85 @@
+# padMule fuzz targets. See fuzz/README.md for how to run these.
+#
+# This crate is DELIBERATELY its own workspace root (the empty `[workspace]`
+# table below). cargo-fuzz builds with a nightly toolchain and sanitizer flags
+# that must not leak into the main `cargo test`/`clippy` gate, and the root
+# Cargo.toml lists its members explicitly, so `fuzz` is invisible to it.
+
+[package]
+name = "mule-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "GPL-2.0-or-later"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Detach from the padMule workspace.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+mule-proto = { path = "../crates/mule-proto" }
+mule-files = { path = "../crates/mule-files" }
+mule-kad = { path = "../crates/mule-kad" }
+mule-engine = { path = "../crates/mule-engine" }
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "packet"
+path = "fuzz_targets/packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tag"
+path = "fuzz_targets/tag.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "link"
+path = "fuzz_targets/link.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "kad_udp"
+path = "fuzz_targets/kad_udp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "met_files"
+path = "fuzz_targets/met_files.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ipfilter"
+path = "fuzz_targets/ipfilter.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ed2k_peer"
+path = "fuzz_targets/ed2k_peer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ed2k_server"
+path = "fuzz_targets/ed2k_server.rs"
+test = false
+doc = false
+bench = false
