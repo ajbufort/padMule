@@ -36,7 +36,7 @@ enum SettingsKey {
     static let incognito = "padMule.incognito"
     /// Who may BROWSE our shared files (eMule `CanSeeShares`). false = Nobody,
     /// true = Everybody. eMule's own default is Nobody, so refusing is upstream
-    /// behaviour rather than a padMule divergence. A "Friends" setting is
+    /// behavior rather than a padMule divergence. A "Friends" setting is
     /// deliberately absent: padMule has no friends list, and an option that
     /// silently behaved as Nobody would be a privacy control that lies.
     static let allowBrowse = "padMule.allowBrowse"

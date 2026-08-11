@@ -39,7 +39,7 @@ struct HelpView: View {
 
                 Section {
                     Text("A transfer row turns amber while it is ACTUALLY receiving bytes. A row with no tint is registered but moving nothing right now - it may be waiting in a queue, hunting for sources, or simply have none online. That is normal on eD2k and not a fault; padMule keeps retrying.")
-                    Text("A row can also carry a badge. Done means finished and verified. Paused means that download is not running - you paused it from its long-press menu, or padMule itself is stopped or sharing in the background. Queued is padMule's own word: Settings can cap how many downloads run at once, and the extras wait as Queued, starting automatically when a slot frees.")
+                    Text("A row can also carry a badge. Done means finished and verified. Paused means you paused it. Stopped means you stopped it - the difference is explained below. Queued means it is waiting for a download slot, because you have set a limit on how many run at once.")
                 } header: {
                     Text("Reading the Transfers list")
                 }
@@ -51,6 +51,24 @@ struct HelpView: View {
                     Text("Sharing a file to another app or service is still available from the preview's own share button.")
                 } header: {
                     Text("Preview vs Open")
+                } footer: {
+                    Text("")
+                }
+
+                Section {
+                    Text("Long-press a transfer for Pause, Stop and Priority. Swipe it for Remove. The three are not the same thing and the difference matters.")
+                    Text("Pause simply halts the download. It keeps everything, including the peers it already found, and picks up where it left off.")
+                    Text("Stop halts it AND lets go of those peers, so padMule stops asking the network about that file. Your progress is kept - Stop is not Remove. Use it when you want a download to go quiet without losing it.")
+                    Text("Remove deletes the download and the partly-downloaded data with it. That cannot be undone.")
+                } header: {
+                    Text("Pause, Stop and Remove")
+                }
+
+                Section {
+                    Text("Your progress is saved as it arrives, not only when a download finishes. If padMule is closed, crashes, or the iPad restarts, the next start picks up where it left off instead of starting the file again.")
+                    Text("padMule plays a short sound when a download finishes, verifies and is saved. You can turn it off in Settings.")
+                } header: {
+                    Text("Progress is saved")
                 }
 
                 Section {
@@ -73,6 +91,7 @@ struct HelpView: View {
                     Text("Sharing your finished files is on by default. Peers give better queue positions to clients that share, so sharing makes your own downloads faster.")
                     Text("padMule pauses sharing on its own in two cases: on a cellular or metered network, so it does not spend your data; and if it sees your public address change, which usually means a VPN tunnel dropped. Both tell you why, and both wait for you to turn it back on. Seeing the change needs a HighID login - if a tunnel drop also costs you HighID, padMule can only warn, and the warning has a Pause sharing button for exactly that.")
                     Text("Leech Mode is simply sharing turned off.")
+                    Text("On the Shared screen, swipe a file for Unshare or Delete. Unshare stops serving it and leaves the file on your iPad. Delete removes it from your iPad as well, and asks first.")
                 } header: {
                     Text("Sharing")
                 }
@@ -85,10 +104,19 @@ struct HelpView: View {
                 }
 
                 Section {
+                    Text("Incognito stops padMule identifying itself to other clients. It is ON by default. padMule already reports itself as aMule 3.0.1, and Incognito removes what is left: a padMule marker in the handshake, and the default nickname.")
+                    Text("It does NOT make you anonymous, and it is not a VPN. It hides what padMule says about itself, not how it behaves - anyone looking closely can still tell. Your address is as visible as it always was.")
+                    Text("Who can see your shared files controls whether another client can list everything you share just by asking. It is set to Nobody by default, which is what eMule defaults to as well. Downloads still in progress are never listed either way.")
+                    Text("Both are in Settings, under Privacy.")
+                } header: {
+                    Text("Privacy")
+                }
+
+                Section {
                     row("Transfers", "What is downloading now. Swipe to remove, long-press to pause or resume a file, set priority, or preview a video before it finishes.")
-                    row("Shared", "What you are serving to others. You can rate and comment on your own files, or unshare one without deleting it.")
+                    row("Shared", "What you are serving to others. Swipe a file to Unshare or Delete it; tap it to rate and comment, which downloaders can see.")
                     row("Stats", "Transfer rates and session totals.")
-                    row("Settings", "Sharing, server lists, ports and VPN, background seeding, default priority, keep-awake.")
+                    row("Settings", "Sharing and privacy, server lists, ports and VPN, background seeding, default priority, how many downloads run at once, and the finish sound.")
                 } header: {
                     Text("The other screens")
                 }

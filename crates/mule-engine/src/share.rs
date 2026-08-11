@@ -700,7 +700,7 @@ pub struct ServeSession {
     /// May this peer BROWSE our library (OP_ASKSHAREDFILES)? eMule's
     /// `CanSeeShares()`, whose own default is `vsfaNobody`
     /// (0.50a Preferences.cpp:2053) - so refusing by default is upstream
-    /// behaviour, not a padMule divergence.
+    /// behavior, not a padMule divergence.
     ///
     /// A refusal answers with an EMPTY LIST rather than silence or a distinct
     /// opcode, which is what eMule does and is also the better privacy shape:
