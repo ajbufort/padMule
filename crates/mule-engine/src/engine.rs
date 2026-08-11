@@ -1733,7 +1733,13 @@ pub struct Engine {
     ///
     /// Only ever lists COMPLETED files: the library is built from `known.met`,
     /// so a download in progress is not browsable whatever this is set to.
-    allow_browse: bool,
+    ///
+    /// An `Arc<AtomicBool>` and READ PER CONNECTION, exactly like `sharing`
+    /// two fields up - NOT copied into the listener at start. It was a plain
+    /// `bool` first, so the value froze at whatever it held when the listener
+    /// started and changing the setting did nothing until Stop/Start. Found by
+    /// flipping the picker on the device and watching the wire still refuse.
+    allow_browse: Arc<AtomicBool>,
     /// The upload switch. `false` is "Leech Mode": we still download, but serve
     /// nothing. An atomic so the listener task reads it without taking a lock.
     sharing: Arc<AtomicBool>,
@@ -1909,7 +1915,7 @@ impl Engine {
             // exposure it removes is real on every connection. A CLI user gets
             // the same protection without having to ask for it.
             incognito: true,
-            allow_browse: false,
+            allow_browse: Arc::new(AtomicBool::new(false)),
             sharing: Arc::new(AtomicBool::new(!ip_paused)),
             upload_gate: Arc::new(UploadGate::new(MAX_UPLOAD_SLOTS, UPLOAD_QUEUE_CAP)),
             known_met_lock: Arc::new(Mutex::new(())),
@@ -2317,12 +2323,12 @@ impl Engine {
     /// opcode - what eMule does, and the better privacy shape besides, since
     /// "I refuse" and "I have nothing" then look identical on the wire.
     pub fn set_allow_browse(&mut self, on: bool) {
-        self.allow_browse = on;
+        self.allow_browse.store(on, Ordering::Relaxed);
     }
 
     /// Whether peers may browse our library.
     pub fn allows_browse(&self) -> bool {
-        self.allow_browse
+        self.allow_browse.load(Ordering::Relaxed)
     }
 
     pub fn set_add_servers_from_server(&mut self, on: bool) {
@@ -2540,7 +2546,7 @@ impl Engine {
         let ip_filter = self.ip_filter.clone();
         let server_probe_ip = Arc::clone(&self.server_probe_ip);
         let known2 = Arc::clone(&self.known2);
-        let allow_browse = self.allow_browse;
+        let allow_browse = Arc::clone(&self.allow_browse);
         let inbound = Arc::new(Semaphore::new(MAX_INBOUND_CONNS));
         let per_ip: PerIpConns = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         let handle = tokio::spawn(async move {
@@ -2619,6 +2625,7 @@ impl Engine {
                 let gate = Arc::clone(&gate);
                 let ip_filter = ip_filter.clone();
                 let known2 = Arc::clone(&known2);
+                let allow_browse = Arc::clone(&allow_browse);
                 tokio::spawn(async move {
                     let _permit = permit;
                     let _ip_slot = ip_slot;
@@ -2750,7 +2757,10 @@ impl Engine {
                                     peer_aich,
                                     peer_ext_requests,
                                     aich: Some(Arc::clone(&known2)),
-                                    allow_browse,
+                                    // READ HERE, per connection, so a change
+                                    // takes effect on the next browse rather
+                                    // than the next listener start.
+                                    allow_browse: allow_browse.load(Ordering::Relaxed),
                                 },
                             )
                             .await;
