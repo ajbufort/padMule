@@ -26,14 +26,28 @@ repo="${CLAUDE_PROJECT_DIR:-/home/ajbufort/claude-projects/padMule}"
 cd "$repo" 2>/dev/null || exit 0
 git rev-parse --git-dir >/dev/null 2>&1 || exit 0
 
-wiki_commit=$(git log -1 --format=%H -- docs/wiki 2>/dev/null)
-if [ -n "$wiki_commit" ]; then
-  code_since=$(git log --format=%H "${wiki_commit}..HEAD" -- . ':!docs' ':!.claude' ':!CLAUDE.md' 2>/dev/null | wc -l | tr -d ' ')
-else
-  code_since=$(git log --format=%H -- . ':!docs' ':!.claude' ':!CLAUDE.md' 2>/dev/null | wc -l | tr -d ' ')
+# THE WIKI LIVES IN ITS OWN REPOSITORY (2026-08-11). It is gitignored here and
+# has no remote, deliberately - see CLAUDE.md. The original hook asked this
+# repo when docs/wiki last changed, which returns NOTHING once the wiki is
+# untracked, so it fell through to counting EVERY code commit ever and reported
+# 316. Compare TIMESTAMPS across the two repositories instead: the wiki's own
+# last commit against this repo's last code commit.
+wiki_time=$(git -C docs/wiki log -1 --format=%ct 2>/dev/null)
+
+if [ -z "$wiki_time" ]; then
+  # No wiki repo reachable (fresh clone, or the wiki was not obtained). Say so
+  # rather than blocking on a count that cannot mean anything here.
+  printf '{"decision":"block","reason":"KB check: docs/wiki has no git repository, so the reflection state cannot be read. The wiki is LOCAL-ONLY and is not in this repo (see CLAUDE.md) - obtain it, or run: git -C docs/wiki init. Do not add the wiki back to the public tree."}\n'
+  exit 0
 fi
 
-if [ "${code_since:-0}" -gt 0 ]; then
-  printf '{"decision":"block","reason":"KB check: %s commit(s) touched code since docs/wiki was last updated. Before stopping, reflect any substantive change into docs/wiki (create/update the entry, update index.md, append log.md) and memory. If the change was genuinely trivial, add a one-line note to docs/wiki/log.md to acknowledge it and satisfy this check."}\n' "$code_since"
+code_time=$(git log -1 --format=%ct -- . ':!docs' ':!.claude' ':!CLAUDE.md' 2>/dev/null)
+[ -z "$code_time" ] && exit 0
+
+if [ "$code_time" -gt "$wiki_time" ]; then
+  # Count the code commits since that moment, for a message that says how much
+  # is outstanding rather than merely that something is.
+  n=$(git log --format=%H --since="@${wiki_time}" -- . ':!docs' ':!.claude' ':!CLAUDE.md' 2>/dev/null | wc -l | tr -d ' ')
+  printf '{"decision":"block","reason":"KB check: %s commit(s) touched code since the wiki was last updated (wiki repo is separate and local-only). Before stopping, reflect any substantive change into docs/wiki (create/update the entry, update index.md, append log.md) and memory, then COMMIT IT IN THE WIKI REPO: git -C docs/wiki add -A && git -C docs/wiki commit. If the change was genuinely trivial, a one-line note in docs/wiki/log.md satisfies this check."}\n' "$n"
 fi
 exit 0
