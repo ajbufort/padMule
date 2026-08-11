@@ -66,8 +66,19 @@ targets:
           - UIInterfaceOrientationPortraitUpsideDown
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
-        # padMule needs outbound TCP/UDP to arbitrary peers; no ATS exemption is
-        # required for raw sockets, but the engine is not HTTP so nothing here.
+        # App Transport Security: nothing here, and nothing needed - but NOT for
+        # the reason this comment used to give. The engine DOES speak HTTP: the
+        # first-run bootstrap and the server-list update fetch over cleartext
+        # http:// (crates/mule-engine/src/bootstrap.rs), and since 2026-08-10 over
+        # https:// as well, using rustls inside the Rust staticlib.
+        #
+        # ATS does not apply because ATS is enforced by the URL Loading System -
+        # NSURLSession/CFNetwork. padMule's HTTP is hand-rolled over raw BSD
+        # sockets, and its TLS is rustls's own, so no CFNetwork request is ever
+        # made and there is nothing for ATS to inspect or block. The same is true
+        # of every eD2k/Kad socket. So NSAppTransportSecurity is absent on purpose;
+        # adding an exemption would grant nothing and would only imply that some
+        # part of the app goes through URLSession, which none of it does.
         #
         # Local network access. WITHOUT this key iOS 14+ SILENTLY DROPS every
         # outgoing packet to the LAN - no error, no failure, just nothing - so

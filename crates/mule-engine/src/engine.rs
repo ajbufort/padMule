@@ -343,10 +343,11 @@ pub enum SearchOutcome {
 
 /// The result of auto-updating the server list from a URL. A URL problem is a
 /// normal outcome the UI reports, not an error it throws (mirrors [`AddResult`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServerListUpdate {
     /// Merged `added` new servers; the file now holds `total`.
     Updated { added: u32, total: u32 },
-    /// The URL was not `http://` (v1 fetches plain http only).
+    /// The URL was neither `http://` nor `https://`.
     BadUrl,
     /// Fetched, but the bytes were not a server.met (an HTML error page, or
     /// malformed data; gzip/zip-wrapped lists ARE unwrapped in the fetch path
@@ -3141,13 +3142,26 @@ impl Engine {
         self.save_pins();
     }
 
-    /// Fetch a server.met from `url` (plain http, unwrapped bytes) and MERGE its
-    /// entries into `config_dir/server.met` - every existing entry (and its tags)
-    /// is kept and only new `(ip, port)`s are appended. The fetched bytes are
-    /// validated as a real server.met BEFORE writing, so a bad URL / HTML error
-    /// page never corrupts the list.
+    /// Fetch a server.met from `url` (`http://` or `https://`, unwrapped bytes)
+    /// and MERGE its entries into `config_dir/server.met` - every existing entry
+    /// (and its tags) is kept and only new `(ip, port)`s are appended. The fetched
+    /// bytes are validated as a real server.met BEFORE writing, so a bad URL /
+    /// HTML error page never corrupts the list.
+    ///
+    /// TLS IS TRANSPORT, NOT TRUST. An `https://` fetch proves only that the bytes
+    /// came unmodified from the host the certificate names; it says nothing about
+    /// what that host chose to put in the file. So `vet_downloaded_servers` below
+    /// runs on the result exactly as it does for plaintext - same gate, same
+    /// rules, no TLS shortcut.
     pub async fn update_server_list(&self, url: &str) -> ServerListUpdate {
-        if !url.starts_with("http://") {
+        // Scheme gate. https was rejected here until 2026-08-10, so a user could
+        // not use an https server list even deliberately - not eMule's design:
+        // eMule sets INTERNET_FLAG_SECURE for AFX_INET_SERVICE_HTTPS
+        // (refs/emule-0.70b/.../HttpDownloadDlg.cpp:461-463). The iOS Settings
+        // screen has always ACCEPTED an https:// URL into the source list
+        // (EngineModel.addServerListUrl), so this rejection was reachable from
+        // ordinary use, not just from a hand-typed edge case.
+        if !url.starts_with("http://") && !url.starts_with("https://") {
             return ServerListUpdate::BadUrl;
         }
         let Ok(body) = bootstrap::http_get_bytes(url).await else {
@@ -3216,11 +3230,12 @@ impl Engine {
     ///
     /// Same posture as [`Engine::merge_discovered_servers`] and for the same
     /// reason - "anything that becomes a datagram target" - but this is the
-    /// path that actually needed it. A list is fetched over PLAIN HTTP from a
-    /// user-configured URL (`update_server_list` rejects anything but
-    /// `http://`), so both the publisher and any intermediary can choose its
-    /// contents; every entry then becomes a UDP target of the status probe and
-    /// the global search. The crawl was gated from the start and this was not,
+    /// path that actually needed it. A list is fetched from a user-configured
+    /// URL, so the PUBLISHER chooses its contents (and over `http://`, so can
+    /// any intermediary - `https://` removes the intermediary but not the
+    /// publisher, which is why this gate is not conditional on the scheme);
+    /// every entry then becomes a UDP target of the status probe and the
+    /// global search. The crawl was gated from the start and this was not,
     /// which is the more dangerous way round: the crawl only ever learns
     /// addresses from servers, while this ingests a file wholesale.
     ///
@@ -5717,17 +5732,22 @@ mod tests {
     /// `MAX_CONTACTS_PER_IP` cuts them to one.
     /// A DOWNLOADED server list cannot point padMule at private space.
     ///
-    /// `update_server_list` fetches over PLAIN HTTP from a user-configured URL,
-    /// so the publisher - or anyone between - chooses the bytes, and every
-    /// entry that lands in server.met becomes a UDP target for the status probe
-    /// and the global search. The crawl path was gated from the beginning; this
-    /// one was not, which is the wrong way round, because the crawl only learns
-    /// addresses one at a time from servers while this ingests a whole file.
+    /// `update_server_list` fetches from a user-configured URL, so the publisher
+    /// chooses the bytes (and over `http://`, so can anyone in between), and
+    /// every entry that lands in server.met becomes a UDP target for the status
+    /// probe and the global search. TLS does not retire this gate: it
+    /// authenticates the HOST, not the host's intentions. The crawl path was
+    /// gated from the beginning; this one was not, which is the wrong way round,
+    /// because the crawl only learns addresses one at a time from servers while
+    /// this ingests a whole file.
     ///
     /// The vetting sits at INGESTION, not at the send sites, so a loopback or
     /// LAN server the USER added stays usable - padMule's own eserver oracle
     /// runs on 127.0.0.1, and gating the fan-out would have broken it while
     /// leaving this hole open.
+    ///
+    /// It is deliberately NOT conditional on the scheme. See
+    /// `the_scheme_gate_admits_https_and_nothing_else` for the other half.
     #[test]
     fn a_downloaded_server_list_cannot_smuggle_in_private_space() {
         let met_ip = |a: u8, b: u8, c: u8, d: u8| u32::from_le_bytes([a, b, c, d]);
@@ -5778,6 +5798,58 @@ mod tests {
         );
         assert_eq!(vetted.servers.len(), 1, "a blocklisted server is dropped");
         assert_eq!(vetted.servers[0].port, 5000);
+    }
+
+    /// The scheme gate must ADMIT https and reject everything else.
+    ///
+    /// Until 2026-08-10 `https://` was answered with `BadUrl`, so an https server
+    /// list could not be used even deliberately - while the iOS Settings screen
+    /// happily ACCEPTED one into the source list (`EngineModel.addServerListUrl`
+    /// takes `http://` or `https://`), so the dead end was reachable from ordinary
+    /// use. That is padMule's own limitation, not the authority's: eMule sets
+    /// INTERNET_FLAG_SECURE for AFX_INET_SERVICE_HTTPS
+    /// (refs/emule-0.70b/eMule0.70b-Sources/srchybrid/HttpDownloadDlg.cpp:461-463).
+    ///
+    /// The distinction the assertions turn on is WHICH failure comes back.
+    /// `Unreachable` means the URL got as far as a socket (loopback port 1
+    /// refuses instantly, so this stays offline); `BadUrl` means the gate turned
+    /// it away. Asserting merely "it fails" would pass on the buggy code too.
+    #[tokio::test]
+    async fn the_scheme_gate_admits_https_and_nothing_else() {
+        let dir = tmp("server-list-scheme");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (engine, _rx) = Engine::new(&dir).unwrap();
+
+        assert_eq!(
+            engine
+                .update_server_list("https://127.0.0.1:1/list.met")
+                .await,
+            ServerListUpdate::Unreachable,
+            "an https URL must be FETCHED (and here fail to connect), not refused"
+        );
+        assert_eq!(
+            engine
+                .update_server_list("http://127.0.0.1:1/list.met")
+                .await,
+            ServerListUpdate::Unreachable,
+            "plaintext must be unchanged"
+        );
+        // Widened by exactly one scheme, not opened. `file://` matters most: it
+        // is the one that would turn a server-list URL into a local-file read.
+        for bad in [
+            "ftp://example.org/list.met",
+            "file:///etc/passwd",
+            "upd.example.org/server.met",
+            "",
+        ] {
+            assert_eq!(
+                engine.update_server_list(bad).await,
+                ServerListUpdate::BadUrl,
+                "{bad:?} must not be fetched"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

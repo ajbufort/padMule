@@ -11,13 +11,26 @@
 //! It also sidesteps iOS App Transport Security entirely: ATS governs
 //! URLSession/CFNetwork, not raw BSD sockets, so a cleartext http:// fetch works
 //! on-device with no Info.plist exemption.
+//!
+//! BOTH schemes are supported. `https://` is fetched over rustls with
+//! certificate verification ON (see [`tls_config`]); `http://` is unchanged, byte
+//! for byte, because the eserver/amuled oracles and the published bootstrap
+//! endpoints are plaintext and breaking them would be worse than the gap.
+//! Supporting https is what eMule already does - it hands WinInet
+//! `INTERNET_FLAG_SECURE` for `AFX_INET_SERVICE_HTTPS`
+//! (refs/emule-0.70b/eMule0.70b-Sources/srchybrid/HttpDownloadDlg.cpp:461-463) -
+//! so rejecting an https URL was padMule's own limitation, not the authority's.
 
 use std::path::Path;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use rustls::pki_types::ServerName;
+use rustls::{ClientConfig, RootCertStore};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
+use tokio_rustls::TlsConnector;
 
 /// Current, trusted sources (see docs/wiki/build-progress.md - the working
 /// source proven live on 2026-07-13).
@@ -45,21 +58,81 @@ impl std::fmt::Display for BootstrapError {
 
 impl std::error::Error for BootstrapError {}
 
-/// Split `http://host[:port]/path`. Only http is used by these endpoints.
-fn split_url(url: &str) -> Option<(String, u16, String)> {
-    let rest = url.strip_prefix("http://")?;
+/// Which transport a URL asks for. Nothing else is accepted - an unknown scheme
+/// (or none at all) is a `BadUrl`, never a silent downgrade to plaintext.
+///
+/// Private: `bootstrap` is a public module, and nothing outside it needs to name
+/// a transport - callers pass a URL string and get bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scheme {
+    /// Plaintext over a bare TCP socket.
+    Http,
+    /// TLS with certificate verification.
+    Https,
+}
+
+/// Split `http://host[:port]/path` or `https://host[:port]/path`.
+fn split_url(url: &str) -> Option<(Scheme, String, u16, String)> {
+    // https FIRST: "http://" is not a prefix of "https://", but ordering the
+    // check the other way round is the classic way to get that wrong later.
+    let (scheme, rest, default_port) = match url.strip_prefix("https://") {
+        Some(rest) => (Scheme::Https, rest, 443u16),
+        None => (Scheme::Http, url.strip_prefix("http://")?, 80u16),
+    };
     let (authority, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, "/"),
     };
     let (host, port) = match authority.rsplit_once(':') {
         Some((h, p)) => (h.to_string(), p.parse().ok()?),
-        None => (authority.to_string(), 80u16),
+        None => (authority.to_string(), default_port),
     };
     if host.is_empty() {
         return None;
     }
-    Some((host, port, path.to_string()))
+    Some((scheme, host, port, path.to_string()))
+}
+
+/// The trust anchors used to verify an `https://` server.
+///
+/// ROOTS ROT - a known, accepted cost. These are the Mozilla CA set COMPILED IN
+/// via `webpki-roots`, not the device's trust store, so the set only changes when
+/// padMule is rebuilt: a root distrusted upstream stays trusted here, and a newly
+/// added root stays unknown here, until the next release. The alternative,
+/// `rustls-platform-verifier`, reads the OS store and never rots, but reaching
+/// the Apple trust store means linking a system framework, and the iOS final
+/// link is performed by xcodebuild from `ios/project.yml` - a linkage change
+/// that cannot be tested on this dev box, where there is no Apple toolchain.
+/// Revisit once CI has proven the plain rustls build; the full rationale, and
+/// what was and was not verified for it, is in the workspace `Cargo.toml`.
+fn tls_roots() -> RootCertStore {
+    RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    }
+}
+
+/// The shared TLS client config, built once.
+///
+/// Certificate verification is ON and there is no way to turn it off: this is the
+/// only config this module builds, `with_root_certificates` is the only verifier
+/// path it offers, and no "accept invalid certificates" escape hatch exists -
+/// behind a feature flag or otherwise. A verification failure surfaces as an
+/// [`BootstrapError::Io`], i.e. the fetch simply did not happen.
+fn tls_config() -> Arc<ClientConfig> {
+    static CFG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
+    CFG.get_or_init(|| {
+        // The crypto provider is named EXPLICITLY rather than taken from the
+        // process default, so this cannot begin panicking at runtime if a second
+        // rustls provider ever enters the dependency graph.
+        Arc::new(
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .expect("ring supports rustls's default protocol versions")
+                .with_root_certificates(tls_roots())
+                .with_no_client_auth(),
+        )
+    })
+    .clone()
 }
 
 /// Find the end of the HTTP head in a RAW byte buffer and return
@@ -73,16 +146,53 @@ fn split_head(buf: &[u8]) -> Option<(u16, usize)> {
     Some((status, end))
 }
 
-/// GET `url` and return the raw body bytes.
+/// GET `url` and return the raw body bytes. `http://` goes over a bare socket,
+/// `https://` over TLS; nothing else is accepted.
 pub async fn http_get_bytes(url: &str) -> Result<Vec<u8>, BootstrapError> {
-    let (host, port, path) = split_url(url).ok_or(BootstrapError::BadUrl)?;
-    let mut stream = timeout(
+    let (scheme, host, port, path) = split_url(url).ok_or(BootstrapError::BadUrl)?;
+    let tcp = timeout(
         Duration::from_secs(10),
         TcpStream::connect((host.as_str(), port)),
     )
     .await
     .map_err(|_| BootstrapError::Io("connect timeout".into()))?
     .map_err(|e| BootstrapError::Io(e.to_string()))?;
+
+    match scheme {
+        Scheme::Http => request_and_read(tcp, &host, &path).await,
+        Scheme::Https => {
+            // An IP-literal host is accepted here too (rustls verifies it against
+            // the certificate's IP SANs); only a syntactically impossible name is
+            // a BadUrl.
+            let name = ServerName::try_from(host.clone()).map_err(|_| BootstrapError::BadUrl)?;
+            // The handshake gets its own bound, matching the connect timeout: a
+            // peer that completes the TCP connect and then stalls mid-handshake
+            // must not hold the fetch open indefinitely.
+            let tls = timeout(
+                Duration::from_secs(10),
+                TlsConnector::from(tls_config()).connect(name, tcp),
+            )
+            .await
+            .map_err(|_| BootstrapError::Io("TLS handshake timeout".into()))?
+            .map_err(|e| BootstrapError::Io(format!("TLS: {e}")))?;
+            request_and_read(tls, &host, &path).await
+        }
+    }
+}
+
+/// Send the GET and read the capped response off an already-connected stream.
+///
+/// Generic over the transport so the request shape, the body cap, the read
+/// timeout and the head/status handling are literally the same code for
+/// plaintext and TLS, and cannot drift apart.
+async fn request_and_read<S>(
+    mut stream: S,
+    host: &str,
+    path: &str,
+) -> Result<Vec<u8>, BootstrapError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let req = format!(
         "GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: padMule\r\nConnection: close\r\nAccept: */*\r\n\r\n"
     );
@@ -96,13 +206,25 @@ pub async fn http_get_bytes(url: &str) -> Result<Vec<u8>, BootstrapError> {
     // then fails to parse, which is reported cleanly rather than OOMing.
     const MAX_HTTP_BODY: u64 = 16 * 1024 * 1024;
     let mut buf = Vec::new();
-    timeout(
+    let read = timeout(
         Duration::from_secs(30),
         (&mut stream).take(MAX_HTTP_BODY).read_to_end(&mut buf),
     )
     .await
-    .map_err(|_| BootstrapError::Io("read timeout".into()))?
-    .map_err(|e| BootstrapError::Io(e.to_string()))?;
+    .map_err(|_| BootstrapError::Io("read timeout".into()))?;
+    match read {
+        Ok(_) => {}
+        // A TLS peer that answers `Connection: close` by closing the TCP socket
+        // WITHOUT first sending close_notify surfaces as UnexpectedEof; real
+        // servers do this. Keep what arrived rather than discarding a complete
+        // response over a missing shutdown record. This is not a new weakness:
+        // the plaintext path has always ended on a bare FIN and relied on the
+        // caller's validator (`looks_like_server_met` / `looks_like_nodes_dat`)
+        // to reject a truncated body, which a full parse does. If nothing at all
+        // arrived, the `split_head` below fails cleanly as Empty.
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
+        Err(e) => return Err(BootstrapError::Io(e.to_string())),
+    }
 
     let (status, body_at) = split_head(&buf).ok_or(BootstrapError::Empty)?;
     if status != 200 {
@@ -275,6 +397,7 @@ mod tests {
         assert_eq!(
             split_url("http://upd.emule-security.org/server.met"),
             Some((
+                Scheme::Http,
                 "upd.emule-security.org".to_string(),
                 80,
                 "/server.met".to_string()
@@ -282,9 +405,123 @@ mod tests {
         );
         assert_eq!(
             split_url("http://h:8080/x"),
-            Some(("h".to_string(), 8080, "/x".to_string()))
+            Some((Scheme::Http, "h".to_string(), 8080, "/x".to_string()))
         );
-        assert_eq!(split_url("https://x/y"), None, "only http is used here");
+    }
+
+    /// An https URL must parse, pick the TLS transport, and default to port 443 -
+    /// not 80, which would connect to a plaintext listener and hand it a
+    /// ClientHello.
+    #[test]
+    fn splits_https_urls_with_the_tls_default_port() {
+        assert_eq!(
+            split_url("https://example.org/list.met"),
+            Some((
+                Scheme::Https,
+                "example.org".to_string(),
+                443,
+                "/list.met".to_string()
+            ))
+        );
+        assert_eq!(
+            split_url("https://h:8443/x"),
+            Some((Scheme::Https, "h".to_string(), 8443, "/x".to_string()))
+        );
+        // No scheme, and schemes we do not speak, stay rejected - an unknown
+        // scheme must never fall through to plaintext.
+        assert_eq!(split_url("ftp://x/y"), None);
+        assert_eq!(split_url("upd.emule-security.org/server.met"), None);
+        assert_eq!(split_url("https://"), None, "empty host");
+    }
+
+    /// The verifier must be fed a REAL trust anchor set. An empty root store would
+    /// still "verify certificates" - it would just reject every one of them - and
+    /// the only symptom would be that https never works, which is easy to blame on
+    /// the network.
+    #[test]
+    fn the_tls_roots_are_a_real_ca_set() {
+        let roots = tls_roots();
+        assert!(
+            roots.roots.len() > 50,
+            "expected the webpki-roots CA set, got {} anchors",
+            roots.roots.len()
+        );
+        // And the config actually builds with them - this call is what would
+        // panic if the crypto provider were misconfigured - and is built ONCE.
+        let cfg = tls_config();
+        assert!(
+            Arc::ptr_eq(&cfg, &tls_config()),
+            "the client config must be built once and shared"
+        );
+    }
+
+    /// Read whatever a client sends on one loopback connection, then hang up.
+    /// Returns the bound port and a handle yielding the first bytes received.
+    ///
+    /// This is the only way to prove the transport OFFLINE: no certificate is
+    /// presented, so both fetches below fail - the assertion is about the bytes
+    /// padMule PUT ON THE WIRE, which is exactly the property under test.
+    async fn first_bytes_listener() -> (u16, tokio::task::JoinHandle<Vec<u8>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return Vec::new();
+            };
+            let mut buf = vec![0u8; 512];
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            buf.truncate(n);
+            buf
+        });
+        (port, handle)
+    }
+
+    /// THE LOAD-BEARING TEST for this change: an `https://` URL must produce a TLS
+    /// ClientHello, never a cleartext `GET`. Without it, "https support" could be
+    /// nothing but a relaxed scheme check that then speaks plaintext to port 443 -
+    /// which would LOOK like it worked against any server that tolerates it, while
+    /// giving up every guarantee TLS was added for.
+    #[tokio::test]
+    async fn the_https_path_speaks_tls_not_plaintext() {
+        let (port, seen) = first_bytes_listener().await;
+        // The listener never presents a certificate, so this must fail; the
+        // failure is expected and irrelevant. The wire bytes are the evidence.
+        let r = http_get_bytes(&format!("https://127.0.0.1:{port}/x")).await;
+        assert!(r.is_err(), "a listener with no certificate cannot succeed");
+        let bytes = seen.await.unwrap();
+        assert!(
+            bytes.len() > 5,
+            "the client sent {} bytes - no handshake happened",
+            bytes.len()
+        );
+        assert!(
+            !bytes.starts_with(b"GET "),
+            "https sent a CLEARTEXT request: {:?}",
+            String::from_utf8_lossy(&bytes[..bytes.len().min(32)])
+        );
+        // TLS record layer: content type 0x16 (handshake), then the legacy
+        // version 0x03 0x01, then the ClientHello message type 0x01.
+        assert_eq!(bytes[0], 0x16, "not a TLS handshake record");
+        assert_eq!(&bytes[1..3], &[0x03, 0x01], "not a TLS record version");
+        assert_eq!(bytes[5], 0x01, "not a ClientHello");
+    }
+
+    /// The control, and the guarantee that mattered most: `http://` is UNCHANGED.
+    /// The oracles (eserver, amuled) and the published bootstrap endpoints are
+    /// plaintext, so a client that started sending ClientHellos to them would be a
+    /// worse regression than the gap this change closes.
+    #[tokio::test]
+    async fn the_http_path_still_speaks_plaintext() {
+        let (port, seen) = first_bytes_listener().await;
+        let _ = http_get_bytes(&format!("http://127.0.0.1:{port}/server.met")).await;
+        let bytes = seen.await.unwrap();
+        let text = String::from_utf8_lossy(&bytes).to_string();
+        assert!(
+            text.starts_with("GET /server.met HTTP/1.1\r\n"),
+            "http must still send a cleartext GET, got {text:?}"
+        );
+        assert!(text.contains("Host: 127.0.0.1\r\n"), "got {text:?}");
+        assert!(text.contains("Connection: close\r\n"), "got {text:?}");
     }
 
     #[test]
@@ -454,5 +691,45 @@ mod live {
         let n = http_get_bytes(NODES_DAT_URL).await.expect("nodes.dat");
         assert!(looks_like_nodes_dat(&n), "got {} bytes", n.len());
         println!("server.met {} bytes, nodes.dat {} bytes", b.len(), n.len());
+    }
+
+    /// The end-to-end proof the offline tests CANNOT give: a full TLS handshake
+    /// against a real certificate, verified against the compiled-in roots, with a
+    /// real server.met coming back and parsing.
+    ///
+    /// The offline suite proves only that a ClientHello leaves the socket. That is
+    /// the mechanism, not the precondition - a config that trusts nothing sends an
+    /// identical ClientHello and then fails every handshake, and the offline test
+    /// could not tell the difference. This is the test that can, so it is worth
+    /// having even though it is ignored by default (the suite must stay offline).
+    ///
+    /// Run: cargo test -p mule-engine --lib -- --ignored --exact \
+    ///      bootstrap::live::fetches_a_real_server_met_over_https
+    #[tokio::test]
+    #[ignore]
+    async fn fetches_a_real_server_met_over_https() {
+        // The SAME canonical host as SERVER_MET_URL, which also answers on 443.
+        let b = http_get_bytes("https://upd.emule-security.org/server.met")
+            .await
+            .expect("https server.met");
+        assert!(looks_like_server_met(&b), "got {} bytes", b.len());
+        println!("https server.met {} bytes", b.len());
+    }
+
+    /// And the other half: certificate verification must actually REJECT. Without
+    /// this, "https support" could be a verifier that accepts anything, and the
+    /// positive test above would still pass.
+    #[tokio::test]
+    #[ignore]
+    async fn https_refuses_a_certificate_that_does_not_verify() {
+        let r = http_get_bytes("https://expired.badssl.com/").await;
+        let Err(BootstrapError::Io(msg)) = r else {
+            panic!("an expired certificate must not be accepted, got {r:?}");
+        };
+        assert!(
+            msg.starts_with("TLS: "),
+            "expected a TLS failure, got {msg}"
+        );
+        println!("rejected as expected: {msg}");
     }
 }

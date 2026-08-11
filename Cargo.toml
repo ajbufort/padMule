@@ -27,3 +27,30 @@ tokio = "1"
 socket2 = "0.6"
 libc = "0.2"
 uniffi = "0.28"
+# TLS for the server-list / bootstrap fetch (https:// URLs).
+#
+# rustls over `ring`, NOT the default `aws-lc-rs` provider, and NOT
+# rustls-platform-verifier. The binding constraint is that padMule cross-compiles
+# to aarch64-apple-ios (and -sim) in CI and there is no Apple toolchain on the
+# dev box, so the iOS build is UNTESTABLE locally and cross-compile risk
+# dominates the first landing.
+#
+# What was VERIFIED here, in ring 0.17.14's own build.rs: its ASM_TARGETS table
+# maps (target_os in APPLE_ABI, target_arch AARCH64) to perlasm_format "ios64",
+# the crate ships 11 pregenerated *-ios64.S files, and the packaged (non-.git)
+# build path uses `pregenerated/` rather than running perl or nasm. So the only
+# new native requirement is a C compiler for the iOS SDK, which the macOS runner
+# has. rustls/tokio-rustls/webpki-roots add no native build at all (rustls's
+# build.rs only probes for nightly; the other two have none).
+#
+# `aws-lc-rs` was NOT verified for these targets - it builds a C library through
+# its own toolchain, and "unverified on the one build we cannot try first" is
+# precisely the risk being avoided. rustls-platform-verifier is the better TRUST
+# story (the OS root store, so no rot), but reaching the Apple trust store means
+# linking a system framework, and the final link is done by xcodebuild, which
+# only sees `-lmule_ffi` - so it would need a new OTHER_LDFLAGS entry in
+# ios/project.yml that equally cannot be tested here. Deliberately deferred;
+# see bootstrap.rs (ROOTS ROT).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+webpki-roots = "1"

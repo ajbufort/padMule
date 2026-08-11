@@ -2286,8 +2286,10 @@ final class EngineModel: ObservableObject {
         }
     }
 
-    /// The canonical public server-list URL (plain http; the engine fetches over a
-    /// raw socket, so no ATS exemption is needed).
+    /// The canonical public server-list URL. Plain http, because that is what the
+    /// endpoint publishes; an https:// source is equally usable since 2026-08-10
+    /// (the engine fetches it with rustls). Either way the fetch is a raw socket
+    /// inside the Rust engine, never URLSession, so no ATS exemption is involved.
     nonisolated static let defaultServerListUrl = "http://upd.emule-security.org/server.met"
 
     /// The name padMule announces when the user has not chosen one. Must equal
@@ -2338,7 +2340,7 @@ final class EngineModel: ObservableObject {
                 case let .updated(added, total):
                     self.notice = "Server list updated: +\(added) new (\(total) total)."
                 case .badUrl:
-                    self.notice = "The server-list URL must start with http://"
+                    self.notice = "The server-list URL must start with http:// or https://"
                 case .notServerMet:
                     self.notice = "That URL did not return a server.met."
                 case .unreachable:

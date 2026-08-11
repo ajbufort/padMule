@@ -651,10 +651,11 @@ impl MuleEngine {
         })
     }
 
-    /// Fetch a server.met from `url` (plain http) and MERGE it into the on-disk
-    /// list - existing servers (and tags) are kept, only new ones appended. Call
-    /// `server_list()` afterwards to re-probe. Blocks on the fetch; off the UI
-    /// thread. The default list URL is `http://upd.emule-security.org/server.met`.
+    /// Fetch a server.met from `url` (`http://` or `https://`; TLS is verified)
+    /// and MERGE it into the on-disk list - existing servers (and tags) are kept,
+    /// only new ones appended. Call `server_list()` afterwards to re-probe. Blocks
+    /// on the fetch; off the UI thread. The default list URL is
+    /// `http://upd.emule-security.org/server.met`.
     pub fn update_server_list(&self, url: String) -> ServerListUpdate {
         self.rt.block_on(async {
             match self.inner.lock().await.update_server_list(&url).await {
