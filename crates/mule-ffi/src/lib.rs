@@ -982,6 +982,18 @@ impl MuleEngine {
             .block_on(async { self.inner.lock().await.unshare_file(h).await })
     }
 
+    /// Unshare a completed file AND delete it from disk. Stronger than
+    /// `unshare_file`, which deliberately leaves the file in place. padMule's
+    /// downloads live in the app container, so without this the only way to get
+    /// rid of one is the Files app.
+    pub fn delete_shared_file(&self, hash: String) -> bool {
+        let Some(h) = parse_hash16(&hash) else {
+            return false;
+        };
+        self.rt
+            .block_on(async { self.inner.lock().await.delete_shared_file(h).await })
+    }
+
     /// How many IP-blocklist ranges are loaded (0 = no filter placed).
     pub fn ip_filter_ranges(&self) -> u32 {
         self.handles.ip_filter_ranges() as u32 // LOCK-FREE
@@ -1161,6 +1173,18 @@ impl MuleEngine {
         };
         self.rt
             .block_on(async { self.inner.lock().await.pause_download(h).await })
+    }
+
+    /// STOP a download (eMule 0.70b StopFile) - stronger than pause, weaker
+    /// than cancel. The bytes and the gap list stay; every source already held
+    /// is dropped and no new one is admitted until the user resumes. Resuming
+    /// clears it, exactly as eMule's ResumeFile clears `m_stopped`.
+    pub fn stop_download(&self, hash: String) -> bool {
+        let Some(h) = parse_hash16(&hash) else {
+            return false;
+        };
+        self.rt
+            .block_on(async { self.inner.lock().await.stop_download(h).await })
     }
 
     /// Resume a paused download (eMule 0.70b ResumeFile). The next retry

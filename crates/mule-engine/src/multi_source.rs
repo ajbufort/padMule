@@ -227,6 +227,25 @@ pub struct Download {
     /// back PAUSED, exactly as eMule 0.70b does. Lock-free for the same
     /// reason as `cancelled`.
     paused: AtomicBool,
+    /// USER-stopped (eMule 0.70b `m_stopped`, `CPartFile::StopFile`). Stop is
+    /// Pause PLUS two things Pause does not do: every source already held is
+    /// DROPPED, and no new source is admitted while it is set - eMule gates
+    /// exactly that, at `CheckAndAddSource` (DownloadQueue.cpp:456),
+    /// `CheckAndAddKnownSource` (:542) and the Kad source-search result handler
+    /// (:1516). Progress is kept: upstream's `StopFile` calls `FlushBuffer()`
+    /// when it is not cancelling.
+    ///
+    /// NOT PERSISTED, and that is upstream-faithful rather than an omission.
+    /// eMule 0.50a writes FT_STATUS only while paused, and aMule reads it back
+    /// as `m_paused = (GetInt() == 1)` then sets `m_stopped = m_paused`
+    /// (PartFile.cpp:521-523) - so neither tree carries a distinct stopped
+    /// state across a restart either. Encoding one as FT_STATUS=2 was
+    /// considered and REFUTED: aMule's test is `== 1`, not nonzero, so a
+    /// padMule-stopped file would open in aMule as NOT PAUSED and silently
+    /// resume. A stopped download therefore returns from a restart PAUSED,
+    /// which in padMule already means no fetch, no retry sweep and no
+    /// source-seeking.
+    stopped: AtomicBool,
     /// The user's download priority (PR_LOW/PR_NORMAL/PR_HIGH). A lock-free
     /// atomic so the fetch manager can read it every round without touching the
     /// transfer lock; the canonical copy is persisted in the PartStore.
@@ -517,6 +536,8 @@ impl Download {
             sources: Mutex::new(Vec::new()),
             cancelled: AtomicBool::new(false),
             paused,
+            // Stop is a session state in every tree - see the field comment.
+            stopped: AtomicBool::new(false),
             priority,
             preview: AtomicBool::new(false),
             finalizing: AtomicBool::new(false),
@@ -657,6 +678,16 @@ impl Download {
         low_id: bool,
         origin: crate::fetch::SourceOrigin,
     ) {
+        // eMule 0.70b refuses a source for a STOPPED file at every admission
+        // point - CheckAndAddSource (DownloadQueue.cpp:456), CheckAndAddKnownSource
+        // (:542) and the Kad source-search result handler (:1516). This is the
+        // one gate padMule needs, because every origin funnels through here;
+        // without it a stopped download would re-accumulate the very list
+        // `set_stopped` just cleared, from a server answer still in flight or a
+        // source-exchange reply.
+        if self.is_stopped() {
+            return;
+        }
         let mut g = self.sources.lock().await;
         if let Some(s) = g.iter_mut().find(|s| s.addr == addr) {
             s.software = software;
@@ -823,6 +854,34 @@ impl Download {
     /// Whether the USER has paused this download.
     pub fn is_paused(&self) -> bool {
         self.paused.load(Ordering::Relaxed)
+    }
+
+    /// eMule 0.70b `CPartFile::StopFile`, the engine half. Pause the download
+    /// (which persists), then do the two things Stop adds: DROP every source
+    /// already held, and latch the flag that refuses new ones. Progress is
+    /// untouched - the bytes and the gap list stay exactly as they were, and
+    /// the persisted met write comes from `set_paused`, matching upstream's
+    /// `FlushBuffer()` on a non-cancelling stop.
+    ///
+    /// Dropping the sources is the point of the feature and not merely tidy: a
+    /// held `SourceInfo` is a peer address this download is still keeping,
+    /// and a stopped file should stop holding a list of who has it.
+    pub async fn set_stopped(&self) {
+        self.stopped.store(true, Ordering::Relaxed);
+        self.set_paused(true).await;
+        self.sources.lock().await.clear();
+    }
+
+    /// Whether the USER stopped this download (eMule `IsStopped`). Cleared by
+    /// resuming, since eMule's `ResumeFile` clears `m_stopped` too.
+    pub fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Relaxed)
+    }
+
+    /// Clear the stopped latch. Called by resume so a stopped download can
+    /// accept sources again (eMule `ResumeFile` sets `m_stopped = false`).
+    pub fn clear_stopped(&self) {
+        self.stopped.store(false, Ordering::Relaxed);
     }
 
     /// The current download priority (PR_LOW/PR_NORMAL/PR_HIGH). Read lock-free

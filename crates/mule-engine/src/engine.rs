@@ -4352,7 +4352,46 @@ impl Engine {
         };
         match dl {
             Some(dl) => {
+                // eMule's ResumeFile clears both: `m_paused = m_stopped = false`
+                // (0.70b PartFile.cpp). Without the second half a stopped
+                // download would resume and then silently refuse every source
+                // it found, which looks exactly like "resume is broken".
+                dl.clear_stopped();
                 dl.set_paused(false).await;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// STOP ONE download (eMule 0.70b `CPartFile::StopFile`). Stronger than
+    /// pause and weaker than cancel: the bytes and the gap list stay, but every
+    /// source already held is dropped and no new one is admitted until the user
+    /// resumes. Returns false if the hash is not in the list.
+    ///
+    /// Worth knowing what this actually buys HERE, because padMule's pause is
+    /// already stronger than eMule's: a paused padMule download is skipped by
+    /// the fetch loop (fetch.rs:546/:573), by the resume sweep (engine.rs) AND
+    /// by the retry sweep's candidate selection, so it has already stopped
+    /// ASKING the network about that hash. Partial files are never Kad-published
+    /// either - the publish set is built from `shared`, which holds completed
+    /// files only. What Stop adds on top is dropping the source list already
+    /// held and refusing new arrivals.
+    pub async fn stop_download(&mut self, hash: [u8; 16]) -> bool {
+        let dl = {
+            let guard = self.downloads.lock().await;
+            let mut found = None;
+            for d in guard.iter() {
+                if d.hash().await == hash {
+                    found = Some(Arc::clone(d));
+                    break;
+                }
+            }
+            found
+        };
+        match dl {
+            Some(dl) => {
+                dl.set_stopped().await;
                 true
             }
             None => false,
@@ -4723,6 +4762,50 @@ impl Engine {
             self.emit(EngineEvent::Server("Stopped sharing a file".into()));
         }
         removed
+    }
+
+    /// Unshare a completed file AND delete it from disk. Returns false if we
+    /// were not sharing that hash; returns true once the share is gone even if
+    /// the unlink itself failed, because the sharing state is the part this
+    /// engine owns and the caller has already been told the file is going.
+    ///
+    /// This has NO upstream counterpart to replicate: eMule cannot even unshare
+    /// a completed download (`ShouldBeShared` returns true for Incoming and
+    /// category paths before the `bMustBeShared` gate, 0.70b
+    /// SharedFileList.cpp:1390-1398, which is why its menu item is greyed out),
+    /// let alone delete one. It exists because padMule's downloads live in the
+    /// app container, where "delete it in Finder" is not available - without
+    /// this the only route off the device is the Files app.
+    ///
+    /// The order matters and is not arbitrary: unshare FIRST, then unlink. The
+    /// reverse would leave a window in which the library still advertises a
+    /// file that is no longer there, and a peer that asked in that window would
+    /// get a slot and then an I/O error rather than a clean "not shared".
+    pub async fn delete_shared_file(&mut self, hash: [u8; 16]) -> bool {
+        let path = {
+            let guard = self.shared.lock().await;
+            guard
+                .iter()
+                .find(|s| s.hash == hash)
+                .map(|s| s.path.clone())
+        };
+        let Some(path) = path else {
+            return false;
+        };
+        if !self.unshare_file(hash).await {
+            return false;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => self.emit(EngineEvent::Server("Deleted a file".into())),
+            Err(e) => {
+                // Say so rather than reporting a clean delete. The share is
+                // already gone, which is the half that protects the user.
+                self.emit(EngineEvent::Server(format!(
+                    "Stopped sharing, but the file could not be deleted: {e}"
+                )));
+            }
+        }
+        true
     }
 
     /// Set a download's priority (Low/Normal/High). Persisted to part.met and
@@ -8601,6 +8684,145 @@ mod tests {
         // Cancelling a hash we are not downloading is a no-op, not a lie.
         assert!(!engine.cancel_download([0x00; 16]).await);
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn delete_shared_file_unshares_it_and_removes_it_from_disk() {
+        let dir = tmp("delete-shared");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+
+        // A real file on disk, shared.
+        let path = dir.join("evidence.bin");
+        std::fs::write(&path, b"payload").unwrap();
+        engine.shared.lock().await.push(SharedFile {
+            hash: [0xCD; 16],
+            size: 7,
+            name: b"evidence.bin".to_vec(),
+            part_hashes: vec![],
+            path: path.clone(),
+            rating: 0,
+            comment: String::new(),
+            aich_root: None,
+        });
+        assert!(path.exists(), "precondition: the file is on disk");
+
+        assert!(engine.delete_shared_file([0xCD; 16]).await, "should delete");
+        assert!(
+            engine.shared.lock().await.is_empty(),
+            "the share must be gone from the library"
+        );
+        assert!(!path.exists(), "the file must be gone from disk");
+
+        // A hash we do not share is a no-op, not a lie - and must not have
+        // deleted anything on the way to saying so.
+        assert!(!engine.delete_shared_file([0x11; 16]).await);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn unshare_leaves_the_file_where_delete_removes_it() {
+        // The two actions sit side by side in the UI and differ in exactly one
+        // observable way. Pinning that difference is the point: an unshare that
+        // quietly deleted would be a data-loss bug no other test would catch.
+        let dir = tmp("unshare-keeps");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+        let path = dir.join("keep.bin");
+        std::fs::write(&path, b"payload").unwrap();
+        engine.shared.lock().await.push(SharedFile {
+            hash: [0xCE; 16],
+            size: 7,
+            name: b"keep.bin".to_vec(),
+            part_hashes: vec![],
+            path: path.clone(),
+            rating: 0,
+            comment: String::new(),
+            aich_root: None,
+        });
+
+        assert!(engine.unshare_file([0xCE; 16]).await);
+        assert!(engine.shared.lock().await.is_empty(), "unshared");
+        assert!(path.exists(), "unshare must NOT delete the file");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn stop_drops_the_sources_refuses_new_ones_and_resume_lets_them_back() {
+        // eMule 0.70b StopFile: pause, RemoveAllSources, and refuse admission
+        // while stopped (DownloadQueue.cpp:456/:542/:1516). ResumeFile clears
+        // it (`m_paused = m_stopped = false`). All three legs, plus the one
+        // that matters most - the bytes survive, because Stop is not Remove.
+        let dir = tmp("stop-download");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+        let store = PartStore::create(&dir, 1, [0xBC; 16], 1000, b"s.bin").unwrap();
+        let dl = Download::new(store);
+        dl.note_source(
+            "eMule".into(),
+            "10.0.0.7:4662".parse().unwrap(),
+            false,
+            false,
+            crate::fetch::SourceOrigin::Server,
+        )
+        .await;
+        assert_eq!(dl.sources().await.len(), 1, "precondition: one source held");
+        engine.downloads.lock().await.push(dl);
+
+        assert!(engine.stop_download([0xBC; 16]).await, "should stop");
+        let dl = Arc::clone(&engine.downloads.lock().await[0]);
+        assert!(dl.is_stopped(), "the stop latch must be set");
+        assert!(dl.is_paused(), "stop pauses too, as StopFile does");
+        assert!(
+            dl.sources().await.is_empty(),
+            "every source held must be dropped"
+        );
+        assert!(
+            dir.join("001.part").exists() && dir.join("001.part.met").exists(),
+            "STOP KEEPS THE PROGRESS - this is not Remove"
+        );
+
+        // A source arriving after the stop (a server answer still in flight, a
+        // source-exchange reply) must be refused, or the list we just cleared
+        // simply refills.
+        dl.note_source(
+            "aMule".into(),
+            "10.0.0.8:4662".parse().unwrap(),
+            false,
+            false,
+            crate::fetch::SourceOrigin::Kad,
+        )
+        .await;
+        assert!(
+            dl.sources().await.is_empty(),
+            "a stopped download must admit no new source"
+        );
+
+        // Resume clears the latch, and sources are accepted again.
+        assert!(engine.resume_download([0xBC; 16]).await);
+        assert!(!dl.is_stopped(), "resume clears the stop latch");
+        assert!(!dl.is_paused(), "resume unpauses");
+        dl.note_source(
+            "aMule".into(),
+            "10.0.0.9:4662".parse().unwrap(),
+            false,
+            false,
+            crate::fetch::SourceOrigin::Kad,
+        )
+        .await;
+        assert_eq!(
+            dl.sources().await.len(),
+            1,
+            "after resume the download takes sources again"
+        );
+
+        assert!(!engine.stop_download([0x00; 16]).await, "unknown hash");
         std::fs::remove_dir_all(&dir).ok();
     }
 

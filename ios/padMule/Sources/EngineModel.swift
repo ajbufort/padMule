@@ -1175,6 +1175,17 @@ final class EngineModel: ObservableObject {
         }
     }
 
+    /// STOP a download (eMule 0.70b StopFile): keeps the bytes, drops every
+    /// source held and refuses new ones until resumed. Between pause (which
+    /// keeps its sources) and cancel (which deletes the progress).
+    func stop(_ hash: String) {
+        guard let e = engine else { return }
+        work.async { [weak self] in
+            _ = e.stopDownload(hash: hash)
+            DispatchQueue.main.async { self?.refreshAll() }
+        }
+    }
+
     // MARK: - Categories
 
     /// Downloads in the currently-selected category (all when no filter).
@@ -1266,6 +1277,16 @@ final class EngineModel: ObservableObject {
         guard let e = engine else { return }
         work.async { [weak self] in
             _ = e.unshareFile(hash: hash)
+            DispatchQueue.main.async { self?.refreshAll() }
+        }
+    }
+
+    /// Unshare a file AND delete it from the device. padMule's downloads live
+    /// in the app container, so the alternative is the Files app.
+    func deleteShared(_ hash: String) {
+        guard let e = engine else { return }
+        work.async { [weak self] in
+            _ = e.deleteSharedFile(hash: hash)
             DispatchQueue.main.async { self?.refreshAll() }
         }
     }

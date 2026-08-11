@@ -144,6 +144,10 @@ struct ContentView: View {
     @State private var newCategoryName = ""
     @State private var sourcesFor: DownloadInfo?
     @State private var ratingFor: SharedFileInfo?
+    /// The shared file a Delete swipe is asking about. Delete is the only
+    /// irreversible action on the Shared screen, so it is confirmed; Unshare
+    /// beside it is not, because the file survives it.
+    @State private var deleteCandidate: SharedFileInfo?
     /// Guards the explicit Stop: it drops connections and releases the router
     /// port, so it asks first.
     @State private var confirmStop = false
@@ -366,6 +370,26 @@ struct ContentView: View {
                 RatingEditorView(hash: f.hash, name: f.name, rating: f.rating, comment: f.comment) { rating, comment in
                     model.setFileRating(f.hash, rating: rating, comment: comment)
                 }
+            }
+            .confirmationDialog(
+                "Delete this file from your iPad?",
+                isPresented: Binding(
+                    get: { deleteCandidate != nil },
+                    set: { if !$0 { deleteCandidate = nil } }),
+                titleVisibility: .visible
+            ) {
+                Button("Delete", role: .destructive) {
+                    if let f = deleteCandidate { model.deleteShared(f.hash) }
+                    deleteCandidate = nil
+                }
+                Button("Cancel", role: .cancel) { deleteCandidate = nil }
+            } message: {
+                // Name the file: a swipe on the wrong row is the likeliest way
+                // to reach this dialog, and the name is what catches it.
+                Text(
+                    (deleteCandidate?.name ?? "")
+                        + "\n\nThis removes it from your shared files AND deletes it "
+                        + "from the device. It cannot be undone.")
             }
         }
     }
@@ -752,6 +776,17 @@ struct ContentView: View {
                                             model.pauseDownload(dl.hash)
                                         } label: {
                                             Label("Pause", systemImage: "pause.fill")
+                                        }
+                                    }
+                                    // eMule 0.70b's StopFile, which it keeps
+                                    // DISTINCT from Pause: stop also drops
+                                    // every source and refuses new ones. The
+                                    // bytes stay - this is not Remove.
+                                    if !dl.paused {
+                                        Button {
+                                            model.stop(dl.hash)
+                                        } label: {
+                                            Label("Stop", systemImage: "stop.fill")
                                         }
                                     }
                                 }
@@ -1206,6 +1241,15 @@ struct ContentView: View {
                             .tint(.blue)
                         }
                         .swipeActions(edge: .trailing) {
+                            // DELETE removes the file from the device as well as
+                            // from the library. It sits behind a confirmation
+                            // because it is the only irreversible action on this
+                            // screen - Unshare beside it is not.
+                            Button(role: .destructive) {
+                                deleteCandidate = f
+                            } label: {
+                                Label("Delete", systemImage: "trash")
+                            }
                             // Stop serving this file; the file stays in your Files.
                             Button {
                                 model.unshare(f.hash)
