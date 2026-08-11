@@ -30,7 +30,45 @@ pub const OP_ASKSHAREDFILES: u8 = 0x4A;
 /// OP_ASKSHAREDFILES). Answering identically whether we have nothing to show or
 /// choose to show nothing is also the better privacy behavior: "denied" and
 /// "empty" are indistinguishable on the wire.
-pub const OP_ASKSHAREDFILESANSWER: u8 = 0x4B; // E3
+pub const OP_ASKSHAREDFILESANSWER: u8 = 0x4B;
+
+/// Browse, the DIRECTORY flavour - and the one a real eMule actually sends to
+/// us (opcodes.h:232-236). eMule picks between the two in
+/// `BaseClient.cpp:1749`: `m_fSharedDirectories ? OP_ASKSHAREDDIRS :
+/// OP_ASKSHAREDFILES`. That flag is set at `BaseClient.cpp:576` for ANY peer
+/// that sends CT_EMULE_VERSION - which padMule does, claiming aMule 3.0.1 - so
+/// eMule NEVER sends us 0x4A. Handling only 0x4A meant the feature worked
+/// against a test that spoke 0x4A and did nothing against the client it was
+/// built for.
+///
+/// `OP_ASKSHAREDDIRS` has a null body; the answer is `<count 4>` then that many
+/// eD2k strings.
+pub const OP_ASKSHAREDDIRS: u8 = 0x5D;
+
+/// "List the files in THIS directory": `<string dir>`.
+pub const OP_ASKSHAREDFILESDIR: u8 = 0x5E;
+
+/// `<count 4>(<string dir>)[count]`.
+pub const OP_ASKSHAREDDIRSANS: u8 = 0x5F;
+
+/// `<string dir><count 4>(<HASH 16><ID 4><PORT 2><tagset>)[count]`.
+pub const OP_ASKSHAREDFILESDIRANS: u8 = 0x60;
+
+/// Refusal for the DIRECTORY flavour, null body. Unlike the 0x4A path - which
+/// eMule refuses with an EMPTY LIST - this one gets its own opcode
+/// (ListenSocket.cpp, case OP_ASKSHAREDDIRS). Faithful to upstream: a client
+/// that receives silence hangs, where one that receives this shows the user a
+/// proper "denied". It leaks nothing about content either way.
+pub const OP_ASKSHAREDDENIEDANS: u8 = 0x61;
+
+/// The single pseudo-directory padMule reports.
+///
+/// eMule sends one name per shared folder via `GetPseudoDirName`
+/// (BaseClient.cpp `SendSharedDirectories`). padMule has exactly one place
+/// shares can live - the completed-downloads folder the Files app shows - so it
+/// reports one entry. "Incoming" is the eD2k word for it and is what a browsing
+/// user expects to see.
+pub const PADMULE_SHARED_DIR: &str = "Incoming"; // E3
 pub const OP_HASHSETANSWER: u8 = 0x52; // E3
 pub const OP_STARTUPLOADREQ: u8 = 0x54; // E3
 pub const OP_ACCEPTUPLOADREQ: u8 = 0x55; // E3

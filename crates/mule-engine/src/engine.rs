@@ -10745,6 +10745,125 @@ mod tests {
     /// Asserted on the ANSWER ARRIVING at all: the refusal shape (count = 0) is
     /// already covered; what was broken, and what this pins, is that anything
     /// comes back.
+    /// THE OPCODES A REAL eMULE ACTUALLY SENDS, end to end through the
+    /// listener. Anthony's eMule reported "Unable to retrieve shared files"
+    /// against a build whose 0x4A path was verified working - because eMule
+    /// never sends 0x4A to us. `BaseClient.cpp:576` sets `m_fSharedDirectories`
+    /// for any peer advertising CT_EMULE_VERSION, which padMule always does, so
+    /// `:1749` picks OP_ASKSHAREDDIRS instead. The previous test spoke the
+    /// opcode I had written rather than the one the client sends.
+    #[tokio::test]
+    async fn the_directory_browse_a_real_emule_sends_is_answered() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = tmp("browse-dirs-e2e");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+        let port = free_local_port();
+        engine.set_ports(port, port, 0, 4672);
+        engine.set_sharing(true);
+        engine.set_allow_browse(true);
+        let path = dir.join("notes.pdf");
+        std::fs::write(&path, vec![3u8; 24]).unwrap();
+        engine.shared.lock().await.push(SharedFile {
+            hash: [0xD1; 16],
+            size: 24,
+            name: b"notes.pdf".to_vec(),
+            part_hashes: vec![],
+            path,
+            rating: 0,
+            comment: String::new(),
+            aich_root: None,
+        });
+        engine.start_listener().await;
+
+        let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let mut body = vec![16u8];
+        body.extend_from_slice(&[0x66u8; 16]);
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&4662u16.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        let mut hello = vec![0xE3u8];
+        hello.extend_from_slice(&((body.len() + 1) as u32).to_le_bytes());
+        hello.push(0x01);
+        hello.extend_from_slice(&body);
+        sock.write_all(&hello).await.unwrap();
+
+        async fn read_pkt(sock: &mut tokio::net::TcpStream) -> (u8, Vec<u8>) {
+            let mut hdr = [0u8; 6];
+            tokio::time::timeout(std::time::Duration::from_secs(5), sock.read_exact(&mut hdr))
+                .await
+                .expect("no answer")
+                .unwrap();
+            let len = u32::from_le_bytes(hdr[1..5].try_into().unwrap()) as usize;
+            let mut rest = vec![0u8; len - 1];
+            sock.read_exact(&mut rest).await.unwrap();
+            (hdr[5], rest)
+        }
+
+        let _ = read_pkt(&mut sock).await; // hello answer
+
+        // STEP 1: the directory list.
+        sock.write_all(&[0xE3u8, 1, 0, 0, 0, crate::transfer::OP_ASKSHAREDDIRS])
+            .await
+            .unwrap();
+        let (op, body) = read_pkt(&mut sock).await;
+        assert_eq!(
+            op,
+            crate::transfer::OP_ASKSHAREDDIRSANS,
+            "a real eMule's browse (0x5D) was not answered"
+        );
+        assert_eq!(
+            u32::from_le_bytes(body[..4].try_into().unwrap()),
+            1,
+            "expected exactly one pseudo-directory"
+        );
+        let nlen = u16::from_le_bytes(body[4..6].try_into().unwrap()) as usize;
+        let name = body[6..6 + nlen].to_vec();
+        assert_eq!(
+            name,
+            crate::transfer::PADMULE_SHARED_DIR.as_bytes(),
+            "wrong directory name"
+        );
+
+        // STEP 2: list THAT directory - the name must come back echoed, or
+        // eMule cannot match the reply to the folder it asked about.
+        let mut req = vec![0xE3u8];
+        let mut rb = Vec::new();
+        rb.push(crate::transfer::OP_ASKSHAREDFILESDIR);
+        rb.extend_from_slice(&(nlen as u16).to_le_bytes());
+        rb.extend_from_slice(&name);
+        req.extend_from_slice(&(rb.len() as u32).to_le_bytes());
+        req.extend_from_slice(&rb);
+        sock.write_all(&req).await.unwrap();
+
+        let (op2, body2) = read_pkt(&mut sock).await;
+        assert_eq!(
+            op2,
+            crate::transfer::OP_ASKSHAREDFILESDIRANS,
+            "the per-directory listing was not answered"
+        );
+        let elen = u16::from_le_bytes(body2[..2].try_into().unwrap()) as usize;
+        assert_eq!(
+            &body2[2..2 + elen],
+            &name[..],
+            "the directory name must be ECHOED"
+        );
+        let cnt = u32::from_le_bytes(body2[2 + elen..6 + elen].try_into().unwrap());
+        assert_eq!(cnt, 1, "the shared file was not listed");
+        assert!(
+            body2.windows(9).any(|w| w == b"notes.pdf"),
+            "the listing does not name the file"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[tokio::test]
     async fn a_browse_reaches_the_handler_through_the_listener() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};

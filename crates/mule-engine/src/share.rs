@@ -404,6 +404,11 @@ pub fn is_upload_request(op: u8) -> bool {
             // and what the unit test could NOT see, because it called
             // `serve_shared` directly and skipped classification entirely.
             | crate::transfer::OP_ASKSHAREDFILES
+            // And the DIRECTORY flavour, which is the one a real eMule sends -
+            // admitting only 0x4A left the handler unreachable for the exact
+            // client the feature exists for.
+            | crate::transfer::OP_ASKSHAREDDIRS
+            | crate::transfer::OP_ASKSHAREDFILESDIR
             // The AICH asks OPEN a session too, because eMule dials us to make
             // them. `SendAICHRequest` hands the packet to
             // `SafeConnectAndSendPacket`, which - when no socket is connected -
@@ -746,6 +751,26 @@ impl Drop for ServedGuard {
 /// `session.credit` is `Some((store, peer_userhash))` on the live engine path,
 /// so the bytes we upload are accrued against this peer's credit record.
 #[allow(clippy::too_many_arguments)]
+/// The files a browse may list: COMPLETED shares whose bytes are still on disk
+/// at the size we hashed.
+///
+/// The on-disk check is the same one the transfer path uses - the downloads
+/// directory is the user-visible Files folder, so a share can vanish under us,
+/// and advertising a file we would then fail to serve is worse than not listing
+/// it. In-progress downloads can never appear here at all: `library` is built
+/// from known.met.
+fn browsable_library(library: &[SharedFile]) -> Vec<crate::server_messages::OfferedFile<'_>> {
+    library
+        .iter()
+        .filter(|f| matches!(std::fs::metadata(&f.path), Ok(m) if m.len() == f.size))
+        .map(|f| crate::server_messages::OfferedFile {
+            hash: f.hash,
+            name: std::str::from_utf8(&f.name).unwrap_or(""),
+            size: f.size,
+        })
+        .collect()
+}
+
 pub async fn serve_shared<S>(
     fs: &mut FramedStream<S>,
     library: &[SharedFile],
@@ -909,6 +934,72 @@ where
             }
         }
         match pkt.opcode {
+            crate::transfer::OP_ASKSHAREDDIRS => {
+                // WHAT A REAL eMULE SENDS US. It chooses the directory flavour
+                // for any peer that advertised CT_EMULE_VERSION
+                // (BaseClient.cpp:576 sets m_fSharedDirectories, :1749 picks
+                // the opcode), and padMule always sends that tag - so 0x4A
+                // below is the path eMule never takes with us.
+                //
+                // Refusal is its OWN opcode here, unlike the 0x4A flavour which
+                // refuses with an empty list. Upstream does exactly this, and a
+                // client given silence simply hangs.
+                if !allow_browse {
+                    fs.write_packet(&Packet::new(
+                        mule_proto::PROT_EDONKEY,
+                        crate::transfer::OP_ASKSHAREDDENIEDANS,
+                        Vec::new(),
+                    ))
+                    .await?;
+                } else {
+                    let mut w = mule_proto::Writer::new();
+                    w.write_u32(1); // one pseudo-directory
+                    w.write_string_u16(crate::transfer::PADMULE_SHARED_DIR.as_bytes());
+                    fs.write_packet(&Packet::new(
+                        mule_proto::PROT_EDONKEY,
+                        crate::transfer::OP_ASKSHAREDDIRSANS,
+                        w.into_inner(),
+                    ))
+                    .await?;
+                }
+            }
+            crate::transfer::OP_ASKSHAREDFILESDIR => {
+                // "List that directory." The answer ECHOES the requested name
+                // before the count - eMule matches the reply to the folder it
+                // asked about, so returning a different string strands the
+                // listing in its UI.
+                let asked = {
+                    let mut r = mule_proto::Reader::new(&pkt.payload);
+                    r.read_string_u16().unwrap_or_default()
+                };
+                if !allow_browse {
+                    fs.write_packet(&Packet::new(
+                        mule_proto::PROT_EDONKEY,
+                        crate::transfer::OP_ASKSHAREDDENIEDANS,
+                        Vec::new(),
+                    ))
+                    .await?;
+                } else {
+                    let offered = browsable_library(library);
+                    let files = crate::server_messages::build_offer_files(
+                        &offered,
+                        crate::server_messages::FILE_COMPLETE_ID,
+                        crate::server_messages::FILE_COMPLETE_PORT,
+                    );
+                    let mut w = mule_proto::Writer::new();
+                    w.write_string_u16(&asked);
+                    // `build_offer_files` already leads with the u32 count, and
+                    // the record layout after it is identical - so the body is
+                    // the echoed name followed by that packet verbatim.
+                    w.write_bytes(&files.payload);
+                    fs.write_packet(&Packet::new(
+                        mule_proto::PROT_EDONKEY,
+                        crate::transfer::OP_ASKSHAREDFILESDIRANS,
+                        w.into_inner(),
+                    ))
+                    .await?;
+                }
+            }
             crate::transfer::OP_ASKSHAREDFILES => {
                 // eMule's "View Files" on a client. It builds the list ONLY if
                 // CanSeeShares() allows, then sends whatever it built - so a
@@ -925,18 +1016,8 @@ where
                 // The same on-disk check the transfer path uses: a file whose
                 // bytes are gone (or resized) is not ours to advertise, or we
                 // would invite a request we then fail.
-                let offered: Vec<crate::server_messages::OfferedFile<'_>> = if allow_browse {
-                    library
-                        .iter()
-                        .filter(
-                            |f| matches!(std::fs::metadata(&f.path), Ok(m) if m.len() == f.size),
-                        )
-                        .map(|f| crate::server_messages::OfferedFile {
-                            hash: f.hash,
-                            name: std::str::from_utf8(&f.name).unwrap_or(""),
-                            size: f.size,
-                        })
-                        .collect()
+                let offered = if allow_browse {
+                    browsable_library(library)
                 } else {
                     Vec::new()
                 };
