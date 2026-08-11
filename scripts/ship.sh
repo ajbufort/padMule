@@ -119,24 +119,56 @@ if [ "$REMOTE_SHA" != "$SHA" ]; then
   exit 1
 fi
 
-echo "-- dispatching CI on this sha"
-# ALL THREE, and all three are CHECKED below. Until 2026-08-07 this script
-# dispatched the Rust gate and never read its conclusion, and never dispatched
-# the Swift tests at all - so guard 1 ("CI must be GREEN for the exact sha")
-# was true only of the iOS build, and a red workspace would ship. That matters
-# more since row 8ci, because the Swift suite is what RENDERS the views, and
-# rendering is the only thing that can catch a layout bug the accessibility
-# tree reads as correct.
-for wf in "iOS build (unsigned IPA)" "Rust unit gate" "iOS unit tests (simulator)"; do
-  gh workflow run "$wf" --ref "$BRANCH"
+# REUSE AN EXISTING GREEN RUN FOR THIS EXACT SHA (handoff 24, fixed 2026-08-11).
+#
+# This used to dispatch all three unconditionally and then wait on its own
+# fresh runs. A push already triggers the same three, so every ship ran them
+# TWICE and paid the flake lottery a second time for no added evidence. It cost
+# two of six ships on 2026-08-11: `ios-test.yml` failed with "The test runner
+# timed out while preparing to run tests" on a sha whose identical workflow had
+# already passed minutes earlier from the push.
+#
+# THIS DOES NOT WEAKEN GUARD 1. The requirement is that CI be GREEN FOR THE
+# EXACT SHA, and a successful run of that workflow at that sha is that evidence
+# whoever triggered it - `require_green` still re-verifies both conclusion and
+# headSha below. What is dropped is only the redundant re-execution.
+green_run_for () {
+  gh run list --workflow="$1" --limit 20 \
+    --json databaseId,headSha,status,conclusion \
+    -q "[.[] | select(.headSha==\"$SHA\" and .status==\"completed\" and .conclusion==\"success\")][0].databaseId"
+}
+
+WORKFLOWS=("iOS build (unsigned IPA)" "Rust unit gate" "iOS unit tests (simulator)")
+# ALL THREE are still CHECKED below. Until 2026-08-07 this script dispatched the
+# Rust gate and never read its conclusion, and never dispatched the Swift tests
+# at all - so guard 1 was true only of the iOS build, and a red workspace would
+# ship. That matters more since row 8ci, because the Swift suite is what RENDERS
+# the views, and rendering is the only thing that can catch a layout bug the
+# accessibility tree reads as correct.
+DISPATCHED=0
+for wf in "${WORKFLOWS[@]}"; do
+  if [ -n "$(green_run_for "$wf")" ]; then
+    echo "-- $wf: already GREEN for $SHORT, reusing it"
+  else
+    echo "-- dispatching '$wf' on this sha"
+    gh workflow run "$wf" --ref "$BRANCH"
+    DISPATCHED=1
+  fi
 done
-sleep 15
+# Only pay the settle delay if something was actually dispatched.
+[ "$DISPATCHED" = "1" ] && sleep 15
 
 # Find a workflow's run FOR THIS EXACT SHA, wait for it, and require success.
 # --limit 20, not 1: the newest run of a workflow is not necessarily ours (a
 # parallel branch, a re-run), and with --limit 1 a mismatch looked identical to
 # "CI has not started yet".
 run_id_for () {
+  # A GREEN run for this sha wins over the newest one. Without this preference
+  # a re-dispatch (or a parallel re-run) would be picked ahead of an already
+  # successful run of the same workflow at the same commit, which is what made
+  # a flaky runner able to block a ship whose CI had already passed.
+  local green; green=$(green_run_for "$1")
+  if [ -n "$green" ]; then echo "$green"; return; fi
   gh run list --workflow="$1" --limit 20 --json databaseId,headSha \
     -q "[.[] | select(.headSha==\"$SHA\")][0].databaseId"
 }
