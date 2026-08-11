@@ -1774,6 +1774,20 @@ pub struct Engine {
     /// The IP blocklist (ipfilter.dat / .p2p), if the user placed one. Shared with
     /// the listener task so inbound peers are gated too. `None` = no filtering.
     ip_filter: Option<Arc<IpFilter>>,
+    /// The eD2k SERVER we are currently using, as an IPv4 in HOST order
+    /// (`u32::from(Ipv4Addr)`, the convention `IpFilter::is_blocked_u32` holds -
+    /// NOT the byte-reversed met u32 that server.met stores). `0` = none.
+    ///
+    /// Shared with the listener task for ONE purpose: that address is exempt from
+    /// the accept-time blocklist drop, because the server's HighID test is an
+    /// inbound eD2k connection we must ANSWER (see `start_listener`). eMule keeps
+    /// the same fact in `CServerConnect::AwaitingTestFromIP` (ServerConnect.cpp:588)
+    /// and matches the probe by the IP it dialed, exactly as this does.
+    ///
+    /// Set BEFORE the dial and left in place while we hold that server, so the
+    /// direction it can go stale in is over-exemption of the last server the user
+    /// chose - never a missing exemption, which is the one that would cost HighID.
+    server_probe_ip: Arc<std::sync::atomic::AtomicU32>,
     /// When we last issued a SERVER search, for the client-side flood guard
     /// ([`SERVER_SEARCH_MIN_INTERVAL`]). In-memory only; a fresh session may search
     /// at once. `None` = never searched this session.
@@ -1866,6 +1880,7 @@ impl Engine {
             known2,
             credit_store,
             ip_filter: None,
+            server_probe_ip: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             server: None,
             connection: None,
             kad: None,
@@ -2380,10 +2395,28 @@ impl Engine {
     }
 
     /// Bind the inbound peer port and accept connections. This is what earns a
-    /// HighID: the server's HighID test is a bare TCP connect+close (no eD2k
-    /// HELLO), so simply ACCEPTING is enough to pass it. Real peers that follow
-    /// get a proper hello handshake. Idempotent; a bind failure is survivable
-    /// (we just stay LowID).
+    /// HighID - and what that costs is MEASURED, not assumed.
+    ///
+    /// THE SERVER'S HighID TEST IS A FULL eD2k HELLO EXCHANGE, not a bare TCP
+    /// connect. Measured 2026-08-10 against the real Lugdunum eserver 17.15
+    /// (the same isolated oracle as `scripts/eserver-oracle.sh`, given a
+    /// fake-public address so the callback runs at all):
+    ///
+    /// | what our listener did with the probe | eserver's verdict |
+    /// |---|---|
+    /// | nothing listening | LowID, "Your 4662 port is not reachable" |
+    /// | accept, then close at once | LowID, "No answer from your 4662 port" |
+    /// | accept, read OP_HELLO, never answer | no ID at all - login timed out |
+    /// | accept + full handshake (this code) | HighID |
+    ///
+    /// So ACCEPTING IS NOT ENOUGH: the probe sends OP_HELLO and waits for our
+    /// OP_HELLOANSWER, and eserver's own two distinct warnings tell the two
+    /// failures apart. Every earlier comment here said the opposite ("a bare
+    /// connect+close... never completes a handshake"), which is what made moving
+    /// the blocklist check look free. It is not free - see the accept loop.
+    ///
+    /// Real peers that follow get the same hello handshake. Idempotent; a bind
+    /// failure is survivable (we just stay LowID).
     ///
     /// An accepted peer plays one of two roles, told apart by who speaks first
     /// (see [`SERVE_PEEK`]): a LEECHER wants to download from us and sends
@@ -2415,6 +2448,7 @@ impl Engine {
         let sharing = Arc::clone(&self.sharing);
         let gate = Arc::clone(&self.upload_gate);
         let ip_filter = self.ip_filter.clone();
+        let server_probe_ip = Arc::clone(&self.server_probe_ip);
         let known2 = Arc::clone(&self.known2);
         let inbound = Arc::new(Semaphore::new(MAX_INBOUND_CONNS));
         let per_ip: PerIpConns = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
@@ -2430,6 +2464,42 @@ impl Engine {
                         continue;
                     }
                 };
+                // BLOCKLIST, AT ACCEPT - before a byte is read or written.
+                //
+                // This used to run only after the hello handshake, which meant a
+                // peer the user has explicitly blocked was first HANDED OUR
+                // IDENTITY: OP_HELLOANSWER carries our userhash, nickname, ports
+                // and capabilities. A blocklist that introduces you to the blocked
+                // party before hanging up is doing half its job. Both authorities
+                // filter here instead: eMule ListenSocket.cpp:2038 (the WSAAccept
+                // condition, which rejects before the connection is even handed up)
+                // and :2152 right after Accept(); aMule ClientTCPSocket.cpp:101 in
+                // InitNetworkData(), called straight from CListenSocket::OnAccept.
+                //
+                // THE ONE EXEMPTION: the eD2k server we are using. Its HighID test
+                // is a full hello exchange (see this function's doc table), so
+                // dropping it here costs HighID outright. Upstream needs no such
+                // exemption because it refuses to CONNECT to a filtered server at
+                // all (aMule ServerSocket.cpp:728, and ServerList.cpp:1009 even
+                // disconnects the current server if the list starts covering it;
+                // eMule ServerSocket.cpp:91) - padMule has no such gate, so it
+                // must carry the exemption instead. It is deliberately narrow: the
+                // exempted connection still meets the post-handshake check below,
+                // so a blocklisted server gets its answer and nothing more.
+                //
+                // HOST ORDER on both sides: `is_blocked` converts the `Ipv4Addr`
+                // itself, and `server_probe_ip` stores `u32::from(Ipv4Addr)`. No
+                // met u32 comes near this comparison - that conversion is the one
+                // this project has shipped backwards three times.
+                if let (Some(f), SocketAddr::V4(v4)) = (&ip_filter, peer) {
+                    let ip = *v4.ip();
+                    let is_our_server = u32::from(ip) == server_probe_ip.load(Ordering::Relaxed)
+                        && u32::from(ip) != 0;
+                    if !is_our_server && f.is_blocked(ip) {
+                        drop(stream);
+                        continue;
+                    }
+                }
                 // Cap concurrent inbound connections: a hostile peer opening
                 // thousands would exhaust fds/tasks. Reject the excess (it can
                 // retry); the permit frees when the connection task ends.
@@ -2466,9 +2536,8 @@ impl Engine {
                     // EncryptedStreamSocket.cpp:214): a plaintext eD2k marker stays
                     // plaintext (byte-identical to the old path); anything else runs
                     // the RC4 responder keyed on OUR userhash. This is what advertising
-                    // crypt-SUPPORTED obligates. A bare connect+close (the server's
-                    // HighID probe) reads no first byte, errors here, and bails - the
-                    // accept already succeeded, so HighID is unaffected.
+                    // crypt-SUPPORTED obligates. A connection that sends no first byte
+                    // errors here and bails.
                     let detect = timeout(
                         Duration::from_secs(8),
                         obf_accept(&mut stream, &me.user_hash),
@@ -2482,8 +2551,10 @@ impl Engine {
                         }
                         _ => return,
                     };
-                    // A bare connect+close (the server's HighID probe) ends here:
-                    // it never sends OP_HELLO, so the handshake errors and we bail.
+                    // Anything that never sends OP_HELLO ends here: the handshake
+                    // errors and we bail. The server's HighID probe DOES send one
+                    // (see this function's doc) and gets its OP_HELLOANSWER below,
+                    // which is the whole reason HighID works.
                     let (
                         peer_hash,
                         peer_accept_comment,
@@ -2539,10 +2610,14 @@ impl Engine {
                     // Record the contact so its credit record exists + last_seen is
                     // fresh (mirrors eMule's GetCredit at hello).
                     credit_store.touch(peer_hash, now_secs());
-                    // Drop a blocklisted PEER now (after the handshake, so the
-                    // server's bare-connect HighID probe - which never completes a
-                    // handshake and already returned above - is never filtered and
-                    // HighID is safe).
+                    // The blocklist again, and it is NOT redundant: the accept-time
+                    // drop above exempts the eD2k server we are using, so this is
+                    // where that exemption ends. A blocklisted server gets its hello
+                    // answered (HighID) and is then dropped before it can be served
+                    // or drive a download. Every other blocked address was already
+                    // gone at accept and never reaches this line. aMule keeps a
+                    // second check for the same defense-in-depth reason
+                    // (ClientTCPSocket.cpp:2026, on every packet received).
                     if let (Some(f), SocketAddr::V4(v4)) = (&ip_filter, peer) {
                         if f.is_blocked(*v4.ip()) {
                             return;
@@ -2784,6 +2859,21 @@ impl Engine {
         tx
     }
 
+    /// Publish (or clear) the address whose inbound connections skip the
+    /// accept-time blocklist drop - the eD2k server we are using, and nothing
+    /// else. IPv6 and `None` both clear it; the listener treats `0` as "no
+    /// exemption", so a peer at 0.0.0.0 can never match.
+    ///
+    /// HOST order (`u32::from(Ipv4Addr)`), the same convention the filter itself
+    /// holds. Not the met u32.
+    fn set_server_probe_ip(&self, addr: Option<SocketAddr>) {
+        let v = match addr {
+            Some(SocketAddr::V4(v4)) => u32::from(*v4.ip()),
+            _ => 0,
+        };
+        self.server_probe_ip.store(v, Ordering::Relaxed);
+    }
+
     /// Connect to ONE specific server the user chose (eMule never auto-connects).
     /// Disconnects any current server first. Returns true on success. Records the
     /// connection + announces our shared library. Kad + downloads are untouched.
@@ -2798,6 +2888,13 @@ impl Engine {
         // A new connection means the server no longer holds our last query, so any
         // "load more" session is stale even if we reconnect to the SAME address.
         self.search_session = None;
+        // Exempt this address from the listener's accept-time blocklist drop, and
+        // do it BEFORE the dial: the HighID test arrives DURING login, between our
+        // OP_LOGINREQUEST and the server's OP_IDCHANGE, so an exemption published
+        // after `connect()` returns would be published too late. eMule's own
+        // `AwaitingTestFromIP` reads the connection ATTEMPT (CS_WAITFORLOGIN), not
+        // the established server, for exactly this reason.
+        self.set_server_probe_ip(Some(addr));
         let login = self.login_request();
         let tx = self.server_sender();
         let mut link = ServerLink::new(addr, login, tx);
@@ -2870,6 +2967,8 @@ impl Engine {
         }
         self.connection = None;
         self.search_session = None;
+        // No server, no probe to expect: the blocklist exemption ends here.
+        self.set_server_probe_ip(None);
         self.emit(EngineEvent::Server("Disconnected from the server".into()));
         self.emit_online_status();
     }
@@ -4889,6 +4988,9 @@ impl Engine {
                 self.server = None;
                 self.connection = None;
                 self.search_session = None;
+                // Same as disconnect_server: we no longer hold that server, so
+                // stop exempting its address from the inbound blocklist.
+                self.set_server_probe_ip(None);
             }
             self.start_kad().await;
             // Re-drive in-progress downloads: while suspended, iPadOS reclaimed the
@@ -10188,6 +10290,208 @@ mod tests {
         let cyrillic = "\u{044f}".repeat(60);
         engine.set_nickname(&cyrillic);
         assert_eq!(engine.nickname().chars().count(), MAX_NICK_LEN);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // THE INBOUND BLOCKLIST GATE
+    // -----------------------------------------------------------------------
+
+    /// A free loopback port, learned from the OS and released. `start_listener`
+    /// MOVES its listener into a spawned task, so there is no way to ask it what
+    /// it bound - and these tests run in parallel with each other, which is
+    /// exactly how the hardcoded-4662 flake in `seeding_keeps_the_listener_up...`
+    /// was born.
+    fn free_local_port() -> u16 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        drop(l);
+        port
+    }
+
+    /// A filter that blocks ALL of loopback - the only address an inbound test
+    /// can arrive from here.
+    fn loopback_blocklist() -> Arc<IpFilter> {
+        Arc::new(IpFilter::parse(
+            "127.0.0.0 - 127.255.255.255 , 0 , test\n",
+            DEFAULT_IPFILTER_LEVEL,
+        ))
+    }
+
+    /// Dial `port` and run the inbound half of the eD2k handshake against it,
+    /// exactly as both a real peer and the SERVER'S HighID PROBE do: OP_HELLO
+    /// out, OP_HELLOANSWER back. `Ok(())` means we got the answer - i.e. padMule
+    /// disclosed its userhash, nick, ports and capabilities to us.
+    async fn hello_into(port: u16) -> Result<(), String> {
+        let stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .map_err(|e| format!("connect: {e}"))?;
+        let mut fs = crate::framed::FramedStream::new(stream);
+        let me = HelloInfo::baseline([0x5A; 16], 0, 4662, 4672, "probe");
+        match timeout(
+            Duration::from_secs(5),
+            crate::peer_conn::peer_handshake_outbound(&mut fs, &me),
+        )
+        .await
+        {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(e)) => Err(format!("{e}")),
+            Err(_) => Err("timed out".into()),
+        }
+    }
+
+    /// THE POINT OF A BLOCKLIST: a peer the user has blocked must not be handed
+    /// our identity first. Until 2026-08-10 the check ran only after the hello
+    /// handshake, so every blocked peer received OP_HELLOANSWER - our userhash,
+    /// nickname, ports and capabilities - and only then got hung up on.
+    ///
+    /// The control arm is the same client against a listener with NO filter, so
+    /// a red here cannot be "the test client is broken" or "the listener never
+    /// came up".
+    ///
+    /// Mutation check: delete the accept-time gate in `start_listener` (the
+    /// post-handshake one still stands) and the blocked arm goes red while the
+    /// control stays green.
+    #[tokio::test]
+    async fn a_blocklisted_peer_never_gets_our_hello() {
+        let dir = tmp("inbound-blocked");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut blocked, _rx) = Engine::new(&dir).unwrap();
+        let blocked_port = free_local_port();
+        blocked.set_ports(blocked_port, blocked_port, 0, 4672);
+        blocked.ip_filter = Some(loopback_blocklist());
+        blocked.start_listener().await;
+        assert!(
+            blocked.listener.is_some(),
+            "precondition: a listener exists"
+        );
+
+        let cdir = tmp("inbound-control");
+        let _ = std::fs::remove_dir_all(&cdir);
+        std::fs::create_dir_all(&cdir).unwrap();
+        let (mut control, _crx) = Engine::new(&cdir).unwrap();
+        let control_port = free_local_port();
+        control.set_ports(control_port, control_port, 0, 4672);
+        control.start_listener().await;
+
+        assert_eq!(
+            hello_into(control_port).await,
+            Ok(()),
+            "CONTROL: an unfiltered listener answers the hello"
+        );
+        assert!(
+            hello_into(blocked_port).await.is_err(),
+            "a blocklisted peer was answered - our userhash, nick and ports went \
+             to an address the user blocked"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&cdir);
+    }
+
+    /// THE BEHAVIOR THE ACCEPT-TIME GATE COULD HAVE COST, and the reason it
+    /// carries an exemption at all.
+    ///
+    /// MEASURED against real Lugdunum eserver 17.15 on 2026-08-10: the HighID
+    /// test is a full eD2k hello exchange, not a bare TCP connect. Accepting and
+    /// closing at once earned LowID ("No answer from your 4662 port"); accepting
+    /// and never answering earned no ID at all; only the full handshake earned
+    /// HighID. So the address we are logging in to must reach the handshake even
+    /// when the user's list covers it.
+    ///
+    /// Mutation check: drop the `is_our_server` term from the accept-time gate
+    /// and this goes red while `a_blocklisted_peer_never_gets_our_hello` stays
+    /// green - the pair is what pins the exemption's SHAPE.
+    #[tokio::test]
+    async fn the_servers_highid_probe_is_answered_even_when_its_address_is_blocklisted() {
+        let dir = tmp("inbound-probe-exempt");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+        let port = free_local_port();
+        engine.set_ports(port, port, 0, 4672);
+        engine.ip_filter = Some(loopback_blocklist());
+        // The server we are "using" is on loopback - the same address the
+        // blocklist covers, which is the whole conflict.
+        engine.set_server_probe_ip(Some("127.0.0.1:4661".parse().unwrap()));
+        engine.start_listener().await;
+
+        assert_eq!(
+            hello_into(port).await,
+            Ok(()),
+            "the HighID probe was dropped by the blocklist - this is LowID"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The plumbing end to end: the exemption must be live DURING the login,
+    /// because that is when the probe arrives - between our OP_LOGINREQUEST and
+    /// the server's OP_IDCHANGE. A mock server does exactly that: it reads the
+    /// login, dials our listener back and runs the hello exchange, and only then
+    /// answers with an ID.
+    ///
+    /// Then it disconnects and probes AGAIN from the same address with the same
+    /// filter: that second probe must be dropped. Same address, same list, one
+    /// difference - so the test cannot pass by accident of the address.
+    ///
+    /// Mutation checks: remove the `set_server_probe_ip(Some(addr))` from
+    /// `connect_to_server` and the first assertion goes red; remove the
+    /// `set_server_probe_ip(None)` from `disconnect_server` and the last one
+    /// does.
+    #[tokio::test]
+    async fn connecting_to_a_server_exempts_its_address_for_the_probe_and_stops_after() {
+        let dir = tmp("inbound-probe-plumbing");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+        let port = free_local_port();
+        engine.set_ports(port, port, 0, 4672);
+        engine.ip_filter = Some(loopback_blocklist());
+        engine.start_listener().await;
+
+        // The mock server: login in, PROBE back, then OP_IDCHANGE.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let probed: Arc<std::sync::Mutex<Option<Result<(), String>>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let rec = Arc::clone(&probed);
+        tokio::spawn(async move {
+            if let Ok((sock, _)) = listener.accept().await {
+                let mut sfs = crate::framed::FramedStream::new(sock);
+                if sfs.read_packet().await.is_err() {
+                    return;
+                }
+                *rec.lock().unwrap() = Some(hello_into(port).await);
+                let _ = sfs
+                    .write_packet(&mule_proto::Packet::new(
+                        mule_proto::PROT_EDONKEY,
+                        crate::server_messages::OP_IDCHANGE,
+                        0x0A00_0001u32.to_le_bytes().to_vec(),
+                    ))
+                    .await;
+                // Hold the link open until the engine hangs up.
+                let _ = sfs.read_packet().await;
+                let _ = sfs.read_packet().await;
+            }
+        });
+
+        assert!(
+            engine.connect_to_server(server_addr).await,
+            "precondition: the mock login succeeded"
+        );
+        assert_eq!(
+            probed.lock().unwrap().clone(),
+            Some(Ok(())),
+            "the server's probe was refused DURING login - the exemption was \
+             published too late, or not at all"
+        );
+
+        engine.disconnect_server().await;
+        assert!(
+            hello_into(port).await.is_err(),
+            "the exemption outlived the server: a blocklisted address is still \
+             being answered after disconnect"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
