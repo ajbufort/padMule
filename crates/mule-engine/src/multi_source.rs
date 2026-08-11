@@ -870,6 +870,15 @@ impl Download {
         self.stopped.store(true, Ordering::Relaxed);
         self.set_paused(true).await;
         self.sources.lock().await.clear();
+        // The POOL COUNTERS have to go with the list, and this was a real
+        // defect found on glass: `sources` is what the engine dials, but the
+        // ROW renders `idlePoolLabel(found:callback:)` from these two, so a
+        // stopped download went on saying "0 of 3 connected" about three
+        // sources it had just released - contradicting its own VoiceOver line.
+        // Dropping the list and leaving the count is the half-updated state
+        // this project keeps meeting: one datum moved, its display did not.
+        self.sources_found.store(0, Ordering::Relaxed);
+        self.sources_callback.store(0, Ordering::Relaxed);
     }
 
     /// Whether the USER stopped this download (eMule `IsStopped`). Cleared by

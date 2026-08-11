@@ -8773,6 +8773,8 @@ mod tests {
         )
         .await;
         assert_eq!(dl.sources().await.len(), 1, "precondition: one source held");
+        dl.note_source_pool(3, 1);
+        assert_eq!(dl.source_pool(), (3, 1), "precondition: a pool is recorded");
         engine.downloads.lock().await.push(dl);
 
         assert!(engine.stop_download([0xBC; 16]).await, "should stop");
@@ -8782,6 +8784,15 @@ mod tests {
         assert!(
             dl.sources().await.is_empty(),
             "every source held must be dropped"
+        );
+        // FOUND ON GLASS 2026-08-11: the row renders its source line from the
+        // POOL COUNTERS, not from `sources`, so clearing only the list left a
+        // stopped download saying "0 of 3 connected" about sources it had just
+        // released. Both have to go.
+        assert_eq!(
+            dl.source_pool(),
+            (0, 0),
+            "the pool counters the ROW renders must be cleared too"
         );
         assert!(
             dir.join("001.part").exists() && dir.join("001.part.met").exists(),
