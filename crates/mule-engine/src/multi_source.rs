@@ -19,6 +19,7 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Mutex;
@@ -354,6 +355,28 @@ struct Inner {
     /// is carried alongside rather than left implicit, and the UI says it out
     /// loud instead of overstating.
     status_reports: u32,
+    /// Bytes committed since the `.part.met` was last written, and when that
+    /// was. Together they throttle the gap-list flush on the receive path -
+    /// see [`MET_SAVE_BYTES`]. Held INSIDE the lock rather than as atomics
+    /// because the only reader is `commit`, which already holds it to close
+    /// the gap: the decision and the save are then one critical section and
+    /// two concurrent sessions cannot both decide to save.
+    since_met_save: u64,
+    met_saved_at: Instant,
+}
+
+impl Inner {
+    /// Write the gap list to `part.met` and restart the throttle window.
+    ///
+    /// Best effort, like every other durability-boundary flush here: a failed
+    /// met write leaves the live gap list correct for this session, and the
+    /// window restarts either way so a persistently failing disk cannot turn
+    /// the receive path into a retry loop.
+    fn save_met(&mut self) {
+        let _ = self.store.save_met();
+        self.since_met_save = 0;
+        self.met_saved_at = Instant::now();
+    }
 }
 
 /// Once the file is within this many bytes of complete, a peer that finds all
@@ -361,6 +384,58 @@ struct Inner {
 /// peer can't stall the last block. Kept small (a few blocks) so the redundant
 /// re-requests only touch the tail of the download.
 const ENDGAME_LIMIT: u64 = 4 * crate::transfer::EMBLOCKSIZE;
+
+/// How much received data may accumulate before [`Download::commit`] writes the
+/// gap list out to `part.met`, and the time cap that catches a slow transfer
+/// which would never reach it.
+///
+/// THE GUARANTEE, in one line: an unclean stop loses at most one PART's worth of
+/// received data, or 60 seconds of it, whichever is less. Above ~155 KB/s the
+/// byte rule governs; below it the clock does.
+///
+/// Both authorities throttle the same way and for the same reason. eMule 0.50a
+/// flushes its write buffer when the buffer passes `GetFileBufferSize()`
+/// (default 256 KiB, Preferences.cpp:2252-2254) OR `GetFileBufferTimeLimit()`
+/// elapses (default 60 s, Preferences.cpp:2258) - PartFile.cpp:2518-2523 - and
+/// each `FlushBuffer` ends in `SavePartFile()` (PartFile.cpp:4941, in the
+/// try-block :4728-4990 of the function that opens at :4702). aMule triggers on
+/// the same pair, with
+/// `BUFFER_TIME_LIMIT` 60000ms (amule-3.0.1 PartFile.h:46,
+/// PartFile.cpp:1504-1508), and in the in-tree oracle the save is additionally
+/// gated on a dirty flag (PartFile.cpp:3475-3478) - noted as what that tree
+/// does, not as a claim about pristine upstream, since both aMule trees here
+/// carry local modifications around this code.
+///
+/// padMule takes the SHAPE (size limit or time limit) and not the size:
+/// upstream's threshold is a WRITE BUFFER, and padMule has no write buffer -
+/// every block is written and fdatasync'd as it lands (`part_store` module
+/// docs). So the size is chosen in padMule's own unit.
+///
+/// One part is deliberately chosen over "save when a part COMPLETES", which is
+/// the more obvious boundary and a strictly WEAKER one: several parts are in
+/// flight at once, so an arbitrary amount of work can accumulate across
+/// incomplete parts before any single one closes. A byte count bounds that
+/// directly and needs no completion tracking.
+///
+/// COST, measured on the dev box 2026-08-10: `save_met` takes 135us for the
+/// worst realistic met (a 4GB file - 442 part hashes and 400 gaps, 18.9KB
+/// written) and 82us for a small one. It is a `write` + two `rename`s with no
+/// fsync. At one save per part that is 135us per ~53 block writes, against the
+/// 6.3ms p99 each of those blocks already spends in write+fdatasync: about
+/// 0.04% added to the receive path, and 0.2% write amplification. It runs
+/// INLINE under the `inner` lock the commit already holds - 135us is not worth
+/// a `spawn_blocking` hop, and it is three orders of magnitude below the 207ms
+/// on-reactor spike that motivated moving the block write off it (ba39dc4).
+const MET_SAVE_BYTES: u64 = PARTSIZE;
+const MET_SAVE_EVERY: Duration = Duration::from_secs(60);
+
+/// Is the gap list due to be written out? Both arms of [`MET_SAVE_BYTES`] as one
+/// pure predicate, so the policy is testable without moving a part's worth of
+/// bytes or waiting a minute - and so `commit` carries no condition of its own
+/// that could drift away from the tested one.
+fn met_save_due(since_save: u64, elapsed: Duration) -> bool {
+    since_save >= MET_SAVE_BYTES || elapsed >= MET_SAVE_EVERY
+}
 
 /// How recently bytes must have landed for a row to KEEP its slot under the
 /// max-active cap (the `receiving` field of [`Download::admission_row`]).
@@ -436,6 +511,8 @@ impl Download {
                 store,
                 availability: vec![0u32; parts],
                 status_reports: 0,
+                since_met_save: 0,
+                met_saved_at: Instant::now(),
             }),
             sources: Mutex::new(Vec::new()),
             cancelled: AtomicBool::new(false),
@@ -774,13 +851,16 @@ impl Download {
         let _ = g.store.save_met();
     }
 
-    /// Flush this download's on-disk `.part.met` (its gap list + priority). The hot
-    /// receive path (`commit`) only fills the IN-MEMORY gap list, so without a flush
-    /// on the durability boundary a suspend-kill loses ALL session progress and
-    /// re-downloads from scratch. Called from `pause()`/`shutdown()`.
+    /// Flush this download's on-disk `.part.met` (its gap list + priority) at a
+    /// durability boundary - `pause()`, `shutdown()`, and the engine's periodic
+    /// checkpoint. `commit` now keeps the met within one part of the truth on
+    /// its own, so this is no longer the ONLY thing standing between a
+    /// suspend-kill and a restart from zero; it still makes a clean boundary
+    /// exact rather than approximate. Restarts the receive path's throttle
+    /// window, since the met is durable as of now.
     pub async fn persist(&self) {
         let mut g = self.inner.lock().await;
-        let _ = g.store.save_met();
+        g.save_met();
     }
 
     /// Whether preview mode is on (first+last-then-sequential block bias).
@@ -1052,6 +1132,22 @@ impl Download {
             .map_err(io::Error::other)??;
         let mut g = self.inner.lock().await;
         g.store.pf.fill_gap(start, start + data.len() as u64);
+        // ...and get that gap list ONTO DISK on a throttle, because closing it
+        // in memory is all this used to do. `PartStore::open` rebuilds the gap
+        // list from part.met, so a met that never advances makes every resume
+        // path a no-op: the engine only got away with it via
+        // `maintain_checkpoint`'s 300s `persist_downloads`, and `mule-cli
+        // peer-download` runs no maintenance at all, so its met NEVER advanced
+        // (a 3-hour run against a real eMule kept 636KB and re-downloaded
+        // ~102MB over the top of it on the next attempt, 2026-08-10). Here
+        // rather than in either caller because `download_from_peer_at` is the
+        // ONE receive loop both the engine and the CLI drive, and this is the
+        // one place in it that knows bytes became durable. See
+        // [`MET_SAVE_BYTES`] for the cadence and what it costs.
+        g.since_met_save += data.len() as u64;
+        if met_save_due(g.since_met_save, g.met_saved_at.elapsed()) {
+            g.save_met();
+        }
         Ok(())
     }
 
@@ -2493,6 +2589,92 @@ mod tests {
         dl.commit(0, &data, None).await.unwrap();
         assert!(dl.is_complete().await);
         assert_eq!(std::fs::read(&part_path).unwrap(), data);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The receive path's met-flush throttle, both arms and both boundaries.
+    /// The BYTE arm is what the resume test below drives; the CLOCK arm is the
+    /// one that carried the measured incident - 636KB over three hours never
+    /// comes within three orders of magnitude of a part, so without it that
+    /// session would still have persisted nothing at all.
+    #[test]
+    fn the_met_flush_is_due_on_either_a_part_of_bytes_or_a_minute() {
+        // The common case: a block or two in, seconds old. Neither arm.
+        assert!(!met_save_due(EMBLOCKSIZE, Duration::from_secs(1)));
+        assert!(!met_save_due(0, Duration::ZERO));
+        // The BYTE arm, at its boundary and one byte below it.
+        assert!(met_save_due(MET_SAVE_BYTES, Duration::ZERO));
+        assert!(!met_save_due(MET_SAVE_BYTES - 1, Duration::ZERO));
+        // The CLOCK arm ALONE, at its boundary and one millisecond below.
+        assert!(met_save_due(0, MET_SAVE_EVERY));
+        assert!(!met_save_due(0, MET_SAVE_EVERY - Duration::from_millis(1)));
+        // The incident's own rate (~59 B/s): due on the clock, nowhere near
+        // due on the bytes.
+        assert!(met_save_due(3_600, Duration::from_secs(61)));
+    }
+
+    /// RESUME AFTER AN UNCLEAN STOP - the precondition every resume path
+    /// depends on, and the one nobody had tested.
+    ///
+    /// `PartStore::open` rebuilds the gap list FROM `part.met`, so resuming is
+    /// worth nothing unless the met ADVANCES while bytes are landing. It did
+    /// not: `commit` closes the gap IN MEMORY, and the only writers were user
+    /// actions (`set_paused`/`set_priority`) plus the engine's 300s
+    /// `maintain_checkpoint`, which `mule-cli peer-download` never runs at all.
+    /// Measured on 2026-08-10: a 3-hour session against a real eMule committed
+    /// 636KB, and the next run into the same out-path resumed a met that said
+    /// nothing was done and re-downloaded ~102MB over the top of correct bytes.
+    ///
+    /// So this test takes bytes in through the REAL path (`commit`) and then
+    /// the process simply GOES AWAY - no pause, no priority change, no
+    /// `persist()`, no `verify_ready_parts()`. What the reopened met claims
+    /// must have shrunk.
+    ///
+    /// Stated in PARTSIZE, not in the throttle constant, because PARTSIZE is
+    /// the GUARANTEE: at most one part's worth of received data is ever lost to
+    /// an unclean stop. A throttle raised past that breaks the promise and this
+    /// goes red, which is the point.
+    #[tokio::test]
+    async fn progress_survives_an_unclean_stop_with_no_user_action() {
+        let dir = tmpdir("unclean-resume");
+        let size = PARTSIZE + 4096;
+        let store = PartStore::create(&dir, 1, [0x7C; 16], size, b"unclean.bin").unwrap();
+        let dl = Download::new(store);
+
+        // One block in. The met must NOT be rewritten per block - the receive
+        // path is hot, and a save per 180KB block is the naive fix this
+        // project's off-reactor write work (ba39dc4) exists to avoid.
+        let block = vec![0xA5u8; EMBLOCKSIZE as usize];
+        dl.commit(0, &block, None).await.unwrap();
+        assert_eq!(
+            PartStore::open(&dir, 1).unwrap().pf.missing(),
+            size,
+            "one block must not trigger a met write"
+        );
+
+        // Now a whole part's worth, in the block sizes the wire delivers.
+        let mut off = EMBLOCKSIZE;
+        while off < PARTSIZE {
+            let n = EMBLOCKSIZE.min(PARTSIZE - off) as usize;
+            dl.commit(off, &block[..n], None).await.unwrap();
+            off += n as u64;
+        }
+        assert_eq!(dl.missing().await, 4096, "in memory: only the tail is left");
+
+        // THE UNCLEAN STOP. Nothing else runs - this is jetsam, or the CLI
+        // harness's own timeout, or the user force-quitting.
+        drop(dl);
+
+        let resumed = PartStore::open(&dir, 1).unwrap();
+        assert!(
+            resumed.pf.missing() < size,
+            "the met never advanced: resume would re-download everything"
+        );
+        assert_eq!(
+            resumed.pf.missing(),
+            4096,
+            "a completed part's worth of progress must be on disk"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

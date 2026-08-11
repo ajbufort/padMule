@@ -1297,7 +1297,7 @@ async fn cmd_peer_download(
         peer_supports,
     });
 
-    match timeout(
+    let outcome = timeout(
         Duration::from_secs(120),
         download_from_peer_at(
             &mut fs,
@@ -1310,8 +1310,18 @@ async fn cmd_peer_download(
             },
         ),
     )
-    .await
-    {
+    .await;
+
+    // The end of the window is this harness's CLEAN durability boundary - the
+    // engine has `pause()`/`shutdown()`, the CLI has here. `commit` keeps the
+    // met within one part of the truth by itself; this makes the handoff to the
+    // NEXT invocation exact instead, which is the whole point of a harness that
+    // is expected to be run again into the same out-path. No bytes can arrive
+    // after the future above resolved, so one flush here covers every way the
+    // rest of this function returns.
+    dl.persist().await;
+
+    match outcome {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => {
             eprintln!("download failed: {e:?}");
