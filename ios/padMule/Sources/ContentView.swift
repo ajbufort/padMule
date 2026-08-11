@@ -1113,13 +1113,26 @@ struct ContentView: View {
 
             Button {
                 // The lifecycle decision (already connected? engine stopped?)
-                // is connectServer's, in ONE place. PRE-EXISTING AND KNOWN:
-                // this `srv.alive` gate leaves a no-reply row's tap inert,
-                // although the SELECTABLE comment below intends a TCP attempt
-                // (44ba972 enabled the rows but left this gate). Kept
-                // unchanged by the stopped-engine fix, which is about the
-                // engine half of the tap, not the row half.
-                if srv.alive { model.connectServer(srv.addr) }
+                // is connectServer's, in ONE place.
+                //
+                // NO `srv.alive` GATE. It used to be here, and it made every
+                // "no reply" row's tap silently inert - 44ba972 made the rows
+                // SELECTABLE and left the gate behind, so the row invited a
+                // tap and then did nothing. THE PROBE IS UDP AND THE LOGIN IS
+                // TCP: "no reply" means the status ping went unanswered, which
+                // plenty of networks and filters cause on their own, and says
+                // nothing about whether a TCP login would succeed. The status
+                // column already tells the user the ping failed; refusing the
+                // tap on top of that decides for them.
+                //
+                // It also BLOCKED A SECURITY TEST (handoff 15, promoted
+                // 2026-08-11): verifying 35f's server-probe exemption needs the
+                // server's own /24 blocklisted, which filters that server's UDP
+                // status reply - so the row never went alive, its tap did
+                // nothing, and the login the test depends on was never
+                // attempted. The gate disabled the only control that could
+                // start the exercise.
+                model.connectServer(srv.addr)
             } label: {
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
