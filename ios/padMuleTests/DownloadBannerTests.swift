@@ -30,6 +30,7 @@ final class DownloadBannerTests: XCTestCase {
         name: String = "file.bin",
         complete: Bool = false,
         paused: Bool = false,
+        stopped: Bool = false,
         queued: Bool = false
     ) -> DownloadInfo {
         DownloadInfo(
@@ -44,6 +45,7 @@ final class DownloadBannerTests: XCTestCase {
             preview: false,
             contiguousPrefix: 0,
             paused: paused,
+            stopped: stopped,
             queued: queued,
             receiving: false,
             sourcesServer: 0,

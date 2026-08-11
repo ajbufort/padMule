@@ -16,7 +16,7 @@ final class TransferRowStateTests: XCTestCase {
     func testDoneBeatsEverything() {
         XCTAssertEqual(
             TransferRowState.badge(
-                complete: true, engineStopped: true, filePaused: true, queued: true),
+                complete: true, engineStopped: true, fileStopped: false, filePaused: true, queued: true),
             .done)
     }
 
@@ -28,28 +28,57 @@ final class TransferRowStateTests: XCTestCase {
     func testEngineStoppedShowsPausedEvenForAQueuedRow() {
         XCTAssertEqual(
             TransferRowState.badge(
-                complete: false, engineStopped: true, filePaused: false, queued: true),
+                complete: false, engineStopped: true, fileStopped: false, filePaused: false, queued: true),
             .paused)
     }
 
     func testFilePausedSaysPausedAndBeatsQueued() {
         XCTAssertEqual(
             TransferRowState.badge(
-                complete: false, engineStopped: false, filePaused: true, queued: true),
+                complete: false, engineStopped: false, fileStopped: false, filePaused: true, queued: true),
             .paused)
     }
 
     func testQueuedSaysQueued() {
         XCTAssertEqual(
             TransferRowState.badge(
-                complete: false, engineStopped: false, filePaused: false, queued: true),
+                complete: false, engineStopped: false, fileStopped: false, filePaused: false, queued: true),
             .queued)
     }
 
     func testAnActiveRowHasNoBadge() {
         XCTAssertNil(
             TransferRowState.badge(
-                complete: false, engineStopped: false, filePaused: false, queued: false))
+                complete: false, engineStopped: false, fileStopped: false, filePaused: false, queued: false))
+    }
+
+
+    /// STOP is a distinct badge and must beat the file's own pause, because
+    /// stop pauses on the way through: a stopped row is ALWAYS also paused, so
+    /// testing pause first would swallow every stopped row and the action
+    /// would be invisible on screen - which is the whole reason the flag was
+    /// surfaced through the FFI at all.
+    func testFileStoppedSaysStoppedAndBeatsFilePaused() {
+        XCTAssertEqual(
+            TransferRowState.badge(
+                complete: false, engineStopped: false, fileStopped: true,
+                filePaused: true, queued: true),
+            .stopped)
+    }
+
+    /// The ENGINE being stopped still wins: when nothing is running every row
+    /// is halted for the same reason, and saying "Stopped" on one of them
+    /// would imply a per-file state the user never chose.
+    func testEngineStoppedBeatsAFileStoppedRow() {
+        XCTAssertEqual(
+            TransferRowState.badge(
+                complete: false, engineStopped: true, fileStopped: true,
+                filePaused: true, queued: true),
+            .paused)
+    }
+
+    func testStoppedLabelIsExactly() {
+        XCTAssertEqual(TransferRowState.Badge.stopped.label, "Stopped")
     }
 
     /// The `engineStopped` input, derived from the ENGINE state: every

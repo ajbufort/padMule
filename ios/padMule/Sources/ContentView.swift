@@ -1609,6 +1609,7 @@ struct ContentView: View {
                 if let badge = TransferRowState.badge(
                     complete: dl.complete,
                     engineStopped: TransferRowState.engineStopped(model.state),
+                    fileStopped: dl.stopped,
                     filePaused: dl.paused,
                     queued: dl.queued)
                 {

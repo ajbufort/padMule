@@ -1113,12 +1113,14 @@ final class EngineModel: ObservableObject {
         }
         let badge = TransferRowState.badge(
             complete: row.complete, engineStopped: engineStopped,
-            filePaused: row.paused, queued: row.queued)
+            fileStopped: row.stopped, filePaused: row.paused, queued: row.queued)
         switch badge {
         case nil:
             return "Downloading \"\(row.name)\"."
         case .queued?:
             return "\"\(row.name)\" is queued - it starts when a download slot frees."
+        case .stopped?:
+            return "\"\(row.name)\" is stopped - its sources were released."
         case .paused?, .done?:
             return nil
         }

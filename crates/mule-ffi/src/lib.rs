@@ -213,6 +213,16 @@ pub struct DownloadInfo {
     /// USER-paused (eMule 0.70b PauseFile): not driven until resumed, and the
     /// flag survives a restart. The row says "Paused".
     pub paused: bool,
+    /// USER-stopped (eMule 0.70b StopFile). A stopped row is ALSO paused - stop
+    /// pauses on the way through - so this is the narrower flag and the row
+    /// must test it FIRST or every stopped row reads as merely "Paused".
+    ///
+    /// It exists because without it Stop is invisible: the user taps Stop, the
+    /// row still says "Paused", and nothing on screen distinguishes the action
+    /// that dropped every source from the one that kept them. A silent path
+    /// must still speak. Session-only, like the engine flag it mirrors - after
+    /// a restart a stopped download is honestly just paused.
+    pub stopped: bool,
     /// Past the max-active cap: registered, not paused, not driven YET -
     /// admitted in add order when a slot frees, except that a row ACTIVELY
     /// RECEIVING keeps its slot first (so resuming an older row cannot flip a
@@ -842,6 +852,7 @@ impl MuleEngine {
                     have,
                     complete: rows[i].1,
                     paused: rows[i].0,
+                    stopped: dl.is_stopped(),
                     queued: queued[i],
                     rating,
                     has_comment,
