@@ -7,7 +7,8 @@
 // callback interface is the later upgrade. See docs/wiki/padmule-enhancement-channel.md
 // ... and docs/wiki/lifecycle-and-reactivation.md for why pause/resume is honest.
 
-import AudioToolbox  // AudioServicesPlaySystemSound - the download-finished beep
+import AVFoundation  // AVAudioPlayer - the download-finished tone (mp3)
+import AudioToolbox  // AudioServicesPlaySystemSound - the fallback tick
 import Foundation
 import OSLog
 import SwiftUI
@@ -2052,8 +2053,46 @@ final class EngineModel: ObservableObject {
     /// right behaviour for an alert the user did not ask to hear right now.
     /// 1057 is the short "Tink": audible without being an alarm, since a busy
     /// queue can finish several files in a row.
+    /// The player must be held: an `AVAudioPlayer` in a local goes out of scope
+    /// and is deallocated before a note ever sounds, which is silence that
+    /// looks like a working call site.
+    private static var finishedPlayer: AVAudioPlayer?
+
+    /// The download-finished sound.
+    ///
+    /// WAS `AudioServicesPlaySystemSound(1057)`, which Anthony reported (handoff
+    /// 30) is "not a beep - it is a super-brief click". It was: 1057 is a UI
+    /// tick, tens of milliseconds, and against a transfer that ran for minutes
+    /// it reads as a glitch rather than a completion. He supplied a real tone,
+    /// bundled as `finished.mp3`.
+    ///
+    /// AVAudioPlayer rather than AudioServices, and not by preference:
+    /// `AudioServicesCreateSystemSoundID` accepts CAF/AIF/WAV only, so an mp3
+    /// through that path fails silently.
+    ///
+    /// IT MUST NOT DISTURB THE SEEDING KEEPALIVE, which holds an ACTIVE
+    /// `.playback` session with a looping silent buffer (BackgroundKeepAlive) -
+    /// ending that session is a suspend. So this deliberately does NOT touch
+    /// the category and does NOT call `setActive`: a fresh player on the
+    /// existing session mixes with the silence and leaves it running. The
+    /// keepalive already sets `.mixWithOthers`, and when it is not running iOS
+    /// gives us a usable default session, so both states work without either
+    /// path configuring the other.
     static func playFinishedSound() {
-        AudioServicesPlaySystemSound(1057)
+        guard let url = Bundle.main.url(forResource: "finished", withExtension: "mp3") else {
+            // Fall back rather than going silent: a missing resource should
+            // degrade to the old tick, not to nothing.
+            AudioServicesPlaySystemSound(1057)
+            return
+        }
+        do {
+            let p = try AVAudioPlayer(contentsOf: url)
+            finishedPlayer = p
+            p.prepareToPlay()
+            p.play()
+        } catch {
+            AudioServicesPlaySystemSound(1057)
+        }
     }
 
     // MARK: - Servers
