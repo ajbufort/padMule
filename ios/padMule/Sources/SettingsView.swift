@@ -211,12 +211,14 @@ struct SettingsView: View {
     private var privacySection: some View {
         Section {
             Toggle("Incognito", isOn: $incognito)
-                .onChange(of: incognito) { _, on in model.setIncognito(on) }
+                // iOS 16 single-parameter form: the project targets 16.0 and
+                // the two-parameter onChange(of:initial:_:) is 17+.
+                .onChange(of: incognito) { on in model.setIncognito(on) }
             Picker("Who can see your shared files", selection: $allowBrowse) {
                 Text("Nobody").tag(false)
                 Text("Everybody").tag(true)
             }
-            .onChange(of: allowBrowse) { _, on in model.setAllowBrowse(on) }
+            .onChange(of: allowBrowse) { on in model.setAllowBrowse(on) }
         } header: {
             Text("Privacy")
         } footer: {
