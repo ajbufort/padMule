@@ -21,9 +21,14 @@ struct SettingsView: View {
     // battery, so the honest default for something that runs while the user is
     // not looking is off.
     @AppStorage(SettingsKey.backgroundSeeding) private var backgroundSeeding = false
-    // Must agree with the registered default (false). Turning it on DISABLES
-    // padMule-to-padMule features, so it can never be the default.
-    @AppStorage(SettingsKey.incognito) private var incognito = false
+    // MUST AGREE with the registered default (true) or the toggle shows one
+    // state while the engine is in the other - the drift SettingsDefaults warns
+    // about, and on a PRIVACY control it is the dangerous direction: the switch
+    // would read OFF while padMule was actually disguised, or vice versa.
+    @AppStorage(SettingsKey.incognito) private var incognito = true
+    // Must agree with the registered default (false = Nobody), which is also
+    // eMule's own default.
+    @AppStorage(SettingsKey.allowBrowse) private var allowBrowse = false
     @AppStorage(SettingsKey.beepOnDownloadComplete) private var beepOnComplete = true
     @AppStorage(SettingsKey.updateServerListAtLaunch) private var updateAtLaunch = false
     @AppStorage(SettingsKey.askServersForServers) private var askServers = true
