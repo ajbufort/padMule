@@ -179,35 +179,46 @@ struct SettingsView: View {
 
     // MARK: - Privacy
 
+    /// The footer text, as ONE literal.
+    ///
+    /// It was a chain of `+` concatenations and the Swift type-checker gave up
+    /// on it: "unable to type-check this expression in reasonable time",
+    /// failing the iOS build. A long concatenation is an inference problem, not
+    /// a formatting choice - so the prose lives here as a single string and the
+    /// view just renders it.
+    private static let privacyFooter = """
+        Stops padMule identifying itself to other clients. It is on by default. \
+        padMule already reports itself as aMule 3.0.1, so this removes what is \
+        left: a padMule marker in the handshake, and the default nickname.
+
+        Two things it does NOT do. It turns OFF padMule-to-padMule features, \
+        because other padMules recognize each other by exactly that marker. \
+        And it hides what padMule SAYS about itself, not how it behaves - \
+        timing, packet order and which requests it answers can still identify \
+        it to anyone looking closely. This is not anonymity, and it is not a VPN.
+
+        "Who can see your shared files" controls whether another client can \
+        list everything you share just by asking. Nobody is the default, and is \
+        what eMule defaults to as well. Downloads still in progress are never \
+        listed either way.
+        """
+
     private var privacySection: some View {
         Section {
             Toggle("Incognito", isOn: $incognito)
                 .onChange(of: incognito) { _, on in model.setIncognito(on) }
+            Picker("Who can see your shared files", selection: $allowBrowse) {
+                Text("Nobody").tag(false)
+                Text("Everybody").tag(true)
+            }
+            .onChange(of: allowBrowse) { _, on in model.setAllowBrowse(on) }
         } header: {
             Text("Privacy")
         } footer: {
             // BOTH limits, on the switch itself. A privacy control that
             // over-promises is worse than none, because it changes what the
             // user risks doing while believing they are covered.
-            Text(
-                "Stops padMule identifying itself to other clients. It already "
-                    + "reports itself as aMule 3.0.1, so this removes what is "
-                    + "left: a padMule marker in the handshake, and the default "
-                    + "nickname.\n\n"
-                    + "Two things it does NOT do. It turns OFF "
-                    + "padMule-to-padMule features, because other padMules "
-                    + "recognize each other by exactly that marker. And it "
-                    + "hides what padMule SAYS about itself, not how it "
-                    + "behaves - timing, packet order and which requests it "
-                    + "answers can still identify it to anyone looking "
-                    + "closely. This is not anonymity, and it is not a VPN.\n\n"
-                    + "\"Who can see your shared files\" controls whether "
-                    + "another client can list everything you share just by "
-                    + "asking. Nobody is the default, and is what eMule "
-                    + "defaults to as well. Downloads still in progress are "
-                    + "never listed either way."
-            )
-            .font(.caption)
+            Text(Self.privacyFooter).font(.caption)
         }
     }
 
