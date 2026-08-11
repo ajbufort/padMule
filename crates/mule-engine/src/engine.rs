@@ -83,6 +83,26 @@ const KAD_UDP_PORT: u16 = 4672;
 /// exactly as before.
 pub const DEFAULT_NICK: &str = "padMule";
 
+/// The nickname INCOGNITO substitutes when the user never changed theirs.
+///
+/// This is aMule 3.0.1's OWN default (`Preferences.cpp:1106`,
+/// `Cfg_Str("/eMule/Nick", s_nick, "https://amule-org.github.io")`), which is
+/// the consistent choice: `CT_EMULE_VERSION` already claims aMule 3.0.1, so a
+/// stock aMule version paired with a stock aMule nickname is coherent where
+/// "aMule 3.0.1" paired with "padMule" is a contradiction that names us.
+///
+/// WHY THIS EXISTS AT ALL: handoff 32 called `CT_NAME` "the loudest" tell - it
+/// is the User Name column in every peer's client list - and then scoped
+/// incognito to the marker tag only. Suppressing the marker while still
+/// broadcasting the literal word "padMule" as our display name would be a
+/// switch that promises concealment and delivers almost none. Found by the
+/// incognito wire test, which asserted on the BYTES and caught the string still
+/// in the payload.
+///
+/// A nickname the user CHOSE is left alone. Incognito hides what padMule says
+/// about itself, not what its owner decided to be called.
+pub const INCOGNITO_NICK: &str = "https://amule-org.github.io";
+
 /// The nickname length cap, in characters. eMule's own number, and BOTH
 /// authorities agree on it: `CPreferences::GetMaxUserNickLength() {return 50;}`
 /// (eMule 0.70b Preferences.h:690, eMule 0.50a Preferences.h:661). eMule applies
@@ -1704,6 +1724,9 @@ pub struct Engine {
     /// Hunter harvest inert on every fresh install - the exact inertness the
     /// 2026-08-03 device pass proved (docs/wiki/feature-server-hunter.md).
     add_servers_from_server: bool,
+    /// INCOGNITO (handoff 32): suppress the padMule marker tag in every HELLO.
+    /// Read by `hello_baseline`, the ONE constructor both hello sites use.
+    incognito: bool,
     /// The upload switch. `false` is "Leech Mode": we still download, but serve
     /// nothing. An atomic so the listener task reads it without taking a lock.
     sharing: Arc<AtomicBool>,
@@ -1874,6 +1897,7 @@ impl Engine {
             shared_dirty: Arc::new(AtomicBool::new(false)),
             harvested_servers: Arc::new(std::sync::Mutex::new(Vec::new())),
             add_servers_from_server: true,
+            incognito: false,
             sharing: Arc::new(AtomicBool::new(!ip_paused)),
             upload_gate: Arc::new(UploadGate::new(MAX_UPLOAD_SLOTS, UPLOAD_QUEUE_CAP)),
             known_met_lock: Arc::new(Mutex::new(())),
@@ -2151,8 +2175,16 @@ impl Engine {
             0,
             self.advertised_port,
             self.kad_advertised_port,
-            &self.nick,
+            if self.incognito && self.nick == DEFAULT_NICK {
+                INCOGNITO_NICK
+            } else {
+                &self.nick
+            },
         )
+        // ONE place, so incognito cannot apply to the inbound hello and not the
+        // outbound one - a client that declares itself on only half its
+        // connections is MORE identifiable, not less.
+        .incognito(self.incognito)
     }
 
     /// The login we present to an eD2k server. Same reason as
@@ -2235,6 +2267,24 @@ impl Engine {
     /// The "update server list when connecting" pref (eMule AddServersFromServer;
     /// see the field doc for the citations and padMule's default-ON deviation).
     /// Takes effect on the NEXT connect/resume, like upstream's.
+    /// Turn INCOGNITO on or off (handoff 32). Takes effect on the next HELLO -
+    /// connections already open keep whatever they declared, which is honest:
+    /// a peer that already saw the marker has already seen it.
+    ///
+    /// STATE THE TWO LIMITS WHEREVER THIS IS EXPOSED: it disables the
+    /// padMule-to-padMule enhancement channel (Layer 1 detection IS the marker),
+    /// and it hides the DECLARATION rather than the BEHAVIOR - timing, ordering,
+    /// capability bits and opcode responses still fingerprint padMule. It is not
+    /// anonymity and must never be presented as such.
+    pub fn set_incognito(&mut self, on: bool) {
+        self.incognito = on;
+    }
+
+    /// Whether the wire declaration is suppressed.
+    pub fn is_incognito(&self) -> bool {
+        self.incognito
+    }
+
     pub fn set_add_servers_from_server(&mut self, on: bool) {
         self.add_servers_from_server = on;
     }
@@ -2931,7 +2981,7 @@ impl Engine {
             if low_id {
                 self.refresh_port_mapping();
             }
-            Self::offer_shared_to(&self.shared, &mut link).await;
+            Self::offer_shared_to(&self.shared, &mut link, self.is_sharing()).await;
             // Ask for the server's own server list exactly where both
             // authorities do - right after the shares offer - and fire-and-
             // forget like theirs (eMule sockets.cpp:253-260, aMule
@@ -3703,7 +3753,35 @@ impl Engine {
     /// to aMule against a compression-advertising server (every live server), and
     /// it keeps a HighID's public IP out of the server's search index (the server
     /// sources us via our login id regardless). No-op with an empty library.
-    async fn offer_shared_to(shared: &Mutex<Vec<SharedFile>>, link: &mut ServerLink) {
+    /// Announce our library to the server (OP_OFFERFILES).
+    ///
+    /// GATED ON `is_sharing` (handoff 16, decided 2026-08-11 by Anthony:
+    /// "protection is key"). Serving was already refused at the upload gate
+    /// while sharing is paused, and Kad publishing was already gated - but the
+    /// server still received this list at login, so the index could NAME every
+    /// file a paused client would then refuse to serve. That is a disclosure
+    /// with no corresponding benefit: nobody can download from us in that
+    /// state, so the only thing the announcement achieves is telling the server
+    /// operator what we hold.
+    ///
+    /// It matters most in exactly the case the pause exists for. The VPN-drop
+    /// guard auto-pauses sharing when our public address changes, precisely so
+    /// padMule stops announcing itself from an address the user did not choose
+    /// - and this path announced the whole library anyway, from that address,
+    ///   on the next login. See [[padmule-vpn-airvpn]].
+    ///
+    /// DIVERGENCE FROM UPSTREAM, deliberate and stated: eMule and aMule offer
+    /// their shares on login unconditionally, because upstream's model has no
+    /// "paused" state that outlives a session and no threat model in which the
+    /// server operator is an adversary. padMule has both.
+    async fn offer_shared_to(
+        shared: &Mutex<Vec<SharedFile>>,
+        link: &mut ServerLink,
+        sharing: bool,
+    ) {
+        if !sharing {
+            return;
+        }
         // aMule caps each OFFERFILES burst at 200 files; we cap too (v1 does not
         // republish the remainder).
         const MAX_OFFER: usize = 200;
@@ -3769,6 +3847,9 @@ impl Engine {
             return;
         }
         // Disjoint field borrows: `server` mutably, `shared` immutably.
+        // Read the sharing flag BEFORE taking the &mut borrow on self.server:
+        // the offer is gated on it (handoff 16) and `is_sharing` takes &self.
+        let sharing = self.is_sharing();
         let Some(link) = self.server.as_mut() else {
             return;
         };
@@ -3779,7 +3860,7 @@ impl Engine {
         // above and here, so nothing was missed); a completion that lands DURING
         // the offer re-arms the flag for the next poll - no lost update.
         self.shared_dirty.store(false, Ordering::Relaxed);
-        Self::offer_shared_to(&self.shared, link).await;
+        Self::offer_shared_to(&self.shared, link, sharing).await;
     }
 
     /// Finalize any download that reached 100% OUTSIDE a fetch task - e.g. a LowID
@@ -10671,6 +10752,134 @@ mod tests {
     /// `connect_to_server` and the first assertion goes red; remove the
     /// `set_server_probe_ip(None)` from `disconnect_server` and the last one
     /// does.
+    /// HANDOFF 16, decided by Anthony 2026-08-11: a client whose sharing is
+    /// PAUSED must not hand the server its library at login. Serving was already
+    /// refused and Kad publishing already gated, but the OFFERFILES burst still
+    /// went out - so the index could name every file the client would then
+    /// refuse to serve, from an address the VPN guard had just decided was not
+    /// the user's choice.
+    ///
+    /// Driven through the real login path against a mock server, and asserted on
+    /// WHAT REACHED THE WIRE - the opcodes the server actually received - not on
+    /// the flag being set. The sharing-ON leg runs the same rig so the assertion
+    /// cannot pass merely because nothing is ever offered.
+    /// INCOGNITO's nickname substitution (handoff 32), at the layer that owns
+    /// it. The marker suppression is tested in `peer::tests`; this pins the
+    /// half that test deliberately cannot see.
+    ///
+    /// Both directions matter and the second is the one worth guarding: a
+    /// nickname the USER chose must survive incognito untouched. Hiding what
+    /// padMule says about itself is the feature; overwriting what its owner
+    /// decided to be called is not, and would be a surprising, silent identity
+    /// change.
+    #[test]
+    fn incognito_replaces_only_the_default_nickname() {
+        let dir = tmp("incognito-nick");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+
+        assert_eq!(engine.hello_baseline().nick, DEFAULT_NICK, "precondition");
+
+        engine.set_incognito(true);
+        assert_eq!(
+            engine.hello_baseline().nick,
+            INCOGNITO_NICK,
+            "an untouched default nick must not keep broadcasting 'padMule' - \
+             it is the User Name column in every peer's client list"
+        );
+        assert_ne!(
+            INCOGNITO_NICK, DEFAULT_NICK,
+            "the substitute must actually differ, or this test proves nothing"
+        );
+
+        // A nickname the user chose is THEIRS. Incognito leaves it alone.
+        engine.set_nickname("Anthony");
+        assert_eq!(
+            engine.hello_baseline().nick,
+            "Anthony",
+            "incognito overwrote a nickname the user chose"
+        );
+
+        engine.set_incognito(false);
+        engine.set_nickname(DEFAULT_NICK);
+        assert_eq!(
+            engine.hello_baseline().nick,
+            DEFAULT_NICK,
+            "with incognito OFF the default nick is unchanged"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_paused_client_offers_no_library_and_a_sharing_one_does() {
+        async fn opcodes_after_login(sharing: bool) -> Vec<u8> {
+            let dir = tmp(if sharing { "offer-on" } else { "offer-off" });
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let (mut engine, _rx) = Engine::new(&dir).unwrap();
+            engine.set_sharing(sharing);
+            engine.shared.lock().await.push(SharedFile {
+                hash: [0xF1; 16],
+                size: 10,
+                name: b"private.bin".to_vec(),
+                part_hashes: vec![],
+                path: dir.join("private.bin"),
+                rating: 0,
+                comment: String::new(),
+                aich_root: None,
+            });
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let seen: Arc<std::sync::Mutex<Vec<u8>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let rec = Arc::clone(&seen);
+            tokio::spawn(async move {
+                if let Ok((sock, _)) = listener.accept().await {
+                    let mut sfs = crate::framed::FramedStream::new(sock);
+                    // The login request.
+                    if sfs.read_packet().await.is_err() {
+                        return;
+                    }
+                    let _ = sfs
+                        .write_packet(&mule_proto::Packet::new(
+                            mule_proto::PROT_EDONKEY,
+                            crate::server_messages::OP_IDCHANGE,
+                            0x0A00_0001u32.to_le_bytes().to_vec(),
+                        ))
+                        .await;
+                    // Everything the client volunteers after the ID answer.
+                    for _ in 0..4 {
+                        match sfs.read_packet().await {
+                            Ok(p) => rec.lock().unwrap().push(p.opcode),
+                            Err(_) => break,
+                        }
+                    }
+                }
+            });
+            assert!(
+                engine.connect_to_server(addr).await,
+                "precondition: the mock login succeeded"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            let out = seen.lock().unwrap().clone();
+            std::fs::remove_dir_all(&dir).ok();
+            out
+        }
+
+        let on = opcodes_after_login(true).await;
+        assert!(
+            on.contains(&crate::server_messages::OP_OFFERFILES),
+            "CONTROL: a SHARING client must still offer its library - got {on:02X?}"
+        );
+
+        let off = opcodes_after_login(false).await;
+        assert!(
+            !off.contains(&crate::server_messages::OP_OFFERFILES),
+            "a PAUSED client handed the server its library anyway - got {off:02X?}"
+        );
+    }
+
     #[tokio::test]
     async fn connecting_to_a_server_exempts_its_address_for_the_probe_and_stops_after() {
         let dir = tmp("inbound-probe-plumbing");

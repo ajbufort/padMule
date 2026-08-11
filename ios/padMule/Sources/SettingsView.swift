@@ -21,6 +21,9 @@ struct SettingsView: View {
     // battery, so the honest default for something that runs while the user is
     // not looking is off.
     @AppStorage(SettingsKey.backgroundSeeding) private var backgroundSeeding = false
+    // Must agree with the registered default (false). Turning it on DISABLES
+    // padMule-to-padMule features, so it can never be the default.
+    @AppStorage(SettingsKey.incognito) private var incognito = false
     @AppStorage(SettingsKey.beepOnDownloadComplete) private var beepOnComplete = true
     @AppStorage(SettingsKey.updateServerListAtLaunch) private var updateAtLaunch = false
     @AppStorage(SettingsKey.askServersForServers) private var askServers = true
@@ -58,6 +61,9 @@ struct SettingsView: View {
             Form {
                 appearanceSection
                 sharingSection
+                // Privacy sits directly under Sharing: what you expose and what
+                // you tell people about yourself are the same question.
+                privacySection
                 serverListSection
                 networkSection
                 downloadsSection
@@ -168,6 +174,35 @@ struct SettingsView: View {
             } else {
                 Text("Leech Mode: downloading only. padMule is not serving any files to peers.")
             }
+        }
+    }
+
+    // MARK: - Privacy
+
+    private var privacySection: some View {
+        Section {
+            Toggle("Incognito", isOn: $incognito)
+                .onChange(of: incognito) { _, on in model.setIncognito(on) }
+        } header: {
+            Text("Privacy")
+        } footer: {
+            // BOTH limits, on the switch itself. A privacy control that
+            // over-promises is worse than none, because it changes what the
+            // user risks doing while believing they are covered.
+            Text(
+                "Stops padMule identifying itself to other clients. It already "
+                    + "reports itself as aMule 3.0.1, so this removes what is "
+                    + "left: a padMule marker in the handshake, and the default "
+                    + "nickname.\n\n"
+                    + "Two things it does NOT do. It turns OFF "
+                    + "padMule-to-padMule features, because other padMules "
+                    + "recognize each other by exactly that marker. And it "
+                    + "hides what padMule SAYS about itself, not how it "
+                    + "behaves - timing, packet order and which requests it "
+                    + "answers can still identify it to anyone looking "
+                    + "closely. This is not anonymity, and it is not a VPN."
+            )
+            .font(.caption)
         }
     }
 

@@ -252,6 +252,18 @@ final class SettingsTests: XCTestCase {
     /// no such type; it is `SettingsDefaults` - so the whole padMuleTests bundle
     /// failed to COMPILE from e3ed990 onward, and three device builds shipped
     /// with the Swift suite red because ship.sh did not check it.
+    /// Incognito must default OFF, and for a reason worth stating: turning it
+    /// on DISABLES padMule-to-padMule features, because other padMules find
+    /// each other by exactly the marker it suppresses. A privacy switch that
+    /// defaulted on would silently remove a capability nobody asked to lose.
+    func testIncognitoRegisteredDefaultIsOff() {
+        SettingsDefaults.register()
+        XCTAssertFalse(
+            UserDefaults.standard.bool(forKey: SettingsKey.incognito),
+            "incognito must default OFF - it disables padMule-to-padMule "
+                + "enhancements, so it has to be opt-in")
+    }
+
     func testBackgroundSeedingRegisteredDefaultIsOff() {
         SettingsDefaults.register()
         XCTAssertFalse(

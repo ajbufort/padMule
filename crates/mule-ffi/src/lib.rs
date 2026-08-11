@@ -993,6 +993,27 @@ impl MuleEngine {
             .block_on(async { self.inner.lock().await.unshare_file(h).await })
     }
 
+    /// INCOGNITO (handoff 32): stop declaring padMule on the wire. Drops the
+    /// enhancement-channel marker tag, writes the 7-tag hello stock aMule
+    /// writes, and swaps an UNCHANGED default nickname for aMule's own default
+    /// (a nickname the user chose is left alone).
+    ///
+    /// TWO LIMITS THE UI MUST STATE, because a switch that over-promises here
+    /// is worse than no switch: it DISABLES padMule-to-padMule enhancements
+    /// (Layer 1 detection IS the marker), and it hides the DECLARATION, not the
+    /// BEHAVIOR - timing, ordering, capability bits and opcode responses still
+    /// fingerprint padMule. It is not anonymity.
+    pub fn set_incognito(&self, on: bool) {
+        self.rt
+            .block_on(async { self.inner.lock().await.set_incognito(on) })
+    }
+
+    /// Whether the wire declaration is currently suppressed.
+    pub fn is_incognito(&self) -> bool {
+        self.rt
+            .block_on(async { self.inner.lock().await.is_incognito() })
+    }
+
     /// Unshare a completed file AND delete it from disk. Stronger than
     /// `unshare_file`, which deliberately leaves the file in place. padMule's
     /// downloads live in the app container, so without this the only way to get

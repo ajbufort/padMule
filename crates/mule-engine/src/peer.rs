@@ -131,6 +131,27 @@ pub struct HelloInfo {
     /// server-assisted LowID callbacks.
     pub server_ip: u32,
     pub server_port: u16,
+    /// INCOGNITO (handoff 32): drop the padMule enhancement-channel marker and
+    /// write SEVEN tags, which is exactly what stock aMule 3.0.1 writes.
+    ///
+    /// Three tells identified padMule on the wire; the others are already gone.
+    /// `CT_EMULE_VERSION` already claims aMule 3.0.1, the userhash is random per
+    /// install, the nickname became user-settable in 8du, and 35e removed the
+    /// constant "PadM" UDP challenge. What remains is this pair: a custom-NAMED
+    /// tag whose name is the literal string "padMule", and an 8-tag hello where
+    /// stock writes 7 - an 8-tag hello CONTAINING a padMule-named tag is
+    /// unambiguous, so the COUNT has to move with the tag or the tell survives.
+    ///
+    /// TWO LIMITS THAT TRAVEL WITH THIS FLAG, and the UI must state both:
+    /// (a) it DISABLES the padMule-to-padMule enhancement channel, because
+    ///     Layer 1 detection IS this marker - incognito and enhancements are
+    ///     mutually exclusive, not independent;
+    /// (b) it hides the DECLARATION, not the BEHAVIOR. Packet ordering, timing,
+    ///     capability bits, block-request depth, the AICH/secure-ident
+    ///     combination and opcode responses all remain, and padMule
+    ///     deliberately diverges from aMule where the authorities conflict. A
+    ///     determined observer can still fingerprint it. THIS IS NOT ANONYMITY.
+    pub incognito: bool,
 }
 
 impl HelloInfo {
@@ -154,7 +175,18 @@ impl HelloInfo {
             compat_options: COMPAT_OPTIONS_BASELINE,
             server_ip: 0,
             server_port: 0,
+            // OFF by default: the marker is padMule's only way to recognise
+            // another padMule, and turning it off silently would disable the
+            // enhancement channel for everyone. Opt in, per handoff 32.
+            incognito: false,
         }
+    }
+
+    /// Turn the wire declaration off (handoff 32). Chainable so a caller that
+    /// already builds a `HelloInfo` does not have to restate every field.
+    pub fn incognito(mut self, on: bool) -> Self {
+        self.incognito = on;
+        self
     }
 
     /// Advertise SecureIdent v1 in MISCOPTIONS1 (bit 16 of the sec_ident nibble),
@@ -196,7 +228,10 @@ fn write_hello_body(w: &mut Writer, h: &HelloInfo) {
     w.write_bytes(&h.user_hash);
     w.write_u32(h.client_id);
     w.write_u16(h.tcp_port);
-    w.write_u32(8); // tag count: 7 baseline + 1 padMule marker
+    // The count MUST track the marker: stock aMule writes 7, and an 8-tag hello
+    // carrying a padMule-named tag is unambiguous either way round - so dropping
+    // one without the other leaves the tell, or malforms the packet.
+    w.write_u32(if h.incognito { 7 } else { 8 });
     write_tag(
         w,
         &Tag::id(CT_NAME, TagValue::Str(h.nick.as_bytes().to_vec())),
@@ -223,7 +258,11 @@ fn write_hello_body(w: &mut Writer, h: &HelloInfo) {
     // padMule enhancement-channel marker (Layer 1). Provably ignored by stock
     // eMule/aMule; recognized by another padMule. caps=0 = presence only (no
     // enhancement is implemented yet, so we honour nothing beyond "I am padMule").
-    write_tag(w, &padmule_marker_tag(0));
+    // Suppressed in incognito - which is exactly why incognito turns the
+    // enhancement channel off: Layer 1 detection IS this tag.
+    if !h.incognito {
+        write_tag(w, &padmule_marker_tag(0));
+    }
     w.write_u32(h.server_ip);
     w.write_u16(h.server_port);
 }
@@ -412,6 +451,57 @@ mod tests {
         assert_eq!(baseline_misc_options1(3), 0x3413_3212); // secure ident = 3
         assert_eq!(baseline_misc_options2(0, 0, 0, KADEMLIA_VERSION), 0x438);
         assert_eq!(COMPAT_OPTIONS_BASELINE, 1);
+    }
+
+    /// INCOGNITO (handoff 32). Asserted on THE BYTES THAT GO OUT, not on the
+    /// flag: the tag count field and the absence of the literal name "padMule"
+    /// anywhere in the payload. Both halves matter - an 8-tag hello carrying a
+    /// padMule-named tag and a 7-tag hello without one are each internally
+    /// consistent, but dropping the tag while still writing 8 would be a
+    /// MALFORMED hello, and writing 7 while still emitting the tag would be
+    /// worse than doing nothing.
+    #[test]
+    fn incognito_drops_the_marker_and_the_tag_count_follows_it() {
+        let normal = build_hello(&sample());
+        let hidden = build_hello(&sample().incognito(true));
+
+        // Tag count sits after the 1-byte prefix, 16-byte hash, u32 id, u16 port.
+        let count = |p: &[u8]| u32::from_le_bytes(p[23..27].try_into().unwrap());
+        assert_eq!(count(&normal.payload), 8, "stock padMule writes 8");
+        assert_eq!(
+            count(&hidden.payload),
+            7,
+            "incognito must write 7 - what stock aMule 3.0.1 writes"
+        );
+
+        // The MARKER is what this layer owns. Use a neutral nick so the
+        // assertion cannot be satisfied - or defeated - by CT_NAME, which
+        // carries whatever the user is called and is substituted one layer up
+        // in `Engine::hello_baseline`.
+        let neutral = || HelloInfo::baseline([0x33; 16], 0x0A00_0001, 4662, 4672, "anon");
+        let has_name = |p: &[u8]| p.windows(7).any(|w| w == b"padMule");
+        assert!(
+            has_name(&build_hello(&neutral()).payload),
+            "precondition: the marker names padMule even when the nick does not"
+        );
+        assert!(
+            !has_name(&build_hello(&neutral().incognito(true)).payload),
+            "the string 'padMule' still appears in an incognito hello"
+        );
+
+        // And it must still PARSE as a hello - a peer that cannot read it is a
+        // louder signal than the tag ever was.
+        let parsed = parse_hello(&hidden.payload, true).expect("incognito hello must parse");
+        assert_eq!(parsed.user_hash, sample().user_hash);
+        assert_eq!(parsed.tcp_port, sample().tcp_port);
+
+        // The ANSWER shares write_hello_body, so it must hide it too - declaring
+        // on inbound but not outbound would make padMule MORE identifiable.
+        let ans = build_hello_answer(&neutral().incognito(true));
+        assert!(
+            !has_name(&ans.payload),
+            "the hello ANSWER still names padMule"
+        );
     }
 
     #[test]

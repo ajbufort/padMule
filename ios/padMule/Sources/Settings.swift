@@ -28,6 +28,12 @@ enum SettingsKey {
     /// keepalive. OFF by default: it costs battery, and the honest default for
     /// something that runs while the user is not looking is off.
     static let backgroundSeeding = "padMule.backgroundSeeding"
+    /// INCOGNITO (handoff 32): stop declaring padMule on the wire - drop the
+    /// enhancement-channel marker, write the 7-tag hello stock aMule writes,
+    /// and replace an UNCHANGED default nickname with aMule's own default.
+    /// OFF by default: it disables padMule-to-padMule enhancements, so turning
+    /// it on silently would remove a capability nobody asked to lose.
+    static let incognito = "padMule.incognito"
     /// Play a short sound when a download finishes, verifies and is saved.
     /// padMule is foreground-only, so a long transfer means the iPad is sitting
     /// there with the app open - a sound is the only way to be told it is done
@@ -107,6 +113,7 @@ enum SettingsDefaults {
             // initializer in SettingsView, or the toggle shows one state while
             // the engine is in the other.
             SettingsKey.backgroundSeeding: false,
+            SettingsKey.incognito: false,
             SettingsKey.beepOnDownloadComplete: true,
             SettingsKey.serverListUrls: [EngineModel.defaultServerListUrl],
             SettingsKey.updateServerListAtLaunch: false,

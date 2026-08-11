@@ -1177,6 +1177,14 @@ final class EngineModel: ObservableObject {
         }
     }
 
+    /// INCOGNITO (handoff 32): stop declaring padMule on the wire. Pushed to the
+    /// engine, which applies it to the ONE hello constructor both directions
+    /// use - so it can never be on for inbound and off for outbound.
+    func setIncognito(_ on: Bool) {
+        guard let e = engine else { return }
+        work.async { e.setIncognito(on: on) }
+    }
+
     /// STOP a download (eMule 0.70b StopFile): keeps the bytes, drops every
     /// source held and refuses new ones until resumed. Between pause (which
     /// keeps its sources) and cancel (which deletes the progress).
@@ -2164,6 +2172,7 @@ final class EngineModel: ObservableObject {
             updateAllServerLists()
         }
         applyAskServersForServers()
+        applyIncognito()
         applyPortSettings()
         applyKeepAwake()
     }
@@ -2175,6 +2184,17 @@ final class EngineModel: ObservableObject {
         guard let e = engine else { return }
         let on = UserDefaults.standard.bool(forKey: SettingsKey.askServersForServers)
         work.async { e.setAddServersFromServer(on: on) }
+    }
+
+    /// Push INCOGNITO into the engine at boot. The engine defaults it OFF, so
+    /// this only matters when the user turned it on - but re-applying
+    /// unconditionally is what keeps the engine and the pref in step, and a
+    /// PRIVACY setting that silently reverts to off on relaunch is the worst
+    /// kind of drift: the user believes they are covered and are not.
+    func applyIncognito() {
+        guard let e = engine else { return }
+        let on = UserDefaults.standard.bool(forKey: SettingsKey.incognito)
+        work.async { e.setIncognito(on: on) }
     }
 
     /// Push the listen/advertised/kad ports and the UPnP toggle into the engine.
