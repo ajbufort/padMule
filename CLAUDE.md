@@ -167,6 +167,13 @@ Three layers, per <https://gist.github.com/karpathy/442a6bf555914893e9891c11519d
 | **Wiki** | `docs/wiki/` | AI-maintained markdown: summaries, entities, cross-references. |
 | **Schema** | this `CLAUDE.md` | Conventions + workflows (you are here). |
 
+**THE WIKI IS LOCAL-ONLY AND NOT IN THIS REPOSITORY (2026-08-11).** `docs/wiki/`
+is gitignored here and has its OWN git repository with no remote and a
+pre-push hook that refuses. It carries design reasoning, threat models and
+project strategy that is deliberately not published. A fresh clone of this
+repository will NOT have it - obtain it separately, and never add it back to
+the public tree.
+
 Start every deep dive at `docs/wiki/index.md`. Two special files:
 
 - `docs/wiki/index.md` - catalog by category, one line per entry.

@@ -24,3 +24,8 @@ refs/
 # copyright problem, not merely 28MB of bloat. refs/ is ignored for the same
 # reason; this is where the ZIPS those trees were extracted from now live.
 /reference-archives/
+
+# The knowledge base is LOCAL-ONLY (2026-08-11).
+# docs/wiki carries design reasoning, threat models and project strategy that
+# is deliberately not published. It has its own git repository with no remote.
+docs/wiki/
