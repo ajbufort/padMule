@@ -29,6 +29,14 @@ current build state is `docs/wiki/build-progress.md`.
   placeholders like `<public-ip>`. Private RFC1918 LAN addresses (192.168.x.x,
   10.x.x.x) are FINE - they are non-routable and document the topology; the
   wiki uses them throughout by established convention.
+- **COMMIT MESSAGES ARE AS PUBLIC AS THE CODE, and permanent.** A public commit
+  message says WHAT CHANGED and why it is correct - never the project's motive,
+  strategy, threat-model framing, or who wants a feature and what for. This is
+  not hypothetical: on 2026-08-11 a purpose statement went out in a commit
+  message while the wiki itself was already being kept private, and a history
+  rewrite could remove it from the repo but NOT from public event archives that
+  capture push payloads. Gitignoring a file does nothing about the message that
+  accompanies the next commit.
 
 ## Architecture (the working tree)
 
