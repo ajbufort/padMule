@@ -44,9 +44,9 @@ use crate::secure_ident::SecureIdentSession;
 use crate::server_crawl::ServerCrawl;
 use crate::server_messages::{
     desc_req_challenge, parse_serv_stat_res, parse_server_desc_res, parse_server_list,
-    LoginRequest, OfferedFile, DEFAULT_SERVER_FLAGS, FILE_COMPLETE_ID, FILE_COMPLETE_PORT,
-    OP_GLOBSERVSTATREQ, OP_GLOBSERVSTATRES, OP_SERVER_DESC_REQ, OP_SERVER_DESC_RES,
-    OP_SERVER_LIST_REQ2, OP_SERVER_LIST_RES, SERV_STAT_CHALLENGE,
+    serv_stat_challenge, LoginRequest, OfferedFile, DEFAULT_SERVER_FLAGS, FILE_COMPLETE_ID,
+    FILE_COMPLETE_PORT, OP_GLOBSERVSTATREQ, OP_GLOBSERVSTATRES, OP_SERVER_DESC_REQ,
+    OP_SERVER_DESC_RES, OP_SERVER_LIST_REQ2, OP_SERVER_LIST_RES,
 };
 use crate::share::{
     classify_inbound, head_hash, serve_shared, InboundKind, ServeSec, SharedFile, UploadGate,
@@ -2914,13 +2914,7 @@ impl Engine {
         let Ok(sock) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0u16)).await else {
             return servers;
         };
-        // The request MUST carry a 4-byte challenge (a modern server ignores a
-        // challenge-less ping); the server echoes it as the response's first u32.
-        let ch = SERV_STAT_CHALLENGE.to_le_bytes();
-        let req = [PROT_EDONKEY, OP_GLOBSERVSTATREQ, ch[0], ch[1], ch[2], ch[3]];
-        // The description challenge varies per probe (its low half is fixed by
-        // the protocol); names learned this round are collected then persisted.
-        let desc_challenge = desc_req_challenge((std::process::id() as u16) ^ 0xA5C3);
+        // Names learned this round are collected here, then persisted.
         let mut learned: Vec<(SocketAddr, String)> = Vec::new();
         // THE BLOCKLIST GATES THESE SENDS (2026-08-09), publicly routable
         // targets only - `blocklist_forbids_send` has the scoping rationale
@@ -2937,19 +2931,44 @@ impl Engine {
                 IpAddr::V6(_) => true,
             })
             .collect();
-        for (e, &send) in servers.iter().zip(&sendable) {
+        // A FRESH (status, description) challenge pair per REQUEST, held here
+        // per server so an answer is only believed when it echoes the challenge
+        // THAT server was asked with. Both authorities do exactly this - eMule
+        // 0.50a ServerList.cpp:335-336 and UDPSocket.cpp:436-437, aMule 3.0.1
+        // ServerList.cpp:336-337 - storing each challenge on the server object,
+        // never one value shared across the sweep. padMule used to send a
+        // compile-time constant status challenge and a description challenge
+        // derived from the PROCESS ID, so one observed probe (plaintext UDP)
+        // handed an attacker the challenge for every other server in the sweep
+        // and for the rest of the session. See `desc_req_challenge` for what
+        // these 16 bits do and do not buy - the ceiling is the wire format's.
+        let challenges: Vec<(u32, u32)> = servers
+            .iter()
+            .map(|_| {
+                (
+                    serv_stat_challenge(rand::random::<u16>()),
+                    desc_req_challenge(rand::random::<u16>()),
+                )
+            })
+            .collect();
+        for ((e, &send), &(stat_ch, desc_ch)) in servers.iter().zip(&sendable).zip(&challenges) {
             if !send {
                 continue;
             }
             if let Some(udp) = e.addr.port().checked_add(4) {
                 let target = SocketAddr::new(e.addr.ip(), udp);
+                // The request MUST carry a 4-byte challenge (a modern server
+                // ignores a challenge-less ping); the server echoes it as the
+                // response's first u32.
+                let ch = stat_ch.to_le_bytes();
+                let req = [PROT_EDONKEY, OP_GLOBSERVSTATREQ, ch[0], ch[1], ch[2], ch[3]];
                 let _ = sock.send_to(&req, target).await;
                 // Ask for the NAME too, exactly as both authorities do right
                 // after a status answer (eMule UDPSocket.cpp:435, aMule
                 // ServerUDPSocket.cpp:243). This is what gives a server found by
                 // the crawl or the gossip harvest a name instead of a bare IP -
                 // discovery yields only ip:port.
-                let ch = desc_challenge.to_le_bytes();
+                let ch = desc_ch.to_le_bytes();
                 let dreq = [PROT_EDONKEY, OP_SERVER_DESC_REQ, ch[0], ch[1], ch[2], ch[3]];
                 let _ = sock.send_to(&dreq, target).await;
             }
@@ -2979,6 +2998,17 @@ impl Engine {
         // the health map is empty and there is nothing to vouch for any of them.
         let mut heard_from_anyone = false;
         let mut buf = [0u8; 2048];
+        // Which entry an answer came from, or None. The send gate is re-checked
+        // here: an answer "from" a blocklisted server was never solicited, and
+        // must not settle a debt the counters do not carry for it. `e.addr` was
+        // built with `ip_from_met_u32` above, so this is the real address, not
+        // the met-order u32. The INDEX is what the caller needs, because the
+        // challenge to check the answer against is that server's own.
+        let sender_index = |servers: &[ServerEntry], src: SocketAddr| -> Option<usize> {
+            servers.iter().zip(&sendable).position(|(e, &s)| {
+                s && e.addr.ip() == src.ip() && e.addr.port().checked_add(4) == Some(src.port())
+            })
+        };
         while awaiting_status > 0 || awaiting_name > 0 {
             let now = tokio::time::Instant::now();
             let deadline = if heard_from_anyone {
@@ -2994,55 +3024,49 @@ impl Engine {
                 Ok(Ok((n, src)))
                     if n >= 2 && buf[0] == PROT_EDONKEY && buf[1] == OP_GLOBSERVSTATRES =>
                 {
-                    // Verify the echoed challenge (anti-spoof) as well as the src.
-                    // The zip re-checks the send gate: an answer "from" a gated
-                    // server was never solicited (the fixed challenge is
-                    // spoofable), and must not settle a debt it does not owe -
-                    // the counters no longer include it.
-                    if let Some((challenge, users, files)) = parse_serv_stat_res(&buf[2..n]) {
-                        if challenge == SERV_STAT_CHALLENGE {
-                            if let Some((e, _)) =
-                                servers.iter_mut().zip(&sendable).find(|(e, &s)| {
-                                    s && e.addr.ip() == src.ip()
-                                        && e.addr.port().checked_add(4) == Some(src.port())
-                                })
-                            {
-                                // Only the FIRST answer from a server settles its
-                                // debt - a duplicate must not drive the counter
-                                // below what is genuinely outstanding.
-                                if !e.alive {
-                                    awaiting_status -= 1;
-                                }
-                                e.alive = true;
-                                e.users = Some(users);
-                                e.files = Some(files);
-                                heard_from_anyone = true;
+                    // Believe the answer only if it came from a server we asked
+                    // AND echoes the challenge WE SENT THAT SERVER. Source
+                    // address alone is forgeable on UDP; a per-server nonce also
+                    // means someone who read one probe off the wire has learned
+                    // nothing about any other server's answer.
+                    if let (Some((challenge, users, files)), Some(i)) =
+                        (parse_serv_stat_res(&buf[2..n]), sender_index(&servers, src))
+                    {
+                        if challenge == challenges[i].0 {
+                            let e = &mut servers[i];
+                            // Only the FIRST answer from a server settles its
+                            // debt - a duplicate must not drive the counter
+                            // below what is genuinely outstanding.
+                            if !e.alive {
+                                awaiting_status -= 1;
                             }
+                            e.alive = true;
+                            e.users = Some(users);
+                            e.files = Some(files);
+                            heard_from_anyone = true;
                         }
                     }
                 }
                 Ok(Ok((n, src)))
                     if n >= 2 && buf[0] == PROT_EDONKEY && buf[1] == OP_SERVER_DESC_RES =>
                 {
-                    if let Some(desc) = parse_server_desc_res(&buf[2..n], desc_challenge) {
-                        let name = desc.name.trim().to_string();
+                    // The SENDER is resolved first, because the challenge the
+                    // answer has to match is the one that server was asked with.
+                    // A tagged answer that does not match it is refused, which is
+                    // what keeps a forged name off the Servers screen.
+                    if let Some(i) = sender_index(&servers, src) {
+                        let desc = parse_server_desc_res(&buf[2..n], challenges[i].1);
+                        let name = desc.map(|d| d.name.trim().to_string()).unwrap_or_default();
                         if !name.is_empty() {
-                            // Same gate re-check as the status handler above.
-                            if let Some((e, _)) =
-                                servers.iter_mut().zip(&sendable).find(|(e, &s)| {
-                                    s && e.addr.ip() == src.ip()
-                                        && e.addr.port().checked_add(4) == Some(src.port())
-                                })
-                            {
-                                // Only ADOPT a learned name; never overwrite one
-                                // the user's own server.met already carries.
-                                if e.name.is_empty() {
-                                    e.name = name;
-                                    learned.push((e.addr, e.name.clone()));
-                                    awaiting_name -= 1;
-                                }
-                                heard_from_anyone = true;
+                            let e = &mut servers[i];
+                            // Only ADOPT a learned name; never overwrite one
+                            // the user's own server.met already carries.
+                            if e.name.is_empty() {
+                                e.name = name;
+                                learned.push((e.addr, e.name.clone()));
+                                awaiting_name -= 1;
                             }
+                            heard_from_anyone = true;
                         }
                     }
                 }
@@ -6624,11 +6648,11 @@ mod tests {
                 let Ok((n, src)) = mock.recv_from(&mut buf).await else {
                     return;
                 };
-                if n < 2 || buf[1] != OP_GLOBSERVSTATREQ {
+                if n < 6 || buf[1] != OP_GLOBSERVSTATREQ {
                     continue;
                 }
                 let mut res = vec![PROT_EDONKEY, OP_GLOBSERVSTATRES];
-                res.extend_from_slice(&SERV_STAT_CHALLENGE.to_le_bytes());
+                res.extend_from_slice(&buf[2..6]); // echo the challenge we were sent
                 res.extend_from_slice(&7u32.to_le_bytes()); // users
                 res.extend_from_slice(&9u32.to_le_bytes()); // files
                 let _ = mock.send_to(&res, src).await;
@@ -6665,6 +6689,213 @@ mod tests {
              blocklist send gate is scoped to publicly routable targets"
         );
         assert_eq!(rows[0].users, Some(7));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A mock server for the UDP probe, on loopback. It records every challenge
+    /// it is sent as `(opcode, value)` and answers both asks. `forge` is what
+    /// makes it an ATTACKER instead of a server: `None` echoes back the
+    /// challenge it was sent, which is what a real server does; `Some((stat,
+    /// desc))` answers with values of the attacker's own choosing. Returns the
+    /// TCP port to write into server.met (the probe pings TCP + 4).
+    async fn spawn_probe_mock(
+        name: &'static str,
+        seen: Arc<std::sync::Mutex<Vec<(u8, u32)>>>,
+        forge: Option<(u32, u32)>,
+    ) -> u16 {
+        let mock = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0u16)).await.unwrap();
+        let tcp_port = mock.local_addr().unwrap().port() - 4;
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            loop {
+                let Ok((n, src)) = mock.recv_from(&mut buf).await else {
+                    return;
+                };
+                if n < 6 || buf[0] != PROT_EDONKEY {
+                    continue;
+                }
+                let sent = u32::from_le_bytes([buf[2], buf[3], buf[4], buf[5]]);
+                if let Ok(mut v) = seen.lock() {
+                    v.push((buf[1], sent));
+                }
+                let mut res = vec![PROT_EDONKEY];
+                match buf[1] {
+                    OP_GLOBSERVSTATREQ => {
+                        res.push(OP_GLOBSERVSTATRES);
+                        res.extend_from_slice(&forge.map_or(sent, |(s, _)| s).to_le_bytes());
+                        let (users, files) = if forge.is_some() {
+                            (999_999u32, 888_888u32) // fabricated
+                        } else {
+                            (11u32, 22u32)
+                        };
+                        res.extend_from_slice(&users.to_le_bytes());
+                        res.extend_from_slice(&files.to_le_bytes());
+                    }
+                    OP_SERVER_DESC_REQ => {
+                        // The NEW (tagged) answer form: <challenge 4><count 4><tags>.
+                        res.push(OP_SERVER_DESC_RES);
+                        res.extend_from_slice(&forge.map_or(sent, |(_, d)| d).to_le_bytes());
+                        res.extend_from_slice(&1u32.to_le_bytes());
+                        let mut w = mule_proto::Writer::new();
+                        mule_proto::write_tag(
+                            &mut w,
+                            &mule_proto::Tag::id(
+                                0x01,
+                                mule_proto::TagValue::Str(name.as_bytes().to_vec()),
+                            ),
+                        );
+                        res.extend_from_slice(&w.into_inner());
+                    }
+                    _ => continue,
+                }
+                let _ = mock.send_to(&res, src).await;
+            }
+        });
+        tcp_port
+    }
+
+    /// server.met holding `ports` in order, none of them carrying a name tag, so
+    /// every entry owes the round a description answer.
+    fn write_nameless_server_met(dir: &std::path::Path, ports: &[u16]) {
+        std::fs::write(
+            dir.join("server.met"),
+            write_server_met(&ServerMet {
+                header: mule_files::server_met::SERVER_MET_HEADER,
+                servers: ports
+                    .iter()
+                    .map(|&port| Server {
+                        ip: u32::from_le_bytes(Ipv4Addr::LOCALHOST.octets()),
+                        port,
+                        tags: Vec::new(),
+                    })
+                    .collect(),
+            }),
+        )
+        .unwrap();
+    }
+
+    fn challenge_for(seen: &Arc<std::sync::Mutex<Vec<(u8, u32)>>>, opcode: u8) -> u32 {
+        let v = seen.lock().unwrap();
+        v.iter()
+            .find(|(op, _)| *op == opcode)
+            .unwrap_or_else(|| panic!("the mock was never sent opcode {opcode:#04x}"))
+            .1
+    }
+
+    /// EVERY REQUEST GETS ITS OWN CHALLENGE - the enabler for the rejection test
+    /// below. Two servers probed in the SAME sweep must be asked with different
+    /// values, because the answer matching is only worth anything if learning
+    /// one server's challenge teaches nothing about another's.
+    ///
+    /// This is what the code did NOT do: the status challenge was a compile-time
+    /// constant and the description challenge came from the PROCESS ID, so both
+    /// were identical for every server and for the whole session.
+    ///
+    /// FLAKE BUDGET: the wire format leaves only 16 bits for the seed (the other
+    /// 16 are INV_SERV_DESC_LEN / the 0x55AA marker), so two honest draws collide
+    /// once in 65536. That ceiling is the format's, not a choice - see
+    /// `desc_req_challenge`.
+    #[tokio::test]
+    async fn the_probe_draws_a_fresh_challenge_for_every_request() {
+        let dir = tmp("probe-fresh-challenge");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let a_seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let b_seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let a_port = spawn_probe_mock("alpha", a_seen.clone(), None).await;
+        let b_port = spawn_probe_mock("bravo", b_seen.clone(), None).await;
+        write_nameless_server_met(&dir, &[a_port, b_port]);
+
+        let (engine, _rx) = Engine::new(&dir).unwrap();
+        let rows = engine.probe_server_list().await;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].name, "alpha", "the honest answers are believed");
+        assert_eq!(rows[1].name, "bravo");
+
+        let a_stat = challenge_for(&a_seen, OP_GLOBSERVSTATREQ);
+        let b_stat = challenge_for(&b_seen, OP_GLOBSERVSTATREQ);
+        let a_desc = challenge_for(&a_seen, OP_SERVER_DESC_REQ);
+        let b_desc = challenge_for(&b_seen, OP_SERVER_DESC_REQ);
+
+        // The halves the wire format owns are still exactly right.
+        for c in [a_stat, b_stat] {
+            assert_eq!(c >> 16, 0x55AA, "the status marker (ServerList.cpp:335)");
+        }
+        for c in [a_desc, b_desc] {
+            assert_eq!(
+                c & 0xFFFF,
+                crate::server_messages::INV_SERV_DESC_LEN as u32,
+                "the invalid-length low half (UDPSocket.cpp:436)"
+            );
+        }
+        // And the halves that are ours differ between the two requests.
+        assert_ne!(
+            a_stat, b_stat,
+            "two servers in one sweep must not share a status challenge"
+        );
+        assert_ne!(
+            a_desc, b_desc,
+            "two servers in one sweep must not share a description challenge"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE SECURITY CLAIM. A server that answers with a challenge it was never
+    /// sent must be refused, so a fabricated name never reaches the Servers
+    /// screen and fabricated user/file counts never make a dead host look alive.
+    ///
+    /// The forged values are not arbitrary: they are the two challenges padMule
+    /// USED to send - the published constant `0x5061644D` and the PID-derived
+    /// `desc_req_challenge((pid as u16) ^ 0xA5C3)`. Both were computable by
+    /// anyone holding the source, and the second was fixed for the whole
+    /// session, so ONE observed probe was enough to forge every later answer.
+    /// Against that old code this test goes RED on both assertions.
+    ///
+    /// The honest server is the CONTROL: it proves the adopt-a-name path works
+    /// in this same round, so the forger's rejection is specific rather than a
+    /// probe that simply believed nobody.
+    #[tokio::test]
+    async fn a_forged_answer_cannot_name_a_server_or_declare_it_alive() {
+        let dir = tmp("probe-forged-answer");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let honest_seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let forger_seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let honest = spawn_probe_mock("alpha", honest_seen.clone(), None).await;
+        let forger = spawn_probe_mock(
+            "spoofed",
+            forger_seen.clone(),
+            Some((
+                0x5061_644D, // the old published status constant ("PadM")
+                desc_req_challenge((std::process::id() as u16) ^ 0xA5C3),
+            )),
+        )
+        .await;
+        write_nameless_server_met(&dir, &[honest, forger]);
+
+        let (engine, _rx) = Engine::new(&dir).unwrap();
+        let rows = engine.probe_server_list().await;
+        assert_eq!(rows.len(), 2);
+
+        // Control: the honest server IS believed.
+        assert_eq!(rows[0].name, "alpha");
+        assert!(rows[0].alive);
+        assert_eq!(rows[0].users, Some(11));
+
+        // The forger is believed about nothing.
+        assert_eq!(
+            rows[1].name, "",
+            "a description answer bearing a challenge we never sent must not \
+             put a name on the Servers screen"
+        );
+        assert!(
+            !rows[1].alive,
+            "a status answer bearing a challenge we never sent must not make a \
+             host read as alive"
+        );
+        assert_eq!(rows[1].users, None, "and its counts are not adopted");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -9330,11 +9561,11 @@ mod tests {
                 let Ok((n, src)) = mock.recv_from(&mut buf).await else {
                     return;
                 };
-                if n < 2 || buf[1] != OP_GLOBSERVSTATREQ {
+                if n < 6 || buf[1] != OP_GLOBSERVSTATREQ {
                     continue; // the description ask - this server does not answer it
                 }
                 let mut res = vec![PROT_EDONKEY, OP_GLOBSERVSTATRES];
-                res.extend_from_slice(&SERV_STAT_CHALLENGE.to_le_bytes()); // echoed
+                res.extend_from_slice(&buf[2..6]); // echo the challenge we were sent
                 res.extend_from_slice(&3_651u32.to_le_bytes()); // users
                 res.extend_from_slice(&47_008u32.to_le_bytes()); // files
                 let _ = mock.send_to(&res, src).await;

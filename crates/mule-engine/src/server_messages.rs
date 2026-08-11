@@ -73,7 +73,26 @@ const ST_DESCRIPTION: u8 = 0x0B;
 
 /// Build the 4-byte challenge for [`OP_SERVER_DESC_REQ`]. `seed` varies the
 /// high half; the low half MUST be [`INV_SERV_DESC_LEN`], which is what makes
-/// the two answer forms distinguishable (eMule `UDPSocket.cpp:436`).
+/// the two answer forms distinguishable. This is byte-for-byte the authority's
+/// own construction - `((uint32)GetRandomUInt16() << 16) + INV_SERV_DESC_LEN`,
+/// eMule 0.50a `UDPSocket.cpp:436`.
+///
+/// DRAW `seed` FRESH FOR EVERY REQUEST, and remember it PER SERVER. eMule keeps
+/// it on the server object (`pServer->SetDescReqChallenge`, `UDPSocket.cpp:437`)
+/// and refuses a tagged answer that does not echo that server's own value
+/// (`UDPSocket.cpp:467`). A seed held constant across a sweep - or worse, for
+/// the process lifetime - hands every later probe's challenge to anyone who saw
+/// ONE request go out, and these are plaintext UDP.
+///
+/// WHAT 16 BITS BUYS, AND WHAT IT DOES NOT. The wire format spends the other 16
+/// on [`INV_SERV_DESC_LEN`], so 65536 values is a CEILING the format imposes,
+/// not a choice. It defeats REPLAY of a captured answer at a later probe, and
+/// BLIND forgery by someone who never saw the request. It does NOT defeat an
+/// on-path attacker who reads the challenge out of the request and answers
+/// before the real server does - nothing in this plaintext exchange can. Nor
+/// does it cover the OLD answer form, which carries no challenge at all and is
+/// authenticated by source address alone; both authorities accept it on exactly
+/// those terms, so padMule does too.
 pub fn desc_req_challenge(seed: u16) -> u32 {
     ((seed as u32) << 16) | INV_SERV_DESC_LEN as u32
 }
@@ -352,9 +371,25 @@ pub fn parse_server_status(payload: &[u8]) -> Result<(u32, u32), IoError> {
 pub const OP_GLOBSERVSTATREQ: u8 = 0x96;
 pub const OP_GLOBSERVSTATRES: u8 = 0x97;
 
-/// The fixed challenge padMule stamps into every status ping; a real server echoes
-/// it as the FIRST u32 of the response, so we can confirm the answer is to OUR ping.
-pub const SERV_STAT_CHALLENGE: u32 = 0x5061_644D; // "PadM"
+/// The high half of a status-ping challenge: a fixed marker, with the low 16
+/// bits drawn fresh per request. BOTH authorities build it exactly so -
+/// `0x55AA0000 + GetRandomUInt16()` (eMule 0.50a `ServerList.cpp:335`) and
+/// `0x55AA0000 + (uint16)rand()` (aMule 3.0.1 `ServerList.cpp:336`) - and both
+/// store the result ON THE SERVER OBJECT (`SetChallenge`) rather than sharing
+/// one value across the sweep. Nothing on the wire READS the marker: a server
+/// echoes the whole u32 back and eMule compares the whole u32 against what it
+/// stored for that server (`UDPSocket.cpp:334`). Keeping it is therefore
+/// FIDELITY, not protocol - our ping looks like every other client's instead of
+/// carrying a constant padMule fingerprint.
+pub const SERV_STAT_CHALLENGE_MARK: u32 = 0x55AA_0000;
+
+/// Build the 4-byte challenge for [`OP_GLOBSERVSTATREQ`]; a real server echoes
+/// it as the FIRST u32 of the response, so we can confirm the answer is to OUR
+/// ping. `seed` must be drawn fresh per request and remembered per server - see
+/// [`desc_req_challenge`] for what those 16 bits do and do not buy.
+pub fn serv_stat_challenge(seed: u16) -> u32 {
+    SERV_STAT_CHALLENGE_MARK | seed as u32
+}
 
 /// Parse an OP_GLOBSERVSTATRES payload into `(challenge, users, files)`, or None if
 /// it is shorter than the 12-byte minimum. Any trailing extension is ignored.
@@ -497,12 +532,32 @@ mod tests {
     #[test]
     fn the_description_challenge_keeps_its_protocol_low_half() {
         // eMule UDPSocket.cpp:436 - the low 16 bits MUST be the invalid length,
-        // because that is what distinguishes the two answer forms.
+        // because that is what distinguishes the two answer forms. Only the HIGH
+        // half is ours to randomize, and it must take every one of its 65536
+        // values or the seed is not free.
         assert_eq!(
             desc_req_challenge(0xBEEF) & 0xFFFF,
             INV_SERV_DESC_LEN as u32
         );
         assert_eq!(desc_req_challenge(0xBEEF) >> 16, 0xBEEF);
+        assert_eq!(desc_req_challenge(0) & 0xFFFF, INV_SERV_DESC_LEN as u32);
+        assert_eq!(
+            desc_req_challenge(0xFFFF) & 0xFFFF,
+            INV_SERV_DESC_LEN as u32
+        );
+        assert_eq!(desc_req_challenge(0xFFFF) >> 16, 0xFFFF);
+    }
+
+    /// The status ping is the MIRROR IMAGE: the marker is in the HIGH half and
+    /// the random seed in the LOW (eMule 0.50a ServerList.cpp:335, aMule 3.0.1
+    /// ServerList.cpp:336 - `0x55AA0000 + rand16()`). Getting the two halves the
+    /// wrong way round on either message would be silently wrong on the wire.
+    #[test]
+    fn the_status_challenge_keeps_its_marker_in_the_high_half() {
+        assert_eq!(serv_stat_challenge(0x1234), 0x55AA_1234);
+        assert_eq!(serv_stat_challenge(0) >> 16, SERV_STAT_CHALLENGE_MARK >> 16);
+        assert_eq!(serv_stat_challenge(0xFFFF) >> 16, 0x55AA);
+        assert_eq!(serv_stat_challenge(0xFFFF) & 0xFFFF, 0xFFFF);
     }
 
     #[test]
@@ -686,14 +741,14 @@ mod tests {
     fn serv_stat_res_reads_challenge_users_and_files() {
         // <challenge 4><users 4><files 4>, then a trailing extension.
         let res = [
-            0x4D, 0x64, 0x61, 0x50, // challenge = 0x5061644D (our SERV_STAT_CHALLENGE)
+            0x34, 0x12, 0xAA, 0x55, // challenge = 0x55AA1234 = serv_stat_challenge(0x1234)
             0x2A, 0x00, 0x00, 0x00, // users = 42
             0x40, 0xE2, 0x01, 0x00, // files = 123456
             0xFF, 0xFF, // trailing bytes -> ignored
         ];
         assert_eq!(
             parse_serv_stat_res(&res),
-            Some((SERV_STAT_CHALLENGE, 42, 123_456))
+            Some((serv_stat_challenge(0x1234), 42, 123_456))
         );
         // Below the 12-byte minimum -> None (the challenge-less 8-byte form the
         // stale header comment described is NOT a valid response).
