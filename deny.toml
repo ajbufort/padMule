@@ -1,0 +1,164 @@
+# cargo-deny policy for padMule. Run by .github/workflows/supply-chain.yml
+# (and locally with `cargo deny check advisories licenses sources`).
+#
+# Three questions, one tool:
+#   advisories - does anything we depend on have a RustSec advisory?
+#   licenses   - is everything we link GPL-2.0-or-later COMPATIBLE? padMule is
+#                GPL-2.0-or-later (root LICENSE + NOTICE) and CLAUDE.md requires
+#                anything borrowed to stay GPL-compatible.
+#   sources    - did every crate come from crates.io, and nowhere else?
+#
+# WHEN THIS JOB GOES RED - THE PLAYBOOK
+# =====================================
+# Read the advisory first, then pick ONE of four. Do not just add an ignore.
+#
+#   1. A FIX EXISTS -> `cargo update -p <crate>` and commit the new Cargo.lock.
+#      This is the common case and takes a minute.
+#
+#   2. NO FIX EXISTS BUT WE CAN DROP THE CRATE -> drop or replace it. Best
+#      outcome; costs the most.
+#
+#   3. NO FIX EXISTS AND WE ARE STUCK -> add an `ignore` entry BELOW with a
+#      `reason` that answers all three of these, or it is not good enough:
+#        (a) why no upgrade is possible (link the upstream issue),
+#        (b) what padMule actually does with the crate - which file, which call,
+#        (c) whether padMule's use is inside the advisory's threat model, said
+#            plainly, including when the answer is "yes".
+#      An ignore is a DECISION that padMule accepts the risk. Say so out loud.
+#      An ignore with reason "transitive, ignore" is worse than no scanner at
+#      all, because it launders the risk into a green check.
+#
+#   4. THE ADVISORY IS WRONG OR DOES NOT APPLY -> still use `ignore`, and say
+#      why in the reason. Do not silence the whole check.
+#
+# What you must NEVER do: delete this file, drop the check from the workflow,
+# or flip a `deny` to `warn` to get a PR merged. If you are about to, the
+# honest move is an `ignore` with a bad reason written down, because at least
+# the next person can find it.
+
+[graph]
+# Deliberately NOT narrowing `targets`. padMule ships aarch64-apple-ios and
+# builds on x86_64 linux, so a target list would be more precise and quieter -
+# but it would also create a blind spot the day someone adds a target and
+# forgets this file. All-targets is the safer default and costs only noise we
+# do not currently have (no advisory in the tree comes from a platform crate).
+#
+# all-features mirrors the flag the CI action passes, so a bare local
+# `cargo deny check advisories licenses sources` sees the SAME graph CI does.
+# Without it, local and CI could disagree about which crates are even present.
+all-features = true
+
+[advisories]
+# `vulnerability` advisories are DENIED - that is cargo-deny's built-in
+# behaviour and there is no knob here, which is the point.
+#
+# Yanked crates are denied too: a yank is the registry telling us not to use a
+# version, and unlike an advisory it is always actionable (`cargo update`).
+yanked = "deny"
+
+# Unmaintained crates are only reported when a WORKSPACE crate depends on one
+# DIRECTLY. Rationale: "unmaintained" is a maintenance signal, not a
+# vulnerability, and a transitively-unmaintained crate is not ours to fix - we
+# chose `uniffi`, not `bincode`. Failing a build on somebody else's dependency
+# choice, forever, is precisely how a scanner gets disabled. If padMule itself
+# picks up an unmaintained crate, that IS ours and this fails.
+# A real VULNERABILITY in a transitive crate still fails, at any depth.
+unmaintained = "workspace"
+
+ignore = [
+    { id = "RUSTSEC-2023-0071", reason = """
+Marvin Attack: rsa 0.9.x does modular exponentiation in non-constant time, so
+private-key operations leak timing information observable over the network.
+
+(a) NO FIX EXISTS. RustCrypto has no patched release; the advisory itself says
+    "No patch is yet available". Tracking: https://github.com/RustCrypto/RSA/issues/626
+
+(b) WHAT WE DO WITH IT. `rsa` is used in exactly one file,
+    crates/mule-engine/src/secure_ident.rs, for eMule Secure Identification:
+    `sign_v1` signs (peer public key || peer challenge) with PKCS#1 v1.5, and
+    `verify_v1` checks the mirror image. There is no RSA decryption anywhere in
+    padMule, only sign and verify.
+
+(c) IS PADMULE IN THE THREAT MODEL? YES, PARTLY, AND WE ACCEPT IT. `sign_v1`
+    performs a private-key operation on a challenge chosen by a remote peer,
+    which is the shape the advisory warns about. Two things bound the damage,
+    neither of which is "it does not apply":
+      - The modulus is 384 bits (RSA_KEY_BITS, secure_ident.rs). That size is
+        set by eMule 0.50a, the wire authority, so padMule cannot raise it or
+        change algorithm without losing interop. A 384-bit modulus is directly
+        factorable on commodity hardware, which is a far cheaper attack than a
+        timing sidechannel. The sidechannel is not the weakest link here; the
+        key size is, and that one is the protocol's, not ours.
+      - The key authenticates eMule CREDIT standing (upload/download karma).
+        Recovering it lets an attacker impersonate a peer's credits. It
+        protects no file contents and no user data.
+
+    Re-check when RustCrypto ships a constant-time release, and swap the crate
+    then - the key size will still be 384 bits, but there is no reason to carry
+    a known sidechannel once a fix exists.
+
+Reviewed 2026-08-10.
+""" },
+]
+
+[licenses]
+# Everything padMule links must be compatible with GPL-2.0-or-later.
+#
+# The one that needs saying out loud: Apache-2.0 is NOT compatible with
+# GPL-2.0-only. It IS compatible with GPL-3.0, and padMule is GPL-2.0-OR-LATER,
+# so the combined work can be conveyed under GPL-3.0 and the Apache-2.0 crates
+# are fine. If padMule were ever relicensed GPL-2.0-only, most of this list
+# would have to go, and so would most of the Rust ecosystem.
+#
+# THE TLS STACK, added 2026-08-10 with commit a9784b7 (handoff #34) and
+# ratified by Anthony the same day. It brought four licenses this file did not
+# previously allow, and they are the reason to read the paragraph above rather
+# than skim it:
+#   ring               Apache-2.0 AND ISC
+#   rustls-webpki      ISC
+#   untrusted          ISC
+#   webpki-roots       CDLA-Permissive-2.0
+# ISC is a lax permissive license the FSF lists as GPL-compatible - routine.
+# CDLA-Permissive-2.0 covers the Mozilla CA BUNDLE (data, not code); it is
+# permissive with no copyleft and no conditions that conflict with the GPL,
+# though the FSF has not ruled on it by name - recorded as a judgement, not a
+# citation.
+# THE ONE WITH A CONSEQUENCE IS ring's Apache-2.0. Per the paragraph above, a
+# combined work containing it CANNOT be conveyed under GPL-2.0-only. padMule is
+# GPL-2.0-OR-LATER, so this is resolved by conveying binaries under GPL-3.0 -
+# but that is a real change in the terms padMule SHIPS under, not a formality,
+# and NOTICE says so explicitly. Anyone who ever wants padMule to be
+# GPL-2.0-only again must drop ring, which today means replacing the rustls
+# crypto provider.
+#
+# TO ADD A LICENSE: check it against the FSF's GPL-compatibility list
+# (https://www.gnu.org/licenses/license-list.html) FIRST, then add it here. A
+# new dependency introducing a new license is exactly what this check is for -
+# it going red on a dependency bump is the check working, not the check being
+# broken.
+allow = [
+    "0BSD",                          # adler2 - permissive, GPL-compatible
+    "Apache-2.0",                    # see the GPL-3.0 note above
+    "Apache-2.0 WITH LLVM-exception", # wasi
+    "BSD-2-Clause",                  # zerocopy
+    "BSD-3-Clause",                  # subtle
+    "CDLA-Permissive-2.0",           # webpki-roots - see the TLS note below
+    "GPL-2.0-or-later",              # padMule's own six crates
+    "ISC",                           # rustls-webpki, untrusted, part of ring
+    "MIT",                           # most of the tree
+    "MPL-2.0",                       # uniffi - FSF lists MPL-2.0 as GPL-compatible
+    "Unicode-3.0",                   # unicode-ident, via an AND clause
+    "Unlicense",                     # memchr (dual with MIT)
+    "Zlib",                          # miniz_oxide (dual with MIT/Apache-2.0)
+]
+confidence-threshold = 0.8
+
+[sources]
+# Every crate must come from crates.io. padMule has no git dependencies and no
+# vendored crates, so this costs nothing today and closes a real door: a git
+# dependency can be repointed or force-pushed without a version bump, and no
+# advisory database covers it.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

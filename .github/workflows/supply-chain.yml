@@ -1,0 +1,85 @@
+# Supply-chain audit. Three questions about padMule's dependency tree:
+# does anything carry a RustSec advisory, is every crate's license compatible
+# with GPL-2.0-or-later, and did every crate come from crates.io? The POLICY
+# lives in deny.toml at the repo root - including the playbook for what to do
+# when this job goes red. Read that file before touching this one.
+#
+# WHY cargo-deny AND NOT cargo-audit: cargo-audit answers only the first
+# question. padMule is GPL-2.0-or-later (root LICENSE + NOTICE) and CLAUDE.md
+# requires anything borrowed to stay GPL-compatible, which makes the license
+# question a real one here rather than box-ticking - and cargo-deny answers all
+# three from one config in one job.
+#
+# WHY THE ACTION AND NOT `cargo install cargo-deny`: installing compiles
+# cargo-deny and its ~200 crates on every cold cache, minutes of CI for a job
+# that should take seconds. The action ships a prebuilt binary. It is published
+# by EmbarkStudios, who also publish cargo-deny itself, so it adds NO new party
+# to trust that running the tool did not already add - which matters more than
+# usual in a workflow whose whole subject is who you trust.
+#
+# WHY @v2 AND NOT A COMMIT SHA: a SHA pin never receives security fixes on its
+# own, and this repo has no Dependabot to raise them. A moving major tag is the
+# safer trade here. Revisit if Dependabot is ever configured.
+#
+# FAILURE POLICY: this job FAILS the build - see deny.toml for what is denied
+# and what is deliberately scoped down. It runs as its OWN workflow rather than
+# a step in rust.yml so it can never slow down or block the unit gate that
+# developers actually wait on, and so a supply-chain failure is legible as a
+# supply-chain failure in the checks list.
+#
+# NOTE ON THE SCHEDULE: a new advisory can land against an UNCHANGED Cargo.lock,
+# and the path filters above would never notice - so the weekly run is the part
+# that catches most real advisories, not the push/PR runs. GitHub only runs
+# schedules on the default branch, and disables them after 60 days with no repo
+# activity; if padMule goes quiet, this is the check that quietly stops.
+name: Supply-chain audit (cargo-deny)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "deny.toml"
+      - ".github/workflows/supply-chain.yml"
+  pull_request:
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "deny.toml"
+      - ".github/workflows/supply-chain.yml"
+  schedule:
+    # Mondays 06:17 UTC. The odd minute is deliberate: GitHub drops scheduled
+    # runs that pile up on the hour.
+    - cron: "17 6 * * 1"
+
+# This job only reads the repo. Nothing here needs a writable token.
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # No cargo cache on purpose. Nothing is compiled, and the advisory
+      # database MUST be fetched fresh or the check is answering last week's
+      # question. If the fetch fails (GitHub down, database moved) cargo-deny
+      # exits non-zero with the real git error - it does not pass silently.
+      # Verified 2026-08-10 against an unreachable db-url: exit 1, error shown.
+      #
+      # log-level: info and --show-stats are what make a GREEN run worth
+      # reading. Together they print the per-check counts AND the full text of
+      # every accepted risk in deny.toml's ignore list, so the one advisory
+      # padMule knowingly carries is restated in every passing build instead of
+      # being buried in a config file nobody opens.
+      - name: cargo-deny (advisories, licenses, sources)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories licenses sources
+          command-arguments: --show-stats
+          log-level: info

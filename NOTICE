@@ -11,6 +11,28 @@ WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
 PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 -------------------------------------------------------------------------------
+Binary distributions are GPL-3.0-or-later
+-------------------------------------------------------------------------------
+
+padMule's own source is GPL-2.0-or-later, as stated above and in LICENSE.
+
+However, padMule links the `ring` cryptography crate (via rustls, for HTTPS
+server-list fetching, added 2026-08-10). `ring` is licensed "Apache-2.0 AND
+ISC", and the Apache License 2.0 is NOT compatible with GPL-2.0-only - its
+patent-termination clause conflicts. Apache-2.0 IS compatible with GPL-3.0.
+
+Because padMule is GPL-2.0-OR-LATER, this is resolved by the "or later" option:
+**a compiled padMule binary that includes `ring` is conveyed under
+GPL-3.0-or-later.** The source remains GPL-2.0-or-later; the combined binary
+work is GPL-3.0-or-later.
+
+This is stated explicitly rather than left implicit because it is a real
+constraint on redistribution, not a formality. Anyone who needs padMule under
+GPL-2.0-only must build without `ring` - today that means replacing the rustls
+crypto provider. The `deny.toml` license policy carries the same reasoning and
+will fail CI if a future dependency introduces a license that breaks this.
+
+-------------------------------------------------------------------------------
 Derivation and third-party code
 -------------------------------------------------------------------------------
 
