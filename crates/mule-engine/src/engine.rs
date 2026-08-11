@@ -1727,6 +1727,13 @@ pub struct Engine {
     /// INCOGNITO (handoff 32): suppress the padMule marker tag in every HELLO.
     /// Read by `hello_baseline`, the ONE constructor both hello sites use.
     incognito: bool,
+    /// May peers BROWSE our library (OP_ASKSHAREDFILES)? eMule's
+    /// `CanSeeShares()`; its own default is `vsfaNobody`
+    /// (0.50a Preferences.cpp:2053), so refusing is upstream behaviour.
+    ///
+    /// Only ever lists COMPLETED files: the library is built from `known.met`,
+    /// so a download in progress is not browsable whatever this is set to.
+    allow_browse: bool,
     /// The upload switch. `false` is "Leech Mode": we still download, but serve
     /// nothing. An atomic so the listener task reads it without taking a lock.
     sharing: Arc<AtomicBool>,
@@ -1897,7 +1904,12 @@ impl Engine {
             shared_dirty: Arc::new(AtomicBool::new(false)),
             harvested_servers: Arc::new(std::sync::Mutex::new(Vec::new())),
             add_servers_from_server: true,
-            incognito: false,
+            // ON by default, agreeing with the registered iOS default: the
+            // enhancement channel it costs is deferred and unbuilt, while the
+            // exposure it removes is real on every connection. A CLI user gets
+            // the same protection without having to ask for it.
+            incognito: true,
+            allow_browse: false,
             sharing: Arc::new(AtomicBool::new(!ip_paused)),
             upload_gate: Arc::new(UploadGate::new(MAX_UPLOAD_SLOTS, UPLOAD_QUEUE_CAP)),
             known_met_lock: Arc::new(Mutex::new(())),
@@ -2175,11 +2187,7 @@ impl Engine {
             0,
             self.advertised_port,
             self.kad_advertised_port,
-            if self.incognito && self.nick == DEFAULT_NICK {
-                INCOGNITO_NICK
-            } else {
-                &self.nick
-            },
+            self.effective_nick(),
         )
         // ONE place, so incognito cannot apply to the inbound hello and not the
         // outbound one - a client that declares itself on only half its
@@ -2190,12 +2198,29 @@ impl Engine {
     /// The login we present to an eD2k server. Same reason as
     /// [`Engine::hello_baseline`]: the nickname a server publishes about us and
     /// the one a peer sees must be the same string, so they come from one place.
+    /// The nickname that actually goes on the wire.
+    ///
+    /// ONE accessor, because there are TWO wire paths and they must agree. The
+    /// first cut substituted the incognito nick in `hello_baseline` only, so
+    /// PEERS saw aMule's default while the SERVER still saw "padMule" - and the
+    /// server is the worse leak of the two, since it publishes the nickname in
+    /// its user list and in search results, where anyone can read it. A
+    /// disguise worn on one of two channels is not a disguise; it is a
+    /// correlation handle.
+    fn effective_nick(&self) -> &str {
+        if self.incognito && self.nick == DEFAULT_NICK {
+            INCOGNITO_NICK
+        } else {
+            &self.nick
+        }
+    }
+
     fn login_request(&self) -> LoginRequest {
         LoginRequest {
             user_hash: self.identity.userhash,
             client_id: 0,
             tcp_port: self.advertised_port,
-            nick: self.nick.clone(),
+            nick: self.effective_nick().to_string(),
             server_flags: DEFAULT_SERVER_FLAGS,
         }
     }
@@ -2283,6 +2308,21 @@ impl Engine {
     /// Whether the wire declaration is suppressed.
     pub fn is_incognito(&self) -> bool {
         self.incognito
+    }
+
+    /// Allow or refuse library browsing (eMule `CanSeeShares`). Takes effect on
+    /// the next request; a browse already answered cannot be recalled.
+    ///
+    /// A refusal answers with an EMPTY LIST, never silence and never a distinct
+    /// opcode - what eMule does, and the better privacy shape besides, since
+    /// "I refuse" and "I have nothing" then look identical on the wire.
+    pub fn set_allow_browse(&mut self, on: bool) {
+        self.allow_browse = on;
+    }
+
+    /// Whether peers may browse our library.
+    pub fn allows_browse(&self) -> bool {
+        self.allow_browse
     }
 
     pub fn set_add_servers_from_server(&mut self, on: bool) {
@@ -2500,6 +2540,7 @@ impl Engine {
         let ip_filter = self.ip_filter.clone();
         let server_probe_ip = Arc::clone(&self.server_probe_ip);
         let known2 = Arc::clone(&self.known2);
+        let allow_browse = self.allow_browse;
         let inbound = Arc::new(Semaphore::new(MAX_INBOUND_CONNS));
         let per_ip: PerIpConns = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         let handle = tokio::spawn(async move {
@@ -2709,6 +2750,7 @@ impl Engine {
                                     peer_aich,
                                     peer_ext_requests,
                                     aich: Some(Arc::clone(&known2)),
+                                    allow_browse,
                                 },
                             )
                             .await;
@@ -10481,7 +10523,11 @@ mod tests {
         assert_eq!(engine.nickname(), "padMule");
         assert_eq!(DEFAULT_NICK, "padMule");
         // And it is what both wire paths would carry, not merely what the
-        // getter reports.
+        // getter reports - WITH INCOGNITO OFF. Incognito now defaults ON and
+        // substitutes an untouched default nick on BOTH paths, so this pins the
+        // plain baseline; the substitution has its own test.
+        let mut engine = engine;
+        engine.set_incognito(false);
         assert_eq!(engine.hello_baseline().nick, "padMule");
         assert_eq!(engine.login_request().nick, "padMule");
         let _ = std::fs::remove_dir_all(&dir);
@@ -10779,9 +10825,18 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let (mut engine, _rx) = Engine::new(&dir).unwrap();
 
+        // The engine now defaults incognito ON, so the DEFAULT-nick case is
+        // already substituted; turn it off to observe the plain baseline first.
+        engine.set_incognito(false);
         assert_eq!(engine.hello_baseline().nick, DEFAULT_NICK, "precondition");
 
         engine.set_incognito(true);
+        assert_eq!(
+            engine.login_request().nick,
+            INCOGNITO_NICK,
+            "THE SERVER path must be disguised too - it publishes the nickname \
+             in its user list and search results, where anyone can read it"
+        );
         assert_eq!(
             engine.hello_baseline().nick,
             INCOGNITO_NICK,

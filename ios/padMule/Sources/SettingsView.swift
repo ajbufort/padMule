@@ -200,7 +200,12 @@ struct SettingsView: View {
                     + "hides what padMule SAYS about itself, not how it "
                     + "behaves - timing, packet order and which requests it "
                     + "answers can still identify it to anyone looking "
-                    + "closely. This is not anonymity, and it is not a VPN."
+                    + "closely. This is not anonymity, and it is not a VPN.\n\n"
+                    + "\"Who can see your shared files\" controls whether "
+                    + "another client can list everything you share just by "
+                    + "asking. Nobody is the default, and is what eMule "
+                    + "defaults to as well. Downloads still in progress are "
+                    + "never listed either way."
             )
             .font(.caption)
         }

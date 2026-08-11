@@ -14,7 +14,23 @@ pub const OP_REQUESTPARTS: u8 = 0x47; // E3
 pub const OP_FILEREQANSNOFIL: u8 = 0x48; // E3
 pub const OP_SETREQFILEID: u8 = 0x4F; // E3
 pub const OP_FILESTATUS: u8 = 0x50; // E3
-pub const OP_HASHSETREQUEST: u8 = 0x51; // E3
+pub const OP_HASHSETREQUEST: u8 = 0x51;
+
+/// A peer asking to BROWSE our shared files (eMule 0.50a opcodes.h:215, null
+/// body). eMule's "View Files" on a client sends this.
+pub const OP_ASKSHAREDFILES: u8 = 0x4A;
+
+/// The browse answer (opcodes.h:216):
+/// `<count 4>(<HASH 16><ID 4><PORT 2><tagset>)[count]` - the SAME record shape
+/// as OP_OFFERFILES, which is why `build_offer_files` is reused for the body.
+///
+/// A REFUSAL IS AN EMPTY LIST, not silence and not a distinct opcode: eMule
+/// builds the list only if `CanSeeShares()` allows, then sends whatever it has,
+/// so a denied peer gets `count = 0` (ListenSocket.cpp, case
+/// OP_ASKSHAREDFILES). Answering identically whether we have nothing to show or
+/// choose to show nothing is also the better privacy behavior: "denied" and
+/// "empty" are indistinguishable on the wire.
+pub const OP_ASKSHAREDFILESANSWER: u8 = 0x4B; // E3
 pub const OP_HASHSETANSWER: u8 = 0x52; // E3
 pub const OP_STARTUPLOADREQ: u8 = 0x54; // E3
 pub const OP_ACCEPTUPLOADREQ: u8 = 0x55; // E3

@@ -34,6 +34,12 @@ enum SettingsKey {
     /// OFF by default: it disables padMule-to-padMule enhancements, so turning
     /// it on silently would remove a capability nobody asked to lose.
     static let incognito = "padMule.incognito"
+    /// Who may BROWSE our shared files (eMule `CanSeeShares`). false = Nobody,
+    /// true = Everybody. eMule's own default is Nobody, so refusing is upstream
+    /// behaviour rather than a padMule divergence. A "Friends" setting is
+    /// deliberately absent: padMule has no friends list, and an option that
+    /// silently behaved as Nobody would be a privacy control that lies.
+    static let allowBrowse = "padMule.allowBrowse"
     /// Play a short sound when a download finishes, verifies and is saved.
     /// padMule is foreground-only, so a long transfer means the iPad is sitting
     /// there with the app open - a sound is the only way to be told it is done
@@ -113,7 +119,12 @@ enum SettingsDefaults {
             // initializer in SettingsView, or the toggle shows one state while
             // the engine is in the other.
             SettingsKey.backgroundSeeding: false,
-            SettingsKey.incognito: false,
+            // ON by default (Anthony, 2026-08-11). It costs the
+            // padMule-to-padMule enhancement channel, which is DEFERRED and
+            // unbuilt - so the capability it disables is theoretical today,
+            // while the exposure it removes is real on every connection.
+            SettingsKey.incognito: true,
+            SettingsKey.allowBrowse: false,
             SettingsKey.beepOnDownloadComplete: true,
             SettingsKey.serverListUrls: [EngineModel.defaultServerListUrl],
             SettingsKey.updateServerListAtLaunch: false,

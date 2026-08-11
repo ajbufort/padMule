@@ -1186,6 +1186,12 @@ final class EngineModel: ObservableObject {
         work.async { e.setIncognito(on: on) }
     }
 
+    /// Allow or refuse library BROWSING (eMule `CanSeeShares`).
+    func setAllowBrowse(_ on: Bool) {
+        guard let e = engine else { return }
+        work.async { e.setAllowBrowse(on: on) }
+    }
+
     /// STOP a download (eMule 0.70b StopFile): keeps the bytes, drops every
     /// source held and refuses new ones until resumed. Between pause (which
     /// keeps its sources) and cancel (which deletes the progress).
@@ -2212,6 +2218,7 @@ final class EngineModel: ObservableObject {
         }
         applyAskServersForServers()
         applyIncognito()
+        applyAllowBrowse()
         applyPortSettings()
         applyKeepAwake()
     }
@@ -2234,6 +2241,15 @@ final class EngineModel: ObservableObject {
         guard let e = engine else { return }
         let on = UserDefaults.standard.bool(forKey: SettingsKey.incognito)
         work.async { e.setIncognito(on: on) }
+    }
+
+    /// Push the browse permission into the engine at boot, for the same reason
+    /// as incognito: a PRIVACY setting that silently reverts on relaunch leaves
+    /// the user believing they are covered when they are not.
+    func applyAllowBrowse() {
+        guard let e = engine else { return }
+        let on = UserDefaults.standard.bool(forKey: SettingsKey.allowBrowse)
+        work.async { e.setAllowBrowse(on: on) }
     }
 
     /// Push the listen/advertised/kad ports and the UPnP toggle into the engine.

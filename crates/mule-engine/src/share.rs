@@ -697,6 +697,15 @@ pub struct ServeSession {
     /// The known2_64.met hashset store, for serving OP_AICHREQUEST recovery
     /// data. `None` (tests without AICH) refuses recovery honestly.
     pub aich: Option<Arc<crate::known2_store::Known2Store>>,
+    /// May this peer BROWSE our library (OP_ASKSHAREDFILES)? eMule's
+    /// `CanSeeShares()`, whose own default is `vsfaNobody`
+    /// (0.50a Preferences.cpp:2053) - so refusing by default is upstream
+    /// behaviour, not a padMule divergence.
+    ///
+    /// A refusal answers with an EMPTY LIST rather than silence or a distinct
+    /// opcode, which is what eMule does and is also the better privacy shape:
+    /// "I refuse" and "I have nothing" are then indistinguishable on the wire.
+    pub allow_browse: bool,
 }
 
 /// Keeps the file's served-peer list honest: registered on latch, removed on
@@ -745,6 +754,7 @@ where
         peer_aich,
         peer_ext_requests,
         aich,
+        allow_browse,
     } = session;
     // Unregisters this peer from the file's served list on EVERY exit path.
     let mut served: Option<ServedGuard> = None;
@@ -887,6 +897,53 @@ where
             }
         }
         match pkt.opcode {
+            crate::transfer::OP_ASKSHAREDFILES => {
+                // eMule's "View Files" on a client. It builds the list ONLY if
+                // CanSeeShares() allows, then sends whatever it built - so a
+                // refusal is `count = 0`, not silence and not a distinct opcode
+                // (0.50a ListenSocket.cpp, case OP_ASKSHAREDFILES). Answering
+                // the same shape either way is also the better privacy
+                // behaviour: "I refuse" and "I have nothing" are then
+                // indistinguishable to the asker.
+                //
+                // Only COMPLETED files can appear here at all - `library` comes
+                // from known.met - so a download in progress is never listed,
+                // whatever this flag says.
+                //
+                // The same on-disk check the transfer path uses: a file whose
+                // bytes are gone (or resized) is not ours to advertise, or we
+                // would invite a request we then fail.
+                let offered: Vec<crate::server_messages::OfferedFile<'_>> = if allow_browse {
+                    library
+                        .iter()
+                        .filter(
+                            |f| matches!(std::fs::metadata(&f.path), Ok(m) if m.len() == f.size),
+                        )
+                        .map(|f| crate::server_messages::OfferedFile {
+                            hash: f.hash,
+                            name: std::str::from_utf8(&f.name).unwrap_or(""),
+                            size: f.size,
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                // FILE_COMPLETE_ID/PORT: the record's id/port fields mean
+                // "complete" for our own shares, exactly as the OFFERFILES path
+                // uses them - the record layout is identical, which is why the
+                // same builder serves both.
+                let body = crate::server_messages::build_offer_files(
+                    &offered,
+                    crate::server_messages::FILE_COMPLETE_ID,
+                    crate::server_messages::FILE_COMPLETE_PORT,
+                );
+                fs.write_packet(&Packet::new(
+                    mule_proto::PROT_EDONKEY,
+                    crate::transfer::OP_ASKSHAREDFILESANSWER,
+                    body.payload,
+                ))
+                .await?;
+            }
             OP_REQUESTFILENAME => {
                 // Only latch a file we actually found: a miss must not clear a
                 // file already named on this connection (aMule sets UploadFileID
@@ -1417,6 +1474,96 @@ mod tests {
         let me = HelloInfo::baseline([0xAA; 16], 0x0A00_0001, 4663, 4673, "dl");
         let (_p, fs) = connect_peer(addr, &me).await.unwrap();
         (data, hash, root, fs, up, dir)
+    }
+
+    /// BROWSE (`OP_ASKSHAREDFILES`). Anthony tried "View Files" from a real
+    /// eMule and got nothing, because padMule handled none of the browse
+    /// opcodes at all.
+    ///
+    /// Both legs, because only the pair is meaningful: refused must yield an
+    /// EMPTY LIST rather than silence (eMule builds the list only if
+    /// `CanSeeShares()` allows and then sends whatever it built, so a denied
+    /// peer gets `count = 0`), and allowed must actually name the file. A
+    /// refusal that closed the connection or sent nothing would be a DIFFERENT
+    /// observable from "I have nothing to show" - and telling those apart is
+    /// exactly what a browsing adversary wants.
+    #[tokio::test]
+    async fn browse_answers_an_empty_list_when_refused_and_the_library_when_allowed() {
+        async fn browse(allow: bool) -> Vec<u8> {
+            let dir = std::env::temp_dir().join(format!("padmule-browse-{allow}"));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("secret-notes.pdf");
+            std::fs::write(&path, vec![7u8; 40]).unwrap();
+            let shared = vec![SharedFile {
+                hash: [0x9C; 16],
+                size: 40,
+                name: b"secret-notes.pdf".to_vec(),
+                part_hashes: vec![],
+                path,
+                rating: 0,
+                comment: String::new(),
+                aich_root: None,
+            }];
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let up = tokio::spawn(async move {
+                let me = HelloInfo::baseline([0xBB; 16], 0, 4662, 4672, "seed");
+                if let Ok((_p, mut fs)) = accept_peer(&listener, &me).await {
+                    let session = ServeSession {
+                        allow_browse: allow,
+                        ..Default::default()
+                    };
+                    let _ = serve_shared(&mut fs, &shared, None, None, 0, session).await;
+                }
+            });
+            let me = HelloInfo::baseline([0xAA; 16], 0x0A00_0001, 4663, 4673, "dl");
+            let (_p, mut fs) = connect_peer(addr, &me).await.unwrap();
+            fs.write_packet(&Packet::new(
+                mule_proto::PROT_EDONKEY,
+                crate::transfer::OP_ASKSHAREDFILES,
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+            let ans = fs.read_packet().await.expect("a browse must be ANSWERED");
+            assert_eq!(
+                ans.opcode,
+                crate::transfer::OP_ASKSHAREDFILESANSWER,
+                "wrong opcode in the browse answer"
+            );
+            drop(fs);
+            let _ = up.await;
+            std::fs::remove_dir_all(&dir).ok();
+            ans.payload
+        }
+
+        let refused = browse(false).await;
+        assert_eq!(
+            u32::from_le_bytes(refused[..4].try_into().unwrap()),
+            0,
+            "a refused browse must answer an EMPTY list, not silence"
+        );
+        assert!(
+            !refused.windows(16).any(|w| w == b"secret-notes.pdf"),
+            "a refused browse leaked a filename"
+        );
+
+        let allowed = browse(true).await;
+        assert_eq!(
+            u32::from_le_bytes(allowed[..4].try_into().unwrap()),
+            1,
+            "CONTROL: an allowed browse must list the file - without this the \
+             refused leg passes even if browse is broken entirely"
+        );
+        assert!(
+            allowed.windows(16).any(|w| w == b"secret-notes.pdf"),
+            "an allowed browse did not name the shared file"
+        );
+        assert!(
+            allowed[4..20] == [0x9C; 16],
+            "the record must lead with the file hash"
+        );
     }
 
     #[tokio::test]

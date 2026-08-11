@@ -256,12 +256,26 @@ final class SettingsTests: XCTestCase {
     /// on DISABLES padMule-to-padMule features, because other padMules find
     /// each other by exactly the marker it suppresses. A privacy switch that
     /// defaulted on would silently remove a capability nobody asked to lose.
-    func testIncognitoRegisteredDefaultIsOff() {
+    /// Incognito defaults ON (Anthony, 2026-08-11). It costs the
+    /// padMule-to-padMule enhancement channel - but that channel is DEFERRED
+    /// and unbuilt, so the capability it disables is theoretical today while
+    /// the exposure it removes is real on every connection.
+    func testIncognitoRegisteredDefaultIsOn() {
+        SettingsDefaults.register()
+        XCTAssertTrue(
+            UserDefaults.standard.bool(forKey: SettingsKey.incognito),
+            "incognito must default ON - protection first, and the enhancement "
+                + "channel it disables is not built yet")
+    }
+
+    /// Browsing defaults to NOBODY, which is also eMule's own default
+    /// (`SeeShare`, vsfaNobody). Letting any peer list everything you share is
+    /// not something to turn on for someone.
+    func testAllowBrowseRegisteredDefaultIsNobody() {
         SettingsDefaults.register()
         XCTAssertFalse(
-            UserDefaults.standard.bool(forKey: SettingsKey.incognito),
-            "incognito must default OFF - it disables padMule-to-padMule "
-                + "enhancements, so it has to be opt-in")
+            UserDefaults.standard.bool(forKey: SettingsKey.allowBrowse),
+            "browsing must default to Nobody - eMule defaults there too")
     }
 
     func testBackgroundSeedingRegisteredDefaultIsOff() {

@@ -1014,6 +1014,22 @@ impl MuleEngine {
             .block_on(async { self.inner.lock().await.is_incognito() })
     }
 
+    /// Allow or refuse library BROWSING (eMule `CanSeeShares`, whose own default
+    /// is `vsfaNobody`). A refusal answers an EMPTY list, never silence.
+    ///
+    /// Only COMPLETED files can ever be listed - the library comes from
+    /// known.met - so a download in progress is not browsable either way.
+    pub fn set_allow_browse(&self, on: bool) {
+        self.rt
+            .block_on(async { self.inner.lock().await.set_allow_browse(on) })
+    }
+
+    /// Whether peers may browse our library.
+    pub fn allows_browse(&self) -> bool {
+        self.rt
+            .block_on(async { self.inner.lock().await.allows_browse() })
+    }
+
     /// Unshare a completed file AND delete it from disk. Stronger than
     /// `unshare_file`, which deliberately leaves the file in place. padMule's
     /// downloads live in the app container, so without this the only way to get
