@@ -19,6 +19,7 @@ use mule_files::clients_met::MAX_PUBKEY_SIZE;
 use mule_files::{read_clients_met, write_clients_met, ClientsMet, CreditEntry};
 
 use crate::credits::{resolve_ident_state, score_ratio_ident};
+use crate::lock::LockRecover;
 
 /// Current Unix time in seconds for `last_seen` stamps. Saturates at `u32::MAX`
 /// (year 2106); a clock before the epoch reads 0.
@@ -31,6 +32,11 @@ pub fn now_secs() -> u32 {
 
 /// A userhash-keyed credit account, byte-compatible with `clients.met` on disk.
 pub struct CreditStore {
+    /// POISON-TOLERANT ([`crate::lock::LockRecover`]): fed by peer-supplied
+    /// userhashes on every hello and every byte moved, so a panic under it must
+    /// not end credit accounting for the app's life. A torn update can only
+    /// leave one peer's byte counters wrong, which is local policy that never
+    /// reaches the wire and is clamped to `[1.0, 10.0]` at score time anyway.
     inner: Mutex<HashMap<[u8; 16], CreditEntry>>,
     /// Whether WE hold a key pair. When false the secure-ident gate is a
     /// pass-through (we cannot verify anyone), so a key-bearing-but-unverified
@@ -70,7 +76,7 @@ impl CreditStore {
     /// Serialize to `clients.met` bytes (empty-history entries are skipped by
     /// `write_clients_met`, as aMule does).
     pub fn save(&self) -> Vec<u8> {
-        let entries: Vec<CreditEntry> = self.inner.lock().unwrap().values().cloned().collect();
+        let entries: Vec<CreditEntry> = self.inner.lock_recover().values().cloned().collect();
         write_clients_met(&ClientsMet { entries })
     }
 
@@ -80,7 +86,7 @@ impl CreditStore {
         now: u32,
         f: impl FnOnce(&mut CreditEntry) -> R,
     ) -> R {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock_recover();
         let e = g
             .entry(userhash)
             .or_insert_with(|| CreditEntry::new(userhash, now));
@@ -139,7 +145,7 @@ impl CreditStore {
         failed: bool,
     ) -> f32 {
         let (uploaded, downloaded, has_key) = {
-            let g = self.inner.lock().unwrap();
+            let g = self.inner.lock_recover();
             match g.get(userhash) {
                 Some(e) => (e.uploaded, e.downloaded, e.key_size > 0),
                 None => (0, 0, false),
@@ -157,6 +163,30 @@ mod tests {
 
     const H: [u8; 16] = [0xAB; 16];
     const NOW: u32 = 1_700_000_000;
+
+    /// MUTEX POISONING (handoff #35a). The credit map is fed by peer-supplied
+    /// userhashes and public keys on every hello and every byte moved; a panic
+    /// under its lock must not end credit accounting for the app's life.
+    #[test]
+    fn a_panic_under_the_credit_lock_leaves_the_store_working() {
+        let s = CreditStore::empty(true);
+        s.add_downloaded(H, 20 * 1_048_576, NOW);
+        crate::lock::poison_for_test(&s.inner);
+
+        // Accrual, key binding, scoring and the clients.met write all continue.
+        s.add_uploaded(H, 1_048_576, NOW);
+        s.touch([0x5C; 16], NOW);
+        // Bytes, not just a touch: `write_clients_met` skips empty histories.
+        s.add_downloaded([0x5C; 16], 1_048_576, NOW);
+        assert!(s.score(&H, Some(1), 1, false) >= CREDIT_MIN_RATIO);
+        s.bind_verified(H, &[0x44; 64], NOW);
+        let bytes = s.save();
+        assert!(!bytes.is_empty(), "the store still serializes");
+        // Round-tripped through a FRESH (unpoisoned) store, so this assertion
+        // does not depend on the recovery it is testing.
+        let reloaded = CreditStore::load(&bytes, NOW, true);
+        assert_eq!(reloaded.inner.lock().unwrap().len(), 2);
+    }
 
     #[test]
     fn accrual_and_save_load_round_trip() {

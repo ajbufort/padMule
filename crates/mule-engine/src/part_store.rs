@@ -33,6 +33,8 @@ use mule_files::part_met::{
     gap_tags, gaps as met_gaps, read_part_met, write_part_met, PartMet, PARTFILE_VERSION,
     PARTFILE_VERSION_LARGEFILE,
 };
+
+use crate::lock::LockRecover;
 use mule_proto::{Tag, TagValue, OLD_MAX_FILE_SIZE, PARTSIZE};
 
 use crate::part_file::{part_size, PartFile};
@@ -79,6 +81,15 @@ pub struct PartStore {
     /// SERIALIZATION (not mere range-disjointness) is load-bearing: endgame
     /// deliberately races two peers onto the SAME final block, and whole-block
     /// "last full write wins" must not become an interleaving of two streams.
+    ///
+    /// POISON-TOLERANT ([`crate::lock::LockRecover`]), and the one site where
+    /// recovery is unconditionally sound: the mutex guards `()`. There is no
+    /// state a panic could leave half-updated - only the serialization ORDER,
+    /// which a recovered guard preserves exactly, so the endgame rule above is
+    /// untouched. The durability invariant is likewise unaffected because it
+    /// does not live in this lock: the gap closes only after `write_and_sync`
+    /// RETURNS Ok. Without recovery, one panic anywhere under this lock would
+    /// end every download's write path for the app's life.
     write_serial: Arc<StdMutex<()>>,
     pub pf: PartFile,
     pub name: Vec<u8>,
@@ -482,7 +493,7 @@ impl DetachedWrite {
                 "block runs past the end of the file",
             ));
         }
-        let _serialized = self.serial.lock().unwrap();
+        let _serialized = self.serial.lock_recover();
         self.file.write_all_at(data, start)?;
         self.file.sync_data()
     }
@@ -814,6 +825,31 @@ mod tests {
         assert_eq!(s.read_part(0).unwrap(), data);
         // Same bounds rule as write_block.
         assert!(w.write_and_sync(3999, &[0u8; 2]).is_err());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// MUTEX POISONING (handoff #35a). `write_serial` is on EVERY download's
+    /// write path, so poisoning it would kill all block writes for the app's
+    /// life. Recovery is unconditionally sound here: the mutex guards `()` -
+    /// there is no state to be left half-updated, only the serialization order,
+    /// which a recovered guard preserves exactly. The durability invariant is
+    /// unaffected because it does not live in the lock: the gap closes only
+    /// after `write_and_sync` RETURNS Ok.
+    #[test]
+    fn a_panic_under_the_write_serial_lock_leaves_writing_working() {
+        let dir = tmpdir("poison");
+        let data: Vec<u8> = (0..4000u32).map(|i| (i * 7) as u8).collect();
+        let mut s = PartStore::create(&dir, 1, [0x51; 16], 4000, b"p.bin").unwrap();
+        let w = s.detach_writer().unwrap();
+        crate::lock::poison_for_test(&s.write_serial);
+
+        // The write still runs, and the bytes really land.
+        w.write_and_sync(0, &data).unwrap();
+        assert_eq!(fs::read(dir.join("001.part")).unwrap(), data);
+        // The bounds rule is untouched, and so is the write_block wrapper that
+        // takes the same lock through its own detached writer.
+        assert!(w.write_and_sync(3999, &[0u8; 2]).is_err());
+        s.write_block(0, &[1u8; 16]).unwrap();
         fs::remove_dir_all(&dir).ok();
     }
 

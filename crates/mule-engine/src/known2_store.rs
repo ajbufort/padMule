@@ -25,12 +25,23 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex as StdMutex;
 
+use crate::lock::LockRecover;
+
 /// The store filename (eMule KNOWN2_MET_FILENAME).
 pub const KNOWN2_MET: &str = "known2_64.met";
 
 pub struct Known2Store {
     path: PathBuf,
     /// Master root -> byte offset of the entry in the file.
+    ///
+    /// POISON-TOLERANT ([`crate::lock::LockRecover`]), and the site with the
+    /// most exposure: `remove`/`prune_orphans` hold this lock across
+    /// `scan_known2_met` and `remove_known2_entry`, i.e. across PARSING the
+    /// whole store file - whose contents include hashsets learned from peers.
+    /// Recovery is safe because this is a pure CACHE that `lookup` re-validates
+    /// from the artifact: it re-reads the root at the offset and rebuilds the
+    /// tree, refusing anything that does not reproduce the root. A torn index
+    /// can therefore cost a miss (we re-ask), never a wrong answer.
     index: StdMutex<HashMap<[u8; 20], u64>>,
 }
 
@@ -61,14 +72,14 @@ impl Known2Store {
 
     /// Whether a hashset for `root` is stored.
     pub fn has(&self, root: &[u8; 20]) -> bool {
-        self.index.lock().unwrap().contains_key(root)
+        self.index.lock_recover().contains_key(root)
     }
 
     /// Append one hashset. Deduplicated by root (eMule SHAHashSet.cpp:770-776);
     /// any write failure or length mismatch rolls the file back to its prior
     /// length so a partial entry never survives (eMule :803/:809).
     pub fn append(&self, root: &[u8; 20], leaves: &[[u8; 20]]) -> std::io::Result<()> {
-        let mut ix = self.index.lock().unwrap();
+        let mut ix = self.index.lock_recover();
         if ix.contains_key(root) {
             return Ok(());
         }
@@ -119,7 +130,7 @@ impl Known2Store {
     /// caller rebuild an identical tree, doubling the CPU of the single most
     /// expensive answer we serve.
     pub fn lookup(&self, root: &[u8; 20], file_size: u64) -> Option<AichTree> {
-        let off = *self.index.lock().unwrap().get(root)?;
+        let off = *self.index.lock_recover().get(root)?;
         let mut f = std::fs::File::open(&self.path).ok()?;
         f.seek(SeekFrom::Start(off)).ok()?;
         let mut hdr = [0u8; 24];
@@ -148,7 +159,7 @@ impl Known2Store {
     /// Remove the hashset for `root` (a file was unshared). Atomic rewrite;
     /// the index is rebuilt from the rewritten bytes.
     pub fn remove(&self, root: &[u8; 20]) {
-        let mut ix = self.index.lock().unwrap();
+        let mut ix = self.index.lock_recover();
         if !ix.contains_key(root) {
             return;
         }
@@ -167,7 +178,7 @@ impl Known2Store {
     /// appears in the catalog. Rewrites atomically only when something is
     /// actually dropped.
     pub fn prune_orphans(&self, live: &HashSet<[u8; 20]>) {
-        let mut ix = self.index.lock().unwrap();
+        let mut ix = self.index.lock_recover();
         let orphans: Vec<[u8; 20]> = ix.keys().filter(|r| !live.contains(*r)).copied().collect();
         if orphans.is_empty() {
             return;
@@ -217,6 +228,34 @@ mod tests {
         let data: Vec<u8> = (0..size).map(|i| (i as u8).wrapping_add(seed)).collect();
         let t = AichTree::from_file_data(&data).unwrap();
         (size as u64, t.master_hash().unwrap(), t.leaves().unwrap())
+    }
+
+    /// MUTEX POISONING (handoff #35a). This index lock is the one held across
+    /// PARSING: `remove`/`prune_orphans` run `scan_known2_met` and
+    /// `remove_known2_entry` over the whole store file while holding it, and
+    /// that file's contents include hashsets learned from peers. A panic there
+    /// would end AICH serving for the app's life. Recovery is safe because the
+    /// index is a pure root->offset CACHE that `lookup` re-validates: it
+    /// re-reads the root at the offset and rebuilds the tree, refusing anything
+    /// that does not reproduce the root, so a stale entry can only cost a miss.
+    #[test]
+    fn a_panic_under_the_index_lock_leaves_the_store_working() {
+        let dir = tmpdir("poison");
+        let store = Known2Store::load(&dir);
+        let (sa, ra, la) = real_set(8, 2);
+        let (sb, rb, lb) = real_set(9, 3);
+        store.append(&ra, &la).unwrap();
+        crate::lock::poison_for_test(&store.index);
+
+        // Reads, appends, removals and the startup prune all still work.
+        assert!(store.has(&ra));
+        assert_eq!(store.lookup(&ra, sa).unwrap().leaves().unwrap(), la);
+        store.append(&rb, &lb).unwrap();
+        assert_eq!(store.lookup(&rb, sb).unwrap().leaves().unwrap(), lb);
+        store.remove(&ra);
+        assert!(!store.has(&ra), "the removal took effect");
+        store.prune_orphans(&HashSet::new());
+        assert!(!store.has(&rb), "the prune took effect");
     }
 
     #[test]

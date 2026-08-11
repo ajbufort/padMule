@@ -19,6 +19,7 @@ pub mod kad_publish;
 pub mod kad_serve;
 pub mod known2_store;
 pub mod link;
+mod lock;
 pub mod multi_source;
 pub mod obf_handshake;
 pub mod part_file;

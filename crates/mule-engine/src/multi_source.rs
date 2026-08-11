@@ -25,6 +25,7 @@ use tokio::sync::Mutex;
 
 use crate::credit_store::now_secs;
 use crate::framed::FramedStream;
+use crate::lock::LockRecover;
 use crate::part_file::data_part_count;
 use crate::part_store::PartStore;
 use crate::secure_ident::{
@@ -317,6 +318,29 @@ pub struct Download {
     asked_sources: StdMutex<HashSet<IpAddr>>,
 }
 
+// POISON TOLERANCE for the six `StdMutex` fields above
+// ([`crate::lock::LockRecover`]). All six are on the peer-facing path - block
+// offsets, AICH roots and source lists a stranger chose - so a panic under any
+// of them would otherwise end this download for the app's life. Worse:
+// `HeldBlocks::drop` takes `reserved`, so a poisoned lock panics DURING an
+// unwind, which aborts the process (proved on the unfixed code: the poison
+// tests SIGABRT).
+//
+// Recovery is safe because none of the six holds an invariant the code cannot
+// re-derive from the artifact:
+//   - `reserved` is a hint. A leaked entry means one block goes unrequested
+//     until restart; a duplicated one is what ENDGAME does on purpose. Both are
+//     states the fetch loop already handles.
+//   - `block_sources` / `banned` / `aich` are evidence and votes. A torn update
+//     costs a blame or a vote, never a wrong verdict: every part is still
+//     judged by its own MD4, and `apply_aich_recovery` re-hashes the bytes on
+//     disk before it fills anything back.
+//   - `sx_sources` / `asked_sources` are dial bookkeeping; a lost or repeated
+//     entry costs one redundant ask.
+// The invariants that DO matter live elsewhere: the gap list is closed only
+// after `write_and_sync` returns Ok (`part_store`), and completion is proved by
+// whole-file MD4.
+
 struct Inner {
     store: PartStore,
     /// Per data-part swarm availability: how many peer sessions have reported
@@ -445,19 +469,19 @@ impl Download {
         if sources.is_empty() {
             return;
         }
-        self.sx_sources.lock().unwrap().extend(sources);
+        self.sx_sources.lock_recover().extend(sources);
     }
 
     /// Take the source-exchange sources learned since the last call. Destructive:
     /// the fetch manager folds each into its dial queue exactly once.
     pub fn take_sx_sources(&self) -> Vec<SxSource> {
-        std::mem::take(&mut *self.sx_sources.lock().unwrap())
+        std::mem::take(&mut *self.sx_sources.lock_recover())
     }
 
     /// Claim the right to ask `ip` for sources on this download. `true` only the
     /// FIRST time, so one peer is never asked twice (see `asked_sources`).
     pub fn mark_asked_sources(&self, ip: IpAddr) -> bool {
-        self.asked_sources.lock().unwrap().insert(ip)
+        self.asked_sources.lock_recover().insert(ip)
     }
 
     /// Claim the single in-flight fetch slot. The FIRST caller gets `true` and must
@@ -913,7 +937,7 @@ impl Download {
         }
         let preview = self.preview.load(Ordering::Relaxed);
         let g = self.inner.lock().await;
-        let reserved = self.reserved.lock().unwrap().clone();
+        let reserved = self.reserved.lock_recover().clone();
         let avail = g.availability.clone();
         let missing = g.store.pf.missing();
         let rarity = |p: u64| avail.get(p as usize).copied().unwrap_or(0);
@@ -929,7 +953,7 @@ impl Download {
                 .pf
                 .next_blocks(&has, &reserved, max, &rarity, true, preview);
         }
-        self.reserved.lock().unwrap().extend_from_slice(&blocks);
+        self.reserved.lock_recover().extend_from_slice(&blocks);
         blocks
     }
 
@@ -942,15 +966,12 @@ impl Download {
         if blocks.is_empty() {
             return;
         }
-        self.reserved
-            .lock()
-            .unwrap()
-            .retain(|b| !blocks.contains(b));
+        self.reserved.lock_recover().retain(|b| !blocks.contains(b));
     }
 
     /// Blocks reserved right now. For tests and diagnostics.
     pub fn reserved_now(&self) -> Vec<(u64, u64)> {
-        self.reserved.lock().unwrap().clone()
+        self.reserved.lock_recover().clone()
     }
 
     /// Write received bytes through to disk and close their gap.
@@ -981,7 +1002,7 @@ impl Download {
         // (localize_corruption), per BLOCK with it (apply_aich_recovery).
         if let Some(addr) = source {
             let end = start.saturating_add(data.len() as u64);
-            let mut bs = self.block_sources.lock().unwrap();
+            let mut bs = self.block_sources.lock_recover();
             let mut pos = start;
             while pos < end {
                 let part_start = pos - pos % PARTSIZE;
@@ -1038,12 +1059,12 @@ impl Download {
     /// corruption). Compared by IP, so it catches a LowID source dialing back from
     /// a new ephemeral port. Both serve paths (sweep + callback) consult this.
     pub fn is_banned(&self, addr: &SocketAddr) -> bool {
-        self.banned.lock().unwrap().contains(&addr.ip())
+        self.banned.lock_recover().contains(&addr.ip())
     }
 
     /// Banned source IPs so far, for tests/telemetry.
     pub fn banned_sources(&self) -> Vec<IpAddr> {
-        self.banned.lock().unwrap().iter().copied().collect()
+        self.banned.lock_recover().iter().copied().collect()
     }
 
     /// Verify every part whose bytes have all arrived. A part that fails is
@@ -1133,9 +1154,9 @@ impl Download {
         // moment, PartFile.cpp:4851-4853). Harmless if no root is ever
         // trusted - the entry simply never gets claimed.
         {
-            let mut bs = self.block_sources.lock().unwrap();
-            let mut banned = self.banned.lock().unwrap();
-            let mut a = self.aich.lock().unwrap();
+            let mut bs = self.block_sources.lock_recover();
+            let mut banned = self.banned.lock_recover();
+            let mut a = self.aich.lock_recover();
             for p in &bad {
                 let (ps, pe) = (p * PARTSIZE, (p + 1) * PARTSIZE);
                 let keys: Vec<u64> = bs
@@ -1182,14 +1203,14 @@ impl Download {
     /// carried an aich part) - VERIFIED, never displaced by votes (eMule
     /// PartFile.cpp:197-201).
     pub fn set_aich_master_verified(&self, root: [u8; 20]) {
-        let mut a = self.aich.lock().unwrap();
+        let mut a = self.aich.lock_recover();
         a.master = Some(root);
         a.status = AichStatus::Verified;
     }
 
     /// The trusted/verified master root, if recovery is allowed to use one.
     pub fn aich_trusted_root(&self) -> Option<[u8; 20]> {
-        let a = self.aich.lock().unwrap();
+        let a = self.aich.lock_recover();
         matches!(a.status, AichStatus::Trusted | AichStatus::Verified)
             .then_some(a.master)
             .flatten()
@@ -1201,7 +1222,7 @@ impl Download {
     /// MINPERCENTAGE_TOTRUST agreement promote the winner to TRUSTED, else
     /// it stays the UNTRUSTED front-runner. A VERIFIED root ignores votes.
     pub fn note_aich_root(&self, ip: IpAddr, root: [u8; 20]) {
-        let mut a = self.aich.lock().unwrap();
+        let mut a = self.aich.lock_recover();
         a.reported.insert(ip, root);
         // VERIFIED is authoritative and ERROR is terminal: neither takes votes
         // (eMule accepts a vote only in EMPTY/UNTRUSTED/TRUSTED,
@@ -1256,7 +1277,7 @@ impl Download {
     /// the (part, root) to put on the wire; the claim self-expires if the
     /// answer never comes.
     pub fn claim_aich_recovery(&self, ip: IpAddr, size: u64) -> Option<(u64, [u8; 20])> {
-        let mut a = self.aich.lock().unwrap();
+        let mut a = self.aich.lock_recover();
         let root = matches!(a.status, AichStatus::Trusted | AichStatus::Verified)
             .then_some(a.master)
             .flatten()?;
@@ -1291,7 +1312,7 @@ impl Download {
     /// whose stale claim has already been handed on must not free the new
     /// asker's claim out from under it.
     pub fn aich_recovery_failed(&self, part: u64, ip: IpAddr) {
-        let mut a = self.aich.lock().unwrap();
+        let mut a = self.aich.lock_recover();
         if let Some(p) = a.pending.get_mut(&part) {
             if p.claim.map(|(owner, _)| owner) == Some(ip) {
                 p.claim = None;
@@ -1303,8 +1324,7 @@ impl Download {
     /// apply path uses, so a superseded claimant's late answer is dropped).
     fn owns_aich_claim(&self, part: u64, ip: IpAddr) -> bool {
         self.aich
-            .lock()
-            .unwrap()
+            .lock_recover()
             .pending
             .get(&part)
             .and_then(|p| p.claim)
@@ -1378,15 +1398,15 @@ impl Download {
         // bytes are no longer the ones the snapshot's source delivered, so a
         // mismatch says nothing about that source.
         let snapshot = {
-            let a = self.aich.lock().unwrap();
+            let a = self.aich.lock_recover();
             a.pending
                 .get(&part)
                 .map(|p| p.contributors.clone())
                 .unwrap_or_default()
         };
         {
-            let bs = self.block_sources.lock().unwrap();
-            let mut banned = self.banned.lock().unwrap();
+            let bs = self.block_sources.lock_recover();
+            let mut banned = self.banned.lock_recover();
             for (start, _len, ok) in &results {
                 if *ok || bs.contains_key(start) {
                     continue;
@@ -1419,7 +1439,7 @@ impl Download {
             let _ = g.store.save_met();
             drop(g);
             if disagrees {
-                let mut a = self.aich.lock().unwrap();
+                let mut a = self.aich.lock_recover();
                 a.status = AichStatus::Error;
                 a.master = None;
                 a.pending.clear();
@@ -1428,7 +1448,7 @@ impl Download {
         }
         // The part's recovery is DONE (good blocks filled, bad ones open for a
         // clean re-fetch); a future MD4 failure re-queues it.
-        self.aich.lock().unwrap().pending.remove(&part);
+        self.aich.lock_recover().pending.remove(&part);
         Ok((good, bad))
     }
 
@@ -2669,6 +2689,58 @@ mod tests {
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    /// MUTEX POISONING (handoff #35a). A `Download` keeps six `std::sync::Mutex`
+    /// fields on the peer-facing path (reservations, per-block attribution, the
+    /// ban set, the AICH vote/claim state, the source-exchange lists). A panic
+    /// under any one of them must not kill the download: `HeldBlocks::drop`
+    /// takes `reserved`, so a poisoned lock would panic mid-unwind and ABORT the
+    /// process rather than merely stall one transfer.
+    #[tokio::test]
+    async fn a_panic_under_a_download_lock_leaves_the_download_working() {
+        let dir = tmpdir("poison");
+        let store = PartStore::create(&dir, 1, [0xC3; 16], 1_000_000, b"p.bin").unwrap();
+        let dl = Download::new(store);
+        crate::lock::poison_for_test(&dl.reserved);
+        crate::lock::poison_for_test(&dl.block_sources);
+        crate::lock::poison_for_test(&dl.banned);
+        crate::lock::poison_for_test(&dl.aich);
+        crate::lock::poison_for_test(&dl.sx_sources);
+        crate::lock::poison_for_test(&dl.asked_sources);
+
+        // Reservations still hand out and give back.
+        let status = FileStatus {
+            hash: [0xC3; 16],
+            complete: true,
+            parts: Vec::new(),
+        };
+        let blocks = dl.take_blocks(&status, 2).await;
+        assert!(!blocks.is_empty(), "blocks are still handed out");
+        assert_eq!(dl.reserved_now().len(), blocks.len());
+        dl.release(&blocks);
+        assert!(dl.reserved_now().is_empty(), "and still given back");
+
+        // Attribution, bans, AICH votes and source exchange all still record.
+        dl.commit(0, &[9u8; 32], Some("203.0.113.4:4662".parse().unwrap()))
+            .await
+            .unwrap();
+        assert!(!dl.is_banned(&"203.0.113.4:4662".parse().unwrap()));
+        dl.note_aich_root(ip("10.1.0.1"), [0xEE; 20]);
+        dl.note_sx_sources(vec![SxSource {
+            ip: 0x0400_0000,
+            port: 4662,
+            server_ip: 0,
+            server_port: 0,
+            user_hash: None,
+            crypt: None,
+        }]);
+        assert_eq!(dl.take_sx_sources().len(), 1);
+        assert!(
+            dl.mark_asked_sources(ip("10.1.0.2")),
+            "the asked set still records"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

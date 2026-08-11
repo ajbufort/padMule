@@ -30,6 +30,7 @@ use crate::identity::NodeIdentity;
 use crate::kad_live::KadNode;
 use crate::known2_store::Known2Store;
 use crate::link::ServerLink;
+use crate::lock::LockRecover;
 use crate::multi_source::{download_from_peer_at, resume_downloads, Download};
 use crate::obf_handshake::{obf_accept, ObfDetect};
 use crate::part_store::PartStore;
@@ -894,6 +895,13 @@ impl Drop for FetchGuard {
 }
 
 /// Per-IP inbound-connection counter shared by the listener.
+///
+/// POISON-TOLERANT ([`crate::lock::LockRecover`]): taken on every accepted
+/// connection and released in `IpConnSlot::drop`, so a poisoned lock would both
+/// close the listener's admission path and turn every later teardown into a
+/// panic mid-unwind - a process ABORT. Recovery is safe because the map holds
+/// nothing but per-IP counters: a torn update leaves one IP off by one, and the
+/// entry is dropped entirely when it reaches zero.
 type PerIpConns = Arc<std::sync::Mutex<std::collections::HashMap<Ipv4Addr, u32>>>;
 
 /// RAII slot for one inbound connection from `ip`: decrements the per-IP count on
@@ -906,7 +914,7 @@ struct IpConnSlot {
 
 impl IpConnSlot {
     fn try_acquire(map: &PerIpConns, ip: Ipv4Addr) -> Option<Self> {
-        let mut m = map.lock().unwrap();
+        let mut m = map.lock_recover();
         let n = m.entry(ip).or_insert(0);
         if *n >= MAX_INBOUND_PER_IP {
             return None;
@@ -921,7 +929,7 @@ impl IpConnSlot {
 
 impl Drop for IpConnSlot {
     fn drop(&mut self) {
-        let mut m = self.map.lock().unwrap();
+        let mut m = self.map.lock_recover();
         if let Some(n) = m.get_mut(&self.ip) {
             *n = n.saturating_sub(1);
             if *n == 0 {
@@ -5529,6 +5537,38 @@ impl Engine {
 mod tests {
     use super::*;
 
+    /// MUTEX POISONING (handoff #35a). The per-IP inbound cap is taken on EVERY
+    /// accepted connection and released in `IpConnSlot::drop`, so poisoning it
+    /// would both close the listener's admission path and turn every later
+    /// connection teardown into a panic mid-unwind - a process ABORT. Recovery
+    /// is safe: the map holds per-IP counters that a torn update can only leave
+    /// off by one, and each entry is removed when it reaches zero.
+    #[test]
+    fn a_panic_under_the_per_ip_lock_leaves_admission_working() {
+        let per_ip: PerIpConns = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let ip = Ipv4Addr::new(203, 0, 113, 7);
+        let first = IpConnSlot::try_acquire(&per_ip, ip).expect("the control acquire");
+        crate::lock::poison_for_test(&per_ip);
+
+        // Admission still counts up to the cap, and still refuses past it.
+        let mut held = vec![first];
+        while let Some(s) = IpConnSlot::try_acquire(&per_ip, ip) {
+            held.push(s);
+            assert!(
+                held.len() <= MAX_INBOUND_PER_IP as usize,
+                "the cap still holds"
+            );
+        }
+        assert_eq!(held.len(), MAX_INBOUND_PER_IP as usize);
+        // And the Drop path - the abort path - still gives the slots back.
+        held.clear();
+        // Read the map back WITHOUT the production helper, so this assertion is
+        // an independent witness rather than a restatement of the fix.
+        let seen = per_ip.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert!(seen.is_empty(), "the entry was cleaned up");
+        assert!(IpConnSlot::try_acquire(&per_ip, ip).is_some());
+    }
+
     #[test]
     fn gate_loaded_nodes_applies_the_amule_load_gate() {
         // aMule filters nodes.dat contacts at LOAD (RoutingZone.cpp:195-199):
@@ -9888,10 +9928,21 @@ mod tests {
         // client's log line.
         engine.set_nickname("Tony\r\n\u{0}iPad");
         assert_eq!(engine.nickname(), "TonyiPad");
+        // Scan the NICK, not the whole packet. The login embeds a RANDOMLY
+        // GENERATED 16-byte userhash (identity.rs:33), so a byte-scan of the
+        // whole payload fails on ~5% of runs when the random bytes happen to
+        // contain a 0x0A - a flake with nothing to do with nicknames, found by
+        // the 35a agent hitting it live. Assert the two things actually
+        // claimed: the sanitized name REACHED the wire, and it carries no
+        // control byte.
         let login = crate::server_messages::build_login_request(&engine.login_request());
         assert!(
-            !login.payload.contains(&b'\n'),
-            "no newline may reach the login packet"
+            login.payload.windows(8).any(|w| w == b"TonyiPad"),
+            "the sanitized nickname must reach the login packet"
+        );
+        assert!(
+            !engine.nickname().bytes().any(|b| b.is_ascii_control()),
+            "no control character may survive sanitization"
         );
 
         // '?' is KEPT - the deliberate divergence from IsValidEd2kString, whose

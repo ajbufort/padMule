@@ -33,6 +33,7 @@ const QUEUE_WAIT: Duration = Duration::from_secs(120);
 
 use crate::credit_store::{now_secs, CreditStore};
 use crate::framed::{FrameError, FramedStream};
+use crate::lock::LockRecover;
 use crate::secure_ident::{
     Identity, SecureIdentSession, OP_PUBLICKEY, OP_SECIDENTSTATE, OP_SIGNATURE,
 };
@@ -140,6 +141,17 @@ impl RequestCounter {
 /// Those are the always-on desktop-seedbox parts of eMule's design; padMule is
 /// foreground-only. The announced rank is a BEST-EFFORT snapshot at queue time;
 /// a later-arriving higher-credit peer can outrank it, as in eMule.
+///
+/// BOTH locks are POISON-TOLERANT ([`crate::lock::LockRecover`]). They are on
+/// the serve path - every inbound peer touches them - and both are taken inside
+/// `Drop` impls (`SlotGuard`, `QueueWaiter`), so a poisoned lock would panic
+/// mid-unwind and ABORT the process rather than merely stop uploads. Recovery
+/// is safe because neither holds a correctness invariant: `served` is an
+/// advertisement cache whose entries are already allowed to go stale the moment
+/// a peer disconnects, and `inner` is a politeness bound - a torn update can
+/// only drift `slots_free` or strand a waiter key, costing at most a few
+/// concurrent uploads or one peer's place in a queue that is re-entered on the
+/// next connection. Nothing here gates data integrity or the wire format.
 pub struct UploadGate {
     inner: std::sync::Mutex<GateInner>,
     /// Woken (all waiters) whenever a slot frees or a waiter leaves; each parked
@@ -189,7 +201,7 @@ impl UploadGate {
     /// source-exchange request for that file can name it - the padMule
     /// equivalent of aMule adding a client to a file's upload list.
     pub fn note_serving(&self, hash: [u8; 16], peer: ServedPeer) {
-        let mut g = self.served.lock().unwrap();
+        let mut g = self.served.lock_recover();
         let v = g.entry(hash).or_default();
         if !v.iter().any(|p| p.addr == peer.addr) {
             v.push(peer);
@@ -200,7 +212,7 @@ impl UploadGate {
     /// `note_serving` by `ServedGuard`, so a dropped connection never leaves a
     /// stale source we would hand to others).
     pub fn stop_serving(&self, hash: &[u8; 16], addr: SocketAddr) {
-        let mut g = self.served.lock().unwrap();
+        let mut g = self.served.lock_recover();
         if let Some(v) = g.get_mut(hash) {
             v.retain(|p| p.addr != addr);
             if v.is_empty() {
@@ -213,7 +225,7 @@ impl UploadGate {
     /// Skips the asker itself and any peer we cannot name usefully (no port),
     /// matching aMule's own skips (`cur_src == forClient`, LowID).
     pub fn sources_for(&self, hash: &[u8; 16], exclude: Option<SocketAddr>) -> Vec<SxSource> {
-        let g = self.served.lock().unwrap();
+        let g = self.served.lock_recover();
         let Some(v) = g.get(hash) else {
             return Vec::new();
         };
@@ -244,14 +256,14 @@ impl UploadGate {
 
     /// Currently-waiting (queued, not yet granted) peers. For tests/telemetry.
     pub fn waiting(&self) -> usize {
-        self.inner.lock().unwrap().waiters.len()
+        self.inner.lock_recover().waiters.len()
     }
 
     /// Grant a slot immediately IFF one is free AND nobody is queued - a newcomer
     /// must never jump ahead of waiting peers. Returns a guard that frees the slot
     /// (and wakes the best waiter) on drop.
     pub fn try_grant(self: &Arc<Self>) -> Option<SlotGuard> {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock_recover();
         if g.slots_free > 0 && g.waiters.is_empty() {
             g.slots_free -= 1;
             Some(SlotGuard {
@@ -266,7 +278,7 @@ impl UploadGate {
     /// rank snapshot + a handle to await a slot, or `None` if the queue is full
     /// (the only refusal, and it is identity-independent).
     pub fn enqueue(self: &Arc<Self>, score_key: u32) -> Option<QueueWaiter> {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock_recover();
         if g.waiters.len() >= self.queue_cap {
             return None;
         }
@@ -292,7 +304,7 @@ pub struct SlotGuard {
 
 impl Drop for SlotGuard {
     fn drop(&mut self) {
-        self.gate.inner.lock().unwrap().slots_free += 1;
+        self.gate.inner.lock_recover().slots_free += 1;
         // Wake all parked waiters; the best-scored one re-checks and takes it.
         self.gate.notify.notify_waiters();
     }
@@ -318,7 +330,7 @@ impl QueueWaiter {
             tokio::pin!(notified);
             notified.as_mut().enable();
             {
-                let mut g = self.gate.inner.lock().unwrap();
+                let mut g = self.gate.inner.lock_recover();
                 if g.slots_free > 0 && g.waiters.iter().next() == Some(&self.key) {
                     g.slots_free -= 1;
                     g.waiters.remove(&self.key);
@@ -336,7 +348,7 @@ impl QueueWaiter {
 impl Drop for QueueWaiter {
     fn drop(&mut self) {
         if !self.done {
-            self.gate.inner.lock().unwrap().waiters.remove(&self.key);
+            self.gate.inner.lock_recover().waiters.remove(&self.key);
             // Our departure may make a slot claimable by the next-best waiter.
             self.gate.notify.notify_waiters();
         }
@@ -1262,6 +1274,41 @@ mod tests {
     use crate::transfer_session::{download_file, TransferError};
     use mule_proto::{ed2k_hash, md4, PARTSIZE};
     use tokio::net::TcpListener;
+
+    /// MUTEX POISONING (handoff #35a). A panic under an `UploadGate` lock must
+    /// not kill the upload gate for the app's life. This gate is on the SERVE
+    /// path - every inbound peer connection touches it - and both its locks are
+    /// taken inside `Drop` impls (`SlotGuard`, `QueueWaiter`), so a poisoned
+    /// lock would panic mid-unwind and ABORT the process rather than merely
+    /// stop uploads.
+    #[test]
+    fn a_panic_under_an_upload_gate_lock_leaves_the_gate_working() {
+        let gate = Arc::new(UploadGate::new(2, 4));
+        crate::lock::poison_for_test(&gate.inner);
+        crate::lock::poison_for_test(&gate.served);
+
+        // Slot bookkeeping still works...
+        let slot = gate.try_grant().expect("a slot is still grantable");
+        assert_eq!(gate.waiting(), 0);
+        let waiter = gate.enqueue(1_000).expect("a waiter can still queue");
+        assert_eq!(gate.waiting(), 1);
+        // ...the served map still answers a source-exchange request...
+        let peer = ServedPeer {
+            addr: "1.2.3.4:4662".parse().unwrap(),
+            user_hash: None,
+            crypt: None,
+        };
+        gate.note_serving([7u8; 16], peer);
+        assert_eq!(gate.sources_for(&[7u8; 16], None).len(), 1);
+        gate.stop_serving(&[7u8; 16], "1.2.3.4:4662".parse().unwrap());
+        assert!(gate.sources_for(&[7u8; 16], None).is_empty());
+        // ...and the RAII drops - the paths that would abort mid-unwind - are
+        // clean and still return the slot / dequeue the waiter.
+        drop(waiter);
+        assert_eq!(gate.waiting(), 0);
+        drop(slot);
+        assert!(gate.try_grant().is_some(), "the freed slot came back");
+    }
 
     #[tokio::test]
     async fn queue_grants_the_highest_credit_waiter_first() {

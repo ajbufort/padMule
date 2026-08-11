@@ -42,9 +42,7 @@ use std::time::Instant as StdInstant;
 use tokio::net::UdpSocket;
 use tokio::time::{timeout, Instant};
 
-/// The message a poisoned lock would carry. A panic while holding one of these
-/// locks is already a bug; propagating the poison is the honest response.
-const LOCK_POISONED: &str = "kad lock poisoned";
+use crate::lock::LockRecover;
 
 /// The contact count padMule requests in a KADEMLIA2_REQ (KAD_FIND_NODE = 0x0B).
 /// A KADEMLIA2_RES with more than this is a malicious over-long answer and is
@@ -234,6 +232,17 @@ pub struct KadNode {
     /// The routing table, reached from two directions: the inbound request
     /// handler reads it, lookups write it. A `std` mutex held for one table
     /// operation and NEVER across an await - use [`KadNode::with_routing`].
+    ///
+    /// POISON-TOLERANT, like every `std` lock on this node
+    /// ([`crate::lock::LockRecover`]). `run_read_loop` takes these locks for
+    /// EVERY datagram a stranger sends us, so a single panic under one would
+    /// otherwise kill Kad for the app's life - and `SlotGuard::drop` takes
+    /// `pending`, so a poisoned lock panics DURING an unwind, which aborts the
+    /// process. Recovery is safe because all of it is self-healing bookkeeping:
+    /// the routing table ages, re-probes and evicts (a torn insert is one
+    /// contact, and a contact is only ever a hint we re-verify); a leaked
+    /// `pending` slot times out; `flood` and `hello_res_sent` are per-minute
+    /// soft counters; `ip_filter` is a single `Arc` swap.
     routing: Arc<Mutex<RoutingTable>>,
     /// The user IP blocklist (ipfilter.dat/.p2p), if loaded. eMule consults it on
     /// every Kad routing insert (RoutingZone.cpp:477); padMule threads the engine's
@@ -331,7 +340,7 @@ fn gated_add_contact(
     // (eMule RoutingZone.cpp:477): a range the user chose to block never enters
     // the routing table. Fail-open when no filter is loaded. Clone the Arc out
     // so the filter guard is not held while the routing lock is taken.
-    let filter = ip_filter.lock().expect(LOCK_POISONED).clone();
+    let filter = ip_filter.lock_recover().clone();
     if let Some(f) = filter {
         if f.is_blocked_u32(c.ip) {
             return;
@@ -345,7 +354,7 @@ fn gated_add_contact(
     // also clears its verified bit on the ip change). Interop-safe: the real Kad
     // network is IP-diverse, so a legitimate peer is never dropped. One lock
     // across check-and-add, so the cap cannot be raced past.
-    let mut t = routing.lock().expect(LOCK_POISONED);
+    let mut t = routing.lock_recover();
     let refresh = t.ip_of(&c.id) == Some(c.ip);
     if c.ip != 0 && !refresh {
         let (same_ip, same_subnet) = t.ip_counts(c.ip);
@@ -372,7 +381,7 @@ fn closest_wire_contacts_serving_in(
     target: &Kad128,
     count: usize,
 ) -> Vec<WireContact> {
-    let g = routing.lock().expect(LOCK_POISONED);
+    let g = routing.lock_recover();
     g.closest_to_serving(target, count)
         .into_iter()
         .map(|c| WireContact {
@@ -391,8 +400,7 @@ fn closest_wire_contacts_in(
     want: usize,
 ) -> Vec<WireContact> {
     routing
-        .lock()
-        .expect(LOCK_POISONED)
+        .lock_recover()
         .closest_to(target, want)
         .into_iter()
         .map(|c| WireContact {
@@ -482,8 +490,7 @@ impl SlotGuard {
 impl Drop for SlotGuard {
     fn drop(&mut self) {
         self.pending
-            .lock()
-            .expect(LOCK_POISONED)
+            .lock_recover()
             .retain(|p| !self.seqs.contains(&p.seq));
     }
 }
@@ -654,7 +661,7 @@ fn flood_allows(
     let Some(budget) = flood_budget(op) else {
         return true; // not a served request; the caller drops it regardless
     };
-    let mut map = flood.lock().expect(LOCK_POISONED);
+    let mut map = flood.lock_recover();
     let tracker = map.entry(op).or_insert_with(|| {
         FloodTracker::new(
             Duration::from_secs(60),
@@ -671,7 +678,7 @@ fn flood_allows(
 /// Note that we answered `ip` with a HELLO_RES, so its ACK is solicited.
 /// Prunes expired entries first, then refuses to grow past [`MAX_TRACKED_IPS`].
 fn note_hello_res_sent(sent: &Mutex<HashMap<u32, StdInstant>>, ip: u32, now: StdInstant) {
-    let mut m = sent.lock().expect(LOCK_POISONED);
+    let mut m = sent.lock_recover();
     m.retain(|_, t| now.duration_since(*t) < ACK_SOLICITED_WINDOW);
     if m.len() < MAX_TRACKED_IPS || m.contains_key(&ip) {
         m.insert(ip, now);
@@ -681,7 +688,7 @@ fn note_hello_res_sent(sent: &Mutex<HashMap<u32, StdInstant>>, ip: u32, now: Std
 /// Did we send `ip` a HELLO_RES within the window? CONSUMES the entry on a
 /// match, so one solicitation admits exactly one ACK (eMule removes it too).
 fn take_hello_res_sent(sent: &Mutex<HashMap<u32, StdInstant>>, ip: u32, now: StdInstant) -> bool {
-    let mut m = sent.lock().expect(LOCK_POISONED);
+    let mut m = sent.lock_recover();
     match m.remove(&ip) {
         Some(t) => now.duration_since(t) < ACK_SOLICITED_WINDOW,
         None => false,
@@ -722,7 +729,7 @@ async fn run_read_loop(ctx: ReadLoop) {
         // dialled. The opcode is part of the match, so an interleaved REQUEST
         // from a peer we are awaiting falls through to the serve path below.
         let slot = {
-            let mut pending = ctx.pending.lock().expect(LOCK_POISONED);
+            let mut pending = ctx.pending.lock_recover();
             pending
                 .iter()
                 .position(|p| p.dest == from && p.expect == op)
@@ -766,8 +773,7 @@ async fn run_read_loop(ctx: ReadLoop) {
                     // only if the address we STORED for that id matches the one
                     // this datagram came from (RoutingZone.cpp:985-986).
                     ctx.routing
-                        .lock()
-                        .expect(LOCK_POISONED)
+                        .lock_recover()
                         .verify_contact(&sender_id, from_ip);
                 }
                 crate::kad_serve::AckVerdict::Drop => {}
@@ -804,8 +810,7 @@ async fn run_read_loop(ctx: ReadLoop) {
         // and the namespaced amuled oracle. Left faithful on purpose.
         if ctx
             .ip_filter
-            .lock()
-            .expect(LOCK_POISONED)
+            .lock_recover()
             .as_ref()
             .is_some_and(|f| f.is_blocked_u32(from_ip))
         {
@@ -847,12 +852,9 @@ async fn run_read_loop(ctx: ReadLoop) {
                 // often the FIRST contact, so this is the earliest moment the
                 // key is available.
                 let our_ip = ctx.current_public_ip.load(Ordering::Relaxed);
-                ctx.routing.lock().expect(LOCK_POISONED).note_verify_key(
-                    &h.id,
-                    from_ip,
-                    dec.sender_vk,
-                    our_ip,
-                );
+                ctx.routing
+                    .lock_recover()
+                    .note_verify_key(&h.id, from_ip, dec.sender_vk, our_ip);
             }
         }
         // Read at ANSWER time through the shared handle, never captured at
@@ -998,7 +1000,7 @@ impl KadNode {
     /// Install the user IP blocklist so blocklisted ranges are dropped from every
     /// routing insert (matching eMule). `None` = no filter (fail-open).
     pub fn set_ip_filter(&self, filter: Option<std::sync::Arc<IpFilter>>) {
-        *self.ip_filter.lock().expect(LOCK_POISONED) = filter;
+        *self.ip_filter.lock_recover() = filter;
     }
 
     pub fn kad_id(&self) -> Kad128 {
@@ -1100,7 +1102,7 @@ impl KadNode {
     }
 
     pub(crate) fn with_routing<R>(&self, f: impl FnOnce(&mut RoutingTable) -> R) -> R {
-        let mut g = self.routing.lock().expect(LOCK_POISONED);
+        let mut g = self.routing.lock_recover();
         f(&mut g)
     }
 
@@ -1302,7 +1304,7 @@ impl KadNode {
         );
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.pending.lock().expect(LOCK_POISONED).push(PendingSlot {
+        self.pending.lock_recover().push(PendingSlot {
             seq,
             dest,
             dest_ip,
@@ -1317,10 +1319,7 @@ impl KadNode {
         match self.socket.send_to(&datagram, dest).await {
             Ok(_) => Ok((seq, rx)),
             Err(e) => {
-                self.pending
-                    .lock()
-                    .expect(LOCK_POISONED)
-                    .retain(|p| p.seq != seq);
+                self.pending.lock_recover().retain(|p| p.seq != seq);
                 Err(KadError::Io(e))
             }
         }
@@ -1958,8 +1957,7 @@ impl KadNode {
                             // drop, so it cannot swallow an IP-fallback match
                             // meant for a later request to the same peer.
                             self.pending
-                                .lock()
-                                .expect(LOCK_POISONED)
+                                .lock_recover()
                                 .retain(|p| p.seq != ev.seq);
                             if ev.kind == ReqKind::Find {
                                 cs.on_timeout(&ev.contact);
@@ -2970,6 +2968,69 @@ mod tests {
         );
     }
 
+    /// MUTEX POISONING (handoff #35a). Every `KadNode` lock sits on the inbound
+    /// UDP path: `run_read_loop` takes `pending`, `flood`, `hello_res_sent`,
+    /// `ip_filter` and `routing` for EVERY datagram a stranger sends us. A panic
+    /// under any of them would kill the Kad node for the app's life - and
+    /// `SlotGuard::drop` takes `pending`, so a poisoned lock would panic
+    /// mid-unwind and ABORT the process. Recovery is safe because all five guard
+    /// self-healing bookkeeping: the routing table ages, re-probes and evicts;
+    /// a leaked pending slot times out; flood counters and the ack-solicited
+    /// window are per-minute soft state; `ip_filter` is one `Arc` swap.
+    #[tokio::test]
+    async fn a_panic_under_a_kad_lock_leaves_the_node_working() {
+        let node = KadNode::bind_with_identity(
+            "127.0.0.1:0".parse().unwrap(),
+            4662,
+            Kad128::from_words([3, 5, 7, 9]),
+            0x3579,
+        )
+        .await
+        .unwrap();
+        // `flood` / `hello_res_sent` live on the read loop, not the node, so
+        // drive their free functions directly - which is the same code the
+        // loop calls per datagram.
+        let flood: Mutex<HashMap<u8, FloodTracker>> = Mutex::new(HashMap::new());
+        let sent: Mutex<HashMap<u32, StdInstant>> = Mutex::new(HashMap::new());
+        crate::lock::poison_for_test(&node.routing);
+        crate::lock::poison_for_test(&node.ip_filter);
+        crate::lock::poison_for_test(&node.pending);
+        crate::lock::poison_for_test(&flood);
+        crate::lock::poison_for_test(&sent);
+
+        // The gated insert path - the ONLY way a contact enters the table -
+        // still takes both the filter and the routing lock and still inserts.
+        let c = WireContact {
+            id: Kad128::from_hash(&[0x77; 16]),
+            ip: 0x0808_0808,
+            udp_port: 4672,
+            tcp_port: 4662,
+            version: 8,
+        };
+        gated_add_contact(&node.routing, &node.ip_filter, &c, true, true, 10);
+        assert_eq!(node.contacts_known(), 1, "the contact still went in");
+        assert_eq!(node.closest_wire_contacts(&c.id, 4).len(), 1);
+        node.set_ip_filter(None);
+
+        // The per-datagram gates still answer, and the pending SlotGuard's Drop
+        // - the abort path - runs clean.
+        let now = StdInstant::now();
+        assert!(flood_allows(&flood, mule_kad::OP_PING, 0x0808_0808, now));
+        note_hello_res_sent(&sent, 0x0808_0808, now);
+        assert!(take_hello_res_sent(&sent, 0x0808_0808, now));
+        {
+            let mut guard = SlotGuard::new(Arc::clone(&node.pending));
+            guard.track(1);
+        }
+        // Read back WITHOUT the production helper, so this is an independent
+        // witness rather than a restatement of the fix.
+        assert!(node
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty());
+    }
+
     /// `request_batch` is CANCELLED in production - the 5s `start_kad` timeout
     /// wraps `bootstrap_any`, whose structural worst case is ~48s, so the
     /// cancellation is the NORMAL path there - and a cancelled future never
@@ -3012,7 +3073,7 @@ mod tests {
             () = tokio::time::sleep(Duration::from_millis(300)) => {}
         }
         assert!(
-            node.pending.lock().expect(LOCK_POISONED).is_empty(),
+            node.pending.lock_recover().is_empty(),
             "a cancelled batch must withdraw its pending slots on drop"
         );
     }
