@@ -50,7 +50,7 @@ all-features = true
 
 [advisories]
 # `vulnerability` advisories are DENIED - that is cargo-deny's built-in
-# behaviour and there is no knob here, which is the point.
+# behavior and there is no knob here, which is the point.
 #
 # Yanked crates are denied too: a yank is the registry telling us not to use a
 # version, and unlike an advisory it is always actionable (`cargo update`).
