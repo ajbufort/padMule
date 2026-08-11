@@ -16,6 +16,50 @@ pub const K: usize = 10;
 /// index/search fine; they just are not all kept in the routing table).
 pub const MAX_CONTACTS_PER_IP: usize = 1;
 pub const MAX_CONTACTS_PER_SUBNET: usize = 10;
+
+/// ECLIPSE RESISTANCE, PER BIN. The global /24 cap above bounds a subnet's share
+/// of the WHOLE table, but a lookup is answered out of ONE bin, so ten contacts
+/// from a single /24 landing in one K=10 bin would hand that subnet 100% of what
+/// padMule returns for that region of the key space - which is the eclipse
+/// attack itself, not a hypothetical. eMule caps one bin at 2 ("no more than 2
+/// IPs from the same /24 block in one bin", RoutingBin.cpp:100-106, applied just
+/// before the not-full insert at :109-113); aMule master carries the identical
+/// rule (RoutingBin.cpp:91-97), so the authorities do not conflict here. With
+/// this an attacker needs FIVE distinct /24s to own one bin instead of one.
+/// padMule had the global cap but not this one until 2026-08-10.
+pub const MAX_SAME_SUBNET_PER_BIN: usize = 2;
+
+/// BEYOND BOTH AUTHORITIES - the only cap here with no upstream counterpart. A
+/// /24 costs an attacker almost nothing, and eMule's per-/24 rules still let a
+/// single /16 hold 10 contacts in each of its 256 /24s: 2560, several times a
+/// healthy table. This bounds any one /16 to a minority share of the table.
+///
+/// /24 stays the unit everywhere else; /16 is simply the coarsest grouping an
+/// offline client can compute. The RIGHT unit is the ASN - one operator can hold
+/// scattered /16s, and one /16 can be shared - but mapping address to ASN needs a
+/// BGP-derived database that padMule cannot ship, refresh, or fetch on a phone,
+/// so /16 is a stated approximation rather than the real thing.
+///
+/// Sized from measurement, not taste: the real 179-contact nodes.dat fixture
+/// holds one contact per /24 and at most 4 in any single /16, so 32 is eight
+/// times the busiest /16 a real table was observed to carry. It cannot bite
+/// during bootstrap, because reaching it requires already holding 32 contacts.
+pub const MAX_CONTACTS_PER_SLASH16: usize = 32;
+
+/// BOOTSTRAP SAFETY, and the constant most likely to be got wrong. Below one
+/// full bin's worth of contacts the table cannot route at all, and a table that
+/// cannot route is a worse failure than any amount of subnet concentration - so
+/// the diversity caps above are simply OFF until we hold this many. The
+/// consequence is exact and deliberate: while starved, padMule admits PRECISELY
+/// what it admitted before these caps existed, so no bootstrap path can regress
+/// and the damage stays bounded by the live layer's global /24 cap of 10.
+///
+/// A deliberate DIVERGENCE from eMule, which applies its per-bin cap
+/// unconditionally and would therefore accept only 2 seeds from one /24 into a
+/// brand-new table. It is the permissive direction, so it can only ever keep a
+/// contact upstream would drop - never the reverse.
+pub const DIVERSITY_STARVED_BELOW: usize = K;
+
 /// A full bin below this level always splits (fine resolution shallow in the tree).
 pub const KBASE: u8 = 4;
 /// A full bin whose zone index is below this also splits (fine resolution near self).
@@ -133,6 +177,38 @@ impl Contact {
     }
 }
 
+/// Is this address SUBJECT to the subnet-diversity caps? Only a routable public
+/// one is. eMule exempts LAN the same way, on every subnet arm it has
+/// (`&& !IsLANIP(...)`, RoutingBin.cpp:102, :274, :318, :331, :396).
+///
+/// padMule's exemption is WIDER on purpose. eMule's `IsLANIP` covers 0/8, 10/8,
+/// 172.16/12 and 192.168/16 but NOT loopback (OtherFunctions.cpp:2071-2089),
+/// because `IsGoodIP` has already dropped 127/8 long before a bin sees it.
+/// padMule's routing table is written DIRECTLY by the CLI and by the
+/// differential/Kad oracles, which run entire swarms on 127.0.0.1, so the test
+/// here is "not a public address" rather than "LAN" - the same deliberate
+/// loopback/LAN carve-out the blocklist send gate made. Widening it costs
+/// nothing: a non-public address can never be the internet-scale attacker these
+/// caps exist to bound, and the live layer refuses private contacts outright
+/// before they ever reach this table (`kad_live::gated_add_contact`).
+fn diversity_governed(ip: u32) -> bool {
+    crate::hardening::is_acceptable_contact_ip(ip, /*allow_private=*/ false)
+}
+
+/// Does this bin already hold [`MAX_SAME_SUBNET_PER_BIN`] contacts from `ip`'s
+/// /24? eMule counts identically (`uSameSubnets`, RoutingBin.cpp:84-89) over
+/// every contact in the bin: a public and a private address can never share a
+/// /24, so LAN entries contribute nothing to a public newcomer's count and no
+/// second filter is needed on the counted side.
+fn subnet_capped(bin: &[Contact], ip: u32) -> bool {
+    diversity_governed(ip)
+        && bin
+            .iter()
+            .filter(|c| c.ip & 0xFFFF_FF00 == ip & 0xFFFF_FF00)
+            .count()
+            >= MAX_SAME_SUBNET_PER_BIN
+}
+
 enum Node {
     /// A bin of up to K contacts, ordered oldest-first (LRU: front = oldest).
     Leaf(Vec<Contact>),
@@ -155,14 +231,16 @@ impl Zone {
         }
     }
 
-    fn add(&mut self, contact: Contact) {
+    /// `starved`: the whole table holds fewer than [`DIVERSITY_STARVED_BELOW`]
+    /// contacts, so the per-bin subnet cap is off (see that constant).
+    fn add(&mut self, contact: Contact, starved: bool) {
         // Descend toward the child matching this contact's distance bit at our
         // level (bit 0 = the half closer to our own ID).
         if let Node::Internal(zero, one) = &mut self.node {
             if contact.distance.bit(self.level as u32) == 0 {
-                zero.add(contact);
+                zero.add(contact, starved);
             } else {
-                one.add(contact);
+                one.add(contact, starved);
             }
             return;
         }
@@ -236,6 +314,17 @@ impl Zone {
                 return;
             }
             if bin.len() < K {
+                // ECLIPSE RESISTANCE, and eMule checks its per-bin caps in
+                // EXACTLY this position: `CRoutingZone::Add` reaches
+                // `CRoutingBin::AddContact` (which holds them) only inside
+                // `if (m_pBin->GetRemaining())`, while a FULL bin is split
+                // first and re-checked in the child (RoutingZone.cpp:568-586).
+                // Refusing is the entire action - eMule returns false and never
+                // evicts anyone to make room (RoutingBin.cpp:102-106), so this
+                // is an ADMISSION rule and not a replacement policy.
+                if !starved && subnet_capped(bin, contact.ip) {
+                    return;
+                }
                 bin.push(contact);
                 return;
             }
@@ -249,7 +338,7 @@ impl Zone {
         }
         // Full, splittable leaf: split, then re-descend into the new subtree.
         self.split();
-        self.add(contact);
+        self.add(contact, starved);
     }
 
     /// eMule `CRoutingBin::SetAlive` (RoutingBin.cpp:125-138): `UpdateType`
@@ -422,9 +511,25 @@ impl RoutingTable {
         }
     }
 
-    /// Add (or refresh) a contact. Ignores our own ID. The anti-sybil per-IP//24
-    /// cap is enforced one layer up (kad_live::add_contact, a LIVE-layer concern -
-    /// see the lookup.rs module note), so this stays a pure routing primitive.
+    /// Add (or refresh) a contact. Ignores our own ID.
+    ///
+    /// TWO ANTI-SYBIL LAYERS MEET HERE, and which lives where is not arbitrary.
+    /// The GLOBAL per-IP and per-/24 caps ([`MAX_CONTACTS_PER_IP`],
+    /// [`MAX_CONTACTS_PER_SUBNET`]) are enforced one layer up in
+    /// `kad_live::gated_add_contact`, alongside the blocklist and the
+    /// routable-address gate, because they are LIVE-layer policy about
+    /// wire-learned contacts. The DIVERSITY caps below cannot live there: a
+    /// per-BIN rule is unstateable outside the bin, and the /16 rule needs the
+    /// whole table's contents. Both therefore also protect the PERSISTED table
+    /// (`Engine::routing`, which `load_nodes` feeds straight through here), so a
+    /// concentrated nodes.dat cannot spend next launch's seed budget on one
+    /// subnet.
+    ///
+    /// NOT OBSERVABLE ON THE WIRE. Everything here decides only whom padMule
+    /// KEEPS. It sends nothing, answers nothing differently (a refused contact
+    /// is simply absent from `closest_to_serving`, which is the same shape as
+    /// one we never heard of), and takes no timing that differs from an ordinary
+    /// full-bin drop, which this table has always done.
     pub fn add(
         &mut self,
         id: Kad128,
@@ -442,6 +547,32 @@ impl RoutingTable {
         if id == self.self_id || version <= 1 {
             return;
         }
+        // ONE walk of the table answers both whole-table diversity questions.
+        //
+        // A GENUINE REFRESH - the same id already here at the SAME address - is
+        // never gated: it adds no new presence, and refusing it would freeze a
+        // peer's port/version/verified update. A known id arriving at a
+        // DIFFERENT address is not a refresh but a MOVE, and faces the caps on
+        // its new address, exactly as eMule re-applies all of its own inside
+        // `ChangeContactIPAddress` (RoutingBin.cpp:291-336). The per-bin cap
+        // needs no such guard: a known id always descends to the bin that holds
+        // it, where the found-contact branch returns before the cap is reached.
+        let (starved, slash16_full) = {
+            let mut all: Vec<&Contact> = Vec::new();
+            self.root.collect(&mut all);
+            let refresh = all.iter().any(|c| c.id == id && c.ip == ip);
+            let starved = all.len() < DIVERSITY_STARVED_BELOW;
+            let net16 = ip & 0xFFFF_0000;
+            let full = !refresh
+                && !starved
+                && diversity_governed(ip)
+                && all.iter().filter(|c| c.ip & 0xFFFF_0000 == net16).count()
+                    >= MAX_CONTACTS_PER_SLASH16;
+            (starved, full)
+        };
+        if slash16_full {
+            return;
+        }
         let c = Contact::new(
             &self.self_id,
             id,
@@ -453,7 +584,7 @@ impl RoutingTable {
             0,
             0,
         );
-        self.root.add(c);
+        self.root.add(c, starved);
     }
 
     /// Record the verify key `key` (minted against OUR IP `key_ip`) that the peer
@@ -1360,6 +1491,287 @@ mod tests {
         assert!(
             !t.contacts().iter().any(|c| c.id == newcomer),
             "the ARRIVING contact is the one dropped, exactly as eMule does"
+        );
+    }
+
+    // --- SUBNET DIVERSITY: SYBIL / ECLIPSE RESISTANCE (2026-08-10) ---
+
+    fn ipv4(a: u8, b: u8, c: u8, d: u8) -> u32 {
+        u32::from_be_bytes([a, b, c, d])
+    }
+
+    /// An id whose top four DISTANCE bits are all 1 (the tables below are rooted
+    /// at the all-zero id, so distance == id). Every such contact descends the
+    /// same path, so a whole flood of them competes for ONE bin - which is
+    /// exactly the shape of an eclipse attempt on one region of the key space.
+    fn far_bin_id(n: u8) -> Kad128 {
+        let mut raw = [0xF0u8; 16];
+        raw[15] = n;
+        Kad128::from_hash(&raw)
+    }
+
+    /// A table holding exactly [`DIVERSITY_STARVED_BELOW`] /24-diverse public
+    /// contacts: the smallest table in which the diversity caps are ARMED. Their
+    /// ids are near self (top bit 0), so the flood ids above land on the other
+    /// side of the first split and never share a bin with them.
+    fn armed_table() -> RoutingTable {
+        let mut t = RoutingTable::new(id(0));
+        for i in 0..DIVERSITY_STARVED_BELOW as u8 {
+            let mut raw = [0u8; 16];
+            raw[1] = i + 1;
+            t.add(
+                Kad128::from_hash(&raw),
+                ipv4(198, 51, i, 1),
+                4672,
+                4662,
+                8,
+                true,
+            );
+        }
+        assert_eq!(
+            t.len(),
+            DIVERSITY_STARVED_BELOW,
+            "the arming fixture must actually reach the starvation floor, or \
+             every test built on it proves nothing"
+        );
+        t
+    }
+
+    /// How many contacts of `ip`'s /24 the table currently holds.
+    fn from_subnet(t: &RoutingTable, ip: u32) -> usize {
+        t.contacts()
+            .iter()
+            .filter(|c| c.ip & 0xFFFF_FF00 == ip & 0xFFFF_FF00)
+            .count()
+    }
+
+    /// THE ECLIPSE PROPERTY. A flood of contacts from ONE /24, all aimed at one
+    /// bin, cannot take more than [`MAX_SAME_SUBNET_PER_BIN`] of that bin's K
+    /// slots - so the subnet cannot become the whole answer padMule gives for
+    /// that region of the key space. eMule RoutingBin.cpp:100-106.
+    #[test]
+    fn one_subnet_cannot_dominate_a_bin() {
+        let mut t = armed_table();
+        let flood = ipv4(203, 0, 113, 0);
+        for n in 1..=8u8 {
+            t.add(far_bin_id(n), flood | n as u32, 4672, 4662, 8, true);
+        }
+        assert_eq!(
+            from_subnet(&t, flood),
+            MAX_SAME_SUBNET_PER_BIN,
+            "eight contacts from one /24 must not take more than the per-bin cap"
+        );
+    }
+
+    /// THE CONTROL, and the half that proves the cap is a DIVERSITY rule rather
+    /// than a smaller bin: the same eight ids, competing for the same bin, are
+    /// ALL kept when they come from eight different /24s. Without this the test
+    /// above would pass just as happily against a bin that dropped everything.
+    #[test]
+    fn a_diverse_flood_fills_the_same_bin_normally() {
+        let mut t = armed_table();
+        let mut kept = 0;
+        for n in 1..=8u8 {
+            t.add(far_bin_id(n), ipv4(203, 0, n, 7), 4672, 4662, 8, true);
+        }
+        for n in 1..=8u8 {
+            if t.contacts().iter().any(|c| c.id == far_bin_id(n)) {
+                kept += 1;
+            }
+        }
+        assert_eq!(
+            kept, 8,
+            "eight /24-diverse contacts must fill the bin normally - the bin \
+             holds K=10, so nothing but the diversity rule could refuse them"
+        );
+    }
+
+    /// BOOTSTRAP SAFETY, the case most likely to be got wrong. A brand-new node,
+    /// or a user whose only reachable peers share a /24, must still be able to
+    /// join: below [`DIVERSITY_STARVED_BELOW`] contacts the caps are off and the
+    /// table admits exactly what it admitted before they existed. A cap that
+    /// starves the table is worse than the attack it prevents.
+    #[test]
+    fn a_starved_table_still_accepts_a_whole_subnet() {
+        let mut t = RoutingTable::new(id(0));
+        let flood = ipv4(203, 0, 113, 0);
+        for n in 1..=8u8 {
+            t.add(far_bin_id(n), flood | n as u32, 4672, 4662, 8, true);
+        }
+        assert_eq!(
+            t.len(),
+            8,
+            "a table too small to route must not refuse the only peers it has"
+        );
+
+        // ... and the rule ARMS itself as soon as the table can route, without
+        // evicting anyone it already accepted (nothing here is a replacement
+        // policy - eMule never evicts to make room either, RoutingBin.cpp:105).
+        for i in 0..DIVERSITY_STARVED_BELOW as u8 {
+            let mut raw = [0u8; 16];
+            raw[1] = i + 1;
+            t.add(
+                Kad128::from_hash(&raw),
+                ipv4(198, 51, i, 1),
+                4672,
+                4662,
+                8,
+                true,
+            );
+        }
+        assert_eq!(from_subnet(&t, flood), 8, "nobody already held is evicted");
+        t.add(far_bin_id(9), flood | 9, 4672, 4662, 8, true);
+        assert!(
+            !t.contacts().iter().any(|c| c.id == far_bin_id(9)),
+            "past the starvation floor the subnet cap engages for NEW contacts"
+        );
+    }
+
+    /// THE ORACLE AND TEST-RIG EXEMPTION, matching what the blocklist work did
+    /// for `blocklist_forbids_send`: loopback and LAN are never subject to the
+    /// diversity caps, because the differential/Kad oracles run whole swarms on
+    /// 127.0.0.1 and a rig that cannot populate a routing table cannot test one.
+    /// eMule exempts LAN on every subnet arm (`!IsLANIP`, RoutingBin.cpp:102).
+    #[test]
+    fn loopback_and_lan_are_exempt_from_the_diversity_caps() {
+        let mut t = armed_table();
+        for n in 1..=4u8 {
+            t.add(far_bin_id(n), ipv4(127, 0, 0, n), 4672, 4662, 8, true);
+        }
+        for n in 5..=8u8 {
+            t.add(far_bin_id(n), ipv4(192, 168, 0, n), 4672, 4662, 8, true);
+        }
+        assert_eq!(
+            from_subnet(&t, ipv4(127, 0, 0, 0)),
+            4,
+            "four loopback contacts in one bin - the oracle rigs depend on this"
+        );
+        assert_eq!(
+            from_subnet(&t, ipv4(192, 168, 0, 0)),
+            4,
+            "and LAN, which is eMule's own exemption"
+        );
+    }
+
+    /// A /24 IS CHEAP; A /16 IS THE NEXT RUNG. eMule's per-/24 rules leave one
+    /// /16 free to hold ten contacts in each of its 256 subnets, so a single
+    /// cheap allocation still buys table dominance. This is padMule's own cap,
+    /// with no upstream counterpart - see [`MAX_CONTACTS_PER_SLASH16`].
+    #[test]
+    fn one_slash16_cannot_dominate_the_whole_table() {
+        let ids: Vec<Kad128> = (0..40u8)
+            .map(|n| {
+                let mut raw = [0u8; 16];
+                raw[0] = n.wrapping_mul(6);
+                raw[15] = n;
+                Kad128::from_hash(&raw)
+            })
+            .collect();
+
+        let mut capped = RoutingTable::new(id(0));
+        for (n, cid) in ids.iter().enumerate() {
+            capped.add(*cid, ipv4(203, 0, n as u8, 1), 4672, 4662, 8, true);
+        }
+        assert_eq!(
+            capped.len(),
+            MAX_CONTACTS_PER_SLASH16,
+            "forty contacts from forty distinct /24s of ONE /16 must stop at the cap"
+        );
+
+        // THE CONTROL: the same forty ids, so the same tree shape, but spread
+        // over forty /16s. They all fit - which is what proves the number above
+        // was the /16 cap talking and not the bin-tree running out of room.
+        let mut diverse = RoutingTable::new(id(0));
+        for (n, cid) in ids.iter().enumerate() {
+            diverse.add(*cid, ipv4(203, n as u8, 0, 1), 4672, 4662, 8, true);
+        }
+        assert!(
+            diverse.len() > MAX_CONTACTS_PER_SLASH16,
+            "the tree itself can hold more than the cap ({} of forty), so the \
+             number above was the /16 rule talking and not the bin-tree \
+             running out of room",
+            diverse.len()
+        );
+    }
+
+    /// INTEROP SAFETY: a cap on ADMISSION must never freeze a contact we already
+    /// hold. A refresh (same id, SAME address) adds no new presence, so it is
+    /// exempt at any table size - while a known id arriving at a DIFFERENT
+    /// address is a move, not a refresh, and faces the caps on its new address
+    /// exactly as eMule's `ChangeContactIPAddress` re-applies its own
+    /// (RoutingBin.cpp:291-336).
+    #[test]
+    fn the_caps_never_block_a_refresh_of_a_contact_we_already_hold() {
+        let mut t = armed_table();
+        let flood = ipv4(203, 0, 113, 0);
+        for n in 1..=8u8 {
+            t.add(far_bin_id(n), flood | n as u32, 4672, 4662, 8, true);
+        }
+        let held: Vec<Kad128> = t
+            .contacts()
+            .iter()
+            .filter(|c| c.ip & 0xFFFF_FF00 == flood)
+            .map(|c| c.id)
+            .collect();
+        assert_eq!(held.len(), MAX_SAME_SUBNET_PER_BIN, "the cap held");
+
+        // The port moves; the address does not. This must land.
+        t.add(held[0], t.ip_of(&held[0]).unwrap(), 5555, 4662, 8, true);
+        let c = t
+            .contacts()
+            .into_iter()
+            .find(|c| c.id == held[0])
+            .expect("a refresh must not evict the contact it refreshes");
+        assert_eq!(c.udp_port, 5555, "the refresh was applied, not dropped");
+        assert_eq!(from_subnet(&t, flood), MAX_SAME_SUBNET_PER_BIN);
+    }
+
+    /// The same interop-safety property on the /16 arm, which is the one that
+    /// could freeze a whole busy subnet: a /16 sitting AT its cap must still let
+    /// the contacts it already holds refresh - and must still refuse to have a
+    /// contact from elsewhere MOVED into it, which is the hijack shape the cap
+    /// exists to bound.
+    #[test]
+    fn a_full_slash16_still_refreshes_its_own_but_refuses_a_move_in() {
+        let mut t = RoutingTable::new(id(0));
+        let cid = |n: u8| {
+            let mut raw = [0u8; 16];
+            raw[0] = n.wrapping_mul(6);
+            raw[15] = n;
+            Kad128::from_hash(&raw)
+        };
+        for n in 0..40u8 {
+            t.add(cid(n), ipv4(203, 0, n, 1), 4672, 4662, 8, true);
+        }
+        assert_eq!(t.len(), MAX_CONTACTS_PER_SLASH16, "the /16 is at its cap");
+
+        // A contact already inside the full /16 refreshes at its own address.
+        let held = t.contacts()[0].clone();
+        t.add(held.id, held.ip, 5555, 4662, 8, true);
+        assert_eq!(
+            t.contacts()
+                .into_iter()
+                .find(|c| c.id == held.id)
+                .expect("the refresh must not evict the contact it refreshes")
+                .udp_port,
+            5555,
+            "a full /16 must not freeze the contacts it already holds"
+        );
+
+        // An OUTSIDER re-pointed into the full /16 is refused and keeps its own
+        // address - eMule re-checks every cap on an ip change the same way
+        // (ChangeContactIPAddress, RoutingBin.cpp:291-336).
+        let outsider = cid(200);
+        t.add(outsider, ipv4(198, 51, 100, 9), 4672, 4662, 8, true);
+        assert!(
+            t.contains(&outsider),
+            "the outsider joined from its own /16"
+        );
+        t.add(outsider, ipv4(203, 0, 200, 1), 4672, 4662, 8, true);
+        assert_eq!(
+            t.ip_of(&outsider),
+            Some(ipv4(198, 51, 100, 9)),
+            "a move into a full /16 is refused, not silently allowed"
         );
     }
 }
