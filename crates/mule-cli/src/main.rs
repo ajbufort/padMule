@@ -36,18 +36,50 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
-/// A demo userhash carrying the eMule marker bytes (byte[5]=14, byte[14]=111).
-/// A real client persists a random one; this is only for the smoke test.
-fn demo_user_hash() -> [u8; 16] {
-    let mut h = [0x42u8; 16];
-    h[5] = 14;
-    h[14] = 111;
-    h
+/// The CLI's userhash: a PERSISTENT RANDOM identity, the same kind the app has.
+///
+/// This used to be a constant - `[0x42; 16]` with the eMule marker bytes - and
+/// its own comment said "only for the smoke test". It was not: this harness
+/// talks to real peers, real eD2k servers and real Kad nodes, and every one of
+/// them saw `42424242420E42424242424242426F42`. Anthony spotted it in his own
+/// eMule's Client Details.
+///
+/// It was two problems, and the second is the worse one:
+///
+/// 1. A CONSTANT is a fingerprint. Anything that sees it knows what it is
+///    talking to, no matter what the hello says.
+/// 2. A SHARED constant is an identity COLLISION. The userhash is the key for
+///    credits, secure identification and bans - so every padMule CLI anywhere
+///    was the same client, inheriting each other's credit history and each
+///    other's bans. That is also the `IS_IDBADGUY` shape from build-progress
+///    8dr: one identity seen from two addresses scores zero.
+///
+/// Now `Identity::load_or_create`, the app's own path, persisted under
+/// `$MULE_CLI_HOME` (default `~/.padmule-cli`) so a given machine keeps ONE
+/// identity across runs - which is what makes credits work at all. Cached,
+/// because eight call sites should not each hit the disk.
+fn cli_user_hash() -> [u8; 16] {
+    static ID: std::sync::OnceLock<[u8; 16]> = std::sync::OnceLock::new();
+    *ID.get_or_init(|| {
+        let dir = std::env::var_os("MULE_CLI_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".padmule-cli"))
+            })
+            .unwrap_or_else(|| std::path::PathBuf::from(".padmule-cli"));
+        let _ = std::fs::create_dir_all(&dir);
+        match mule_engine::identity::NodeIdentity::load_or_create(&dir) {
+            Ok(id) => id.userhash,
+            // A random one beats falling back to the constant: unwritable
+            // storage should cost persistence, not everyone's distinctness.
+            Err(_) => mule_engine::identity::NodeIdentity::generate().userhash,
+        }
+    })
 }
 
 fn demo_login() -> LoginRequest {
     LoginRequest {
-        user_hash: demo_user_hash(),
+        user_hash: cli_user_hash(),
         client_id: 0,
         tcp_port: 4662,
         nick: "padMule".to_string(),
@@ -581,7 +613,7 @@ async fn cmd_listen(port: u16) {
     println!("listening for inbound peers on {bind}");
     println!("(with WSL mirrored mode this is reachable on the Windows host IP)");
     println!("validate the forward: point an external port checker at <public-ip>:{port}");
-    let me = HelloInfo::baseline(demo_user_hash(), 0, port, 4672, "padMule");
+    let me = HelloInfo::baseline(cli_user_hash(), 0, port, 4672, "padMule");
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
@@ -645,7 +677,7 @@ async fn cmd_sec_ident(addr: SocketAddr, obf: Option<[u8; 16]>) {
     use mule_engine::{Identity, SecureIdentSession};
 
     let id = Identity::generate();
-    let mut me = HelloInfo::baseline(demo_user_hash(), 0, 4662, 4672, "padMule");
+    let mut me = HelloInfo::baseline(cli_user_hash(), 0, 4662, 4672, "padMule");
     me.misc_options1 = baseline_misc_options1(1); // advertise SecureIdent v1
 
     let (peer, mut fs) = match match obf {
@@ -744,7 +776,7 @@ async fn cmd_peer_probe(addr: SocketAddr, hash: [u8; 16]) {
         }
     };
     let mut fs = FramedStream::new(stream);
-    let me = HelloInfo::baseline(demo_user_hash(), 0, 4662, 4672, "padMule");
+    let me = HelloInfo::baseline(cli_user_hash(), 0, 4662, 4672, "padMule");
     println!("-> OP_HELLO");
     if let Err(e) = fs.write_packet(&build_hello(&me)).await {
         eprintln!("write hello failed: {e}");
@@ -863,7 +895,7 @@ async fn cmd_aich_probe(addr: SocketAddr, hash: [u8; 16], size: u64, part: u16) 
         build_aich_file_hash_req, build_aich_request, parse_aich_answer, parse_aich_file_hash_ans,
         AichAnswer, OP_AICHANSWER, OP_AICHFILEHASHANS,
     };
-    let me = HelloInfo::baseline(demo_user_hash(), 0, 4662, 4672, "padMule");
+    let me = HelloInfo::baseline(cli_user_hash(), 0, 4662, 4672, "padMule");
     let (_peer, mut fs) = match connect_peer(addr, &me).await {
         Ok(v) => v,
         Err(e) => {
@@ -1065,7 +1097,7 @@ async fn cmd_serve_file(port: u16, path: &str, eserver: Option<(String, u16)>) {
     use std::time::Duration;
     // Advertise secure-ident so a downloader (real amuled) challenges us - the
     // precondition for verifying it - and drive our half of the exchange.
-    let me = HelloInfo::baseline(demo_user_hash(), 0, port, 4672, "padMule").with_secident();
+    let me = HelloInfo::baseline(cli_user_hash(), 0, port, 4672, "padMule").with_secident();
     let identity = Arc::new(Identity::generate());
     let size = data.len() as u64;
     let path_buf = std::path::PathBuf::from(path);
@@ -1222,7 +1254,7 @@ async fn cmd_peer_download(
     // aMule's ParanoidFilter (ClientTCPSocket.cpp:300). Advertise SecureIdent so
     // the peer initiates secure-ident toward us - this makes the differential
     // test exercise the real exchange against a live aMule/eMule.
-    let me = HelloInfo::baseline(demo_user_hash(), 0, 4662, 4672, "padMule").with_secident();
+    let me = HelloInfo::baseline(cli_user_hash(), 0, 4662, 4672, "padMule").with_secident();
     let connect = async {
         match obf_target {
             Some(th) => connect_peer_obf(addr, &me, &th).await,
@@ -1777,7 +1809,7 @@ async fn cmd_kad_fetch(nodes_path: &str, hash: [u8; 16], size: u64, out: &str) {
         }
     };
     let dl = Download::new(store);
-    let me = HelloInfo::baseline(demo_user_hash(), 0, 4662, 4672, "padMule");
+    let me = HelloInfo::baseline(cli_user_hash(), 0, 4662, 4672, "padMule");
 
     println!("downloading from {} connectable source(s)...", reg.len());
     let fetched = fetch_from_sources(&dl, reg.sources(), &me, Duration::from_secs(60), None).await;
@@ -1858,7 +1890,7 @@ async fn cmd_search_download(met_path: &str, keyword: &str, out: &str) {
 
     // Connect + login to the first server that answers.
     let login = LoginRequest {
-        user_hash: demo_user_hash(),
+        user_hash: cli_user_hash(),
         client_id: 0,
         tcp_port: 4662,
         nick: "padMule".to_string(),
@@ -2024,7 +2056,7 @@ async fn cmd_search_download(met_path: &str, keyword: &str, out: &str) {
         }
     };
     let dl = Download::new(store);
-    let me = HelloInfo::baseline(demo_user_hash(), 0, 4662, 4672, "padMule");
+    let me = HelloInfo::baseline(cli_user_hash(), 0, 4662, 4672, "padMule");
     let mut reg = reg;
 
     // The download manager pulls in parallel and rides out upload-queue
@@ -2586,7 +2618,7 @@ async fn cmd_link(link: &str, out: Option<&str>) {
             if let Some(root) = f.aich {
                 dl.set_aich_master_verified(root);
             }
-            let me = HelloInfo::baseline(demo_user_hash(), 0, 4662, 4672, "padMule");
+            let me = HelloInfo::baseline(cli_user_hash(), 0, 4662, 4672, "padMule");
             println!("downloading from {} embedded source(s)...", sources.len());
             let cfg = ManagerConfig::Fixed {
                 parallel: 4,
@@ -2643,7 +2675,7 @@ async fn cmd_fetch_complete(
     let active: std::sync::Arc<tokio::sync::Mutex<Option<std::sync::Arc<Download>>>> =
         std::sync::Arc::new(tokio::sync::Mutex::new(None));
     if let Ok(listener) = TcpListener::bind(("0.0.0.0", 4662)).await {
-        let me_in = HelloInfo::baseline(demo_user_hash(), 0, 4662, 4672, "padMule");
+        let me_in = HelloInfo::baseline(cli_user_hash(), 0, 4662, 4672, "padMule");
         let active_l = active.clone();
         tokio::spawn(async move {
             loop {
@@ -2677,7 +2709,7 @@ async fn cmd_fetch_complete(
     }
 
     let login = LoginRequest {
-        user_hash: demo_user_hash(),
+        user_hash: cli_user_hash(),
         client_id: 0,
         tcp_port: 4662,
         nick: "padMule".to_string(),
@@ -2777,7 +2809,7 @@ async fn cmd_fetch_complete(
         .filter(|p| !p.as_os_str().is_empty())
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let me = HelloInfo::baseline(demo_user_hash(), 0, 4662, 4672, "padMule");
+    let me = HelloInfo::baseline(cli_user_hash(), 0, 4662, 4672, "padMule");
 
     // HighID source addresses we have already watched stall (queue us / go
     // silent). Used to skip other files whose only source is that same busy peer.
@@ -3205,6 +3237,63 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The CLI's identity must be RANDOM and PERSISTENT, not the old
+    /// `[0x42; 16]` constant.
+    ///
+    /// Both halves are load-bearing and for different reasons. Random, because
+    /// a constant is a fingerprint AND - worse - a shared identity: the
+    /// userhash keys credits, secure identification and bans, so every padMule
+    /// CLI anywhere was one client inheriting the others' history. Persistent,
+    /// because an identity regenerated per run earns no credits and looks like
+    /// a new stranger to every peer, every time.
+    #[test]
+    fn the_cli_identity_is_random_and_persists() {
+        let dir = std::env::temp_dir().join("padmule-cli-identity-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let first = mule_engine::identity::NodeIdentity::load_or_create(&dir)
+            .unwrap()
+            .userhash;
+        let again = mule_engine::identity::NodeIdentity::load_or_create(&dir)
+            .unwrap()
+            .userhash;
+        assert_eq!(first, again, "the identity must survive a reload");
+
+        // Not the constant this replaced, in any of its bytes-except-markers
+        // form. Checked explicitly rather than "is not all 0x42", because the
+        // old value carried the eMule marker bytes and would slip a naive test.
+        let old = {
+            let mut h = [0x42u8; 16];
+            h[5] = 14;
+            h[14] = 111;
+            h
+        };
+        assert_ne!(first, old, "the CLI is still using the demo constant");
+
+        // The eMule marker bytes must still be there - a peer reads them to
+        // decide we are eMule-compatible at all.
+        assert_eq!(first[5], 14, "marker byte 5");
+        assert_eq!(first[14], 111, "marker byte 14");
+
+        // A DIFFERENT directory is a DIFFERENT client. Without this, "random"
+        // could still mean "one value baked in at build time".
+        let other = std::env::temp_dir().join("padmule-cli-identity-test-2");
+        let _ = std::fs::remove_dir_all(&other);
+        std::fs::create_dir_all(&other).unwrap();
+        let elsewhere = mule_engine::identity::NodeIdentity::load_or_create(&other)
+            .unwrap()
+            .userhash;
+        assert_ne!(
+            first, elsewhere,
+            "two installs must not share one identity - that is the collision \
+             the constant caused"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&other).ok();
+    }
 
     /// `open_or_create_part` must RESUME a matching part and REFUSE a
     /// mismatched one. The refusal is the load-bearing half: `1.part` is a
