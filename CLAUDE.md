@@ -92,6 +92,18 @@ absence. eMule ships Windows-1252, so **25 of 714 source files in
 plus `PartFile.cpp`, `KnownFile.cpp` and `Preferences.h`. Measured:
 `grep -c 'case OP_ASKSHAREDFILES' ListenSocket.cpp` -> empty, exit 1;
 `/usr/bin/grep -c` -> 4. `LC_ALL=C` does NOT help; `-a` does.
+**THE SECOND HALF, FOUND 2026-08-12 AND WORSE THAN THE FIRST: that same `grep`
+honors `.gitignore`, and `refs/` IS GITIGNORED (`.gitignore:5`) - so a
+REPO-ROOT sweep does not read the authority AT ALL.** This is not limited to
+non-UTF-8 files; it hides all three reference trees and `docs/wiki/` too, and it
+EXITS 0, so there is not even the exit-1 tell the encoding half leaves. Measured:
+`grep -rl 'OP_ASKSHAREDDENIEDANS' .` -> 9 files, **ZERO** of them under
+`refs/emule`; `/usr/bin/grep -rl` -> 62 files, 6 of them eMule. The bare tool
+answers a WIRE-AUTHORITY question with padMule's own code plus the committed
+`amule-3.0.1/`, and looks like it searched the lot. Name the path
+(`grep -r X refs/emule-0.50a/`) and the ignore rule no longer applies - but the
+encoding trap still does, so `/usr/bin/grep` remains the only safe form.
+
 A POSITIVE finding survives this, a NEGATIVE one does not - "the authority does
 not do X" is exactly what a silent grep manufactures, and that class of claim is
 this project's strongest evidence. The 2026-08-12 audit found the KB CLEAN
@@ -173,7 +185,10 @@ Details and what is portable from them: `docs/wiki/ref-ecosystem.md`.
 source "$HOME/.cargo/env"              # cargo is NOT on the default PATH
 
 cargo build --workspace
-cargo test --workspace                 # the unit gate (840 passed / 4 ignored at 2026-08-11, offline; the handoff carries the current count)
+cargo test --workspace                 # the unit gate (845 passed / 0 failed / 5 ignored at 086d07e, 2026-08-12, offline; the handoff carries the current count)
+# NO SINGLE LINE STATES THE TOTAL - the suite is per-crate and the figure is the
+# SUM of 16 `test result: ok` lines. Do not pipe the run through `tail`: that
+# reported 80 from 6 surviving lines while the exit status stayed honestly 0.
 # -D warnings is NOT optional: bare clippy EXITS 0 on warnings, so a gate without
 # it goes GREEN over them (measured 2026-08-11: identical findings, exit 0 vs 101).
 cargo clippy --workspace --all-targets -- -D warnings
