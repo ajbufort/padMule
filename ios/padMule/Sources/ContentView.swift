@@ -1199,20 +1199,16 @@ struct ContentView: View {
                 ))
                 // Say the current EFFECTIVE state, and why, so a user whose
                 // sharing was auto-paused does not think the toggle is broken -
-                // same reasoning as SettingsView's sharingPausedForMeteredLink
-                // footer, checked first for the same reason: it overrides
-                // whatever the toggle itself reads.
-                if model.sharingPausedForIpChange {
-                    Text("Sharing is paused because your public address changed (likely a VPN drop or a network switch). Turn sharing back on when you're ready.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                } else {
-                    Text(model.sharing
-                        ? "padMule serves these files to other peers while it's open. Sharing earns you better standing in their queues, so your own downloads go faster."
-                        : "Leech Mode: downloading only. padMule is not serving any files to peers.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
+                // through the SAME rule and the SAME words as the Settings
+                // footer (`SharingStatus`), which is what stops the two screens
+                // describing one state two ways. This caption used to know only
+                // the address-change pause: a METERED pause fell through to the
+                // toggle's own value and read as "Leech Mode: downloading
+                // only", crediting the user with a pause padMule imposed, while
+                // the switch above bounced back with nothing saying why.
+                Text(model.sharingStatus.caption)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             Section(model.sharedFiles.isEmpty ? "Library" : "Library (\(model.sharedFiles.count))") {

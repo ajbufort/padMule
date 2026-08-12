@@ -146,16 +146,25 @@ struct SettingsView: View {
                 get: { pauseOnCellular },
                 set: { pauseOnCellular = $0; model.applyEffectiveSharing() }
             ))
+            // GATED ON THE EFFECTIVE STATE, not on the stored preference.
+            // `EngineModel.enterBackground()` requires the engine to actually
+            // BE sharing before it takes the keepalive, so while a pause is in
+            // force this control changed a value nothing would read - on
+            // cellular it sat enabled and inert. Disabled, with the footer
+            // below naming the pause, it says the same thing the engine means.
             Toggle("Keep sharing in the background", isOn: $backgroundSeeding)
-                .disabled(!shareUploads)
+                .disabled(model.sharingStatus != .sharing)
         } header: {
             Text("Sharing")
         } footer: {
             // Say the current EFFECTIVE state, and why, so a user whose sharing
-            // was auto-paused does not think the toggle is broken.
-            if model.sharingPausedForMeteredLink {
-                Text("Sharing is paused right now because you are on a metered network. It resumes automatically on Wi-Fi. This pauses uploading only - downloads continue and still use data.")
-            } else if shareUploads {
+            // was auto-paused does not think the toggle is broken - through the
+            // SAME rule and the SAME words as the Shared screen
+            // (`SharingStatus`). This footer used to test only the metered
+            // pause, so during a public-address pause it fell through to the
+            // "share uploads" branch and stated padMule was serving files while
+            // the engine was refusing every request.
+            if model.sharingStatus == .sharing {
                 // Two paragraphs, because they answer different questions: what
                 // sharing buys, and what the background option costs. The second
                 // is deliberately blunt about the limits - a user who thinks
@@ -169,7 +178,7 @@ struct SettingsView: View {
                 // with the code, so nothing but a picture could have caught it.
                 // A VStack makes the grouping explicit and both paragraphs show.
                 VStack(alignment: .leading, spacing: 6) {
-                Text("padMule serves your finished files to other peers while it is open. Sharing earns you better standing in their queues, so your own downloads go faster.")
+                Text(model.sharingStatus.caption)
                 Text(
                     backgroundSeeding
                         ? "padMule will keep serving after you switch away, so you keep earning standing while you are not looking. It uses more battery, and downloads still stop - only uploads continue. iPadOS can still reclaim the app at any time; when it does, padMule pauses cleanly and resumes when you come back."
@@ -177,7 +186,7 @@ struct SettingsView: View {
                 )
                 }
             } else {
-                Text("Leech Mode: downloading only. padMule is not serving any files to peers.")
+                Text(model.sharingStatus.caption)
             }
         }
     }

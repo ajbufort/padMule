@@ -91,6 +91,144 @@ final class SettingsTests: XCTestCase {
         )
     }
 
+    /// WHICH PAUSE IS IN FORCE, through the REAL rule (`SharingStatus.of`) that
+    /// both sharing screens render - not a restatement of it, per the
+    /// `sharingDecision` lesson above.
+    ///
+    /// The two defects this pins: the Settings footer knew only the metered
+    /// pause (so during an address-change pause it showed "Share uploads" ON
+    /// and stated padMule was serving files), and the Shared screen knew only
+    /// the address-change pause (so a metered pause read as the user's own
+    /// Leech Mode). Every case below is one screen's former blind spot.
+    func testSharingStatusNamesWhicheverPauseIsActuallyInForce() {
+        // The two plain states.
+        XCTAssertEqual(
+            SharingStatus.of(
+                wanted: true, pauseOnMetered: true, metered: false, pausedForIpChange: false),
+            .sharing)
+        XCTAssertEqual(
+            SharingStatus.of(
+                wanted: false, pauseOnMetered: true, metered: false, pausedForIpChange: false),
+            .leech)
+        // The metered pause - the Shared screen's blind spot.
+        XCTAssertEqual(
+            SharingStatus.of(
+                wanted: true, pauseOnMetered: true, metered: true, pausedForIpChange: false),
+            .pausedForMeteredLink,
+            "a metered pause must not read as the user's own Leech Mode")
+        // The address-change pause - the Settings footer's blind spot.
+        XCTAssertEqual(
+            SharingStatus.of(
+                wanted: true, pauseOnMetered: false, metered: false, pausedForIpChange: true),
+            .pausedForIpChange,
+            "an address-change pause must not read as sharing")
+        // BOTH at once: the address change wins, because it is the one that
+        // does NOT end by itself. Naming the metered pause here would promise a
+        // resumption on Wi-Fi that sharingDecision refuses to perform - it
+        // returns nil for exactly these inputs.
+        XCTAssertEqual(
+            SharingStatus.of(
+                wanted: true, pauseOnMetered: true, metered: true, pausedForIpChange: true),
+            .pausedForIpChange,
+            "the pause that needs the user must outrank the one that clears itself")
+        XCTAssertNil(
+            EngineModel.sharingDecision(
+                wanted: true, pauseOnMetered: true, metered: true,
+                pausedForIpChange: true, userInitiated: false),
+            "the Wi-Fi promise would be false here - which is why the caption must not make it")
+        // Neither pause applies to a user who is not trying to share. The
+        // engine really can latch the address-change flag with sharing already
+        // off: `note_public_id` does not consult it, and `set_sharing(false)`
+        // deliberately leaves it alone.
+        XCTAssertEqual(
+            SharingStatus.of(
+                wanted: false, pauseOnMetered: true, metered: true, pausedForIpChange: true),
+            .leech,
+            "with the preference off there is no choice left to have paused")
+    }
+
+    /// THE SCREEN AND THE ENGINE CANNOT DISAGREE, over EVERY input combination.
+    ///
+    /// Two rules describe one thing: `SharingStatus.of` decides what the screens
+    /// say, `EngineModel.sharingDecision` decides what the engine is told. Both
+    /// REAL methods are called here, and the invariant is that `.sharing` comes
+    /// back for exactly the inputs that push `true`. That is the whole reason a
+    /// caption can be trusted - and it is the property that broke when the two
+    /// screens each carried their own half of the rule.
+    func testTheCaptionRuleAndTheEnginePushCannotDisagree() {
+        var checked = 0
+        for wanted in [false, true] {
+            for pauseOnMetered in [false, true] {
+                for metered in [false, true] {
+                    for ipPaused in [false, true] {
+                        let inputs =
+                            "wanted \(wanted), pauseOnMetered \(pauseOnMetered), "
+                            + "metered \(metered), ipPaused \(ipPaused)"
+                        let status = SharingStatus.of(
+                            wanted: wanted, pauseOnMetered: pauseOnMetered,
+                            metered: metered, pausedForIpChange: ipPaused)
+                        // Not user-initiated: this is the launch push and every
+                        // incidental recompute, which is the direction that can
+                        // lie to the user.
+                        let pushed = EngineModel.sharingDecision(
+                            wanted: wanted, pauseOnMetered: pauseOnMetered,
+                            metered: metered, pausedForIpChange: ipPaused,
+                            userInitiated: false)
+                        XCTAssertEqual(
+                            status == .sharing, pushed == true,
+                            "the screen says \(status) while the engine is pushed "
+                                + "\(String(describing: pushed)) - \(inputs)")
+                        if status != .sharing {
+                            XCTAssertNotEqual(
+                                pushed, true,
+                                "a caption that explains why sharing is off must never ride "
+                                    + "along with a push that turns it on - \(inputs)")
+                        }
+                        checked += 1
+                    }
+                }
+            }
+        }
+        // COUNT that the loop actually ran the whole space - a nested loop that
+        // silently iterated nothing is a green test that proves nothing.
+        XCTAssertEqual(checked, 16, "all 16 input combinations must be compared")
+    }
+
+    /// ONE STATE, ONE SET OF WORDS. The captions live on `SharingStatus` so the
+    /// two screens physically cannot word the same state differently; these pin
+    /// the promises inside them, which is what made the old copies wrong.
+    func testEachSharingStateGetsItsOwnWordsAndOnlyOneOfThemPromisesWiFi() {
+        let all: [SharingStatus] = [.sharing, .leech, .pausedForIpChange, .pausedForMeteredLink]
+        XCTAssertEqual(
+            Set(all.map { $0.caption }).count, all.count,
+            "four distinct states need four distinct captions")
+        // "It resumes automatically on Wi-Fi" is TRUE of the metered pause and
+        // FALSE of the address-change pause, which is exactly the sentence the
+        // Settings footer used to show during an address-change pause.
+        XCTAssertTrue(SharingStatus.pausedForMeteredLink.caption.contains("Wi-Fi"))
+        for state in all where state != .pausedForMeteredLink {
+            XCTAssertFalse(
+                state.caption.contains("Wi-Fi"),
+                "only the metered pause ends on its own, so only it may promise Wi-Fi - \(state)")
+        }
+        // "Leech Mode" credits the USER with the decision, so no padMule-imposed
+        // pause may use it - the Shared screen's old defect.
+        XCTAssertTrue(SharingStatus.leech.caption.contains("Leech Mode"))
+        for state in all where state != .leech {
+            XCTAssertFalse(
+                state.caption.contains("Leech Mode"),
+                "a pause padMule imposed must not be credited to the user - \(state)")
+        }
+        // And only the sharing state may claim padMule is serving - the
+        // Settings footer's old defect.
+        XCTAssertTrue(SharingStatus.sharing.caption.contains("padMule serves"))
+        for state in all where state != .sharing {
+            XCTAssertFalse(
+                state.caption.contains("padMule serves"),
+                "nothing but the sharing state may say padMule is serving files - \(state)")
+        }
+    }
+
     func testDefaultsRegisterTheProtectiveValues() {
         // Both the sharing default and the metered-pause default must be ON, so a
         // fresh install protects a data plan without the user configuring anything.

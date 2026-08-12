@@ -691,6 +691,10 @@ final class EngineModel: ObservableObject {
 
         let path = dir.path
         let docsPath = docs.path
+        // The metered verdict is main-actor state, so it is read HERE and
+        // carried in: the sharing push below runs on the work queue and must
+        // decide from the same inputs `applyEffectiveSharing` would use.
+        let metered = meteredNow
         engineLog.notice("boot: config=\(path, privacy: .public)")
         work.async { [weak self] in
             do {
@@ -699,10 +703,10 @@ final class EngineModel: ObservableObject {
                 // The engine RESTORES the ip-change pause from disk in its
                 // constructor (the guard fired in a PREVIOUS launch and the
                 // user has not resumed sharing). Captured here, before any
-                // poll exists, so the main-thread seed below cannot miss it.
-                // Both reads are lock-free.
+                // poll exists, so the main-thread seed below cannot miss it -
+                // and it is also an INPUT to the sharing push below, which is
+                // why it is read before start() rather than after. Lock-free.
                 let ipPaused = e.sharingPausedForIpChange()
-                let sharingNow = e.isSharing()
                 // Ports and the UPnP toggle MUST be pushed before start(): they
                 // take effect when the listener binds, and every launch builds a
                 // fresh engine - so applying them afterwards (with the other
@@ -741,6 +745,33 @@ final class EngineModel: ObservableObject {
                 // registered default on a first launch rather than the false
                 // UserDefaults returns for an absent key.
                 e.setIncognito(on: d.bool(forKey: SettingsKey.incognito))
+                // SHARING closes the same startup window, and it is the one
+                // that serves BYTES. The engine defaults sharing ON
+                // (`Engine::new` builds it `AtomicBool::new(!ip_paused)`) and
+                // the listener consults the flag per inbound request, while
+                // `Engine::start` binds that listener PARTWAY THROUGH and then
+                // keeps working - `map_port`, `start_kad`, `resume_fetches`.
+                // Pushing this only in the completion below therefore left a
+                // Leech-Mode user serving real file data to every peer that
+                // reached the port in between, on every launch. Decided here,
+                // it is decided before the listener exists.
+                //
+                // The REAL rule, not a copy of it: `sharingDecision`'s nil case
+                // is what stops this launch-time push - which no user
+                // initiated - from clearing a restored address-change pause.
+                if let effective = EngineModel.sharingDecision(
+                    wanted: d.bool(forKey: SettingsKey.shareUploads),
+                    pauseOnMetered: d.bool(forKey: SettingsKey.pauseSharingOnCellular),
+                    metered: metered,
+                    pausedForIpChange: ipPaused,
+                    userInitiated: false
+                ) {
+                    e.setSharing(on: effective)
+                }
+                // Read AFTER that push, so the mirror the main thread seeds
+                // below is what the engine actually holds rather than the
+                // default it came up with.
+                let sharingNow = e.isSharing()
                 e.start()
                 engineLog.notice("boot OK; engine started")
                 DispatchQueue.main.async {
@@ -759,6 +790,14 @@ final class EngineModel: ObservableObject {
                     // Re-apply persisted settings the moment the engine exists.
                     // Without this the engine keeps its own defaults and the
                     // user's choices look like they were ignored.
+                    //
+                    // Sharing was ALREADY pushed, before start() - see above.
+                    // This re-apply stays for the same reason `applyIncognito`
+                    // re-applies a preference boot() also pushed early: it is
+                    // the one call that publishes `sharing` and logs the
+                    // decision, and re-applying unconditionally is what keeps
+                    // engine and preference in step. It is idempotent, and its
+                    // nil case still protects the restored pause.
                     self.applyEffectiveSharing()
                     self.applyLaunchSettings()
                     self.startPolling()
@@ -1012,7 +1051,15 @@ final class EngineModel: ObservableObject {
     /// banner explaining why it had stopped. On iOS there is no kill switch, so
     /// that guard is the whole protection. Turning sharing OFF is always safe
     /// and is never suppressed; only the ON direction is gated.
-    static func sharingDecision(
+    ///
+    /// This decides what the ENGINE is told. `SharingStatus.of` decides what the
+    /// SCREEN says from the same inputs, and the two agree by construction:
+    /// `.sharing` comes back for exactly the inputs that push `true` here.
+    /// Change one without the other and `SettingsTests` fails.
+    ///
+    /// `nonisolated` because `boot()` calls it from the work queue, BEFORE
+    /// `start()` - same reason as `nicknameToPush`.
+    nonisolated static func sharingDecision(
         wanted: Bool,
         pauseOnMetered: Bool,
         metered: Bool,
@@ -1069,12 +1116,27 @@ final class EngineModel: ObservableObject {
         work.async { e.setSharing(on: effective) }
     }
 
-    /// True when sharing is off ONLY because of the metered-network rule, so the
-    /// UI can explain itself rather than look broken.
-    var sharingPausedForMeteredLink: Bool {
-        meteredNow
-            && UserDefaults.standard.bool(forKey: SettingsKey.pauseSharingOnCellular)
-            && UserDefaults.standard.bool(forKey: SettingsKey.shareUploads)
+    /// WHAT THE SHARING CONTROLS SAY - the live value of the shared rule, from
+    /// the same inputs `applyEffectiveSharing` feeds the engine. Both the
+    /// Settings footer and the Shared screen's caption render this, so neither
+    /// can describe a pause the other one omits.
+    ///
+    /// It replaced `sharingPausedForMeteredLink`, whose whole vocabulary was
+    /// "metered pause or not" - which is why the Settings footer could not
+    /// mention the address-change pause at all, and said padMule was serving
+    /// files while that pause was in force.
+    ///
+    /// All three inputs republish this view: `meteredNow` and
+    /// `sharingPausedForIpChange` are `@Published` (and re-assigned by every
+    /// poll tick), and the two preferences are `@AppStorage` on the Settings
+    /// screen that writes them.
+    var sharingStatus: SharingStatus {
+        SharingStatus.of(
+            wanted: UserDefaults.standard.bool(forKey: SettingsKey.shareUploads),
+            pauseOnMetered: UserDefaults.standard.bool(forKey: SettingsKey.pauseSharingOnCellular),
+            metered: meteredNow,
+            pausedForIpChange: sharingPausedForIpChange
+        )
     }
 
     /// Latest metered verdict from the NetworkWatcher; the app feeds this in.
@@ -2231,14 +2293,25 @@ final class EngineModel: ObservableObject {
     /// the user asked for it, and honor the keep-awake preference.
     func applyLaunchSettings() {
         restoreSearchFilters()
-        if UserDefaults.standard.bool(forKey: SettingsKey.updateServerListAtLaunch) {
-            updateAllServerLists()
-        }
+        // THE CHEAP PREFERENCE PUSHES GO FIRST, the network work last.
+        //
+        // `work` is a SERIAL queue and `updateAllServerLists()` enqueues one
+        // BLOCKING HTTP fetch per configured list, so with "Update all lists at
+        // launch" on - or simply with several list URLs, or one unreachable one
+        // - every push below used to wait behind the whole round of fetches.
+        // `applyAllowBrowse` is the one that matters: it fails CLOSED (both the
+        // engine default and the registered iOS default are "Nobody"), so the
+        // delay was never an exposure, but a privacy preference arriving
+        // minutes into a launch is still a window in which the engine holds a
+        // value the user did not choose.
         applyAskServersForServers()
         applyIncognito()
         applyAllowBrowse()
         applyPortSettings()
         applyKeepAwake()
+        if UserDefaults.standard.bool(forKey: SettingsKey.updateServerListAtLaunch) {
+            updateAllServerLists()
+        }
     }
 
     /// Push the "ask a fresh login for its server list" pref into the engine.
