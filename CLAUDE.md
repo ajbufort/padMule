@@ -27,6 +27,11 @@ current build state is `docs/wiki/build-progress.md`.
   treat it as read-only.
 - aMule is GPL-2.0-or-later; padMule is too (root `LICENSE` + `NOTICE`).
   Anything borrowed from other forks (e.g. eMule AI) stays GPL-compatible.
+  The compiled BINARY goes further: linking `ring` (Apache-2.0, via rustls, for
+  the HTTPS server-list fetch) forces the "or later" option, so a build that
+  includes it is conveyed under GPL-3.0-or-later while the SOURCE stays
+  GPL-2.0-or-later. `NOTICE` calls that a real constraint on redistribution, not
+  a formality - read it before touching dependencies or writing release notes.
 - The repo is PUBLIC (github.com/ajbufort/padMule). Never commit real public
   IPs, client IDs, MACs, or other personal network identifiers; use
   placeholders like `<public-ip>`. Private RFC1918 LAN addresses (192.168.x.x,
@@ -40,6 +45,17 @@ current build state is `docs/wiki/build-progress.md`.
   rewrite could remove it from the repo but NOT from public event archives that
   capture push payloads. Gitignoring a file does nothing about the message that
   accompanies the next commit.
+- **ALL AGENTIC WORK IS COORDINATED FOR GUARANTEED NON-COLLISION** (standing
+  2026-08-09; amended 2026-08-11). Work runs via dispatched agents: the
+  coordinator scopes, dispatches and VERIFIES - it does not edit. Coordination
+  is not best-effort - non-collision is guaranteed BY CONSTRUCTION, before
+  anything is dispatched. Publish an ownership map first: one sole writer per
+  path, no path owned twice. Exactly ONE agent may run cargo (concurrent builds
+  race `target/`). Two tasks touching one file are one agent's job or two serial
+  jobs. The knowledge-base ingest is a SERIAL TAIL, never parallel, and a claim
+  whose truth depends on another agent's outcome is held for that tail instead
+  of handed to both. Working in place rather than in a worktree removes the
+  safety net, so file ownership becomes the only guarantee.
 
 ## Architecture (the working tree)
 
@@ -49,9 +65,11 @@ current build state is `docs/wiki/build-progress.md`.
 | `crates/mule-files` | On-disk formats, byte-compatible with upstream: server.met, known.met, part.met (+gaps), known2_64.met (AICH hashsets), clients.met, nodes.dat, preferences, ipfilter.dat/.p2p. Plus `pins` - padMule's own pinned.txt, the one format here with no upstream counterpart. |
 | `crates/mule-kad` | Kad2: UDP framing + obfuscation, message codecs, routing bin-tree, iterative lookup, anti-abuse hardening. Offline-testable. |
 | `crates/mule-engine` | The live engine: server link, peer transfer, TCP obfuscation, secure ident, credits, Kad node, fetch/search/catalog, share/upload, UPnP + NAT-PMP, and the `Engine` lifecycle facade. |
-| `crates/mule-cli` | Dev + live-network harness (30 subcommands: login, listen, peer-*, kad-* incl. `kad-serve`, upnp-*, *-search, offer-*, link, fetch-complete, aich-*, ...). |
+| `crates/mule-cli` | Dev + live-network harness (31 subcommands: login, listen, peer-*, kad-* incl. `kad-serve`, upnp-*, *-search, offer-*, link, fetch-complete, aich-*, ...). |
 | `crates/mule-ffi` | UniFFI seam: sync facade over the async engine; Swift bindings generated in CI from the compiled library. |
 | `ios/` | SwiftUI app. XcodeGen `project.yml`; the pbxproj is generated in CI, never committed. |
+| `fuzz/` | 8 cargo-fuzz targets over the parse paths (packet, tag, link, kad_udp, met_files, ipfilter, ed2k_peer, ed2k_server). Its OWN workspace root, so `cargo test/clippy/fmt --workspace` never sees it; nightly-only and NOT wired into any CI workflow - run it by hand. |
+| `scripts/` | Oracles + the deploy loop: `build-amuled-oracle.sh`/`differential-test.sh`, `amuled-reverse-oracle.sh`, `kad-store-oracle.sh`/`kad-verify-oracle.sh`, `eserver-oracle.sh`, `emule-oracle.sh`, `aich-golden.sh`, `simulate.sh`, `device-timing.sh`, and `ship.sh`. |
 | `amule-3.0.1/` | Vendored upstream C++ - reference oracle only. `build-oracle/` holds a built amuled for differential tests. |
 | `refs/` | Gitignored source oracles: eMule 0.50a (the WIRE authority), eMule 0.70b (community fork), aMule master. |
 
@@ -126,8 +144,10 @@ Details and what is portable from them: `docs/wiki/ref-ecosystem.md`.
 source "$HOME/.cargo/env"              # cargo is NOT on the default PATH
 
 cargo build --workspace
-cargo test --workspace                 # the unit gate (838 tests at 2026-08-11, offline; the handoff carries the current count)
-cargo clippy --workspace --all-targets # must be warning-free
+cargo test --workspace                 # the unit gate (840 passed / 4 ignored at 2026-08-11, offline; the handoff carries the current count)
+# -D warnings is NOT optional: bare clippy EXITS 0 on warnings, so a gate without
+# it goes GREEN over them (measured 2026-08-11: identical findings, exit 0 vs 101).
+cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 
 # LIVE STRESS HARNESS (dozens of real downloads through the app's own FFI):
@@ -148,10 +168,19 @@ cargo fmt --all -- --check
 scripts/build-amuled-oracle.sh         # one-time build into build-oracle/
 scripts/differential-test.sh           # padMule downloads from real amuled, byte-for-byte
 
-# CI: push to main, pull requests, or workflow_dispatch trigger
-#   .github/workflows/rust.yml      - the unit gate above (test+clippy+fmt) on ubuntu
-#   .github/workflows/ios-build.yml - unsigned padMule.ipa artifact (macOS runner)
-#   .github/workflows/ios-test.yml  - Swift unit tests on an iPad simulator
+# ONTO THE IPAD - the only route. Closed loop: commit -> CI -> verify the artifact
+# -> sign -> install -> read CFBundleVersion back OFF the device. Aborts on a dirty
+# tree or an unpushed HEAD, and holds an flock so only ONE ship runs at a time.
+scripts/ship.sh                        # [--no-install]
+
+# CI: push to main, pull requests, or workflow_dispatch trigger - plus a weekly
+# cron on the supply-chain audit, which is the trigger that matters most there:
+# a new advisory lands against an UNCHANGED Cargo.lock, so no push would fire it.
+#   .github/workflows/rust.yml         - the unit gate above (test+clippy+fmt) on ubuntu
+#   .github/workflows/ios-build.yml    - unsigned padMule.ipa artifact (macOS runner)
+#   .github/workflows/ios-test.yml     - Swift unit tests on an iPad simulator
+#   .github/workflows/supply-chain.yml - cargo-deny: advisories, licenses, sources (policy in deny.toml)
+# ship.sh gates on the FIRST THREE only - a supply-chain red does NOT block a ship.
 # No Apple secrets anywhere.
 ```
 
