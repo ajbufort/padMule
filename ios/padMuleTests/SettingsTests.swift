@@ -131,6 +131,54 @@ final class SettingsTests: XCTestCase {
             "advertised Kad port must default to the bound one")
     }
 
+    /// THE DEFAULT SERVER-LIST URL IS `https://`, AND `register()` SEEDS IT.
+    ///
+    /// The SCHEME is the load-bearing part, so that is what the first assertion
+    /// pins rather than the whole literal. A URL reaching the engine from this
+    /// screen is a USER url: `Engine::update_server_list` fetches it exactly as
+    /// written, and only the engine's BUILT-IN bootstrap retries in the clear
+    /// when a TLS attempt never lands. Nothing downstream upgrades this string,
+    /// and `register(defaults:)` supplies a value only for an ABSENT key - so a
+    /// plaintext default here would be plaintext for good on every install that
+    /// took it.
+    ///
+    /// NO TEST READ THIS CONSTANT UNTIL 2026-08-12. The five
+    /// `http://upd.emule-security.org/server.met` literals in the test below are
+    /// a fixture that test writes into UserDefaults itself, not a pin of the
+    /// constant - so a silent revert to `http://` passed the entire suite.
+    ///
+    /// HONEST LIMIT on the second assertion: it compares against the constant,
+    /// so the host may move without this test objecting, and a literal restated
+    /// inside `register()` would pass it too. What it catches is the seeding
+    /// going away or pointing somewhere else; the scheme pin above is what
+    /// catches a downgrade.
+    func testDefaultServerListUrlIsHttpsAndSeedsTheRegisteredDefault() {
+        XCTAssertTrue(
+            EngineModel.defaultServerListUrl.hasPrefix("https://"),
+            "the default server-list URL must be https - a URL from this path is a USER "
+                + "url the engine never downgrades, so plaintext here is plaintext for good")
+
+        // Isolate the key the way the test below does: the REGISTERED default is
+        // only visible while the persistent domain holds no value of its own.
+        let d = UserDefaults.standard
+        let saved = d.stringArray(forKey: SettingsKey.serverListUrls)
+        defer {
+            if let saved {
+                d.set(saved, forKey: SettingsKey.serverListUrls)
+            } else {
+                d.removeObject(forKey: SettingsKey.serverListUrls)
+            }
+        }
+        d.removeObject(forKey: SettingsKey.serverListUrls)
+
+        SettingsDefaults.register()
+        XCTAssertEqual(
+            d.stringArray(forKey: SettingsKey.serverListUrls),
+            [EngineModel.defaultServerListUrl],
+            "register() must seed padMule.serverListUrls with the constant's value - that "
+                + "is the list a fresh install starts with, and it is never revisited")
+    }
+
     /// Calls the REAL `EngineModel.addServerListUrl`, not a restatement of its
     /// rule - the restated version pinned an accept function this file wrote
     /// itself and would have stayed green through any change in the model. The
