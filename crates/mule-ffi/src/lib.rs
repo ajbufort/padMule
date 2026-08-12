@@ -747,7 +747,7 @@ impl MuleEngine {
     /// before the setting existed announced.
     pub fn nickname(&self) -> String {
         self.rt
-            .block_on(async { self.inner.lock().await.nickname().to_string() })
+            .block_on(async { self.inner.lock().await.nickname() })
     }
 
     /// The nickname other clients actually SEE. Differs from `nickname()` only
@@ -756,7 +756,7 @@ impl MuleEngine {
     /// sees another.
     pub fn wire_nickname(&self) -> String {
         self.rt
-            .block_on(async { self.inner.lock().await.wire_nickname().to_string() })
+            .block_on(async { self.inner.lock().await.wire_nickname() })
     }
 
     /// Set the name peers and servers are told. The engine sanitizes it
@@ -764,9 +764,9 @@ impl MuleEngine {
     /// to "padMule") - it is the side that writes the bytes, so it is the side
     /// that decides what is sendable.
     ///
-    /// Takes effect on the next server login and the next outbound fetch. Peers
-    /// that dial US keep seeing the previous name until the listener is rebuilt
-    /// (Stop then Start); the Settings footer says so.
+    /// Takes effect on the next server login, the next outbound fetch AND the
+    /// next peer that dials US - the listener reads the nickname per accepted
+    /// connection, so no Stop/Start is needed for it any more.
     pub fn set_nickname(&self, nick: String) {
         self.rt
             .block_on(async { self.inner.lock().await.set_nickname(&nick) });
@@ -1012,6 +1012,12 @@ impl MuleEngine {
     /// (Layer 1 detection IS the marker), and it hides the DECLARATION, not the
     /// BEHAVIOR - timing, ordering, capability bits and opcode responses still
     /// fingerprint padMule. It is not anonymity.
+    ///
+    /// Takes effect on the next HELLO in BOTH directions, with no Stop/Start:
+    /// the listener reads the flag per accepted connection. It used to be
+    /// snapshotted at bind time, so a mid-session toggle hid the outbound half
+    /// only - and a disguise worn on one of two channels is a correlation
+    /// handle, not a disguise.
     pub fn set_incognito(&self, on: bool) {
         self.rt
             .block_on(async { self.inner.lock().await.set_incognito(on) })

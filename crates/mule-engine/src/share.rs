@@ -771,6 +771,44 @@ fn browsable_library(library: &[SharedFile]) -> Vec<crate::server_messages::Offe
         .collect()
 }
 
+/// The answer a browse gets when we will NOT list: `None` for anything that is
+/// not a browse.
+///
+/// ONE PLACE, because there are two callers and the shape differs BY OPCODE.
+/// `serve_shared` refuses when the user's setting forbids browsing; the listener
+/// refuses when sharing is off entirely (build-progress 8ed: a client that will
+/// not SERVE must not NAME what it holds - disclosure with no matching benefit).
+/// A second copy is how the two answers would later drift apart.
+///
+/// - 0x4A `OP_ASKSHAREDFILES` -> `OP_ASKSHAREDFILESANSWER` with count = 0. eMule
+///   builds the list only if `CanSeeShares()` allows and then sends whatever it
+///   built (0.50a ListenSocket.cpp, case OP_ASKSHAREDFILES), so "I refuse" and
+///   "I have nothing" are indistinguishable to the asker.
+/// - 0x5D / 0x5E -> `OP_ASKSHAREDDENIEDANS`, null body. The directory flavour
+///   has its own refusal opcode upstream; silence is what makes a client hang.
+pub fn browse_refusal(op: u8) -> Option<Packet> {
+    match op {
+        crate::transfer::OP_ASKSHAREDFILES => Some(Packet::new(
+            mule_proto::PROT_EDONKEY,
+            crate::transfer::OP_ASKSHAREDFILESANSWER,
+            crate::server_messages::build_offer_files(
+                &[],
+                crate::server_messages::FILE_COMPLETE_ID,
+                crate::server_messages::FILE_COMPLETE_PORT,
+            )
+            .payload,
+        )),
+        crate::transfer::OP_ASKSHAREDDIRS | crate::transfer::OP_ASKSHAREDFILESDIR => {
+            Some(Packet::new(
+                mule_proto::PROT_EDONKEY,
+                crate::transfer::OP_ASKSHAREDDENIEDANS,
+                Vec::new(),
+            ))
+        }
+        _ => None,
+    }
+}
+
 pub async fn serve_shared<S>(
     fs: &mut FramedStream<S>,
     library: &[SharedFile],
@@ -943,14 +981,12 @@ where
                 //
                 // Refusal is its OWN opcode here, unlike the 0x4A flavour which
                 // refuses with an empty list. Upstream does exactly this, and a
-                // client given silence simply hangs.
+                // client given silence simply hangs. Both shapes come from
+                // `browse_refusal`, the one place the listener refuses from too.
                 if !allow_browse {
-                    fs.write_packet(&Packet::new(
-                        mule_proto::PROT_EDONKEY,
-                        crate::transfer::OP_ASKSHAREDDENIEDANS,
-                        Vec::new(),
-                    ))
-                    .await?;
+                    if let Some(no) = browse_refusal(pkt.opcode) {
+                        fs.write_packet(&no).await?;
+                    }
                 } else {
                     let mut w = mule_proto::Writer::new();
                     w.write_u32(1); // one pseudo-directory
@@ -973,12 +1009,9 @@ where
                     r.read_string_u16().unwrap_or_default()
                 };
                 if !allow_browse {
-                    fs.write_packet(&Packet::new(
-                        mule_proto::PROT_EDONKEY,
-                        crate::transfer::OP_ASKSHAREDDENIEDANS,
-                        Vec::new(),
-                    ))
-                    .await?;
+                    if let Some(no) = browse_refusal(pkt.opcode) {
+                        fs.write_packet(&no).await?;
+                    }
                 } else {
                     let offered = browsable_library(library);
                     let files = crate::server_messages::build_offer_files(
@@ -1016,26 +1049,30 @@ where
                 // The same on-disk check the transfer path uses: a file whose
                 // bytes are gone (or resized) is not ours to advertise, or we
                 // would invite a request we then fail.
-                let offered = if allow_browse {
-                    browsable_library(library)
+                //
+                // The empty-list refusal comes from `browse_refusal`, the one
+                // place the listener refuses from too.
+                if !allow_browse {
+                    if let Some(no) = browse_refusal(pkt.opcode) {
+                        fs.write_packet(&no).await?;
+                    }
                 } else {
-                    Vec::new()
-                };
-                // FILE_COMPLETE_ID/PORT: the record's id/port fields mean
-                // "complete" for our own shares, exactly as the OFFERFILES path
-                // uses them - the record layout is identical, which is why the
-                // same builder serves both.
-                let body = crate::server_messages::build_offer_files(
-                    &offered,
-                    crate::server_messages::FILE_COMPLETE_ID,
-                    crate::server_messages::FILE_COMPLETE_PORT,
-                );
-                fs.write_packet(&Packet::new(
-                    mule_proto::PROT_EDONKEY,
-                    crate::transfer::OP_ASKSHAREDFILESANSWER,
-                    body.payload,
-                ))
-                .await?;
+                    // FILE_COMPLETE_ID/PORT: the record's id/port fields mean
+                    // "complete" for our own shares, exactly as the OFFERFILES
+                    // path uses them - the record layout is identical, which is
+                    // why the same builder serves both.
+                    let body = crate::server_messages::build_offer_files(
+                        &browsable_library(library),
+                        crate::server_messages::FILE_COMPLETE_ID,
+                        crate::server_messages::FILE_COMPLETE_PORT,
+                    );
+                    fs.write_packet(&Packet::new(
+                        mule_proto::PROT_EDONKEY,
+                        crate::transfer::OP_ASKSHAREDFILESANSWER,
+                        body.payload,
+                    ))
+                    .await?;
+                }
             }
             OP_REQUESTFILENAME => {
                 // Only latch a file we actually found: a miss must not clear a

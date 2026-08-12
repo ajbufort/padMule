@@ -1091,6 +1091,16 @@ async fn finish_download(
 /// grants one immediately if free, or QUEUES the peer (OP_QUEUERANKING) and
 /// grants a freed slot in place. The permit is held inside serve_shared for the
 /// whole session.
+///
+/// A BROWSE MUST BE DECLINED IN ITS OWN SHAPE, not with "no file" and never with
+/// silence. `first` can be a browse (`is_upload_request` admits 0x4A/0x5D/0x5E
+/// as session openers), and a browse carries a NULL BODY - so the hash-headed
+/// decline below wrote nothing at all and the socket just closed, which is the
+/// "Unable to retrieve shared files" hang in a shipped configuration (Leech
+/// Mode, or the persisted VPN address-change pause, with browse allowed).
+/// [`crate::share::browse_refusal`] is consulted FIRST for the same reason it
+/// exists: one rule, one place, and it also keeps a 0x5E whose directory NAME is
+/// 16 bytes or longer from being mistaken for a file hash by `head_hash`.
 #[allow(clippy::too_many_arguments)]
 async fn serve_inbound<S>(
     fs: &mut FramedStream<S>,
@@ -1105,7 +1115,11 @@ async fn serve_inbound<S>(
 {
     if !sharing.load(Ordering::Relaxed) {
         // Leech Mode: we may hold the file, but we are not sharing - say so.
-        if let Some(h) = head_hash(&first.payload) {
+        // A browse gets the refusal for its own flavour and NEVER the listing:
+        // a client that will not serve must not name what it holds (8ed).
+        if let Some(no) = crate::share::browse_refusal(first.opcode) {
+            let _ = fs.write_packet(&no).await;
+        } else if let Some(h) = head_hash(&first.payload) {
             let _ = fs.write_packet(&build_file_req_ans_no_fil(&h)).await;
         }
         return;
@@ -1661,6 +1675,55 @@ fn fold_probe_round(h: &mut ProbeHealth, answered: bool, users: u32, files: u32)
     }
 }
 
+/// The identity padMule declares on the wire: the nickname, and the INCOGNITO
+/// flag that decides both the marker tag and which nickname is used.
+///
+/// THE ENGINE'S ONLY COPY. It sits behind an `Arc<Mutex<..>>` because the
+/// listener's accept task outlives every setter and must read it LIVE, per
+/// accepted connection - `start_listener` used to build one `HelloInfo` at bind
+/// time and clone that snapshot into every connection, so a user who turned
+/// Incognito on mid-session kept declaring "padMule" to every peer that dialled
+/// US while the outbound half (rebuilt per fetch) really was hidden. A disguise
+/// worn on one of two channels is not a disguise, it is a correlation handle.
+///
+/// The pair lives in ONE cell rather than two shared fields on purpose: the
+/// substitution couples them (see [`WireIdentity::effective_nick`]), and there
+/// is no second copy to refresh, so a future setter cannot forget to publish.
+#[derive(Debug, Clone)]
+struct WireIdentity {
+    /// The name we announce to peers (CT_NAME in the HELLO) and to servers
+    /// (CT_NAME in the login). Always the sanitized form - `set_nickname` is the
+    /// only writer and it never stores anything `sanitize_nick` would reject, so
+    /// every reader gets a value that is safe to put on the wire as-is.
+    nick: String,
+    /// INCOGNITO (handoff 32): suppress the padMule marker tag in every HELLO.
+    incognito: bool,
+}
+
+impl WireIdentity {
+    /// The nickname that actually goes on the wire. Incognito substitutes only
+    /// an UNTOUCHED default: a nickname the user chose is theirs, and silently
+    /// overwriting it would be a surprising identity change rather than a
+    /// disguise.
+    fn effective_nick(&self) -> &str {
+        if self.incognito && self.nick == DEFAULT_NICK {
+            INCOGNITO_NICK
+        } else {
+            &self.nick
+        }
+    }
+
+    /// The HELLO baseline, before any per-site capability flags. THE ONE
+    /// constructor: [`Engine::hello_baseline`] and the accept loop both land
+    /// here, so a peer can never be told a different name depending on who
+    /// dialled whom. The ports are passed in because they are NOT live - see
+    /// [`Engine::set_ports`], which takes effect on the next `start()`.
+    fn hello(&self, user_hash: [u8; 16], tcp_port: u16, kad_udp_port: u16) -> HelloInfo {
+        HelloInfo::baseline(user_hash, 0, tcp_port, kad_udp_port, self.effective_nick())
+            .incognito(self.incognito)
+    }
+}
+
 /// The padMule engine. Create with [`Engine::new`], drive with the lifecycle
 /// methods, observe via the returned event receiver.
 pub struct Engine {
@@ -1724,9 +1787,10 @@ pub struct Engine {
     /// Hunter harvest inert on every fresh install - the exact inertness the
     /// 2026-08-03 device pass proved (docs/wiki/feature-server-hunter.md).
     add_servers_from_server: bool,
-    /// INCOGNITO (handoff 32): suppress the padMule marker tag in every HELLO.
-    /// Read by `hello_baseline`, the ONE constructor both hello sites use.
-    incognito: bool,
+    /// The nickname + INCOGNITO flag, in their only copy. Shared with the
+    /// listener's accept task, which reads them PER CONNECTION - see
+    /// [`WireIdentity`] for why they must be live and why they share one cell.
+    wire_identity: Arc<std::sync::Mutex<WireIdentity>>,
     /// May peers BROWSE our library (OP_ASKSHAREDFILES)? eMule's
     /// `CanSeeShares()`; its own default is `vsfaNobody`
     /// (0.50a Preferences.cpp:2053), so refusing is upstream behaviour.
@@ -1788,11 +1852,6 @@ pub struct Engine {
     /// misleading - when a VPN tunnel is carrying the traffic, because the
     /// mapping would be made on the LAN router the tunnel bypasses.
     upnp_enabled: bool,
-    /// The name we announce to peers (CT_NAME in the HELLO) and to servers
-    /// (CT_NAME in the login). Always the sanitized form - `set_nickname` is the
-    /// only writer and it never stores anything `sanitize_nick` would reject, so
-    /// every reader gets a value that is safe to put on the wire as-is.
-    nick: String,
     /// Our public IPv4, as UPnP/SSDP reported it (`theApp.GetPublicIP`). Learned
     /// in `map_port`, fed to the Kad node so it can echo a peer's UDP verify key
     /// (bound to THIS ip) and be verified faster. `None` until a mapping succeeds;
@@ -1910,11 +1969,14 @@ impl Engine {
             shared_dirty: Arc::new(AtomicBool::new(false)),
             harvested_servers: Arc::new(std::sync::Mutex::new(Vec::new())),
             add_servers_from_server: true,
-            // ON by default, agreeing with the registered iOS default: the
-            // enhancement channel it costs is deferred and unbuilt, while the
-            // exposure it removes is real on every connection. A CLI user gets
-            // the same protection without having to ask for it.
-            incognito: true,
+            wire_identity: Arc::new(std::sync::Mutex::new(WireIdentity {
+                nick: DEFAULT_NICK.to_string(),
+                // ON by default, agreeing with the registered iOS default: the
+                // enhancement channel it costs is deferred and unbuilt, while
+                // the exposure it removes is real on every connection. A CLI
+                // user gets the same protection without having to ask for it.
+                incognito: true,
+            })),
             allow_browse: Arc::new(AtomicBool::new(false)),
             sharing: Arc::new(AtomicBool::new(!ip_paused)),
             upload_gate: Arc::new(UploadGate::new(MAX_UPLOAD_SLOTS, UPLOAD_QUEUE_CAP)),
@@ -1933,7 +1995,6 @@ impl Engine {
             kad_port: KAD_UDP_PORT,
             kad_advertised_port: KAD_UDP_PORT,
             upnp_enabled: true,
-            nick: DEFAULT_NICK.to_string(),
             public_ip: Arc::new(std::sync::Mutex::new(None)),
             listener: None,
             server_tx: None,
@@ -2160,8 +2221,8 @@ impl Engine {
     }
 
     /// The name peers and servers are told. Always sanitized, never empty.
-    pub fn nickname(&self) -> &str {
-        &self.nick
+    pub fn nickname(&self) -> String {
+        self.wire_identity.lock_recover().nick.clone()
     }
 
     /// Set the name peers and servers are told, applying eMule's nickname rules
@@ -2171,34 +2232,26 @@ impl Engine {
     /// WHEN IT REACHES THE WIRE, precisely: a server login builds its
     /// `LoginRequest` at connect time and a fetch builds its HELLO at fetch
     /// time, so both pick this up on the NEXT connection with no restart. The
-    /// INBOUND listener is the exception - `start_listener` builds one
-    /// `HelloInfo` and hands it to the accept task, so peers that dial US keep
-    /// seeing the old name until the listener is rebuilt. VERIFIED, not assumed:
-    /// `pause()` aborts the listener and `resume()` calls `start_listener()`
-    /// again, so a plain background/foreground cycle picks the new name up too -
-    /// but `pause_for_seeding` deliberately leaves the listener UP, so a user
-    /// with background seeding on does not get that for free. Stop then Start is
-    /// the one action that always works, which is what the Settings footer says.
+    /// INBOUND listener USED TO BE the exception - `start_listener` built one
+    /// `HelloInfo` at bind time and handed that snapshot to the accept task, so
+    /// peers that dialled US kept seeing the old name until the listener was
+    /// rebuilt. It no longer is: the accept loop reads [`WireIdentity`] per
+    /// accepted connection, so a rename reaches the very next inbound hello.
     pub fn set_nickname(&mut self, nick: &str) {
-        self.nick = sanitize_nick(nick);
+        self.wire_identity.lock_recover().nick = sanitize_nick(nick);
     }
 
     /// The HELLO we present to a peer, before any per-site capability flags.
     /// ONE constructor for both HELLO sites (the inbound listener and an
     /// outbound fetch) so a peer can never be told a different name - or a
-    /// different port - depending on who dialled whom.
+    /// different port - depending on who dialled whom. Both land in
+    /// [`WireIdentity::hello`]; this is the outbound entry to it.
     fn hello_baseline(&self) -> HelloInfo {
-        HelloInfo::baseline(
+        self.wire_identity.lock_recover().hello(
             self.identity.userhash,
-            0,
             self.advertised_port,
             self.kad_advertised_port,
-            self.effective_nick(),
         )
-        // ONE place, so incognito cannot apply to the inbound hello and not the
-        // outbound one - a client that declares itself on only half its
-        // connections is MORE identifiable, not less.
-        .incognito(self.incognito)
     }
 
     /// The login we present to an eD2k server. Same reason as
@@ -2220,16 +2273,15 @@ impl Engine {
     /// thing and every peer saw another. Anthony hit this looking for his own
     /// client in eMule's list and not finding it. A privacy feature that lies
     /// to its own user about what it is doing is the wrong kind of quiet.
-    pub fn wire_nickname(&self) -> &str {
+    pub fn wire_nickname(&self) -> String {
         self.effective_nick()
     }
 
-    fn effective_nick(&self) -> &str {
-        if self.incognito && self.nick == DEFAULT_NICK {
-            INCOGNITO_NICK
-        } else {
-            &self.nick
-        }
+    fn effective_nick(&self) -> String {
+        self.wire_identity
+            .lock_recover()
+            .effective_nick()
+            .to_string()
     }
 
     fn login_request(&self) -> LoginRequest {
@@ -2237,7 +2289,7 @@ impl Engine {
             user_hash: self.identity.userhash,
             client_id: 0,
             tcp_port: self.advertised_port,
-            nick: self.effective_nick().to_string(),
+            nick: self.effective_nick(),
             server_flags: DEFAULT_SERVER_FLAGS,
         }
     }
@@ -2310,8 +2362,10 @@ impl Engine {
     /// see the field doc for the citations and padMule's default-ON deviation).
     /// Takes effect on the NEXT connect/resume, like upstream's.
     /// Turn INCOGNITO on or off (handoff 32). Takes effect on the next HELLO -
-    /// connections already open keep whatever they declared, which is honest:
-    /// a peer that already saw the marker has already seen it.
+    /// INBOUND AS WELL AS OUTBOUND, because the accept loop reads
+    /// [`WireIdentity`] per accepted connection rather than a snapshot taken at
+    /// bind time. Connections already open keep whatever they declared, which is
+    /// honest: a peer that already saw the marker has already seen it.
     ///
     /// STATE THE TWO LIMITS WHEREVER THIS IS EXPOSED: it disables the
     /// padMule-to-padMule enhancement channel (Layer 1 detection IS the marker),
@@ -2319,12 +2373,12 @@ impl Engine {
     /// capability bits and opcode responses still fingerprint padMule. It is not
     /// anonymity and must never be presented as such.
     pub fn set_incognito(&mut self, on: bool) {
-        self.incognito = on;
+        self.wire_identity.lock_recover().incognito = on;
     }
 
     /// Whether the wire declaration is suppressed.
     pub fn is_incognito(&self) -> bool {
-        self.incognito
+        self.wire_identity.lock_recover().incognito
     }
 
     /// Allow or refuse library browsing (eMule `CanSeeShares`). Takes effect on
@@ -2542,11 +2596,25 @@ impl Engine {
             )));
             return;
         };
-        // Advertise crypt SUPPORTED so crypt-required peers can reach us, and
-        // secure-ident so a leecher challenges us (the precondition for verifying
-        // IT - the exchange is mutual). The accept loop wires the matching inbound
-        // obf-accept and the secure-ident drain (all halves land together).
-        let me = self.hello_baseline().with_crypt_supported().with_secident();
+        // WHO WE SAY WE ARE, read PER ACCEPTED CONNECTION.
+        //
+        // This used to be one `HelloInfo` built here and cloned into every
+        // connection, which froze the nickname and the INCOGNITO flag at bind
+        // time: a user who turned Incognito on mid-session kept declaring
+        // "padMule" to every peer that dialled US, while `is_incognito()` said
+        // it was on and the outbound half (rebuilt per fetch) really was hidden.
+        // Same shape as `sharing` and `allow_browse` a few lines down, and the
+        // same bug `allow_browse` had.
+        //
+        // The PORTS are still snapshotted, deliberately: `set_ports` is
+        // documented as taking effect on the next `start()`, and it also changes
+        // the port we BIND and the UPnP mapping we made - advertising a new port
+        // while listening on the old one would invite peers to a port nothing
+        // answers on.
+        let wire_identity = Arc::clone(&self.wire_identity);
+        let user_hash = self.identity.userhash;
+        let advertised_port = self.advertised_port;
+        let kad_advertised_port = self.kad_advertised_port;
         let identity = Arc::clone(&self.identity.rsa);
         let credit_store = Arc::clone(&self.credit_store);
         let downloads = Arc::clone(&self.downloads);
@@ -2626,7 +2694,16 @@ impl Engine {
                     },
                     SocketAddr::V6(_) => None,
                 };
-                let me = me.clone();
+                // READ HERE, per connection: crypt SUPPORTED so crypt-required
+                // peers can reach us, and secure-ident so a leecher challenges
+                // us (the precondition for verifying IT - the exchange is
+                // mutual). The accept loop wires the matching inbound obf-accept
+                // and the secure-ident drain (all halves land together).
+                let me = wire_identity
+                    .lock_recover()
+                    .hello(user_hash, advertised_port, kad_advertised_port)
+                    .with_crypt_supported()
+                    .with_secident();
                 let identity = Arc::clone(&identity);
                 let credit_store = Arc::clone(&credit_store);
                 let downloads = Arc::clone(&downloads);
@@ -10931,6 +11008,153 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A BROWSE WHILE SHARING IS OFF MUST BE REFUSED, NOT IGNORED.
+    ///
+    /// `serve_inbound` bails on `!sharing` and answered only when the first
+    /// packet carried a 16-byte hash head - and a browse has a NULL BODY, so the
+    /// asker got silence and the socket closed. That is the same "Unable to
+    /// retrieve shared files" hang the browse feature spent three defects
+    /// fixing, reachable in a SHIPPED configuration: Leech Mode, or the
+    /// persisted VPN address-change pause, with browse set to Everybody.
+    ///
+    /// Refusing (rather than listing) is the decided position - build-progress
+    /// 8ed gated OFFERFILES on `is_sharing` because naming files we would then
+    /// refuse to serve is disclosure with no matching benefit. The identical
+    /// argument holds here.
+    ///
+    /// THE TWO REFUSAL SHAPES DIFFER BY OPCODE: 0x4A answers count = 0 (eMule
+    /// builds the list only if `CanSeeShares()` allows, then sends whatever it
+    /// built), 0x5D/0x5E answer OP_ASKSHAREDDENIEDANS. Both are asserted, and
+    /// the sharing-ON control runs the same rig - without it the refused leg
+    /// would pass even if browse were broken entirely.
+    ///
+    /// Through the REAL LISTENER: calling `serve_shared` directly cannot see
+    /// this at all, because the bug is in the caller.
+    #[tokio::test]
+    async fn a_browse_while_sharing_is_off_is_refused_not_ignored() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const SECRET: &[u8] = b"leech-mode-secret.bin";
+
+        async fn browse(tag: &str, sharing: bool, ask: u8) -> (u8, Vec<u8>) {
+            let dir = tmp(tag);
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let (mut engine, _rx) = Engine::new(&dir).unwrap();
+            let port = free_local_port();
+            engine.set_ports(port, port, 0, 4672);
+            engine.set_sharing(sharing);
+            engine.set_allow_browse(true);
+            let path = dir.join(String::from_utf8(SECRET.to_vec()).unwrap());
+            std::fs::write(&path, vec![7u8; 32]).unwrap();
+            engine.shared.lock().await.push(SharedFile {
+                hash: [0xB7; 16],
+                size: 32,
+                name: SECRET.to_vec(),
+                part_hashes: vec![],
+                path,
+                rating: 0,
+                comment: String::new(),
+                aich_root: None,
+            });
+            engine.start_listener().await;
+
+            let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            let mut body = vec![16u8];
+            body.extend_from_slice(&[0x3Cu8; 16]);
+            body.extend_from_slice(&0u32.to_le_bytes()); // client id
+            body.extend_from_slice(&4662u16.to_le_bytes()); // tcp port
+            body.extend_from_slice(&0u32.to_le_bytes()); // tag count
+            body.extend_from_slice(&0u32.to_le_bytes()); // server ip
+            body.extend_from_slice(&0u16.to_le_bytes()); // server port
+            let mut hello = vec![0xE3u8];
+            hello.extend_from_slice(&((body.len() + 1) as u32).to_le_bytes());
+            hello.push(crate::peer::OP_HELLO);
+            hello.extend_from_slice(&body);
+            sock.write_all(&hello).await.unwrap();
+
+            async fn read_pkt(sock: &mut tokio::net::TcpStream, what: &str) -> (u8, Vec<u8>) {
+                let mut hdr = [0u8; 6];
+                tokio::time::timeout(std::time::Duration::from_secs(5), sock.read_exact(&mut hdr))
+                    .await
+                    .unwrap_or_else(|_| panic!("{what}: SILENCE - the peer hangs"))
+                    .unwrap_or_else(|e| panic!("{what}: {e} - the peer hangs"));
+                let len = u32::from_le_bytes(hdr[1..5].try_into().unwrap()) as usize;
+                let mut rest = vec![0u8; len - 1];
+                sock.read_exact(&mut rest).await.unwrap();
+                (hdr[5], rest)
+            }
+
+            let _ = read_pkt(&mut sock, "hello answer").await;
+            sock.write_all(&[0xE3u8, 1, 0, 0, 0, ask]).await.unwrap();
+            let answered = read_pkt(&mut sock, "the browse was never answered").await;
+            let _ = std::fs::remove_dir_all(&dir);
+            answered
+        }
+
+        // CONTROL FIRST: sharing ON, so a refusal below cannot pass merely
+        // because browsing is broken end to end.
+        let (op, body) = browse("browse-on-4a", true, crate::transfer::OP_ASKSHAREDFILES).await;
+        assert_eq!(
+            op,
+            crate::transfer::OP_ASKSHAREDFILESANSWER,
+            "CONTROL: a sharing client answers 0x4A"
+        );
+        assert_eq!(
+            u32::from_le_bytes(body[..4].try_into().unwrap()),
+            1,
+            "CONTROL: the shared file must be listed while sharing is on"
+        );
+        assert!(
+            body.windows(SECRET.len()).any(|w| w == SECRET),
+            "CONTROL: the listing must name the file"
+        );
+        let (op, body) = browse("browse-on-5d", true, crate::transfer::OP_ASKSHAREDDIRS).await;
+        assert_eq!(
+            op,
+            crate::transfer::OP_ASKSHAREDDIRSANS,
+            "CONTROL: a sharing client answers 0x5D"
+        );
+        assert_eq!(
+            u32::from_le_bytes(body[..4].try_into().unwrap()),
+            1,
+            "CONTROL: one pseudo-directory while sharing is on"
+        );
+
+        // THE REGRESSION: sharing OFF must still ANSWER, with the refusal shape
+        // that matches the flavour asked, and must name nothing.
+        let (op, body) = browse("browse-off-4a", false, crate::transfer::OP_ASKSHAREDFILES).await;
+        assert_eq!(
+            op,
+            crate::transfer::OP_ASKSHAREDFILESANSWER,
+            "0x4A refuses with an EMPTY LIST, its own answer opcode - not \
+             silence and not the directory refusal"
+        );
+        assert_eq!(
+            u32::from_le_bytes(body[..4].try_into().unwrap()),
+            0,
+            "a refused 0x4A must carry count = 0"
+        );
+        assert!(
+            !body.windows(SECRET.len()).any(|w| w == SECRET),
+            "a client that refuses to SERVE must not NAME what it holds"
+        );
+
+        let (op, body) = browse("browse-off-5d", false, crate::transfer::OP_ASKSHAREDDIRS).await;
+        assert_eq!(
+            op,
+            crate::transfer::OP_ASKSHAREDDENIEDANS,
+            "0x5D refuses with its OWN opcode (OP_ASKSHAREDDENIEDANS) - a client \
+             given silence simply hangs"
+        );
+        assert!(
+            body.is_empty(),
+            "OP_ASKSHAREDDENIEDANS has a null body; it must name nothing"
+        );
+    }
+
     #[tokio::test]
     async fn a_blocklisted_peer_never_gets_our_hello() {
         let dir = tmp("inbound-blocked");
@@ -11082,6 +11306,131 @@ mod tests {
             DEFAULT_NICK,
             "with incognito OFF the default nick is unchanged"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// INCOGNITO ON THE INBOUND HELLO, THROUGH THE REAL LISTENER.
+    ///
+    /// `start_listener` built ONE `HelloInfo` at bind time and cloned that same
+    /// snapshot into every accepted connection, so a user who turned Incognito
+    /// on mid-session kept declaring "padMule" to every peer that dialled US -
+    /// while `is_incognito()` said it was on and the OUTBOUND half really was
+    /// hidden (`find_and_fetch` rebuilds its hello per fetch). That is the worst
+    /// possible state: a disguise worn on one of two channels is not a disguise,
+    /// it is a correlation handle.
+    ///
+    /// Asserted ON THE BYTES a peer receives - the HELLOANSWER tag count (8 with
+    /// the marker, 7 without, which is what stock aMule writes) and the literal
+    /// "padMule", which appears both as the marker tag's NAME and as the default
+    /// nickname's value. A test that called `hello_baseline()` directly could
+    /// not see this defect, because the defect is in what the listener KEPT.
+    ///
+    /// Every leg is a BRAND-NEW connection against a listener that was never
+    /// restarted, and both directions are asserted - a stuck value passes a
+    /// one-directional test.
+    #[tokio::test]
+    async fn incognito_flipped_after_the_listener_started_reaches_the_inbound_hello() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        /// Dial the listener as a peer would and hand back the HELLOANSWER body.
+        async fn inbound_hello_answer(port: u16) -> Vec<u8> {
+            let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            let mut body = vec![16u8];
+            body.extend_from_slice(&[0x2Bu8; 16]);
+            body.extend_from_slice(&0u32.to_le_bytes()); // client id
+            body.extend_from_slice(&4662u16.to_le_bytes()); // tcp port
+            body.extend_from_slice(&0u32.to_le_bytes()); // tag count
+            body.extend_from_slice(&0u32.to_le_bytes()); // server ip
+            body.extend_from_slice(&0u16.to_le_bytes()); // server port
+            let mut hello = vec![0xE3u8];
+            hello.extend_from_slice(&((body.len() + 1) as u32).to_le_bytes());
+            hello.push(crate::peer::OP_HELLO);
+            hello.extend_from_slice(&body);
+            sock.write_all(&hello).await.unwrap();
+
+            let mut hdr = [0u8; 6];
+            tokio::time::timeout(std::time::Duration::from_secs(5), sock.read_exact(&mut hdr))
+                .await
+                .expect("no hello answer")
+                .unwrap();
+            assert_eq!(hdr[5], crate::peer::OP_HELLOANSWER, "not a HELLOANSWER");
+            let len = u32::from_le_bytes(hdr[1..5].try_into().unwrap()) as usize;
+            let mut rest = vec![0u8; len - 1];
+            sock.read_exact(&mut rest).await.unwrap();
+            rest
+        }
+
+        /// The hello body's tag count: userhash(16) + client id(4) + port(2).
+        fn tag_count(body: &[u8]) -> u32 {
+            u32::from_le_bytes(body[22..26].try_into().unwrap())
+        }
+        fn declares_padmule(body: &[u8]) -> bool {
+            body.windows(7).any(|w| w == b"padMule")
+        }
+
+        let dir = tmp("incognito-inbound");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+        let port = free_local_port();
+        engine.set_ports(port, port, 0, 4672);
+        // Bind while DECLARING, so the snapshot the bug kept is the loud one.
+        engine.set_incognito(false);
+        engine.start_listener().await;
+
+        let declared = inbound_hello_answer(port).await;
+        assert_eq!(
+            tag_count(&declared),
+            8,
+            "CONTROL: with incognito off the marker tag is present"
+        );
+        assert!(
+            declares_padmule(&declared),
+            "CONTROL: with incognito off the wire says 'padMule'"
+        );
+
+        // FLIP IT MID-SESSION. The listener is deliberately NOT restarted.
+        engine.set_incognito(true);
+        assert!(engine.is_incognito(), "precondition: the engine agrees");
+        let hidden = inbound_hello_answer(port).await;
+        assert_eq!(
+            tag_count(&hidden),
+            7,
+            "a peer DIALLING US was still told an 8-tag hello after Incognito \
+             was turned on - the listener kept the identity it snapshotted at \
+             bind time"
+        );
+        assert!(
+            !declares_padmule(&hidden),
+            "a peer DIALLING US was still handed the literal 'padMule' after \
+             Incognito was turned on"
+        );
+
+        // The NICKNAME must be live too, or a live flag and a snapshot nick
+        // desync into the same half-worn disguise.
+        engine.set_nickname("TonyPad");
+        let renamed = inbound_hello_answer(port).await;
+        assert!(
+            renamed.windows(7).any(|w| w == b"TonyPad"),
+            "a nickname set mid-session never reached a peer that dialled us"
+        );
+
+        // AND BACK, because a stuck value passes a one-directional test.
+        engine.set_nickname(DEFAULT_NICK);
+        engine.set_incognito(false);
+        let redeclared = inbound_hello_answer(port).await;
+        assert_eq!(
+            tag_count(&redeclared),
+            8,
+            "turning Incognito back OFF must declare again"
+        );
+        assert!(
+            declares_padmule(&redeclared),
+            "turning Incognito back OFF must declare again"
+        );
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
