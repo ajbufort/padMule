@@ -71,10 +71,12 @@ use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
-/// The ports padMule advertises and listens on (eD2k TCP, Kad UDP).
-/// The eD2k defaults. Both are now overridable (see `Engine::set_ports`):
-/// a VPN that forwards an ASSIGNED remote port is the case that needs it.
+/// The eD2k TCP port padMule advertises and listens on. Overridable (see
+/// `Engine::set_ports`): a VPN that forwards an ASSIGNED remote port is the case
+/// that needs it.
 const TCP_PORT: u16 = 4662;
+
+/// The Kad UDP port, same story as [`TCP_PORT`] and overridable the same way.
 const KAD_UDP_PORT: u16 = 4672;
 
 /// The nickname padMule announces when the user has not chosen one. It is what
@@ -2254,18 +2256,6 @@ impl Engine {
         )
     }
 
-    /// The login we present to an eD2k server. Same reason as
-    /// [`Engine::hello_baseline`]: the nickname a server publishes about us and
-    /// the one a peer sees must be the same string, so they come from one place.
-    /// The nickname that actually goes on the wire.
-    ///
-    /// ONE accessor, because there are TWO wire paths and they must agree. The
-    /// first cut substituted the incognito nick in `hello_baseline` only, so
-    /// PEERS saw aMule's default while the SERVER still saw "padMule" - and the
-    /// server is the worse leak of the two, since it publishes the nickname in
-    /// its user list and in search results, where anyone can read it. A
-    /// disguise worn on one of two channels is not a disguise; it is a
-    /// correlation handle.
     /// The nickname other clients actually SEE, for the UI to display.
     ///
     /// Settings showed the STORED nickname ("padMule") while Incognito was
@@ -2277,6 +2267,15 @@ impl Engine {
         self.effective_nick()
     }
 
+    /// The nickname that actually goes on the wire.
+    ///
+    /// ONE accessor, because there are TWO wire paths and they must agree. The
+    /// first cut substituted the incognito nick in `hello_baseline` only, so
+    /// PEERS saw aMule's default while the SERVER still saw "padMule" - and the
+    /// server is the worse leak of the two, since it publishes the nickname in
+    /// its user list and in search results, where anyone can read it. A
+    /// disguise worn on one of two channels is not a disguise; it is a
+    /// correlation handle.
     fn effective_nick(&self) -> String {
         self.wire_identity
             .lock_recover()
@@ -2284,6 +2283,9 @@ impl Engine {
             .to_string()
     }
 
+    /// The login we present to an eD2k server. Same reason as
+    /// [`Engine::hello_baseline`]: the nickname a server publishes about us and
+    /// the one a peer sees must be the same string, so they come from one place.
     fn login_request(&self) -> LoginRequest {
         LoginRequest {
             user_hash: self.identity.userhash,
@@ -2358,9 +2360,6 @@ impl Engine {
         self.last_public_id = Some(id);
     }
 
-    /// The "update server list when connecting" pref (eMule AddServersFromServer;
-    /// see the field doc for the citations and padMule's default-ON deviation).
-    /// Takes effect on the NEXT connect/resume, like upstream's.
     /// Turn INCOGNITO on or off (handoff 32). Takes effect on the next HELLO -
     /// INBOUND AS WELL AS OUTBOUND, because the accept loop reads
     /// [`WireIdentity`] per accepted connection rather than a snapshot taken at
@@ -2396,6 +2395,9 @@ impl Engine {
         self.allow_browse.load(Ordering::Relaxed)
     }
 
+    /// The "update server list when connecting" pref (eMule AddServersFromServer;
+    /// see the field doc for the citations and padMule's default-ON deviation).
+    /// Takes effect on the NEXT connect/resume, like upstream's.
     pub fn set_add_servers_from_server(&mut self, on: bool) {
         self.add_servers_from_server = on;
     }
@@ -3600,16 +3602,6 @@ impl Engine {
         self.merge_discovered_servers(pending).await
     }
 
-    /// Filter a set of learned `(ip, port)`s and merge the survivors into
-    /// server.met, returning how many were NEW. The ONE safety gate shared by
-    /// both discovery channels - the connect-time gossip harvest and the
-    /// recursive UDP crawl - so the rule cannot drift between them.
-    ///
-    /// Keeps only routable public ip:port, honoring the user ipfilter. A server
-    /// advertising 127.0.0.1, a LAN address, or a blocked range is bogus or
-    /// hostile, and adding it would later point the UDP status probe (and the
-    /// crawl itself) at our own network - the SSRF posture from build-progress
-    /// 8z/B8 applies to anything that becomes a datagram target.
     /// Drop entries a DOWNLOADED server list must never be able to introduce:
     /// unroutable/private/loopback addresses, port 0, and anything the user's
     /// blocklist covers.
@@ -3655,6 +3647,16 @@ impl Engine {
         }
     }
 
+    /// Filter a set of learned `(ip, port)`s and merge the survivors into
+    /// server.met, returning how many were NEW. The ONE safety gate shared by
+    /// both discovery channels - the connect-time gossip harvest and the
+    /// recursive UDP crawl - so the rule cannot drift between them.
+    ///
+    /// Keeps only routable public ip:port, honoring the user ipfilter. A server
+    /// advertising 127.0.0.1, a LAN address, or a blocked range is bogus or
+    /// hostile, and adding it would later point the UDP status probe (and the
+    /// crawl itself) at our own network - the SSRF posture from build-progress
+    /// 8z/B8 applies to anything that becomes a datagram target.
     async fn merge_discovered_servers(&mut self, pending: Vec<(u32, u16)>) -> u32 {
         let filter = self.ip_filter.clone();
         let fresh: Vec<Server> = pending
@@ -4697,9 +4699,9 @@ impl Engine {
     /// serverless client still gets Kad sources and vice versa. Returns the
     /// registry plus the LowID source IPs worth a server callback (empty unless
     /// WE are HighID - a LowID cannot receive a callback).
-    /// Find sources for `hash`, spending at most `budget` on it.
     ///
-    /// The budget bounds EACH arm rather than the whole call, which is the
+    /// Spends at most `budget` on it. The budget bounds EACH arm rather than the
+    /// whole call, which is the
     /// difference between "best effort" and "all or nothing". The old shape
     /// wrapped this function in an outer `timeout` at the call site: since the
     /// two arms are joined (the wait is the SLOWER of the two, not the sum), a
@@ -8014,16 +8016,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A HighID client id IS our public address, so a CHANGE in it between two
-    /// logins means our traffic is leaving by a different route than before -
-    /// most importantly, a VPN tunnel that dropped. Stock iOS has no kill
-    /// switch, so padMule would otherwise keep seeding from the real address
-    /// with nothing on screen to say so. Sharing is therefore paused and the
-    /// user is warned LOUDLY.
-    ///
-    /// PRIVACY: the address is compared internally and NEVER emitted - the
-    /// event carries no payload at all, for the same reason `connect_to_server`
-    /// refuses to record the client id in any user-visible text.
     /// The publish duty is GATED: it runs nothing while stopped, while paused,
     /// or while sharing is off - the same "only when we mean it" discipline the
     /// seeding/VPN work follows. The open arms give the engine a real (loopback)
@@ -8393,6 +8385,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A HighID client id IS our public address, so a CHANGE in it between two
+    /// logins means our traffic is leaving by a different route than before -
+    /// most importantly, a VPN tunnel that dropped. Stock iOS has no kill
+    /// switch, so padMule would otherwise keep seeding from the real address
+    /// with nothing on screen to say so. Sharing is therefore paused and the
+    /// user is warned LOUDLY.
+    ///
+    /// PRIVACY: the address is compared internally and NEVER emitted - the
+    /// event carries no payload at all, for the same reason `connect_to_server`
+    /// refuses to record the client id in any user-visible text.
     #[test]
     fn a_changed_public_address_pauses_sharing_and_warns() {
         let dir = tmp("ip-change");

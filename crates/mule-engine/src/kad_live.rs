@@ -560,11 +560,6 @@ impl ValueAsk<'_> {
     }
 }
 
-/// What the owning read loop needs. Copies of the immutable identity, and the
-/// SAME `Arc` handles the node's setters write through - never captured VALUES,
-/// which is the whole point of AMENDMENT 2: `start_kad` configures the node
-/// after binding it, so a value captured at spawn would freeze `ip_filter` at
-/// `None` and the advertised port at "bound".
 /// The contact-aging clock, shared by the node and its read loop so a promotion
 /// from an inbound HELLO and one from a probe answer are stamped on the SAME
 /// timeline. Session-MONOTONIC on purpose: aging is never persisted (neither
@@ -590,6 +585,11 @@ impl AgingClock {
     }
 }
 
+/// What the owning read loop needs. Copies of the immutable identity, and the
+/// SAME `Arc` handles the node's setters write through - never captured VALUES,
+/// which is the whole point of AMENDMENT 2: `start_kad` configures the node
+/// after binding it, so a value captured at spawn would freeze `ip_filter` at
+/// `None` and the advertised port at "bound".
 struct ReadLoop {
     socket: Arc<UdpSocket>,
     kad_id: Kad128,
