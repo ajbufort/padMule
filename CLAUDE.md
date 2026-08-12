@@ -181,6 +181,11 @@ scripts/ship.sh                        # [--no-install]
 #   .github/workflows/ios-test.yml     - Swift unit tests on an iPad simulator
 #   .github/workflows/supply-chain.yml - cargo-deny: advisories, licenses, sources (policy in deny.toml)
 # ship.sh gates on the FIRST THREE only - a supply-chain red does NOT block a ship.
+# READING CI EVIDENCE: the `paths:` filters are evaluated over the WHOLE PUSHED
+# RANGE and the run is attributed to the TIP sha - so a docs-only PUSH builds
+# nothing, but a docs-only COMMIT pushed alongside code commits does (`feedc8e`
+# touched only CLAUDE.md; all four ran on it because its push carried
+# `56bd47e..feedc8e`). Absent runs for a sha do NOT mean it went untested.
 # No Apple secrets anywhere.
 ```
 
