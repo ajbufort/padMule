@@ -131,6 +131,21 @@ impl CreditStore {
         });
     }
 
+    /// The public key already bound to this userhash, if any.
+    ///
+    /// eMule's `CClientCredits::InitalizeIdent` (ClientCredits.cpp:360-370) reads
+    /// exactly this at the moment a peer's credit record is attached: with
+    /// `nKeySize != 0` it copies `abySecureIdent` into the live key slot, and
+    /// every later sign/verify works on THAT key rather than on whatever the peer
+    /// sends. Handing this to a [`crate::secure_ident::SecureIdentSession`] is
+    /// what makes a stolen userhash unusable.
+    pub fn stored_key(&self, userhash: &[u8; 16]) -> Option<Vec<u8>> {
+        let g = self.inner.lock_recover();
+        let e = g.get(userhash)?;
+        let len = e.key_size as usize;
+        (len > 0).then(|| e.secure_ident[..len.min(MAX_PUBKEY_SIZE)].to_vec())
+    }
+
     /// The peer's upload-queue credit multiplier on this connection, in `[1.0,
     /// 10.0]`. `verified_ip` is `Some(ip)` if the peer proved its identity THIS
     /// session (from `ip`); `failed` if a verification was attempted and failed.

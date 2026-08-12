@@ -44,8 +44,43 @@ const PADMULE_HELLO_TAG: &[u8] = b"padMule";
 /// The enhancement-channel protocol version padMule advertises.
 pub const PADMULE_CHANNEL_VERSION: u8 = 1;
 
-/// The Kad protocol version padMule advertises (KADEMLIA_VERSION 0.49b).
-pub const KADEMLIA_VERSION: u32 = 0x08;
+/// The Kad protocol version padMule advertises IN THE eD2k HELLO
+/// (CT_EMULE_MISCOPTIONS2 low nibble). NOT the version padMule's Kad node
+/// speaks on the Kad network, which is 8 and stays 8 (`mule-kad` implements
+/// KADEMLIA2_HELLO_RES_ACK, the version-8 requirement) - these are two separate
+/// declarations and eMule cross-checks them nowhere.
+///
+/// 5 (KADEMLIA_VERSION5_48a), NOT 8, and that is deliberate. eMule's own table
+/// spells out what the higher numbers oblige a client to do: version 6 "needs to
+/// support: OP_FWCHECKUDPREQ (!)" and version 7 "needs to support
+/// OP_KAD_FWTCPCHECK_ACK" (opcodes.h:27-28). padMule answers NEITHER. 0xA7
+/// arrives on TCP as the FIRST packet after the hello (`SendFirewallCheckUDPRequest`
+/// hands it to `SafeConnectAndSendPacket`, BaseClient.cpp:3140), so it does not
+/// even open a serve session - `classify_inbound` drops the connection - and
+/// answering it properly means sending KADEMLIA2_FIREWALLUDP (0x62) out of our
+/// Kad UDP socket, which nothing in `mule-kad` can build.
+///
+/// This number is READ, not decorative: `GetKadVersion() <= KADEMLIA_VERSION5_48a
+/// || GetKadPort() == 0` cancels the UDP firewall check outright (eMule
+/// BaseClient.cpp:3129-3131; aMule 3.0.1 BaseClient.cpp:2908 is the same guard),
+/// and `GetKadVersion() >= KADEMLIA_VERSION7_49a` picks 0xA8 over the older UDP
+/// ack (eMule ClientList.cpp:551; aMule ClientList.cpp:593). Declaring 5 makes
+/// every well-behaved peer cancel before it asks, which is the ONLY honest
+/// option while the opcodes are unimplemented: the standing rule on this module
+/// is never to advertise a capability padMule does not honour.
+///
+/// WHAT IT COSTS, stated plainly: `baseline_misc_options2` is no longer
+/// byte-equal to stock aMule 3.0.1 (which advertises 8 - Constants.h:29 -> 0x438;
+/// we emit 0x435), so this is a new wire tell that Incognito does not hide.
+/// Accepted, because the alternative tell is louder and repeats: a client that
+/// claims version 8 and then HANGS UP on 0xA7 is anomalous every single time it
+/// is asked, whereas 5 is a real eMule 0.48a-era value that no peer questions.
+/// Raise it to 8 the day 0xA7 is answered, not before.
+///
+/// Everything below 6 is unaffected and still declared: > 1 is what keeps a peer
+/// willing to bootstrap Kad from us (eMule ListenSocket.cpp:353, aMule
+/// BaseClient.cpp:713).
+pub const KADEMLIA_VERSION: u32 = 0x05;
 
 /// Compute CT_EMULE_MISCOPTIONS1 with the padMule baseline capabilities.
 /// `sec_ident` is 0 (no crypto) or 3 (secure-ident available, Wave 5). Derived
@@ -85,8 +120,15 @@ pub const fn baseline_misc_options1(sec_ident: u32) -> u32 {
 
 /// Compute CT_EMULE_MISCOPTIONS2 with the padMule baseline capabilities.
 /// Crypt flags are 0 until Wave 5; captcha/direct-UDP-callback are 0 (not
-/// supported in v1). Derived from BaseClient.cpp:1131-1144; baseline (crypt off,
-/// kad 0x08) = 0x438, byte-equal to a real aMule/eMule.
+/// supported in v1). Derived from BaseClient.cpp:1131-1144.
+///
+/// WITH `kad_version = 8` this yields 0x438, which is byte-equal to a real
+/// aMule 3.0.1 (Constants.h:29 declares 8; eMule 0.50a declares 9,
+/// opcodes.h:31). **padMule no longer passes 8**: every call site passes
+/// [`KADEMLIA_VERSION`], which is 5, so the emitted baseline is 0x435 and is
+/// byte-equal to NEITHER authority. That is a deliberate trade, and the
+/// reasoning (including what it costs Incognito) is on [`KADEMLIA_VERSION`].
+/// Do not read the 0x438 above as what goes on the wire today.
 pub const fn baseline_misc_options2(
     crypt_supported: u32,
     crypt_requested: u32,
@@ -122,13 +164,41 @@ pub struct HelloInfo {
     pub client_id: u32,
     pub tcp_port: u16,
     pub nick: String,
+    /// The eD2k CLIENT UDP port - the low half of CT_EMULE_UDPPORTS, where a
+    /// peer sends OP_REASKFILEPING to keep its place in our queue cheaply.
+    /// ALWAYS 0 for padMule, which runs no such service (see `share::UploadGate`:
+    /// "no UDP OP_REASKFILEPING"). 0 is the honest value and it degrades
+    /// cleanly - eMule gates the reask on `GetUDPPort() != 0`
+    /// (DownloadClient.cpp:1531) and falls back to TCP - whereas a port we never
+    /// answer on costs the peer its reask budget for nothing.
     pub udp_port: u16,
+    /// The KAD UDP port - the HIGH half of CT_EMULE_UDPPORTS. Read by peers to
+    /// decide whether to bootstrap Kad from us, whether we may be asked for a
+    /// UDP firewall check, and (with the server pair below) whether a firewalled
+    /// uploader will admit us to its queue at all.
     pub kad_udp_port: u16,
     pub misc_options1: u32,
     pub misc_options2: u32,
     pub compat_options: u32,
-    /// The server we are connected to (0 if none), advertised so peers can do
-    /// server-assisted LowID callbacks.
+    /// The eD2k server we are logged in to, as eMule writes it at the END of the
+    /// hello body (BaseClient.cpp:1122-1140: the live server when
+    /// `serverconnect->IsConnected()`, 0/0 otherwise).
+    ///
+    /// padMule ALWAYS SENDS 0/0 - nothing assigns these. That is a deliberate
+    /// gap, not an oversight: writing them correctly means reading the CONNECTED
+    /// server live at each hello (a snapshot taken at listener start is this
+    /// project's most-repeated bug shape), and the engine has no such cell - its
+    /// `server_probe_ip` is set at DIAL time, before login can fail, and carries
+    /// no port.
+    ///
+    /// What 0/0 costs, per the authority: a peer cannot see we share its server,
+    /// so it never treats us as same-server for `IsLocalServer` - which skips the
+    /// server-callback route to a LowID us (BaseClient.cpp:1578) and forgoes one
+    /// of the disjuncts in `CUploadQueue::AddClientToQueue`'s LowID-abuse refusal
+    /// (UploadQueue.cpp:537-544). That refusal no longer bites either way, since
+    /// the same guard clears the moment `GetKadPort()` is non-zero - which it now
+    /// is. Peers also cannot add our server to their list
+    /// (BaseClient.cpp:639-640).
     pub server_ip: u32,
     pub server_port: u16,
     /// INCOGNITO (handoff 32): drop the padMule enhancement-channel marker and
@@ -155,12 +225,23 @@ pub struct HelloInfo {
 }
 
 impl HelloInfo {
-    /// A baseline HelloInfo (no crypto, no Kad connection, no buddy).
+    /// A baseline HelloInfo (no crypto, no buddy).
+    ///
+    /// THE PORT PARAMETER IS THE KAD ONE. There is only one UDP port padMule can
+    /// honestly name - its Kad socket - and it goes in the HIGH half of
+    /// CT_EMULE_UDPPORTS; the eD2k client-UDP half is 0 because padMule answers
+    /// nothing there (see [`HelloInfo::udp_port`]). This used to take the CLIENT
+    /// udp port and hardcode `kad_udp_port: 0`, while the engine's only caller
+    /// passed it the KAD port - so both halves went out wrong, and the unit test
+    /// could not see it because it set `kad_udp_port` directly, which no
+    /// production caller can do. eMule packs it
+    /// `(kadUDPPort << 16) | thePrefs.GetUDPPort()` (BaseClient.cpp:1029-1031)
+    /// and splits it back at :459-460; aMule 3.0.1 BaseClient.cpp:505-506 agrees.
     pub fn baseline(
         user_hash: [u8; 16],
         client_id: u32,
         tcp_port: u16,
-        udp_port: u16,
+        kad_udp_port: u16,
         nick: &str,
     ) -> Self {
         HelloInfo {
@@ -168,8 +249,8 @@ impl HelloInfo {
             client_id,
             tcp_port,
             nick: nick.to_string(),
-            udp_port,
-            kad_udp_port: 0,
+            udp_port: 0,
+            kad_udp_port,
             misc_options1: baseline_misc_options1(0),
             misc_options2: baseline_misc_options2(0, 0, 0, KADEMLIA_VERSION),
             compat_options: COMPAT_OPTIONS_BASELINE,
@@ -449,7 +530,16 @@ mod tests {
         // (padMule's serve path answers OP_MULTIPACKET(_EXT)).
         assert_eq!(baseline_misc_options1(0), 0x3410_3212);
         assert_eq!(baseline_misc_options1(3), 0x3413_3212); // secure ident = 3
-        assert_eq!(baseline_misc_options2(0, 0, 0, KADEMLIA_VERSION), 0x438);
+
+        // MISCOPTIONS2 is byte-equal to stock aMule 3.0.1 in every field EXCEPT
+        // the Kad-version nibble: aMule declares 8 (Constants.h:29) for 0x438,
+        // padMule declares 5 and so emits 0x435. The difference is deliberate and
+        // [`KADEMLIA_VERSION`] carries the whole argument - it is the one number
+        // here that obliges us to answer opcodes we have not implemented. The
+        // literals lead on purpose: written as `KADEMLIA_VERSION` this assertion
+        // would move with the constant and could never catch it changing.
+        assert_eq!(baseline_misc_options2(0, 0, 0, 5), 0x435);
+        assert_eq!(baseline_misc_options2(0, 0, 0, KADEMLIA_VERSION), 0x435);
         assert_eq!(COMPAT_OPTIONS_BASELINE, 1);
     }
 

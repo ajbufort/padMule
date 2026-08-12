@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use mule_engine::peer::HelloInfo;
 use mule_engine::{
-    accept_peer, download_file, fetch_from_sources, peer_handshake_inbound, serve_file, Download,
-    FramedStream, ManagerConfig, PartStore, PeerSource, SourceOrigin,
+    accept_peer, download_file, fetch_from_sources, fixed_hello, peer_handshake_inbound,
+    serve_file, Download, FramedStream, ManagerConfig, PartStore, PeerSource, SourceOrigin,
 };
 use mule_proto::ed2k_hash;
 use tokio::net::TcpListener;
@@ -212,7 +212,7 @@ async fn download_manager_completes_from_multiple_parallel_peers() {
     std::fs::create_dir_all(&dir).unwrap();
     let store = PartStore::create(&dir, 1, hash, data.len() as u64, b"multi.bin").unwrap();
     let dl = Download::new(store);
-    let me = HelloInfo::baseline(user_hash(), 0, 4662, 4672, "padMule");
+    let me = fixed_hello(HelloInfo::baseline(user_hash(), 0, 4662, 4672, "padMule"));
 
     let cfg = ManagerConfig::Fixed {
         parallel: 3,

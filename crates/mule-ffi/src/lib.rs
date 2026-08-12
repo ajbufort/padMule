@@ -1481,11 +1481,14 @@ mod tests {
         // offline_engine, not MuleEngine::new: keep the test hermetic even if a
         // future edit adds a start() (the exact drift the 8aa lint fixed once).
         let eng = offline_engine(&dir, &format!("{dir}-dl"));
-        assert!(eng.is_sharing(), "sharing defaults ON");
+        // FAILS CLOSED. The app can only push the stored preference after
+        // start() returns, and the listener is bound and answering by then, so
+        // an engine that has not been told anything must serve nothing.
+        assert!(!eng.is_sharing(), "sharing must default OFF");
+        eng.set_sharing(true);
+        assert!(eng.is_sharing(), "the user's ON reaches the engine");
         eng.set_sharing(false);
         assert!(!eng.is_sharing(), "Leech Mode: sharing OFF");
-        eng.set_sharing(true);
-        assert!(eng.is_sharing(), "back ON");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

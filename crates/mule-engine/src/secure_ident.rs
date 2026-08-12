@@ -236,7 +236,16 @@ pub struct SecureIdentSession {
     peer_challenge: u32,
     /// What the peer still wants from us (its requested state).
     peer_wants: u8,
+    /// The peer's public key - eMule's `m_abyPublicKey`. Filled EITHER from the
+    /// key already bound to the peer's userhash in `clients.met` (at
+    /// construction, [`SecureIdentSession::with_stored_key`]) OR, only when
+    /// there is none, from the OP_PUBLICKEY the peer sends. Everything signs and
+    /// verifies against THIS.
     peer_pubkey: Option<Vec<u8>>,
+    /// True when [`Self::peer_pubkey`] came from the credit store rather than
+    /// from this connection - eMule's `m_pCredits->nKeySize != 0`, the condition
+    /// that makes `SetSecureIdent` refuse to replace the key.
+    key_is_on_file: bool,
     sent_our_key: bool,
     sent_our_sig: bool,
     peer_verified: bool,
@@ -261,11 +270,39 @@ impl SecureIdentSession {
             peer_challenge: 0,
             peer_wants: IS_ALLREQUESTSSENT,
             peer_pubkey: None,
+            key_is_on_file: false,
             sent_our_key: false,
             sent_our_sig: false,
             peer_verified: false,
             verify_attempted: false,
         }
+    }
+
+    /// Adopt the public key already bound to this peer's userhash, if any -
+    /// eMule's `CClientCredits::InitalizeIdent` (ClientCredits.cpp:360-370),
+    /// which copies `abySecureIdent` into the live key slot whenever
+    /// `nKeySize != 0` and only then leaves it empty.
+    ///
+    /// THIS IS THE ANTI-THEFT MECHANISM, not a cache. A userhash is public - it
+    /// rides in the clear in every hello - so a thief can claim one freely; what
+    /// it cannot do is produce a signature under the key we ALREADY hold for
+    /// that hash. Verifying against the key the peer just sent verifies nothing,
+    /// because the peer chose both halves. Once this is set, `OP_PUBLICKEY` is
+    /// read and DISCARDED (eMule's `SetSecureIdent` returns false rather than
+    /// replacing a stored key, :397-400) and both the signature we send and the
+    /// one we check use the stored bytes (`CreateSignature` :511,
+    /// `VerifyIdent` :546).
+    ///
+    /// Callers pass [`crate::credit_store::CreditStore::stored_key`]. `None`
+    /// (unknown peer, or no credit store on this path) leaves the session exactly
+    /// as it was: the first key a peer presents is the one that binds, which is
+    /// how any peer becomes known in the first place.
+    pub fn with_stored_key(mut self, stored: Option<Vec<u8>>) -> Self {
+        if let Some(key) = stored.filter(|k| !k.is_empty()) {
+            self.peer_pubkey = Some(key);
+            self.key_is_on_file = true;
+        }
+        self
     }
 
     /// Our opening OP_SECIDENTSTATE: on a fresh connection we do not have the
@@ -314,7 +351,17 @@ impl SecureIdentSession {
             }
             OP_PUBLICKEY => {
                 let key = parse_public_key(payload)?;
-                self.peer_pubkey = Some(key);
+                // PARSED, THEN DISCARDED when we already have this userhash's key
+                // on file: "verified Public key cannot change, use only if there
+                // is not public key yet" - eMule's `SetSecureIdent` returns false
+                // instead of copying (ClientCredits.cpp:397-400). Accepting it
+                // would let anyone who copies a userhash off the wire re-key the
+                // identity and then satisfy our challenge with a keypair of their
+                // own choosing. Still parsed first, so a malformed packet is
+                // still rejected as one.
+                if !self.key_is_on_file {
+                    self.peer_pubkey = Some(key);
+                }
                 // Now that we hold the peer's key we can sign a deferred request.
                 self.try_sign(id, &mut out);
             }
@@ -346,7 +393,11 @@ impl SecureIdentSession {
         }
     }
 
-    /// Verify the peer's signature over `our_pubkey || our_challenge`. At most one
+    /// Verify the peer's signature over `our_pubkey || our_challenge`, against
+    /// the key on file for its userhash when there is one and only otherwise
+    /// against the key it sent (see [`Self::with_stored_key`]) - eMule's
+    /// `VerifyIdent` works on `pTarget->GetSecureIdent()` for the same reason
+    /// (ClientCredits.cpp:546). At most one
     /// real RSA verify per connection: the honest exchange sends one signature, so
     /// a peer streaming OP_SIGNATURE cannot force repeated public-key verifies. The
     /// attempt is only consumed once we actually hold the peer's key (an early
@@ -492,6 +543,94 @@ mod tests {
             !a.peer_verified(),
             "the verify attempt is spent; the second signature is ignored"
         );
+    }
+
+    /// THE KEY ON FILE IS THE ONE THAT VERIFIES - the property this module's
+    /// first line claims ("so a stolen userhash cannot steal the credits") and
+    /// the one it did not have.
+    ///
+    /// A userhash travels in the clear in every hello, so copying one is free.
+    /// What stops the copy from inheriting the credits is eMule's substitution:
+    /// `InitalizeIdent` loads the STORED key into `m_abyPublicKey` when
+    /// `nKeySize != 0` (ClientCredits.cpp:360-370), `SetSecureIdent` refuses to
+    /// replace it (:397-400), and `VerifyIdent` verifies against
+    /// `pTarget->GetSecureIdent()` (:546). Verifying against the key the peer
+    /// just sent verifies nothing at all - any keypair passes.
+    ///
+    /// The loss is BOUNDED: credits only reweight the upload queue and
+    /// `CreditStore::score` never returns below the floor, so what a thief could
+    /// take is queue position, never data.
+    #[test]
+    fn a_stolen_userhash_cannot_verify_with_a_key_of_its_own() {
+        use crate::credit_store::CreditStore;
+        use crate::credits::CREDIT_MIN_RATIO;
+
+        const H: [u8; 16] = [0x9E; 16];
+        const NOW: u32 = 1_700_000_000;
+        let ip = 0x0A00_0001;
+        let us = Identity::generate();
+        let genuine = Identity::generate();
+        let thief = Identity::generate();
+
+        // The genuine owner of H verified once and has since earned credits.
+        let store = CreditStore::empty(true);
+        store.bind_verified(H, genuine.public_key_der(), NOW);
+        store.add_downloaded(H, 20 * 1_048_576, NOW);
+
+        // The thief claims H, presents its OWN key and signs with it correctly.
+        let challenge = 0x4242_4242;
+        let mut sess = SecureIdentSession::with_challenge(&us, challenge)
+            .with_stored_key(store.stored_key(&H));
+        let pk = build_public_key(thief.public_key_der());
+        sess.on_packet(&us, pk.opcode, &pk.payload).unwrap();
+        let sig = build_signature(&thief.sign_v1(us.public_key_der(), challenge));
+        sess.on_packet(&us, sig.opcode, &sig.payload).unwrap();
+        assert!(
+            !sess.peer_verified(),
+            "a fresh keypair must not verify against the key on file for this userhash"
+        );
+        // ...so it earns no bonus: a key-bearing peer that has not verified is
+        // IdNeeded, which scores the floor.
+        assert_eq!(
+            store.score(&H, None, ip, false),
+            CREDIT_MIN_RATIO,
+            "an unverified impostor must not collect the owner's credit bonus"
+        );
+
+        // CONTROL, so a red above cannot be "nothing verifies any more": the
+        // genuine holder of the stored key still verifies and still earns.
+        let mut real = SecureIdentSession::with_challenge(&us, challenge)
+            .with_stored_key(store.stored_key(&H));
+        let pk = build_public_key(genuine.public_key_der());
+        real.on_packet(&us, pk.opcode, &pk.payload).unwrap();
+        let sig = build_signature(&genuine.sign_v1(us.public_key_der(), challenge));
+        real.on_packet(&us, sig.opcode, &sig.payload).unwrap();
+        assert!(
+            real.peer_verified(),
+            "the owner of the stored key must still verify"
+        );
+        assert!(
+            store.score(&H, Some(ip), ip, false) > CREDIT_MIN_RATIO,
+            "and still earn its bonus"
+        );
+    }
+
+    /// WITH NO KEY ON FILE, THE FIRST KEY WINS - `SetSecureIdent` succeeds only
+    /// when `nKeySize == 0` (ClientCredits.cpp:399), which is how a peer we have
+    /// never verified gets bound at all. Without this the substitution above
+    /// would lock every unknown peer out of secure ident entirely.
+    #[test]
+    fn a_peer_we_have_no_key_for_still_verifies_with_the_one_it_sends() {
+        let us = Identity::generate();
+        let peer = Identity::generate();
+        let challenge = 0x3131_3131;
+        let mut sess = SecureIdentSession::with_challenge(&us, challenge).with_stored_key(None);
+        let pk = build_public_key(peer.public_key_der());
+        sess.on_packet(&us, pk.opcode, &pk.payload).unwrap();
+        let sig = build_signature(&peer.sign_v1(us.public_key_der(), challenge));
+        sess.on_packet(&us, sig.opcode, &sig.payload).unwrap();
+        assert!(sess.peer_verified());
+        assert_eq!(sess.peer_pubkey(), peer.public_key_der());
     }
 
     #[test]

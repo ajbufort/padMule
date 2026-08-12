@@ -2094,7 +2094,15 @@ where
     // wait on it, so a peer that does not answer just stays unverified.
     let mut sec: Option<(SecureIdentSession, Arc<Identity>)> = match sec {
         Some(ctx) => {
-            let session = SecureIdentSession::new(&ctx.identity);
+            // THE SAME SUBSTITUTION THE SERVE SIDE MAKES (see `start_listener`):
+            // check the challenge against the key already bound to this
+            // userhash, never against whatever key the peer sends. Both
+            // directions matter - a verified source here is what
+            // `note_source_verified` weighs when deciding whose AICH root to
+            // trust, so an impostor that could re-key an identity could vote
+            // with a reputation it did not earn.
+            let session = SecureIdentSession::new(&ctx.identity)
+                .with_stored_key(credit.as_ref().and_then(|(store, uh)| store.stored_key(uh)));
             if ctx.peer_supports {
                 let start = session.start();
                 fs.write_packet(&start).await?;

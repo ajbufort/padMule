@@ -50,8 +50,8 @@ pub use engine::{
     ServerInfo, ServerListUpdate,
 };
 pub use fetch::{
-    download_file, fetch_from_sources, FetchOutcome, ManagerConfig, PeerScoreboard, PeerSource,
-    SourceOrigin, SourceRegistry,
+    download_file, fetch_from_sources, fixed_hello, FetchOutcome, HelloFn, ManagerConfig,
+    PeerScoreboard, PeerSource, SourceOrigin, SourceRegistry,
 };
 pub use framed::{FrameError, FramedStream};
 pub use identity::NodeIdentity;

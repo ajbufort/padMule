@@ -495,6 +495,29 @@ pub fn rounds_for_priority(priority: u8) -> usize {
     }
 }
 
+/// How a fetch worker obtains the HELLO it is about to send: called PER
+/// CONNECTION, immediately before each dial.
+///
+/// A `HelloInfo` VALUE cannot do this job. A Normal-priority sweep is eight
+/// rounds of four workers at up to 45s a peer, and its source pool GROWS
+/// mid-sweep from source exchange - so an identity captured when the task was
+/// spawned is still introducing us to brand-new peers many minutes later. That
+/// is exactly what it did: a user who turned Incognito ON kept handing the
+/// padMule marker tag and the literal "padMule" nickname to every new source a
+/// running download dialled, while the INBOUND half (which reads the engine's
+/// one `WireIdentity` per accepted connection) really was hidden. A disguise
+/// worn on one of two channels is not a disguise, it is a correlation handle.
+///
+/// There is deliberately no second copy of the identity here: the engine hands
+/// in a closure over ITS cell, so the two HELLO paths cannot drift.
+pub type HelloFn = Arc<dyn Fn() -> HelloInfo + Send + Sync>;
+
+/// A [`HelloFn`] that never changes - for the CLI harnesses and the tests,
+/// which have no live identity to track and want exactly what they passed.
+pub fn fixed_hello(me: HelloInfo) -> HelloFn {
+    Arc::new(move || me.clone())
+}
+
 /// The download manager: pull `dl` to completion from `sources`, sweeping the set
 /// up to a round budget with several peers at a time. Stops early once complete.
 /// Both the peer count and the round budget come from `config` and, for
@@ -502,10 +525,14 @@ pub fn rounds_for_priority(priority: u8) -> usize {
 /// raising an actively-fetching download to High immediately widens both.
 /// Source discovery/refresh is the caller's job (re-issue get-sources / a Kad
 /// search between calls and pass a wider set).
+///
+/// `me` is a [`HelloFn`], not a `HelloInfo`, and for the same live-read reason
+/// the round and peer budgets are: this sweep outlives the settings the user
+/// held when it started.
 pub async fn download_file(
     dl: &Arc<Download>,
     sources: &[PeerSource],
-    me: &HelloInfo,
+    me: &HelloFn,
     config: ManagerConfig,
     identity: Option<Arc<Identity>>,
     credit_store: Option<Arc<CreditStore>>,
@@ -559,7 +586,7 @@ pub async fn download_file(
         let mut handles = Vec::with_capacity(parallel);
         for _ in 0..parallel {
             let dl = Arc::clone(dl);
-            let me = me.clone();
+            let me = Arc::clone(me);
             let queue = Arc::clone(&queue);
             let scoreboard = Arc::clone(&scoreboard);
             let per = config.per_peer();
@@ -586,10 +613,14 @@ pub async fn download_file(
                         continue;
                     }
                     tried += 1;
+                    // BUILT HERE, per connection - see [`HelloFn`]. Anywhere
+                    // earlier and this sweep would introduce us with whatever
+                    // the user's settings were when it was spawned.
+                    let hello = me();
                     match fetch_one(
                         &dl,
                         &src,
-                        &me,
+                        &hello,
                         per,
                         identity.as_ref(),
                         credit_store.as_ref(),
@@ -906,5 +937,92 @@ mod tests {
             "same addr - deduped"
         );
         assert_eq!(reg.len(), 1);
+    }
+    /// PER CONNECTION - not per sweep, and not per round either.
+    ///
+    /// The engine-level test
+    /// (`incognito_flipped_during_a_fetch_reaches_the_next_outbound_hello`)
+    /// catches the shipped defect, a snapshot taken once for the whole task,
+    /// but it dials only once per round, so a fix that read the identity once
+    /// per ROUND would pass it. Measured: a mutant that hoisted the read to the
+    /// top of the worker loop went GREEN there. This closes that gap - ONE
+    /// worker, ONE round, TWO dials, and the identity changes between them, so
+    /// the only way the second hello can differ is if it was built at DIAL
+    /// time. Both waits are bounded; a regression fails rather than hangs.
+    #[tokio::test]
+    async fn the_hello_is_rebuilt_for_every_dial_inside_one_round() {
+        use crate::part_store::PartStore;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // A peer that reads our hello, answers nothing, and changes what we are
+        // called after the FIRST connection - strictly before a second can exist.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, mut hellos) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let flipped = Arc::new(AtomicBool::new(false));
+        let flip = Arc::clone(&flipped);
+        tokio::spawn(async move {
+            let mut seen = 0usize;
+            while let Ok((sock, _)) = listener.accept().await {
+                let mut fs = crate::framed::FramedStream::new(sock);
+                let Ok(pkt) = fs.read_packet().await else {
+                    continue;
+                };
+                if tx.send(pkt.payload).is_err() {
+                    return;
+                }
+                seen += 1;
+                if seen == 1 {
+                    flip.store(true, Ordering::Relaxed);
+                }
+            }
+        });
+
+        let dir = std::env::temp_dir().join(format!("padmule-hellofn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = PartStore::create(&dir, 1, [0x21; 16], 4000, b"hellofn.bin").unwrap();
+        let dl = Arc::new(Download::new(store));
+        let me: HelloFn = Arc::new(move || {
+            let nick = if flipped.load(Ordering::Relaxed) {
+                "after"
+            } else {
+                "before"
+            };
+            HelloInfo::baseline([0x21; 16], 0, 4662, 4672, nick)
+        });
+
+        let src = PeerSource {
+            addr,
+            user_hash: None,
+            crypt: None,
+            origin: SourceOrigin::Server,
+        };
+        let cfg = ManagerConfig::Fixed {
+            parallel: 1,
+            per_peer: Duration::from_secs(5),
+            rounds: 1,
+        };
+        let pool = [src.clone(), src];
+        let sweep = download_file(&dl, &pool, &me, cfg, None, None, None);
+        let _ = timeout(Duration::from_secs(20), sweep).await;
+
+        let first = hellos.try_recv().expect("the sweep never dialled");
+        assert!(
+            first.windows(6).any(|w| w == b"before"),
+            "CONTROL: the first dial carries the identity we started with"
+        );
+        let second = hellos
+            .try_recv()
+            .expect("one round with two sources must produce two dials");
+        assert!(
+            second.windows(5).any(|w| w == b"after"),
+            "the second dial of the SAME round reused the first dial's hello"
+        );
+        assert!(
+            !second.windows(6).any(|w| w == b"before"),
+            "the second dial still carried the old identity"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

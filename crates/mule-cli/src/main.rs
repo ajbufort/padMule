@@ -25,9 +25,10 @@ use mule_engine::server_messages::{LoginRequest, DEFAULT_SERVER_FLAGS};
 use mule_engine::sources::{build_callback_request, build_get_sources, parse_found_sources};
 use mule_engine::{
     catalog, connect_peer, connect_peer_obf, connect_server, download_file, download_from_peer,
-    download_from_peer_at, fetch_from_sources, login_handshake, obf_accept, peer_handshake_inbound,
-    serve_shared, Download, FramedStream, Identity, KadNode, ManagerConfig, ObfDetect, PartStore,
-    SecIdentCtx, ServerEvent, ServerLink, ServerState, SharedFile, SourceRegistry,
+    download_from_peer_at, fetch_from_sources, fixed_hello, login_handshake, obf_accept,
+    peer_handshake_inbound, serve_shared, Download, FramedStream, Identity, KadNode, ManagerConfig,
+    ObfDetect, PartStore, SecIdentCtx, ServerEvent, ServerLink, ServerState, SharedFile,
+    SourceRegistry,
 };
 use mule_files::{read_nodes_dat, read_server_met};
 use mule_kad::{kad_filename_matches, kad_keyword_target, kad_keywords, KeywordEntry};
@@ -2056,7 +2057,13 @@ async fn cmd_search_download(met_path: &str, keyword: &str, out: &str) {
         }
     };
     let dl = Download::new(store);
-    let me = HelloInfo::baseline(cli_user_hash(), 0, 4662, 4672, "padMule");
+    let me = fixed_hello(HelloInfo::baseline(
+        cli_user_hash(),
+        0,
+        4662,
+        4672,
+        "padMule",
+    ));
     let mut reg = reg;
 
     // The download manager pulls in parallel and rides out upload-queue
@@ -2618,7 +2625,13 @@ async fn cmd_link(link: &str, out: Option<&str>) {
             if let Some(root) = f.aich {
                 dl.set_aich_master_verified(root);
             }
-            let me = HelloInfo::baseline(cli_user_hash(), 0, 4662, 4672, "padMule");
+            let me = fixed_hello(HelloInfo::baseline(
+                cli_user_hash(),
+                0,
+                4662,
+                4672,
+                "padMule",
+            ));
             println!("downloading from {} embedded source(s)...", sources.len());
             let cfg = ManagerConfig::Fixed {
                 parallel: 4,
@@ -2809,7 +2822,13 @@ async fn cmd_fetch_complete(
         .filter(|p| !p.as_os_str().is_empty())
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let me = HelloInfo::baseline(cli_user_hash(), 0, 4662, 4672, "padMule");
+    let me = fixed_hello(HelloInfo::baseline(
+        cli_user_hash(),
+        0,
+        4662,
+        4672,
+        "padMule",
+    ));
 
     // HighID source addresses we have already watched stall (queue us / go
     // silent). Used to skip other files whose only source is that same busy peer.

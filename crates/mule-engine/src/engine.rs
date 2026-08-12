@@ -24,7 +24,7 @@ use crate::bootstrap;
 use crate::catalog::{catalog, tag_str, tag_u64, RankedFile};
 use crate::connection::{ServerEvent, ServerState};
 use crate::credit_store::{now_secs, CreditStore};
-use crate::fetch::{download_file, ManagerConfig, PeerSource, SourceRegistry};
+use crate::fetch::{download_file, HelloFn, ManagerConfig, PeerSource, SourceRegistry};
 use crate::framed::FramedStream;
 use crate::identity::NodeIdentity;
 use crate::kad_live::KadNode;
@@ -1923,6 +1923,26 @@ fn ip_pause_path(config_dir: &Path) -> PathBuf {
     config_dir.join("sharing_paused_for_ip_change.txt")
 }
 
+/// Path of the SHARING preference marker. Its EXISTENCE is the state, and the
+/// polarity is the whole point: PRESENT means the user has sharing ON, ABSENT
+/// means OFF, so an engine that has never been told anything FAILS CLOSED.
+///
+/// `sharing` defaulted to ON and was not persisted at all, which made every
+/// launch a serving window: the UI can only push the stored preference after
+/// `start()` returns, and `start()` binds the listener first and then does two
+/// HTTP fetches, SSDP/SOAP and a Kad bootstrap - while the flag is consulted
+/// PER INBOUND REQUEST. A user who chose Leech Mode uploaded real file data on
+/// every single launch, and no amount of pushing the preference sooner can
+/// close a window that opens before the push exists.
+///
+/// Written by `set_sharing`, which is the ONLY writer: the ip-change guard
+/// deliberately leaves it alone (that pause has its own marker and must not be
+/// mistaken for the user changing their mind), and `Engine::new` requires BOTH
+/// - a stored ON and no ip-change pause - before it will come back sharing.
+fn sharing_pref_path(config_dir: &Path) -> PathBuf {
+    config_dir.join("sharing_on.txt")
+}
+
 impl Engine {
     /// Load (or create) the identity in `config_dir` and return the engine plus
     /// the event stream the UI drains.
@@ -1948,6 +1968,12 @@ impl Engine {
         // and the status atomic is set too so the UI's first lock-free read
         // can already say WHY.
         let ip_paused = ip_pause_path(&config_dir).exists();
+        // SHARING FAILS CLOSED. Restored here, for the same reason the pause
+        // above is: the listener binds inside `start()` and reads this atomic
+        // per inbound request, long before the UI can push anything. BOTH
+        // conditions are required - a stored ON and no ip-change pause - so a
+        // restored preference can never overrule the guard.
+        let sharing = !ip_paused && sharing_pref_path(&config_dir).exists();
         let status = StatusPub::default();
         status.ip_paused.store(ip_paused, Ordering::Relaxed);
         let engine = Engine {
@@ -1980,7 +2006,7 @@ impl Engine {
                 incognito: true,
             })),
             allow_browse: Arc::new(AtomicBool::new(false)),
-            sharing: Arc::new(AtomicBool::new(!ip_paused)),
+            sharing: Arc::new(AtomicBool::new(sharing)),
             upload_gate: Arc::new(UploadGate::new(MAX_UPLOAD_SLOTS, UPLOAD_QUEUE_CAP)),
             known_met_lock: Arc::new(Mutex::new(())),
             known2,
@@ -2231,23 +2257,32 @@ impl Engine {
     /// (see [`sanitize_nick`] - trimmed, no control characters, at most
     /// [`MAX_NICK_LEN`] characters, empty falls back to [`DEFAULT_NICK`]).
     ///
-    /// WHEN IT REACHES THE WIRE, precisely: a server login builds its
-    /// `LoginRequest` at connect time and a fetch builds its HELLO at fetch
-    /// time, so both pick this up on the NEXT connection with no restart. The
-    /// INBOUND listener USED TO BE the exception - `start_listener` built one
-    /// `HelloInfo` at bind time and handed that snapshot to the accept task, so
-    /// peers that dialled US kept seeing the old name until the listener was
-    /// rebuilt. It no longer is: the accept loop reads [`WireIdentity`] per
-    /// accepted connection, so a rename reaches the very next inbound hello.
+    /// WHEN IT REACHES THE WIRE, precisely: EVERY path reads [`WireIdentity`]
+    /// at the moment it needs a name, so a rename reaches the very next
+    /// connection in either direction with no restart. A server login builds
+    /// its `LoginRequest` at connect time; the accept loop builds its
+    /// HELLOANSWER per accepted connection; a fetch builds its HELLO per DIAL.
+    ///
+    /// Both of the other two were once snapshots and both were wrong for the
+    /// same reason. `start_listener` built one `HelloInfo` at bind time, so
+    /// peers dialling US kept the old name until the listener was rebuilt;
+    /// `spawn_fetch` built one before its `tokio::spawn`, so a sweep already
+    /// running kept the old name for every new source it dialled - up to eight
+    /// rounds of four peers, against a pool that grows mid-sweep.
     pub fn set_nickname(&mut self, nick: &str) {
         self.wire_identity.lock_recover().nick = sanitize_nick(nick);
     }
 
     /// The HELLO we present to a peer, before any per-site capability flags.
-    /// ONE constructor for both HELLO sites (the inbound listener and an
-    /// outbound fetch) so a peer can never be told a different name - or a
-    /// different port - depending on who dialled whom. Both land in
-    /// [`WireIdentity::hello`]; this is the outbound entry to it.
+    ///
+    /// TEST-ONLY. Both PRODUCTION HELLO sites hold the identity cell itself and
+    /// call [`WireIdentity::hello`] at the moment they need a packet - the
+    /// accept loop per accepted connection, `spawn_fetch`'s [`HelloFn`] per
+    /// dial - because anything that hands out a `HelloInfo` VALUE to be kept is
+    /// a snapshot, and both sites shipped that bug. This is the convenience the
+    /// nickname/incognito tests assert on; it must never become a call site
+    /// again.
+    #[cfg(test)]
     fn hello_baseline(&self) -> HelloInfo {
         self.wire_identity.lock_recover().hello(
             self.identity.userhash,
@@ -2308,9 +2343,20 @@ impl Engine {
 
     /// Turn uploading on or off. Off is the download-only "Leech Mode"; the
     /// listener consults this per connection, so it takes effect immediately.
+    ///
+    /// DURABLE, written synchronously here (see [`sharing_pref_path`]): the
+    /// engine must know the answer in `Engine::new`, before `start()` binds a
+    /// listener that will be asked to serve. Note what this stores is the
+    /// EFFECTIVE state, not a separate "user preference" - a metered pause
+    /// persists as OFF, which is the fail-closed direction, and the UI pushes
+    /// the live answer again a moment into the next launch.
     pub fn set_sharing(&mut self, on: bool) {
         self.sharing.store(on, Ordering::Relaxed);
         if on {
+            let _ = std::fs::write(
+                sharing_pref_path(&self.config_dir),
+                b"sharing is ON; padMule serves files to peers\n",
+            );
             // The user has decided; stop saying we paused for them. The
             // persisted marker goes too, so a LATER relaunch does not
             // re-pause - the OFF direction leaves it alone on purpose (a
@@ -2319,6 +2365,17 @@ impl Engine {
             self.sharing_paused_for_ip_change = false;
             self.status.ip_paused.store(false, Ordering::Relaxed);
             let _ = std::fs::remove_file(ip_pause_path(&self.config_dir));
+            // RE-OFFER. The OFFERFILES burst is fired once, at login, and is
+            // gated on this flag (handoff 16) - and with sharing now failing
+            // closed, the common launch logs in BEFORE the preference arrives.
+            // Without this the library would stay absent from the server's
+            // index for the whole session, so nobody could source us from the
+            // files we had just decided to share. The 1s heartbeat's
+            // `maintain_shares` picks it up; it is a no-op while offline, and
+            // a reconnect re-offers everything anyway.
+            self.shared_dirty.store(true, Ordering::Relaxed);
+        } else {
+            let _ = std::fs::remove_file(sharing_pref_path(&self.config_dir));
         }
     }
 
@@ -2361,10 +2418,12 @@ impl Engine {
     }
 
     /// Turn INCOGNITO on or off (handoff 32). Takes effect on the next HELLO -
-    /// INBOUND AS WELL AS OUTBOUND, because the accept loop reads
-    /// [`WireIdentity`] per accepted connection rather than a snapshot taken at
-    /// bind time. Connections already open keep whatever they declared, which is
-    /// honest: a peer that already saw the marker has already seen it.
+    /// INBOUND AS WELL AS OUTBOUND, and outbound includes a fetch ALREADY
+    /// RUNNING: the accept loop reads [`WireIdentity`] per accepted connection
+    /// and `spawn_fetch` hands its sweep a [`HelloFn`] over the same cell, read
+    /// per dial, so neither holds a snapshot. Connections already open keep
+    /// whatever they declared, which is honest: a peer that already saw the
+    /// marker has already seen it.
     ///
     /// STATE THE TWO LIMITS WHEREVER THIS IS EXPOSED: it disables the
     /// padMule-to-padMule enhancement channel (Layer 1 detection IS the marker),
@@ -2842,7 +2901,16 @@ impl Engine {
                     let sec = (peer_secident > 0).then(|| {
                         let cs = Arc::clone(&credit_store);
                         ServeSec::new(
-                            SecureIdentSession::new(&identity),
+                            // WITH THE KEY WE ALREADY HAVE FOR THIS USERHASH, if
+                            // any. Without it the challenge is checked against
+                            // whatever key the peer just sent, which proves only
+                            // that it owns a keypair - so anyone who copies a
+                            // userhash off the wire could claim its credit
+                            // history. eMule loads the stored key the moment the
+                            // credit record is attached (InitalizeIdent,
+                            // ClientCredits.cpp:360-370).
+                            SecureIdentSession::new(&identity)
+                                .with_stored_key(credit_store.stored_key(&peer_hash)),
                             Arc::clone(&identity),
                             // On verification, bind the peer's key to its userhash
                             // (eMule Verified: first key-bind wipes prior credits).
@@ -4906,9 +4974,36 @@ impl Engine {
             crate::stats::note_fetch_busy();
             return;
         }
+        // WHO WE SAY WE ARE, built PER CONNECTION rather than once for the task.
+        //
+        // This used to be one `HelloInfo` built here, before the spawn, and
+        // cloned into every worker of every round - which froze the nickname and
+        // the INCOGNITO flag for the life of the sweep. A Normal-priority sweep
+        // is eight rounds of four workers at up to 45s a peer and its source
+        // pool GROWS mid-sweep from source exchange, so a user who turned
+        // Incognito on kept declaring the marker tag and the literal "padMule"
+        // to every brand-new peer this download then dialled, while the INBOUND
+        // half was already live per accepted connection. Same shape, same cell,
+        // same fix as `start_listener` - see [`WireIdentity`].
+        //
+        // The PORTS and the userhash are snapshotted, exactly as the accept loop
+        // does and for the same reason: `set_ports` is documented as taking
+        // effect on the next `start()`, and the userhash is fixed per install.
+        //
         // Advertise SecureIdent v1 in the fetch HELLO so a source will initiate
         // the exchange toward us; pass our RSA identity so we can respond + verify.
-        let me = self.hello_baseline().with_secident();
+        let me: HelloFn = {
+            let wire_identity = Arc::clone(&self.wire_identity);
+            let user_hash = self.identity.userhash;
+            let tcp_port = self.advertised_port;
+            let kad_udp_port = self.kad_advertised_port;
+            Arc::new(move || {
+                wire_identity
+                    .lock_recover()
+                    .hello(user_hash, tcp_port, kad_udp_port)
+                    .with_secident()
+            })
+        };
         let identity = Arc::clone(&self.identity.rsa);
         let credit_store = Arc::clone(&self.credit_store);
         // Sources learned mid-sweep via source exchange are filtered too.
@@ -8419,7 +8514,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let (mut engine, mut rx) = Engine::new(&dir).unwrap();
-        assert!(engine.is_sharing(), "sharing is on by default");
+        // Sharing FAILS CLOSED on a fresh engine, so the state this guard
+        // exists to take away has to be established first - otherwise every
+        // assertion below passes on a flag that was never on.
+        engine.set_sharing(true);
+        assert!(engine.is_sharing(), "precondition: sharing is on");
 
         // First HighID login: nothing to compare against yet.
         engine.note_public_id(0x0102_0304, false);
@@ -8474,6 +8573,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let (mut engine, mut rx) = Engine::new(&dir).unwrap();
+        // Sharing FAILS CLOSED on a fresh engine: establish the state the guard
+        // is supposed to take away, or the pause proves nothing.
+        engine.set_sharing(true);
 
         // Hands out id 0x0A000001 first, then 0x0B000002 - two different public
         // addresses, as a dropped tunnel would produce.
@@ -8539,8 +8641,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        // Launch 1: the guard fires.
+        // Launch 1: the user is sharing (which is now a STORED fact, so the
+        // relaunch below has something to be wrong about), then the guard fires.
         let (mut e1, _rx1) = Engine::new(&dir).unwrap();
+        e1.set_sharing(true);
         e1.note_public_id(0x0102_0304, false);
         e1.note_public_id(0x0506_0708, false);
         assert!(!e1.is_sharing(), "precondition: the guard paused sharing");
@@ -8586,6 +8690,154 @@ mod tests {
         );
         assert!(!e4.sharing_paused_for_ip_change());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SHARING FAILS CLOSED, AND IT FAILS CLOSED ACROSS THE LAUNCH WINDOW.
+    ///
+    /// `sharing` used to default to ON and the engine never persisted it, so a
+    /// user who chose Leech Mode served real file data on EVERY launch: the app
+    /// pushes its stored preference only after `start()` returns, and `start()`
+    /// binds the listener FIRST and then does two HTTP fetches, SSDP/SOAP and a
+    /// Kad bootstrap. The flag is read PER INBOUND REQUEST, so that window is
+    /// structural, not a race - and unlike `allow_browse`, which defaults false
+    /// against a stored true, this one failed OPEN.
+    ///
+    /// The remedy is the one the ip-change pause already uses: make the
+    /// preference DURABLE and restore it in `Engine::new`, before anything can
+    /// serve. That closes the window in BOTH directions rather than trading one
+    /// for the other - a plain default flip would leave a sharing user unable to
+    /// be indexed, because the OFFERFILES burst happens at login, inside the
+    /// same window, and is gated on this very flag.
+    #[test]
+    fn sharing_fails_closed_on_a_fresh_engine_and_is_restored_from_disk() {
+        let dir = tmp("sharing-persist");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // An engine nobody has told anything shares NOTHING - this is the very
+        // atomic the upload listener reads per request.
+        let (mut e1, _rx1) = Engine::new(&dir).unwrap();
+        assert!(
+            !e1.is_sharing(),
+            "a fresh engine must not serve before the user's preference arrives"
+        );
+        assert!(
+            !e1.handles().is_sharing(),
+            "the lock-free handle the listener holds must agree"
+        );
+
+        // The user turns it on -> a relaunch is sharing from its first instant,
+        // WITHOUT waiting for the UI, so the login-time OFFERFILES burst is not
+        // silently suppressed either.
+        e1.set_sharing(true);
+        drop(e1);
+        let (mut e2, _rx2) = Engine::new(&dir).unwrap();
+        assert!(
+            e2.is_sharing(),
+            "a stored ON must be restored before start() binds the listener"
+        );
+
+        // ...and OFF persists too, or the fix only works in one direction.
+        e2.set_sharing(false);
+        drop(e2);
+        let (mut e3, _rx3) = Engine::new(&dir).unwrap();
+        assert!(!e3.is_sharing(), "a stored OFF must survive a relaunch");
+
+        // THE IP-CHANGE PAUSE STILL WINS over a stored ON: the guard's premise
+        // is that the USER decides when to resume, and a restored preference
+        // must not quietly overrule the pause that outlived the process.
+        e3.set_sharing(true);
+        e3.note_public_id(0x0102_0304, false);
+        e3.note_public_id(0x0506_0708, false);
+        assert!(!e3.is_sharing(), "precondition: the guard paused sharing");
+        drop(e3);
+        let (e4, _rx4) = Engine::new(&dir).unwrap();
+        assert!(
+            !e4.is_sharing(),
+            "the ip-change pause must outrank a stored sharing preference"
+        );
+        assert!(e4.sharing_paused_for_ip_change(), "...and still say why");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ...and TURNING SHARING ON RE-OFFERS THE LIBRARY.
+    ///
+    /// The OFFERFILES burst goes out once, at login, and is gated on `sharing`
+    /// (handoff 16). Only `shared_dirty` triggers another one. So an engine that
+    /// logged in while closed - which is now every launch until the preference
+    /// arrives, and was already the case for anyone leaving Leech Mode
+    /// mid-session - would stay absent from the server's index for the whole
+    /// session, serving a library nobody could find. Raising the dirty flag when
+    /// sharing opens is what makes the fail-closed default cost nothing.
+    ///
+    /// Asserted on the opcodes the SERVER received, not on the flag.
+    #[tokio::test]
+    async fn turning_sharing_on_re_offers_the_library_the_login_suppressed() {
+        let dir = tmp("sharing-reoffer");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+        assert!(!engine.is_sharing(), "precondition: closed at login");
+        engine.shared.lock().await.push(SharedFile {
+            hash: [0xF2; 16],
+            size: 10,
+            name: b"findable.bin".to_vec(),
+            part_hashes: vec![],
+            path: dir.join("findable.bin"),
+            rating: 0,
+            comment: String::new(),
+            aich_root: None,
+        });
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen: Arc<std::sync::Mutex<Vec<u8>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rec = Arc::clone(&seen);
+        tokio::spawn(async move {
+            if let Ok((sock, _)) = listener.accept().await {
+                let mut sfs = crate::framed::FramedStream::new(sock);
+                if sfs.read_packet().await.is_err() {
+                    return;
+                }
+                let _ = sfs
+                    .write_packet(&mule_proto::Packet::new(
+                        mule_proto::PROT_EDONKEY,
+                        crate::server_messages::OP_IDCHANGE,
+                        0x0A00_0001u32.to_le_bytes().to_vec(),
+                    ))
+                    .await;
+                for _ in 0..6 {
+                    match sfs.read_packet().await {
+                        Ok(p) => rec.lock().unwrap().push(p.opcode),
+                        Err(_) => break,
+                    }
+                }
+            }
+        });
+        assert!(
+            engine.connect_to_server(addr).await,
+            "precondition: the mock login succeeded"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(
+            !seen
+                .lock()
+                .unwrap()
+                .contains(&crate::server_messages::OP_OFFERFILES),
+            "CONTROL: a closed client must not offer at login"
+        );
+
+        // The user's preference arrives (or they leave Leech Mode).
+        engine.set_sharing(true);
+        engine.maintain_shares().await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let after = seen.lock().unwrap().clone();
+        assert!(
+            after.contains(&crate::server_messages::OP_OFFERFILES),
+            "turning sharing on left the library unannounced for the whole \
+             session - the server can never source us; got {after:02X?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Drain without awaiting (the sender is synchronous here).
@@ -11041,6 +11293,249 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // WHAT THE HELLO DECLARES, READ OFF A REAL CONNECTION
+    // -----------------------------------------------------------------------
+
+    /// CT_EMULE_UDPPORTS and CT_EMULE_MISCOPTIONS2 as the numbers they are on
+    /// the wire (ClientTags.h). Declared here rather than imported from
+    /// `peer.rs` for the reason [`CT_NAME_TAG`] gives: a test that re-derives an
+    /// id from the module it is checking proves less, not more.
+    const CT_EMULE_UDPPORTS_TAG: u8 = 0xF9;
+    const CT_EMULE_MISCOPTIONS2_TAG: u8 = 0xFE;
+
+    /// The Kad port these tests tell the engine to ADVERTISE. Deliberately
+    /// different from the Kad port it BINDS (4672), from the TCP port, and from
+    /// every default in this file, so no assertion below can be satisfied by a
+    /// coincidence.
+    const KAD_ADVERTISED_UNDER_TEST: u16 = 51235;
+
+    /// Pull a numeric-id UINT32 tag's value out of a parsed hello.
+    fn hello_tag_u32(p: &crate::peer::ParsedHello, id: u8) -> Option<u32> {
+        p.tags.iter().find_map(|t| match (&t.name, &t.value) {
+            (TagName::Id(i), TagValue::U32(v)) if *i == id => Some(*v),
+            _ => None,
+        })
+    }
+
+    /// The OP_HELLOANSWER a peer that dials padMule actually receives, off a
+    /// real socket through `start_listener`'s accept loop.
+    ///
+    /// THIS IS THE PRODUCTION HELLO SITE (`engine.rs` accept loop ->
+    /// `WireIdentity::hello`), not a hand-built `HelloInfo`. It matters: the
+    /// unit test in `peer.rs` that covers the UDP-ports tag assigns
+    /// `kad_udp_port` DIRECTLY on the struct, which no production caller can
+    /// do - so it stayed green through a live positional-argument bug that put
+    /// the Kad port in the eD2k client-UDP slot.
+    async fn hello_answer_off_the_listener(tag: &str) -> crate::peer::ParsedHello {
+        let dir = tmp(tag);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+        let port = free_local_port();
+        engine.set_ports(port, port, 4672, KAD_ADVERTISED_UNDER_TEST);
+        engine.start_listener().await;
+
+        let stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("the listener must be up");
+        let mut fs = crate::framed::FramedStream::new(stream);
+        let me = HelloInfo::baseline([0x5A; 16], 0, 4662, 4672, "probe");
+        let answer = timeout(
+            Duration::from_secs(5),
+            crate::peer_conn::peer_handshake_outbound(&mut fs, &me),
+        )
+        .await
+        .expect("the listener must answer within the budget")
+        .expect("a HELLOANSWER, not an error");
+        let _ = std::fs::remove_dir_all(&dir);
+        answer
+    }
+
+    /// THE KAD PORT GOES IN THE KAD HALF, AND WE CLAIM NO eD2k CLIENT-UDP PORT.
+    ///
+    /// CT_EMULE_UDPPORTS packs two ports: the KAD port in the high 16 bits, the
+    /// eD2k CLIENT UDP port in the low 16. eMule 0.50a writes
+    /// `((uint32)kadUDPPort << 16) | ((uint32)thePrefs.GetUDPPort() << 0)`
+    /// (BaseClient.cpp:1029-1031) and reads it back the same way
+    /// (`m_nKadPort = temptag.GetInt() >> 16; m_nUDPPort = (uint16)temptag.GetInt();`,
+    /// BaseClient.cpp:459-460); aMule 3.0.1 BaseClient.cpp:505-506 is identical.
+    ///
+    /// padMule had them THE WRONG WAY ROUND: the engine passed the Kad port into
+    /// `HelloInfo::baseline`'s `udp_port` parameter and the Kad half was
+    /// hardcoded 0, so every peer read "Kad port 0" plus an eD2k client UDP port
+    /// that is really our Kad socket. Both halves are load-bearing - a Kad port
+    /// of 0 is what makes eMule cancel a UDP firewall check
+    /// (BaseClient.cpp:3129-3131), refuse a firewalled uploader's queue entry
+    /// (UploadQueue.cpp:537-544) and skip the Kad bootstrap it would otherwise
+    /// take from us (ListenSocket.cpp:353).
+    #[tokio::test]
+    async fn the_hello_answer_carries_our_kad_port_in_the_kad_half() {
+        let answer = hello_answer_off_the_listener("hello-udpports").await;
+        let packed = hello_tag_u32(&answer, CT_EMULE_UDPPORTS_TAG)
+            .expect("every padMule hello carries CT_EMULE_UDPPORTS");
+        assert_eq!(
+            packed >> 16,
+            KAD_ADVERTISED_UNDER_TEST as u32,
+            "the KAD port belongs in the HIGH half, and it is the ADVERTISED one"
+        );
+        assert_eq!(
+            packed & 0xFFFF,
+            0,
+            "padMule runs no eD2k client-UDP service (no OP_REASKFILEPING - see \
+             share.rs UploadGate), so the low half must be 0: eMule gates its UDP \
+             reask on GetUDPPort() != 0 (DownloadClient.cpp:1531) and falls back \
+             to TCP, whereas a port we never answer on costs the peer its reasks"
+        );
+    }
+
+    /// A KAD VERSION IS A PROMISE ABOUT TWO CLIENT-TCP OPCODES.
+    ///
+    /// eMule's own table says so: version 6 "needs to support: OP_FWCHECKUDPREQ
+    /// (!)" and version 7 "needs to support OP_KAD_FWTCPCHECK_ACK"
+    /// (opcodes.h:27-28). padMule answers NEITHER (0xA7 is not in
+    /// `is_upload_request`, so it does not even open a serve session, and there
+    /// is no KADEMLIA2_FIREWALLUDP sender anywhere in `mule-kad`) - so it must
+    /// not claim a version that promises them. The version the hello carries is
+    /// exactly what eMule reads before deciding whether to ask:
+    /// `GetKadVersion() <= KADEMLIA_VERSION5_48a || GetKadPort() == 0` cancels
+    /// the check outright (BaseClient.cpp:3129-3131; aMule 3.0.1
+    /// BaseClient.cpp:2908 is the same guard).
+    ///
+    /// The bound below is the AUTHORITY's number (5 = KADEMLIA_VERSION5_48a),
+    /// deliberately not `peer::KADEMLIA_VERSION` - an assertion written against
+    /// our own constant moves with it and can never catch it changing.
+    #[tokio::test]
+    async fn the_hello_answer_promises_no_kad_opcode_padmule_cannot_answer() {
+        let answer = hello_answer_off_the_listener("hello-kadversion").await;
+        let misc2 = hello_tag_u32(&answer, CT_EMULE_MISCOPTIONS2_TAG)
+            .expect("every padMule hello carries CT_EMULE_MISCOPTIONS2");
+        let kad_version = misc2 & 0xF;
+        assert!(
+            kad_version <= 5,
+            "declared Kad version {kad_version} promises OP_FWCHECKUDPREQ (>= 6) \
+             or OP_KAD_FWTCPCHECK_ACK (>= 7), which padMule does not answer"
+        );
+        assert!(
+            kad_version > 1,
+            "still > 1, or a peer will not even bootstrap Kad from us \
+             (eMule ListenSocket.cpp:353, aMule BaseClient.cpp:713)"
+        );
+    }
+
+    /// THE ACCEPT LOOP HANDS THE SESSION THE KEY WE HAVE ON FILE - the CALLER,
+    /// not the function.
+    ///
+    /// eMule binds a verified public key to a userhash for good: `InitalizeIdent`
+    /// copies the STORED key into `m_abyPublicKey` whenever `nKeySize != 0`
+    /// (ClientCredits.cpp:360-370), `SetSecureIdent` REFUSES to replace it
+    /// ("verified Public key cannot change", :397-400), and both
+    /// `CreateSignature` (:511) and `VerifyIdent` (:546) then work on
+    /// `GetSecureIdent()` - the stored key. THAT SUBSTITUTION IS THE ANTI-THEFT
+    /// MECHANISM: a thief who copies a userhash off the wire arrives with its own
+    /// keypair and cannot make the stored key verify.
+    ///
+    /// Asserted END TO END because a unit test cannot see the caller: the session
+    /// only holds the stored key if `start_listener` looks it up and passes it,
+    /// and a test that constructed the session itself would pass with that lookup
+    /// missing. The observable is on the wire and is eMule's own behaviour: the
+    /// signature padMule sends covers THE KEY ON FILE, so the impostor's key
+    /// cannot verify it - and the control proves it is the stored key rather than
+    /// merely garbage.
+    #[tokio::test]
+    async fn an_impostor_gets_a_signature_over_the_key_we_have_on_file() {
+        use crate::secure_ident::{
+            build_public_key, build_sec_ident_state, parse_public_key, parse_sec_ident_state,
+            parse_signature, verify_v1, Identity, IS_KEYANDSIGNEEDED, OP_PUBLICKEY,
+            OP_SECIDENTSTATE, OP_SIGNATURE,
+        };
+
+        const H: [u8; 16] = [0x9E; 16];
+        let genuine = Identity::generate();
+        let thief = Identity::generate();
+
+        let dir = tmp("secident-stolen-hash");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+        let port = free_local_port();
+        engine.set_ports(port, port, 4672, KAD_ADVERTISED_UNDER_TEST);
+        // The genuine owner of userhash H verified with us on some earlier
+        // connection, so its key is on file.
+        engine
+            .credit_store
+            .bind_verified(H, genuine.public_key_der(), now_secs());
+        engine.start_listener().await;
+
+        // The thief dials us claiming H and advertising secure-ident support (the
+        // gate the accept loop uses to run its half of the exchange at all).
+        let stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let mut fs = crate::framed::FramedStream::new(stream);
+        let me = HelloInfo::baseline(H, 0, 4662, 4672, "thief").with_secident();
+        timeout(
+            Duration::from_secs(5),
+            crate::peer_conn::peer_handshake_outbound(&mut fs, &me),
+        )
+        .await
+        .expect("hello must be answered")
+        .expect("a HELLOANSWER");
+
+        // padMule opens with its own challenge; we answer with the THIEF's key
+        // and our own challenge, which is what makes it sign.
+        let opening = timeout(Duration::from_secs(5), fs.read_packet_unpacked())
+            .await
+            .expect("padMule must open the secure-ident exchange")
+            .expect("a packet");
+        assert_eq!(opening.opcode, OP_SECIDENTSTATE);
+        let our_challenge = 0x7A7A_7A7Au32;
+        fs.write_packet(&build_public_key(thief.public_key_der()))
+            .await
+            .unwrap();
+        fs.write_packet(&build_sec_ident_state(IS_KEYANDSIGNEEDED, our_challenge))
+            .await
+            .unwrap();
+
+        // Collect padMule's key and signature.
+        let mut padmule_key: Option<Vec<u8>> = None;
+        let mut sig: Option<Vec<u8>> = None;
+        for _ in 0..6 {
+            let Ok(Ok(pkt)) = timeout(Duration::from_secs(5), fs.read_packet_unpacked()).await
+            else {
+                break;
+            };
+            match pkt.opcode {
+                OP_PUBLICKEY => padmule_key = parse_public_key(&pkt.payload).ok(),
+                OP_SIGNATURE => sig = parse_signature(&pkt.payload).ok(),
+                OP_SECIDENTSTATE => {
+                    let _ = parse_sec_ident_state(&pkt.payload);
+                }
+                _ => {}
+            }
+            if padmule_key.is_some() && sig.is_some() {
+                break;
+            }
+        }
+        let padmule_key = padmule_key.expect("padMule must send its public key");
+        let sig = sig.expect("padMule must sign the challenge");
+
+        // The thief cannot verify it: padMule signed the key on file, not the one
+        // the thief just presented.
+        assert!(
+            !verify_v1(&padmule_key, thief.public_key_der(), our_challenge, &sig),
+            "padMule signed the impostor's fresh key - a stolen userhash would \
+             inherit the real owner's identity"
+        );
+        // CONTROL: it IS the stored key that was signed, not noise.
+        assert!(
+            verify_v1(&padmule_key, genuine.public_key_der(), our_challenge, &sig),
+            "the signature must cover the STORED key (eMule CreateSignature, \
+             ClientCredits.cpp:511)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// THE POINT OF A BLOCKLIST: a peer the user has blocked must not be handed
     /// our identity first. Until 2026-08-10 the check ran only after the hello
     /// handshake, so every blocked peer received OP_HELLOANSWER - our userhash,
@@ -11556,11 +12051,17 @@ mod tests {
     ///
     /// `start_listener` built ONE `HelloInfo` at bind time and cloned that same
     /// snapshot into every accepted connection, so a user who turned Incognito
-    /// on mid-session kept declaring "padMule" to every peer that dialled US -
-    /// while `is_incognito()` said it was on and the OUTBOUND half really was
-    /// hidden (`find_and_fetch` rebuilds its hello per fetch). That is the worst
-    /// possible state: a disguise worn on one of two channels is not a disguise,
-    /// it is a correlation handle.
+    /// on mid-session kept declaring "padMule" to every peer that dialled US
+    /// while `is_incognito()` said it was on. A disguise worn on one of two
+    /// channels is not a disguise, it is a correlation handle.
+    ///
+    /// [CORRECTED: this test's original text claimed the OUTBOUND half was
+    /// already hidden because it "rebuilds its hello per fetch". Per FETCH is
+    /// not per CONNECTION - `spawn_fetch` snapshotted one `HelloInfo` before
+    /// its `tokio::spawn`, so a sweep already running kept declaring for up to
+    /// eight rounds against a pool that grows mid-sweep. Fixed with a
+    /// [`HelloFn`] over the same cell; pinned by
+    /// `incognito_flipped_during_a_fetch_reaches_the_next_outbound_hello`.]
     ///
     /// Asserted ON THE BYTES a peer receives - the HELLOANSWER tag count (8 with
     /// the marker, 7 without, which is what stock aMule writes) and the literal
@@ -11672,6 +12173,121 @@ mod tests {
         assert!(
             declares_padmule(&redeclared),
             "turning Incognito back OFF must declare again"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// INCOGNITO ON THE OUTBOUND HELLO, THROUGH THE REAL FETCH PATH.
+    ///
+    /// The symmetric half of the test above, and the half that was still
+    /// broken: `spawn_fetch` built ONE `HelloInfo` before `tokio::spawn` and
+    /// `download_file` cloned that snapshot into every worker of every round.
+    /// A Normal-priority sweep is eight rounds of four workers at up to 45s a
+    /// peer, and its source pool GROWS mid-sweep from source exchange - so a
+    /// user who turned Incognito on kept handing the marker tag and the literal
+    /// "padMule" to every brand-new peer a running download dialled, for as
+    /// long as the sweep lasted.
+    ///
+    /// Asserted ON THE BYTES the peer receives, not on a flag: the OP_HELLO tag
+    /// count (8 with the marker, 7 without - what stock aMule writes) and the
+    /// literal "padMule", which is both the marker tag's NAME and the default
+    /// nickname's value.
+    ///
+    /// DETERMINISTIC without a sleep: one source, so exactly one dial per
+    /// sweep round, and the mock peer flips the flag itself after reading the
+    /// FIRST hello - strictly before the second dial can exist. Every wait is
+    /// bounded, so a regression fails instead of hanging.
+    #[tokio::test]
+    async fn incognito_flipped_during_a_fetch_reaches_the_next_outbound_hello() {
+        use crate::part_store::PartStore;
+
+        /// Tag count in an OP_HELLO payload: the userhash LENGTH byte (16),
+        /// then userhash(16) + client id(4) + tcp port(2).
+        fn tag_count(payload: &[u8]) -> u32 {
+            u32::from_le_bytes(payload[23..27].try_into().unwrap())
+        }
+        fn declares_padmule(payload: &[u8]) -> bool {
+            payload.windows(7).any(|w| w == b"padMule")
+        }
+
+        let dir = tmp("incognito-outbound");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+        // Start DECLARING, so the snapshot the bug kept is the loud one.
+        engine.set_incognito(false);
+
+        // A mock source that reads our hello, answers nothing (the dial fails
+        // and the sweep moves on to its next round), and turns Incognito ON
+        // after the first connection.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, mut hellos) = mpsc::unbounded_channel::<Vec<u8>>();
+        let wire_identity = Arc::clone(&engine.wire_identity);
+        tokio::spawn(async move {
+            let mut seen = 0usize;
+            while let Ok((sock, _)) = listener.accept().await {
+                let mut fs = crate::framed::FramedStream::new(sock);
+                let Ok(pkt) = fs.read_packet().await else {
+                    continue;
+                };
+                if tx.send(pkt.payload).is_err() {
+                    return;
+                }
+                seen += 1;
+                if seen == 1 {
+                    // FLIP IT MID-SWEEP. The fetch task is deliberately NOT
+                    // restarted, and the user never touched this download.
+                    wire_identity.lock_recover().incognito = true;
+                }
+            }
+        });
+
+        let store = PartStore::create(&dir, 9, [0x44; 16], 5000, b"incognito.bin").unwrap();
+        engine.spawn_fetch(
+            Download::new(store),
+            [0x44; 16],
+            5000,
+            "incognito.bin",
+            vec![PeerSource {
+                addr,
+                user_hash: None,
+                crypt: None,
+                origin: crate::fetch::SourceOrigin::Server,
+            }],
+        );
+
+        let wait = Duration::from_secs(10);
+        let first = timeout(wait, hellos.recv())
+            .await
+            .expect("the fetch never dialled the source")
+            .expect("the mock peer hung up");
+        assert_eq!(
+            tag_count(&first),
+            8,
+            "CONTROL: with Incognito off the outbound hello carries the marker"
+        );
+        assert!(
+            declares_padmule(&first),
+            "CONTROL: with Incognito off the outbound hello says 'padMule'"
+        );
+
+        let second = timeout(wait, hellos.recv())
+            .await
+            .expect("the fetch never dialled again - it must sweep more rounds")
+            .expect("the mock peer hung up");
+        assert_eq!(
+            tag_count(&second),
+            7,
+            "a peer a RUNNING FETCH dialled was still told an 8-tag hello after \
+             Incognito was turned on - the fetch task kept the identity it \
+             snapshotted when it was spawned"
+        );
+        assert!(
+            !declares_padmule(&second),
+            "a peer a RUNNING FETCH dialled was still handed the literal \
+             'padMule' after Incognito was turned on"
         );
 
         std::fs::remove_dir_all(&dir).ok();
