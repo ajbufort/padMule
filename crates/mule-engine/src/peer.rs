@@ -45,42 +45,49 @@ const PADMULE_HELLO_TAG: &[u8] = b"padMule";
 pub const PADMULE_CHANNEL_VERSION: u8 = 1;
 
 /// The Kad protocol version padMule advertises IN THE eD2k HELLO
-/// (CT_EMULE_MISCOPTIONS2 low nibble). NOT the version padMule's Kad node
-/// speaks on the Kad network, which is 8 and stays 8 (`mule-kad` implements
-/// KADEMLIA2_HELLO_RES_ACK, the version-8 requirement) - these are two separate
-/// declarations and eMule cross-checks them nowhere.
+/// (CT_EMULE_MISCOPTIONS2 low nibble). DERIVED from the version padMule's Kad
+/// node speaks on the Kad network, because upstream cannot let the two drift:
+/// eMule reads the single `KADEMLIA_VERSION` macro straight into the nibble
+/// (BaseClient.cpp:1081; aMule BaseClient.cpp:1113). One declaration, one
+/// number.
 ///
-/// 5 (KADEMLIA_VERSION5_48a), NOT 8, and that is deliberate. eMule's own table
-/// spells out what the higher numbers oblige a client to do: version 6 "needs to
-/// support: OP_FWCHECKUDPREQ (!)" and version 7 "needs to support
-/// OP_KAD_FWTCPCHECK_ACK" (opcodes.h:27-28). padMule answers NEITHER. 0xA7
-/// arrives on TCP as the FIRST packet after the hello (`SendFirewallCheckUDPRequest`
-/// hands it to `SafeConnectAndSendPacket`, BaseClient.cpp:3140), so it does not
-/// even open a serve session - `classify_inbound` drops the connection - and
-/// answering it properly means sending KADEMLIA2_FIREWALLUDP (0x62) out of our
-/// Kad UDP socket, which nothing in `mule-kad` can build.
+/// HISTORY, because the number moved and the reason it moved is the point.
+/// Until 2026-08-12 this was a hand-written `0x05` (KADEMLIA_VERSION5_48a) while
+/// the Kad wire said 8, deliberately: eMule's table spells out what the higher
+/// numbers oblige a client to do - version 6 "needs to support:
+/// OP_FWCHECKUDPREQ (!)" and version 7 "needs to support OP_KAD_FWTCPCHECK_ACK"
+/// (opcodes.h:27-28) - and padMule answered neither, so 5 was the honest
+/// declaration. `classify_inbound` now recognises OP_FWCHECKUDPREQ (0xA7) and
+/// the connection task answers it with KADEMLIA2_FIREWALLUDP out of our own Kad
+/// socket, so the version-6 obligation is MET and the number moves to match.
 ///
-/// This number is READ, not decorative: `GetKadVersion() <= KADEMLIA_VERSION5_48a
-/// || GetKadPort() == 0` cancels the UDP firewall check outright (eMule
-/// BaseClient.cpp:3129-3131; aMule 3.0.1 BaseClient.cpp:2908 is the same guard),
-/// and `GetKadVersion() >= KADEMLIA_VERSION7_49a` picks 0xA8 over the older UDP
-/// ack (eMule ClientList.cpp:551; aMule ClientList.cpp:593). Declaring 5 makes
-/// every well-behaved peer cancel before it asks, which is the ONLY honest
-/// option while the opcodes are unimplemented: the standing rule on this module
-/// is never to advertise a capability padMule does not honour.
+/// THE TWO HALVES HAD TO LAND TOGETHER, and this is the part worth remembering:
+/// declaring 5 was free, because `GetKadVersion() <= KADEMLIA_VERSION5_48a`
+/// makes the peer bail BEFORE sending 0xA7 and book the test as CANCELLED
+/// (BaseClient.cpp:3129-3132 -> `SetUDPFWCheckResult(false, bTestCancelled=true)`,
+/// which UDPFirewallTester.cpp:125,165-167 does not count). Declaring 8 while
+/// staying silent is NOT free: the peer sends 0xA7, we drop the connection, and
+/// `Disconnected` books `SetUDPFWCheckResult(false, cancelled=false)`
+/// (BaseClient.cpp:1206-1207) - a COUNTED FAILURE. Two of those and the
+/// requester declares ITSELF UDP-firewalled (UDP_FIREWALLTEST_CLIENTSTOASK = 2,
+/// UDPFirewallTester.cpp:38,150-160). So two silent padMules claiming 8 could
+/// push a healthy eMule into a false verdict. Never raise this without the
+/// answerer.
 ///
-/// WHAT IT COSTS, stated plainly: `baseline_misc_options2` is no longer
-/// byte-equal to stock aMule 3.0.1 (which advertises 8 - Constants.h:29 -> 0x438;
-/// we emit 0x435), so this is a new wire tell that Incognito does not hide.
-/// Accepted, because the alternative tell is louder and repeats: a client that
-/// claims version 8 and then HANGS UP on 0xA7 is anomalous every single time it
-/// is asked, whereas 5 is a real eMule 0.48a-era value that no peer questions.
-/// Raise it to 8 the day 0xA7 is answered, not before.
+/// Version 7's OP_KAD_FWTCPCHECK_ACK is still unimplemented, which is why this
+/// tracks `mule_kad::KADEMLIA_VERSION` (8, aMule's level) rather than eMule's 9:
+/// aMule 3.0.1 declares 8 and does not send 0xA8 either
+/// (`ClientList.cpp:593` picks it only for a peer at >= 7 that WE are testing -
+/// an outbound duty padMule has no equivalent of, since it never runs a TCP
+/// firewall check on anyone).
 ///
-/// Everything below 6 is unaffected and still declared: > 1 is what keeps a peer
-/// willing to bootstrap Kad from us (eMule ListenSocket.cpp:353, aMule
-/// BaseClient.cpp:713).
-pub const KADEMLIA_VERSION: u32 = 0x05;
+/// WHAT IT BUYS: `baseline_misc_options2` is once again byte-equal to stock
+/// aMule 3.0.1 (Constants.h:29 -> 0x438), so the 0x435 tell that Incognito could
+/// not hide is gone.
+///
+/// Still > 1, which is what keeps a peer willing to bootstrap Kad from us (eMule
+/// ListenSocket.cpp:353, aMule BaseClient.cpp:713).
+pub const HELLO_KAD_VERSION: u32 = mule_kad::KADEMLIA_VERSION as u32;
 
 /// Compute CT_EMULE_MISCOPTIONS1 with the padMule baseline capabilities.
 /// `sec_ident` is 0 (no crypto) or 3 (secure-ident available, Wave 5). Derived
@@ -122,13 +129,20 @@ pub const fn baseline_misc_options1(sec_ident: u32) -> u32 {
 /// Crypt flags are 0 until Wave 5; captcha/direct-UDP-callback are 0 (not
 /// supported in v1). Derived from BaseClient.cpp:1131-1144.
 ///
-/// WITH `kad_version = 8` this yields 0x438, which is byte-equal to a real
-/// aMule 3.0.1 (Constants.h:29 declares 8; eMule 0.50a declares 9,
-/// opcodes.h:31). **padMule no longer passes 8**: every call site passes
-/// [`KADEMLIA_VERSION`], which is 5, so the emitted baseline is 0x435 and is
-/// byte-equal to NEITHER authority. That is a deliberate trade, and the
-/// reasoning (including what it costs Incognito) is on [`KADEMLIA_VERSION`].
-/// Do not read the 0x438 above as what goes on the wire today.
+/// WITH `kad_version = 8` this yields 0x438, byte-equal to a real aMule 3.0.1
+/// with the crypt layer OFF (Constants.h:29 declares 8; eMule 0.50a declares 9,
+/// opcodes.h:31). Every call site passes [`HELLO_KAD_VERSION`], which IS 8.
+///
+/// **0x438 IS THE BASELINE, NOT WHAT GOES ON THE WIRE.** The accept loop builds
+/// its hello `.with_crypt_supported()`, which sets bit 7, so the LISTENER emits
+/// **0x4B8** - and 0x4B8 is likewise what a stock aMule 3.0.1 sends in that same
+/// configuration. The engine test
+/// `the_hello_answer_declares_8_and_padmule_answers_what_8_promises` asserts the
+/// emitted value as a LITERAL for exactly this reason; this constant is pinned
+/// separately. (The pair read 0x438/0x4B8 -> 0x435/0x4B5 between 2026-08-11 and
+/// 2026-08-12, while the hello declared 5 because OP_FWCHECKUDPREQ went
+/// unanswered - see [`HELLO_KAD_VERSION`] for that history and why the two
+/// halves had to land together.)
 pub const fn baseline_misc_options2(
     crypt_supported: u32,
     crypt_requested: u32,
@@ -252,7 +266,7 @@ impl HelloInfo {
             udp_port: 0,
             kad_udp_port,
             misc_options1: baseline_misc_options1(0),
-            misc_options2: baseline_misc_options2(0, 0, 0, KADEMLIA_VERSION),
+            misc_options2: baseline_misc_options2(0, 0, 0, HELLO_KAD_VERSION),
             compat_options: COMPAT_OPTIONS_BASELINE,
             server_ip: 0,
             server_port: 0,
@@ -288,7 +302,7 @@ impl HelloInfo {
     /// set this once the inbound obf-accept path is actually wired (never advertise
     /// a capability we do not honor, and never set REQUIRED).
     pub fn with_crypt_supported(mut self) -> Self {
-        self.misc_options2 = baseline_misc_options2(1, 0, 0, KADEMLIA_VERSION);
+        self.misc_options2 = baseline_misc_options2(1, 0, 0, HELLO_KAD_VERSION);
         self
     }
 }
@@ -531,15 +545,18 @@ mod tests {
         assert_eq!(baseline_misc_options1(0), 0x3410_3212);
         assert_eq!(baseline_misc_options1(3), 0x3413_3212); // secure ident = 3
 
-        // MISCOPTIONS2 is byte-equal to stock aMule 3.0.1 in every field EXCEPT
-        // the Kad-version nibble: aMule declares 8 (Constants.h:29) for 0x438,
-        // padMule declares 5 and so emits 0x435. The difference is deliberate and
-        // [`KADEMLIA_VERSION`] carries the whole argument - it is the one number
-        // here that obliges us to answer opcodes we have not implemented. The
-        // literals lead on purpose: written as `KADEMLIA_VERSION` this assertion
-        // would move with the constant and could never catch it changing.
+        // MISCOPTIONS2 is byte-equal to stock aMule 3.0.1: aMule declares Kad
+        // version 8 (Constants.h:29) for 0x438, and so do we. The literals lead
+        // on purpose - written as `HELLO_KAD_VERSION` this assertion would move
+        // with the constant and could never catch it changing. Both lines are
+        // needed: the first pins the ENCODING (nibble 8 -> 0x438), the second
+        // pins WHAT WE DECLARE against that encoding.
+        assert_eq!(baseline_misc_options2(0, 0, 0, 8), 0x438);
+        assert_eq!(baseline_misc_options2(0, 0, 0, HELLO_KAD_VERSION), 0x438);
+        // The old declaration, kept as a live counter-example: 5 encodes to
+        // 0x435 and the hello carried it until 2026-08-12. It is a legal input,
+        // just not ours any more.
         assert_eq!(baseline_misc_options2(0, 0, 0, 5), 0x435);
-        assert_eq!(baseline_misc_options2(0, 0, 0, KADEMLIA_VERSION), 0x435);
         assert_eq!(COMPAT_OPTIONS_BASELINE, 1);
     }
 
@@ -627,7 +644,7 @@ mod tests {
         assert!(caps.large_files);
         assert!(caps.source_ex2);
         assert!(!caps.supports_crypt);
-        assert_eq!(caps.kad_version, KADEMLIA_VERSION as u8);
+        assert_eq!(caps.kad_version, HELLO_KAD_VERSION as u8);
     }
 
     #[test]

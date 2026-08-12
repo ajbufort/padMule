@@ -288,6 +288,161 @@ impl Drop for KadNode {
 /// wants echoed next time.
 type ReplyAnswer = (Vec<u8>, bool, u32);
 
+/// Everything answering an inbound OP_FWCHECKUDPREQ needs, reachable from the
+/// eD2k TCP side: the peer asks over TCP and the answer leaves over Kad UDP, so
+/// something has to bridge the two.
+///
+/// **THE SOCKET HANDLE IS `Weak` AND MUST STAY `Weak`.** The Kad socket binds a
+/// FIXED port (`self.kad_port`), and `resume()` rebinds it; a per-connection
+/// task holding a STRONG `Arc` past `pause()` keeps that port occupied, so the
+/// rebind fails into "Kad UDP port unavailable" and Kad is silently dead for the
+/// rest of the session. Connection tasks are DETACHED (`tokio::spawn` in
+/// `start_listener`) and `pause()` aborts only the accept loop, so nothing else
+/// bounds their lifetime. The invariant is therefore "no strong `Arc<UdpSocket>`
+/// may outlive the `KadNode`", and [`KadFwCheckCtx::answer`] keeps it by
+/// upgrading for one SYNCHRONOUS `try_send_to` inside a non-async block - a
+/// strong reference can never straddle an await.
+///
+/// `routing` is an ordinary strong `Arc`: it holds no OS resource, so an extra
+/// holder costs memory and nothing else.
+///
+/// `Clone` so a connection task can lift it out of the engine's shared slot and
+/// drop the (std) lock guard before awaiting - a guard must never straddle an
+/// await. The clone carries only the `Weak`, so it cannot pin the port either.
+#[derive(Clone)]
+pub struct KadFwCheckCtx {
+    sock: std::sync::Weak<UdpSocket>,
+    routing: Arc<Mutex<RoutingTable>>,
+    udp_key: u32,
+}
+
+/// Attempts at handing one firewall-check datagram to the socket.
+///
+/// MEASURED, not guessed: tokio's `try_send_to` returns `WouldBlock` on a socket
+/// whose WRITABLE readiness the driver has not established yet - not because the
+/// buffer is full, but because `Registration::try_io` declines to attempt the
+/// syscall while its cached readiness is empty. A fresh `UdpSocket` reproduces
+/// it on the first call and succeeds after any runtime park. The Kad socket's
+/// read loop keeps the driver polling it, so in practice readiness is long since
+/// established by the time an inbound peer finishes a hello - but the failure
+/// mode if it is not is a SILENTLY DROPPED answer, which is precisely the
+/// counted failure this whole feature exists to prevent. So: retry a couple of
+/// times. The same retry covers a genuinely full send buffer.
+const FWCHECK_SEND_TRIES: usize = 3;
+/// Gap between those attempts. Two datagrams at worst cost 20ms, against a
+/// 10-second linger.
+const FWCHECK_SEND_RETRY: Duration = Duration::from_millis(5);
+
+/// One datagram the firewall-check answer wants sent: the port to send it TO,
+/// and the bytes. Built PURE so the whole answer shape is testable without a
+/// socket; [`KadFwCheckCtx::answer`] is the thin part that sends them.
+///
+/// eMule's `ProcessFirewallCheckUDPRequest` (BaseClient.cpp:3145-3186; aMule
+/// 3.0.1 BaseClient.cpp:2923-2962 is a line-for-line transcription, so there is
+/// no conflict to arbitrate):
+///
+/// - `intern_port == 0` -> answer NOTHING (`:3160`).
+/// - `sender_key == 0` -> eMule only warns (`:3164`) and still answers, but the
+///   answer goes out UNOBFUSCATED: `bEncrypt` is `hash != NULL || (bKad &&
+///   receiverKey != 0)` (ClientUDPSocket.cpp:571), and both are false here.
+/// - one datagram to `intern_port`, plus a SECOND to `extern_port` when that is
+///   non-zero and different - the PAT case, where the requester learns which of
+///   its two ports got through by reading back the port we echo
+///   (UDPFirewallTester.cpp:138-145).
+///
+/// Obfuscation is the RECEIVER-KEY path (marker bit 0x02): eMule sends with
+/// `CKadUDPKey(dwSenderKey, GetPublicIP())`, whose `GetKeyValue(myIP)` yields
+/// `dwSenderKey` (KadUDPKey.h:31) as `nReceiverVerifyKey`, and the sender key
+/// riding along is our own `GetUDPVerifyKey(destIP)`
+/// (ClientUDPSocket.cpp:517-518).
+pub fn fw_check_udp_datagrams(
+    payload: &[u8],
+    peer_ip: u32,
+    our_udp_key: u32,
+    error_already_known: bool,
+) -> Vec<(u16, Vec<u8>)> {
+    if payload.len() < 8 {
+        return Vec::new();
+    }
+    let intern_port = u16::from_le_bytes([payload[0], payload[1]]);
+    let extern_port = u16::from_le_bytes([payload[2], payload[3]]);
+    let sender_key = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+    if intern_port == 0 {
+        return Vec::new();
+    }
+    let mut ports = vec![intern_port];
+    if extern_port != 0 && extern_port != intern_port {
+        ports.push(extern_port);
+    }
+    ports
+        .into_iter()
+        .map(|port| {
+            let (op, p) = mule_kad::build_firewall_udp(error_already_known, port);
+            let frame = pack_kad(op, p);
+            let dg = if sender_key == 0 {
+                frame
+            } else {
+                kad_obfuscate_response(
+                    &frame,
+                    rand::random(),
+                    sender_key,
+                    mule_kad::udp_verify_key(our_udp_key, peer_ip),
+                    rand::random(),
+                )
+            };
+            (port, dg)
+        })
+        .collect()
+}
+
+impl KadFwCheckCtx {
+    /// Answer one OP_FWCHECKUDPREQ. Returns how many datagrams were handed to
+    /// the socket (0 = we declined, which is a legitimate outcome).
+    ///
+    /// `bErrorAlreadyKnown` is eMule's "my answer may be biased because I
+    /// already know you": it ORs an active upload/download/chat with this client
+    /// into a routing-table lookup (BaseClient.cpp:3150-3155). padMule has no
+    /// cheap analogue of the transfer half and OMITS it - the only effect is
+    /// reporting 0 where eMule would report 1, and the requester has already
+    /// filtered for peers it has not talked to (`GetContact(ip, 0, false)` is
+    /// the half that actually fires).
+    pub async fn answer(&self, payload: &[u8], peer: SocketAddr) -> usize {
+        let SocketAddr::V4(v4) = peer else {
+            return 0; // Kad is IPv4-only; there is no address to answer at.
+        };
+        let peer_ip = u32::from(*v4.ip());
+        let already_known = self.routing.lock_recover().ip_counts(peer_ip).0 > 0;
+        let out = fw_check_udp_datagrams(payload, peer_ip, self.udp_key, already_known);
+        let mut sent = 0usize;
+        for (port, dg) in out {
+            let dest = SocketAddr::V4(SocketAddrV4::new(*v4.ip(), port));
+            for attempt in 0..FWCHECK_SEND_TRIES {
+                // THE STRONG `Arc` IS BORN AND DIES INSIDE THIS BLOCK, which is
+                // the whole invariant (see the type's doc). The await below is
+                // OUTSIDE it, so no strong reference is ever alive across one.
+                let outcome = {
+                    let Some(s) = self.sock.upgrade() else {
+                        // Kad is down: eMule's `!IsRunning() ||
+                        // GetUDPListener() == NULL` bail (BaseClient.cpp:3146).
+                        return sent;
+                    };
+                    s.try_send_to(&dg, dest).is_ok()
+                };
+                if outcome {
+                    sent += 1;
+                    break;
+                }
+                if attempt + 1 < FWCHECK_SEND_TRIES {
+                    tokio::time::sleep(FWCHECK_SEND_RETRY).await;
+                }
+                // Out of attempts: drop this answer. eMule is best-effort here
+                // too - its answer goes through the upload bandwidth throttler.
+            }
+        }
+        sent
+    }
+}
+
 /// One in-flight outbound request: what it takes to match a reply back to it.
 struct PendingSlot {
     seq: u64,
@@ -1001,6 +1156,17 @@ impl KadNode {
     /// routing insert (matching eMule). `None` = no filter (fail-open).
     pub fn set_ip_filter(&self, filter: Option<std::sync::Arc<IpFilter>>) {
         *self.ip_filter.lock_recover() = filter;
+    }
+
+    /// A handle the eD2k listener can answer OP_FWCHECKUDPREQ through. The
+    /// socket reference is deliberately WEAK - see [`KadFwCheckCtx`] for the
+    /// port-rebind invariant that depends on it.
+    pub fn fw_check_ctx(&self) -> KadFwCheckCtx {
+        KadFwCheckCtx {
+            sock: Arc::downgrade(&self.socket),
+            routing: Arc::clone(&self.routing),
+            udp_key: self.udp_key,
+        }
     }
 
     pub fn kad_id(&self) -> Kad128 {
@@ -1727,7 +1893,12 @@ impl KadNode {
                             (pack_kad(op, p), OP_SEARCH_RES)
                         }
                         ValueAsk::PublishKeyword { entries } => {
-                            let (op, p) = build_publish_key_req(&target, entries);
+                            // THE FRAME IS PER-CONTACT, which is what lets the
+                            // AICH tag be version-gated: eMule builds the
+                            // taglist against `byTargetKadVersion`
+                            // (Search.cpp:1601) and `c` is the contact this
+                            // datagram is addressed to.
+                            let (op, p) = build_publish_key_req(&target, entries, c.version);
                             (pack_kad(op, p), OP_PUBLISH_RES)
                         }
                         ValueAsk::PublishSource { our_hash, entry } => {
@@ -2186,6 +2357,183 @@ pub struct ResolveOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The exact 8 bytes eMule's `SendFirewallCheckUDPRequest` builds
+    /// (BaseClient.cpp:3136-3140): intern port, extern port, our verify key for
+    /// the peer, all little-endian.
+    fn fwcheck_payload(intern: u16, extern_: u16, key: u32) -> Vec<u8> {
+        let mut p = Vec::new();
+        p.extend_from_slice(&intern.to_le_bytes());
+        p.extend_from_slice(&extern_.to_le_bytes());
+        p.extend_from_slice(&key.to_le_bytes());
+        p
+    }
+
+    /// THE ANSWER SHAPE, ASSERTED AS BYTES.
+    ///
+    /// One KADEMLIA2_FIREWALLUDP to the INTERN port and, because the requester
+    /// declared a different EXTERN one (the PAT case), a second to that - each
+    /// echoing the port it was sent to, which is the only way the requester
+    /// learns which of the two got through (UDPFirewallTester.cpp:138-145).
+    /// The plaintext frame is asserted with LITERAL bytes: 0xE4 (Kad protocol),
+    /// 0x62 (KADEMLIA2_FIREWALLUDP), then errorcode + port LE.
+    #[test]
+    fn the_firewall_check_answer_goes_to_both_ports_and_echoes_each() {
+        let peer_ip = u32::from(Ipv4Addr::new(203, 0, 113, 9));
+        let out = fw_check_udp_datagrams(
+            &fwcheck_payload(4672, 12345, 0),
+            peer_ip,
+            0xABCD_1234,
+            false,
+        );
+        assert_eq!(out.len(), 2, "intern port and a differing extern port");
+        assert_eq!(out[0].0, 4672);
+        assert_eq!(out[1].0, 12345);
+        // sender_key 0 means eMule sends UNOBFUSCATED (bEncrypt is
+        // `hash != NULL || (bKad && receiverKey != 0)`, ClientUDPSocket.cpp:571),
+        // so the frame is readable right here.
+        assert_eq!(out[0].1, vec![0xE4, 0x62, 0x00, 0x40, 0x12]);
+        assert_eq!(out[1].1, vec![0xE4, 0x62, 0x00, 0x39, 0x30]);
+
+        // Already a Kad contact -> errorcode 1 ("my answer may be biased").
+        let known = fw_check_udp_datagrams(&fwcheck_payload(4672, 0, 0), peer_ip, 1, true);
+        assert_eq!(known.len(), 1, "extern port 0 adds no second datagram");
+        assert_eq!(known[0].1, vec![0xE4, 0x62, 0x01, 0x40, 0x12]);
+
+        // Extern EQUAL to intern is also one datagram - eMule's second
+        // condition, and the ordinary no-PAT case.
+        let same = fw_check_udp_datagrams(&fwcheck_payload(4672, 4672, 0), peer_ip, 1, false);
+        assert_eq!(same.len(), 1, "extern == intern adds no second datagram");
+    }
+
+    /// BOTH REFUSALS. `intern_port == 0` is eMule's explicit bail
+    /// (BaseClient.cpp:3160-3162); a truncated payload has no ports to answer at
+    /// and must not panic on the slice.
+    #[test]
+    fn the_firewall_check_refuses_a_zero_intern_port_and_a_short_payload() {
+        let ip = u32::from(Ipv4Addr::new(203, 0, 113, 9));
+        assert!(
+            fw_check_udp_datagrams(&fwcheck_payload(0, 12345, 7), ip, 1, false).is_empty(),
+            "intern port 0 -> answer NOTHING, even though extern is valid"
+        );
+        for n in 0..8 {
+            assert!(
+                fw_check_udp_datagrams(&vec![0xFFu8; n], ip, 1, false).is_empty(),
+                "a {n}-byte payload is not a firewall-check request"
+            );
+        }
+    }
+
+    /// THE RECEIVER-KEY PATH IS THE ONE TAKEN, proven by decrypting our own
+    /// datagram the way the REQUESTER would: it deobfuscates with the key IT
+    /// minted and handed us, and `used_receiver_key` must be true (marker bit
+    /// 0x02). A NodeID-keyed answer would be undecryptable to it - the requester
+    /// has no idea what our Kad ID is at this point in the exchange.
+    #[test]
+    fn the_firewall_check_answer_uses_the_requesters_sender_key() {
+        // The requester's key for US, exactly as it computes it.
+        let requester_secret = 0x5566_7788u32;
+        let our_ip = u32::from(Ipv4Addr::new(198, 51, 100, 4));
+        let sender_key = mule_kad::udp_verify_key(requester_secret, our_ip);
+        assert_ne!(
+            sender_key, 0,
+            "the key must be non-zero or this proves nothing"
+        );
+
+        let peer_ip = u32::from(Ipv4Addr::new(203, 0, 113, 9));
+        let our_udp_key = 0x0BAD_F00Du32;
+        let out = fw_check_udp_datagrams(
+            &fwcheck_payload(4672, 0, sender_key),
+            peer_ip,
+            our_udp_key,
+            false,
+        );
+        assert_eq!(out.len(), 1);
+        assert_ne!(
+            out[0].1,
+            vec![0xE4, 0x62, 0x00, 0x40, 0x12],
+            "a non-zero sender key must obfuscate the answer"
+        );
+
+        // Deobfuscated the way the REQUESTER really does it: with its own
+        // secret and the IP it sent the request to, never with `sender_key`
+        // handed back to it - so this proves its own derivation recovers the
+        // key, not merely that our two calls agree.
+        let dec = mule_kad::kad_deobfuscate(
+            &out[0].1,
+            &Kad128::from_hash(&[0x11; 16]),
+            requester_secret,
+            our_ip,
+        )
+        .expect("the requester must be able to decrypt what we sent");
+        assert!(
+            dec.used_receiver_key,
+            "the RECEIVER-KEY path (marker 0x02), not the NodeID path"
+        );
+        assert_eq!(dec.receiver_vk, sender_key, "we echo the key it handed us");
+        assert_eq!(
+            dec.sender_vk,
+            mule_kad::udp_verify_key(our_udp_key, peer_ip),
+            "and ride our own key for its address along, so it can verify US"
+        );
+        assert_eq!(dec.payload, vec![0xE4, 0x62, 0x00, 0x40, 0x12]);
+    }
+
+    /// KAD DOWN -> NO ANSWER, AND IT IS STRUCTURAL RATHER THAN REMEMBERED.
+    ///
+    /// eMule bails on `!IsRunning() || GetUDPListener() == NULL`
+    /// (BaseClient.cpp:3146-3149). padMule has no equivalent check to forget: the
+    /// handle holds a `Weak` socket, so a dropped `KadNode` - which is exactly
+    /// what `set_kad(None)` does on every `pause()` - makes `upgrade()` fail and
+    /// the answer simply does not happen.
+    ///
+    /// The LIVE arm is the control. Without it a `Weak` that never upgraded would
+    /// pass the negative just as well, and the test would prove nothing.
+    #[tokio::test]
+    async fn a_dropped_kad_node_leaves_the_firewall_check_answerer_silent() {
+        let node = KadNode::bind("127.0.0.1:0".parse().unwrap(), 4662)
+            .await
+            .expect("a loopback Kad node must bind");
+        let ctx = node.fw_check_ctx();
+        // Loopback both ways: the datagram never leaves this machine.
+        let peer: SocketAddr = "127.0.0.1:4662".parse().unwrap();
+        let payload = fwcheck_payload(4672, 0, 0xDEAD_BEEF);
+
+        assert_eq!(
+            ctx.answer(&payload, peer).await,
+            1,
+            "a LIVE node must answer, or the negative below proves nothing"
+        );
+
+        drop(node);
+        // `KadNode::drop` ABORTS the read loop, and abort is ASYNCHRONOUS: that
+        // task holds the last strong `Arc<UdpSocket>` until the runtime reaps
+        // it, so the socket outlives the node by a scheduling quantum. Wait for
+        // the reap, bounded - it is the same window `pause()` closes long before
+        // `resume()` rebinds (see the engine-level lifetime test). Asserted on
+        // the WEAK itself, so this loop cannot be satisfied by a send that
+        // merely failed.
+        let mut reaped = false;
+        for _ in 0..200 {
+            if ctx.sock.upgrade().is_none() {
+                reaped = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            reaped,
+            "the socket outlived its node by more than 2s - something other than \
+             the read loop is holding a strong reference, and that something \
+             would keep the Kad port bound past pause()"
+        );
+        assert_eq!(
+            ctx.answer(&payload, peer).await,
+            0,
+            "the socket is gone, so the answerer must be silent - no separate \
+             `IsRunning()` check to forget"
+        );
+    }
 
     #[test]
     fn contact_ip_uses_the_big_endian_view_confirmed_live() {
@@ -2663,6 +3011,7 @@ mod tests {
             size: 1000,
             complete_sources: 1,
             file_type: "Iso".to_string(),
+            aich_root: None,
         }];
         let stored = node
             // 10s, not 300ms (8cs): a loaded box can make the FIND reply miss a
@@ -2677,6 +3026,117 @@ mod tests {
             "a PUBLISH_KEY_REQ went out"
         );
         assert_eq!(stored, 1, "the storing node's ack was counted");
+    }
+
+    /// A mock storing node that CAPTURES the PUBLISH_KEY_REQ body it receives,
+    /// so a test can assert what really went on the wire rather than that
+    /// something did.
+    fn spawn_capturing_publish_mock(
+        peer: UdpSocket,
+        peer_id: Kad128,
+        target: Kad128,
+        seen: Arc<Mutex<Vec<Vec<u8>>>>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            loop {
+                let Ok((n, from)) = peer.recv_from(&mut buf).await else {
+                    return;
+                };
+                let Some(dec) = kad_deobfuscate(&buf[..n], &peer_id, 0, ip_u32(&from)) else {
+                    continue;
+                };
+                let Ok((op, body)) = unpack_kad(&dec.payload) else {
+                    continue;
+                };
+                let (rop, rpayload) = if op == mule_kad::OP_KAD2_REQ {
+                    mule_kad::build_kad2_res(&target, &[])
+                } else if op == mule_kad::OP_PUBLISH_KEY_REQ {
+                    seen.lock_recover().push(body.to_vec());
+                    let mut res = body[..16.min(body.len())].to_vec();
+                    res.resize(16, 0);
+                    res.push(40);
+                    (mule_kad::OP_PUBLISH_RES, res)
+                } else {
+                    continue;
+                };
+                let dg = kad_obfuscate_response(
+                    &pack_kad(rop, rpayload),
+                    0x2468,
+                    dec.sender_vk,
+                    MOCK_SENDER_VK,
+                    0x80,
+                );
+                let _ = peer.send_to(&dg, from).await;
+            }
+        })
+    }
+
+    /// THE CALL SITE, not the builder. `build_publish_key_req`'s own unit test
+    /// proves the v9 gate; this proves the LOOKUP DRIVER actually feeds it the
+    /// CONTACT's version byte. Those are different claims, and this project has
+    /// shipped a correct function nothing called with the right argument before.
+    ///
+    /// Run twice against the SAME entry with the only difference being the
+    /// routing contact's declared version, so the tag's presence can be caused
+    /// by nothing else.
+    #[tokio::test]
+    async fn the_publish_path_feeds_the_contacts_own_version_to_the_builder() {
+        let root = [0x5Cu8; 20];
+        let mut expected = vec![0x0A, 0x01, 0x00, 0x36, 0x14];
+        expected.extend_from_slice(&root);
+
+        for (contact_version, want_tag) in [(8u8, false), (9u8, true)] {
+            let our_id = Kad128::from_words([5, 5, 9, u32::from(contact_version)]);
+            let mut node =
+                KadNode::bind_with_identity("127.0.0.1:0".parse().unwrap(), 4662, our_id, 0x9999)
+                    .await
+                    .unwrap();
+            node.set_public_ip(0x0A00_0001);
+            let target = kad_keyword_target("ubuntu");
+            let w = target.words();
+            let peer_id = Kad128::from_words([w[0], w[1] ^ 1, w[2], w[3]]);
+            let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let peer_addr = peer.local_addr().unwrap();
+            node.with_routing(|t| {
+                t.add(
+                    peer_id,
+                    ip_u32(&peer_addr),
+                    peer_addr.port(),
+                    4662,
+                    contact_version,
+                    true,
+                )
+            });
+            let seen: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+            let mock = spawn_capturing_publish_mock(peer, peer_id, target, Arc::clone(&seen));
+            let entries = vec![KeywordEntry {
+                file_id: Kad128::from_hash(&[0xBB; 16]),
+                name: "ubuntu.iso".to_string(),
+                size: 1000,
+                complete_sources: 1,
+                file_type: "Iso".to_string(),
+                aich_root: Some(root),
+            }];
+            let stored = node
+                .publish_keyword(&target, &entries, Duration::from_secs(10))
+                .await
+                .unwrap();
+            mock.abort();
+            assert_eq!(
+                stored, 1,
+                "the store must have happened at v{contact_version}"
+            );
+            let bodies = seen.lock_recover().clone();
+            assert_eq!(bodies.len(), 1, "exactly one PUBLISH_KEY_REQ");
+            let carried = bodies[0].windows(expected.len()).any(|s| s == expected);
+            assert_eq!(
+                carried,
+                want_tag,
+                "a contact declaring v{contact_version} must {} the AICH tag",
+                if want_tag { "receive" } else { "not receive" }
+            );
+        }
     }
 
     #[tokio::test]

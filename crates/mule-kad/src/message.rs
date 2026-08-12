@@ -46,17 +46,30 @@ pub const OP_PUBLISH_RES_ACK: u8 = 0x4C;
 pub const OP_PING: u8 = 0x60;
 /// Liveness pong.
 pub const OP_PONG: u8 = 0x61;
+/// The UDP half of a peer's Kad firewall check (KADEMLIA2_FIREWALLUDP,
+/// opcodes.h:619): `errorcode u8 | UDPPort_Used u16`. We SEND this - unsolicited,
+/// out of our Kad socket - to a peer that asked over eD2k TCP with
+/// OP_FWCHECKUDPREQ; its arrival is what proves the peer's UDP port is open.
+pub const OP_FIREWALL_UDP: u8 = 0x62;
 
 /// aMule's `KADEMLIA_VERSION` (`kad2/Constants.h`).
 pub const KADEMLIA_VERSION_AMULE: u8 = 0x08;
 /// eMule's `KADEMLIA_VERSION` (`opcodes.h`).
 pub const KADEMLIA_VERSION_EMULE: u8 = 0x09;
+/// The version at which a contact understands `TAG_KADAICHHASHPUB` on a keyword
+/// publish (eMule `KADEMLIA_VERSION9_50a`, opcodes.h:30 - "handling AICH hashes
+/// on keyword storage"). Read PER TARGET CONTACT, never against our own
+/// declaration: eMule gates the tag on `byTargetKadVersion` alone
+/// (Search.cpp:1601).
+pub const KADEMLIA_VERSION9_50A: u8 = 0x09;
 /// The version byte written into every self-contact. This is the ONE genuine
 /// eMule-vs-aMule Kad wire divergence (eMule 0x09, aMule 0x08). padMule ports
 /// aMule and implements exactly its v8 feature level (KADMISCOPTIONS +
 /// HELLO_RES_ACK), so it advertises 0x08 - claiming 0x09 would assert eMule's
-/// v9 AICH-on-keyword capability we do not provide. Interop-test both at the
-/// live gate; flipping this constant is the only change needed.
+/// v9 AICH-on-keyword capability. We PUBLISH that tag to v9 targets (see
+/// [`build_publish_key_req`]) but do not INDEX it for others, which is the half
+/// v9 actually promises. Interop-test both at the live gate; flipping this
+/// constant is the only change needed.
 pub const KADEMLIA_VERSION: u8 = KADEMLIA_VERSION_AMULE;
 
 // --- KADEMLIA2_REQ `type` byte = GetRequestContactCount (opcodes.h:622-625;
@@ -99,6 +112,14 @@ pub const TAG_FILETYPE: u8 = 0x03;
 pub const TAG_FILESIZE: u8 = 0x02;
 /// Advertised source/availability count (u32).
 pub const TAG_SOURCES: u8 = 0x15;
+/// The publisher's AICH root hash for the file, a 20-byte BSOB (eMule
+/// `TAG_KADAICHHASHPUB` "\x36", opcodes.h:383). Sent only to a target contact at
+/// [`KADEMLIA_VERSION9_50A`] or above.
+pub const TAG_KADAICHHASHPUB: u8 = 0x36;
+/// Length of an AICH root hash on the wire (eMule `CAICHHash::GetHashSize()` =
+/// `HASHSIZE` = 20, SHAHashSet.h:69,109). The indexer validates the BSOB against
+/// exactly this (KademliaUDPListener.cpp:1333) and drops any other length.
+pub const AICH_HASH_SIZE: usize = 20;
 
 // --- Kad tag wire types (TagTypes.h). ---
 const TT_HASH16: u8 = 0x01;
@@ -919,10 +940,20 @@ pub struct KeywordEntry {
     pub complete_sources: u32,
     /// eD2k file-type search term ("Audio"/"Video"/...), empty to omit.
     pub file_type: String,
+    /// Our AICH root hash for this file, if we have one. `None` is the honest
+    /// pre-AICH case and omits the tag entirely, mirroring eMule's
+    /// `HasAICHHash()` half of the gate (Search.cpp:1601).
+    pub aich_root: Option<[u8; AICH_HASH_SIZE]>,
 }
 
 impl KeywordEntry {
-    fn tags(&self) -> Vec<KadTag> {
+    /// The tags for ONE target contact. `target_kad_version` is that contact's
+    /// declared version byte, and it decides ONE thing: whether the AICH tag is
+    /// included. eMule builds this list per target for exactly that reason
+    /// (`byTargetKadVersion >= KADEMLIA_VERSION9_50a && HasAICHHash()`,
+    /// Search.cpp:1601-1603) - an older node has no arm for the tag and would
+    /// index it as an opaque unknown.
+    fn tags(&self, target_kad_version: u8) -> Vec<KadTag> {
         let mut tags = vec![KadTag {
             name: TAG_FILENAME,
             value: KadTagValue::Str(self.name.as_bytes().to_vec()),
@@ -944,6 +975,15 @@ impl KeywordEntry {
             name: TAG_SOURCES,
             value: KadTagValue::Int(self.complete_sources as u64),
         });
+        // BETWEEN sources and filetype, where eMule emits it (Search.cpp:1601).
+        if let Some(root) = self.aich_root {
+            if target_kad_version >= KADEMLIA_VERSION9_50A {
+                tags.push(KadTag {
+                    name: TAG_KADAICHHASHPUB,
+                    value: KadTagValue::Bsob(root.to_vec()),
+                });
+            }
+        }
         if !self.file_type.is_empty() {
             tags.push(KadTag {
                 name: TAG_FILETYPE,
@@ -963,16 +1003,38 @@ pub const PUBLISH_KEY_FILES_PER_PACKET: usize = 50;
 /// [`PUBLISH_KEY_FILES_PER_PACKET`]; this refuses to emit more than that in one
 /// packet (eMule's own `byPacket[1024*50]` bound made concrete), truncating and
 /// correcting the count so the u16 and the records always agree.
-pub fn build_publish_key_req(keyword_target: &Kad128, entries: &[KeywordEntry]) -> (u8, Vec<u8>) {
+///
+/// `target_kad_version` is the version byte of the CONTACT this datagram is
+/// addressed to, so the frame is genuinely per-target - which is what lets a v9
+/// node get `TAG_KADAICHHASHPUB` while a v8 node does not (Search.cpp:1601).
+pub fn build_publish_key_req(
+    keyword_target: &Kad128,
+    entries: &[KeywordEntry],
+    target_kad_version: u8,
+) -> (u8, Vec<u8>) {
     let entries = &entries[..entries.len().min(PUBLISH_KEY_FILES_PER_PACKET)];
     let mut w = Writer::new();
     w.write_bytes(&keyword_target.to_wire());
     w.write_u16(entries.len() as u16);
     for e in entries {
         w.write_bytes(&e.file_id.to_wire());
-        write_kad_taglist(&mut w, &e.tags());
+        write_kad_taglist(&mut w, &e.tags(target_kad_version));
     }
     (OP_PUBLISH_KEY_REQ, w.into_inner())
+}
+
+/// Build a KADEMLIA2_FIREWALLUDP: `errorcode u8 | UDPPort_Used u16`.
+///
+/// `error_already_known` is eMule's `bErrorAlreadyKnown` - "I already have you
+/// as a Kad contact, so my answer may be biased"; `port_used` ECHOES the port
+/// this datagram is being sent to, which is how the requester learns WHICH of
+/// its two candidate ports got through (`nIncomingPort` decides
+/// `SetUseExternKadPort`, UDPFirewallTester.cpp:138-145).
+pub fn build_firewall_udp(error_already_known: bool, port_used: u16) -> (u8, Vec<u8>) {
+    let mut w = Writer::new();
+    w.write_u8(u8::from(error_already_known));
+    w.write_u16(port_used);
+    (OP_FIREWALL_UDP, w.into_inner())
 }
 
 /// What we publish about OURSELVES as a source for a file. HighID only for
@@ -1668,8 +1730,9 @@ mod tests {
             size: 1_500_000,
             complete_sources: 7,
             file_type: "Iso".to_string(),
+            aich_root: None,
         };
-        let (op, p) = build_publish_key_req(&kw, std::slice::from_ref(&entry));
+        let (op, p) = build_publish_key_req(&kw, std::slice::from_ref(&entry), KADEMLIA_VERSION);
         assert_eq!(op, OP_PUBLISH_KEY_REQ);
         assert_eq!(&p[..16], &kw.to_wire()[..], "keyword target first");
         assert_eq!(u16::from_le_bytes([p[16], p[17]]), 1, "count = 1");
@@ -1701,9 +1764,13 @@ mod tests {
             size: big,
             complete_sources: 1,
             file_type: String::new(),
+            aich_root: None,
         };
-        let (_, p) =
-            build_publish_key_req(&Kad128::from_hash(&[0; 16]), std::slice::from_ref(&entry));
+        let (_, p) = build_publish_key_req(
+            &Kad128::from_hash(&[0; 16]),
+            std::slice::from_ref(&entry),
+            KADEMLIA_VERSION,
+        );
         let mut r = Reader::new(&p[34..]);
         let tags = read_kad_taglist(&mut r).unwrap();
         let f = SearchResult {
@@ -1750,14 +1817,105 @@ mod tests {
                 size: 1,
                 complete_sources: 0,
                 file_type: String::new(),
+                aich_root: None,
             })
             .collect();
-        let (_, p) = build_publish_key_req(&Kad128::from_hash(&[0; 16]), &entries);
+        let (_, p) =
+            build_publish_key_req(&Kad128::from_hash(&[0; 16]), &entries, KADEMLIA_VERSION);
         assert_eq!(
             u16::from_le_bytes([p[16], p[17]]),
             PUBLISH_KEY_FILES_PER_PACKET as u16,
             "one packet never carries more than 50 files"
         );
+    }
+
+    /// THE AICH PUBLISH TAG IS GATED ON THE TARGET'S VERSION, NOT OURS.
+    ///
+    /// eMule emits `TAG_KADAICHHASHPUB` only when
+    /// `byTargetKadVersion >= KADEMLIA_VERSION9_50a && HasAICHHash()`
+    /// (Search.cpp:1601-1603) - our own declared version is never consulted, so
+    /// padMule can publish it while still declaring 8. The bytes below are
+    /// LITERAL, never re-derived from the constants under test: type `0x0A`
+    /// (TT_BSOB), nameLen `01 00` LE, name `0x36`, BSOB length `0x14` = 20, then
+    /// the 20 raw hash bytes - the exact shape the indexer validates
+    /// (`IsBsob() && GetBsobSize() == CAICHHash::GetHashSize()`,
+    /// KademliaUDPListener.cpp:1333).
+    #[test]
+    fn the_aich_publish_tag_goes_only_to_a_version_9_target() {
+        let root = [0x5Cu8; 20];
+        let with_aich = KeywordEntry {
+            file_id: Kad128::from_hash(&[0xBB; 16]),
+            name: "ubuntu.iso".to_string(),
+            size: 1_500_000,
+            complete_sources: 7,
+            file_type: String::new(),
+            aich_root: Some(root),
+        };
+        let kw = Kad128::from_hash(&[0xAA; 16]);
+
+        let mut expected = vec![0x0A, 0x01, 0x00, 0x36, 0x14];
+        expected.extend_from_slice(&root);
+
+        let (_, to_v9) = build_publish_key_req(&kw, std::slice::from_ref(&with_aich), 9);
+        assert!(
+            to_v9.windows(expected.len()).any(|w| w == expected),
+            "a version-9 target must receive 0x0A 01 00 36 14 <20 bytes>"
+        );
+
+        let (_, to_v8) = build_publish_key_req(&kw, std::slice::from_ref(&with_aich), 8);
+        assert!(
+            !to_v8.windows(expected.len()).any(|w| w == expected),
+            "a version-8 target has no arm for the tag and must not receive it"
+        );
+        // And the tag is the ONLY difference: an older target still gets the
+        // byte-identical frame padMule sent before this feature existed.
+        let without = KeywordEntry {
+            aich_root: None,
+            ..with_aich.clone()
+        };
+        let (_, baseline) = build_publish_key_req(&kw, std::slice::from_ref(&without), 8);
+        assert_eq!(to_v8, baseline, "the v8 frame must not move");
+
+        // No AICH root: omitted even at 9 (eMule's `HasAICHHash()` half).
+        let (_, none_at_v9) = build_publish_key_req(&kw, std::slice::from_ref(&without), 9);
+        assert!(
+            !none_at_v9
+                .windows(5)
+                .any(|w| w[..4] == [0x0A, 0x01, 0x00, 0x36]),
+            "no AICH hash means no tag, whatever the target version"
+        );
+        // The tag count byte tracks the tag list, or the whole record desyncs.
+        let mut r = Reader::new(&to_v9[34..]);
+        let tags = read_kad_taglist(&mut r).unwrap();
+        assert_eq!(
+            tags.iter().filter(|t| t.name == TAG_KADAICHHASHPUB).count(),
+            1,
+            "exactly one AICH tag, and the count byte must have counted it"
+        );
+        // It still reads back as a plain file result - the AICH tag must not
+        // disturb the fields a searcher actually renders.
+        let f = SearchResult {
+            answer: with_aich.file_id,
+            tags,
+        }
+        .as_file()
+        .expect("a v9 publish is still a readable file record");
+        assert_eq!(f.name, "ubuntu.iso");
+        assert_eq!(f.size, 1_500_000);
+    }
+
+    /// KADEMLIA2_FIREWALLUDP is three bytes and every one is read: the errorcode
+    /// tells the requester our answer may be biased, and the echoed port tells it
+    /// WHICH of its candidate ports got through (UDPFirewallTester.cpp:138-145).
+    /// Literal bytes, not the constants under test.
+    #[test]
+    fn the_firewall_udp_answer_is_errorcode_then_the_echoed_port() {
+        let (op, p) = build_firewall_udp(false, 0x1234);
+        assert_eq!(op, 0x62, "KADEMLIA2_FIREWALLUDP (opcodes.h:619)");
+        assert_eq!(p, vec![0x00, 0x34, 0x12], "errorcode 0, port LE");
+
+        let (_, known) = build_firewall_udp(true, 4672);
+        assert_eq!(known, vec![0x01, 0x40, 0x12], "errorcode 1 when known");
     }
 
     #[test]

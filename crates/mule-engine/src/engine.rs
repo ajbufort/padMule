@@ -27,7 +27,7 @@ use crate::credit_store::{now_secs, CreditStore};
 use crate::fetch::{download_file, HelloFn, ManagerConfig, PeerSource, SourceRegistry};
 use crate::framed::FramedStream;
 use crate::identity::NodeIdentity;
-use crate::kad_live::KadNode;
+use crate::kad_live::{KadFwCheckCtx, KadNode};
 use crate::known2_store::Known2Store;
 use crate::link::ServerLink;
 use crate::lock::LockRecover;
@@ -456,6 +456,25 @@ fn apply_search_filters(mut ranked: Vec<RankedFile>, filters: &SearchFilters) ->
 /// silent, waiting for us to drive the download of one of OUR files. This
 /// timeout is what routes each connection to the right half of the listener.
 const SERVE_PEEK: Duration = Duration::from_secs(3);
+
+/// How long we hold an inbound connection OPEN after answering
+/// OP_FWCHECKUDPREQ, so our TCP FIN cannot beat our own UDP answer to the
+/// requester. See the `InboundKind::KadFwCheck` arm in `start_listener` for what
+/// losing that race costs the peer. eMule's answerer leaves the socket to a 40s
+/// idle timeout; 10s is well past any plausible loopback-to-internet delivery
+/// and bounds what one connection can hold.
+const FWCHECK_LINGER: Duration = Duration::from_secs(10);
+
+/// Packets we will read during [`FWCHECK_LINGER`] before giving up on the peer
+/// closing. An honest requester sends NOTHING after 0xA7, so the first read
+/// blocks until it closes or the budget expires; this only bounds a peer that
+/// keeps talking (the reason `classify_inbound` caps its drain too).
+const FWCHECK_LINGER_PKTS: usize = 8;
+
+/// One shared file as the Kad publisher sees it: `(hash, size, name, keywords,
+/// aich_root)`. Projected out from under the `shared` lock so the publish walk
+/// never holds it, which is why it is a tuple rather than a borrow.
+type PublishableFile = ([u8; 16], u64, String, Vec<String>, Option<[u8; 20]>);
 
 /// The most simultaneous uploads we grant. Modest by desktop standards (aMule
 /// floors at 20) because an iPad on a phone uplink is not a seedbox. A peer
@@ -1827,6 +1846,14 @@ pub struct Engine {
     connection: Option<ServerInfo>,
     /// The live Kad node (owns the UDP socket), once bootstrapped.
     kad: Option<KadNode>,
+    /// The handle an inbound eD2k connection answers OP_FWCHECKUDPREQ through,
+    /// mirroring `kad` exactly - `set_kad` is the ONE writer, so "Kad is down"
+    /// becomes `upgrade() -> None` and the refusal is correct BY CONSTRUCTION
+    /// rather than by a remembered check. Shared (not cloned) into the accept
+    /// loop, for the same reason the nickname is read per connection: a handle
+    /// snapshotted at listener start would answer with a socket that
+    /// pause/resume already replaced.
+    kad_fw: Arc<std::sync::Mutex<Option<KadFwCheckCtx>>>,
     /// The last HighID client id we were assigned, which IS our public address.
     /// Kept ONLY to notice a change; never emitted, never rendered.
     last_public_id: Option<u32>,
@@ -2016,6 +2043,7 @@ impl Engine {
             server: None,
             connection: None,
             kad: None,
+            kad_fw: Arc::new(std::sync::Mutex::new(None)),
             last_public_id: None,
             sharing_paused_for_ip_change: ip_paused,
             listen_port: TCP_PORT,
@@ -2707,6 +2735,7 @@ impl Engine {
         let server_probe_ip = Arc::clone(&self.server_probe_ip);
         let known2 = Arc::clone(&self.known2);
         let allow_browse = Arc::clone(&self.allow_browse);
+        let kad_fw = Arc::clone(&self.kad_fw);
         let inbound = Arc::new(Semaphore::new(MAX_INBOUND_CONNS));
         let per_ip: PerIpConns = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         let handle = tokio::spawn(async move {
@@ -2795,6 +2824,7 @@ impl Engine {
                 let ip_filter = ip_filter.clone();
                 let known2 = Arc::clone(&known2);
                 let allow_browse = Arc::clone(&allow_browse);
+                let kad_fw = Arc::clone(&kad_fw);
                 tokio::spawn(async move {
                     let _permit = permit;
                     let _ip_slot = ip_slot;
@@ -2942,6 +2972,53 @@ impl Engine {
                                 },
                             )
                             .await;
+                        }
+                        // A peer is testing whether ITS Kad UDP port is open and
+                        // needs us to send an unsolicited datagram at it. This
+                        // is the version-6 obligation `peer::HELLO_KAD_VERSION`
+                        // now claims, so it has to be honoured here or the claim
+                        // is a lie that COSTS the requester (a dropped check is
+                        // a counted failure, and two of those declare it
+                        // firewalled - BaseClient.cpp:1206-1207,
+                        // UDPFirewallTester.cpp:38,150-160).
+                        InboundKind::KadFwCheck { payload } => {
+                            // CLONED OUT of the shared slot and the guard
+                            // dropped before any await - a std lock must never
+                            // straddle one. The clone carries a `Weak` socket,
+                            // so holding it through the linger below cannot pin
+                            // the Kad port past a pause (see `KadFwCheckCtx`).
+                            let ctx = kad_fw.lock_recover().clone();
+                            // BOUND FOR THE WHOLE ARM, deliberately: the handle
+                            // stays alive across the linger below, which is the
+                            // shape the `Weak` has to survive. Binding it
+                            // tighter would hide the very hazard its type is
+                            // chosen to prevent.
+                            let sent = match &ctx {
+                                Some(c) => c.answer(&payload, peer).await,
+                                None => 0, // Kad is not running: answer nothing
+                            };
+                            // THE LINGER, and it is not politeness. Our UDP
+                            // answer and our TCP FIN race; if the FIN wins, the
+                            // requester's `Disconnected` books a COUNTED FAILURE
+                            // while its KadState is still KS_FWCHECK_UDP, and
+                            // the answer that arrives afterwards is DISCARDED
+                            // (`if (!IsFWCheckUDPRunning()) return;`,
+                            // UDPFirewallTester.cpp:117-118). eMule never hits
+                            // this because its answerer leaves the socket to a
+                            // 40s idle timeout. Hold until the peer closes or
+                            // the budget expires; the cost is one of
+                            // MAX_INBOUND_CONNS permits.
+                            if sent > 0 {
+                                let _ = timeout(FWCHECK_LINGER, async {
+                                    for _ in 0..FWCHECK_LINGER_PKTS {
+                                        if fs.read_packet_unpacked().await.is_err() {
+                                            return; // the peer closed: race won
+                                        }
+                                    }
+                                })
+                                .await;
+                            }
+                            drop(ctx); // explicit: the handle outlived the linger
                         }
                         // Spoke, but not an upload request: nothing we can do.
                         InboundKind::Other => {}
@@ -5852,21 +5929,25 @@ impl Engine {
         // firewalled node (no public id) publishes keywords but not sources.
         let can_publish_source = self.last_public_id.is_some();
         let now = u64::from(now_secs());
-        // (hash, size, name, keywords) for each shared file.
-        let files: Vec<([u8; 16], u64, String, Vec<String>)> = {
+        // (hash, size, name, keywords, aich_root) for each shared file. The AICH
+        // root rides along because a v9 target gets it published as
+        // TAG_KADAICHHASHPUB; it is `None` for any file we have not hashed an
+        // AICH tree for, which omits the tag exactly as eMule's `HasAICHHash()`
+        // does.
+        let files: Vec<PublishableFile> = {
             let shared = self.shared.lock().await;
             shared
                 .iter()
                 .map(|s| {
                     let name = String::from_utf8_lossy(&s.name).into_owned();
                     let words = mule_kad::kad_keywords(&name);
-                    (s.hash, s.size, name, words)
+                    (s.hash, s.size, name, words, s.aich_root)
                 })
                 .collect()
         };
         let schedule_input: Vec<([u8; 16], Vec<String>)> = files
             .iter()
-            .map(|(h, _, _, words)| (*h, words.clone()))
+            .map(|(h, _, _, words, _)| (*h, words.clone()))
             .collect();
         self.publish_schedule
             .refill(now, &schedule_input, can_publish_source);
@@ -5890,7 +5971,7 @@ impl Engine {
 
         let stored = match job {
             crate::kad_publish::PublishJob::Source(hash) => {
-                let Some((_, size, _, _)) = files.iter().find(|(h, ..)| *h == hash) else {
+                let Some((_, size, ..)) = files.iter().find(|(h, ..)| *h == hash) else {
                     return 0; // unshared between refill and now
                 };
                 let target = Kad128::from_hash(&hash);
@@ -5907,7 +5988,8 @@ impl Engine {
                 .await
             }
             crate::kad_publish::PublishJob::Keyword { file, word } => {
-                let Some((_, size, name, _)) = files.iter().find(|(h, ..)| *h == file) else {
+                let Some((_, size, name, _, aich_root)) = files.iter().find(|(h, ..)| *h == file)
+                else {
                     return 0;
                 };
                 let target = kad_keyword_target(&word);
@@ -5922,6 +6004,8 @@ impl Engine {
                     // the filename, which IS published). Faithful to eMule's
                     // note that the format tag is no longer sent (Search.cpp).
                     file_type: String::new(),
+                    // Emitted only to a v9 target, and only when we have one.
+                    aich_root: *aich_root,
                 };
                 timeout(
                     KAD_PUBLISH_BUDGET,
@@ -6082,6 +6166,11 @@ impl Engine {
     /// comment asking callers to remember it.
     fn set_kad(&mut self, node: Option<KadNode>) {
         self.absorb_kad_routing();
+        // THE FIREWALL-CHECK HANDLE, for the same "cannot be forgotten" reason.
+        // `Some(node)` fills it, `None` clears it, and nothing else writes it -
+        // so the answerer can never outlive the socket it would answer through,
+        // and Kad being off needs no separate check anywhere.
+        *self.kad_fw.lock_recover() = node.as_ref().map(KadNode::fw_check_ctx);
         self.kad = node;
         // Immediate, not left to the next heartbeat: pause/resume swaps the live
         // table wholesale and a stale count across that boundary is exactly the
@@ -11389,38 +11478,200 @@ mod tests {
         );
     }
 
-    /// A KAD VERSION IS A PROMISE ABOUT TWO CLIENT-TCP OPCODES.
+    /// A KAD VERSION IS A PROMISE ABOUT CLIENT-TCP OPCODES, AND WE NOW KEEP IT.
     ///
-    /// eMule's own table says so: version 6 "needs to support: OP_FWCHECKUDPREQ
-    /// (!)" and version 7 "needs to support OP_KAD_FWTCPCHECK_ACK"
-    /// (opcodes.h:27-28). padMule answers NEITHER (0xA7 is not in
-    /// `is_upload_request`, so it does not even open a serve session, and there
-    /// is no KADEMLIA2_FIREWALLUDP sender anywhere in `mule-kad`) - so it must
-    /// not claim a version that promises them. The version the hello carries is
-    /// exactly what eMule reads before deciding whether to ask:
-    /// `GetKadVersion() <= KADEMLIA_VERSION5_48a || GetKadPort() == 0` cancels
-    /// the check outright (BaseClient.cpp:3129-3131; aMule 3.0.1
-    /// BaseClient.cpp:2908 is the same guard).
+    /// eMule's table says version 6 "needs to support: OP_FWCHECKUDPREQ (!)"
+    /// (opcodes.h:27), and the promise is the ONLY reason the number is
+    /// interesting. This test therefore asserts BOTH halves together, because
+    /// they are only safe together: declaring 5 is free (the peer bails before
+    /// asking and books the test CANCELLED - BaseClient.cpp:3129-3132,
+    /// UDPFirewallTester.cpp:125,165-167), but declaring 8 while silent is NOT -
+    /// the peer asks, we drop the connection, and `Disconnected` books a COUNTED
+    /// failure (BaseClient.cpp:1206-1207). Two of those and the requester
+    /// declares ITSELF UDP-firewalled (UDPFirewallTester.cpp:38,150-160). Two
+    /// silent padMules could push a healthy eMule into a false verdict.
     ///
-    /// The bound below is the AUTHORITY's number (5 = KADEMLIA_VERSION5_48a),
-    /// deliberately not `peer::KADEMLIA_VERSION` - an assertion written against
-    /// our own constant moves with it and can never catch it changing.
+    /// The predecessor of this test asserted `kad_version <= 5`. It was NOT
+    /// relaxed to `<= 8` - that would have left the bump untied to the answerer
+    /// and let a future edit delete the answerer while the claim stayed. The
+    /// invariant is the CONJUNCTION.
+    ///
+    /// The numbers are LITERALS, never re-derived from `peer::HELLO_KAD_VERSION`
+    /// (which would move with the constant and could never catch it changing).
+    /// 0x4B8 is what THE LISTENER emits, not the `baseline_misc_options2`
+    /// default: the accept loop builds its hello `.with_crypt_supported()`, which
+    /// sets bit 7 on top of the 0x438 baseline that `peer.rs` pins separately.
+    /// Both are byte-equal to a stock aMule 3.0.1 in the same configuration
+    /// (Constants.h:29 -> Kad version 8).
     #[tokio::test]
-    async fn the_hello_answer_promises_no_kad_opcode_padmule_cannot_answer() {
+    async fn the_hello_answer_declares_8_and_padmule_answers_what_8_promises() {
         let answer = hello_answer_off_the_listener("hello-kadversion").await;
         let misc2 = hello_tag_u32(&answer, CT_EMULE_MISCOPTIONS2_TAG)
             .expect("every padMule hello carries CT_EMULE_MISCOPTIONS2");
-        let kad_version = misc2 & 0xF;
-        assert!(
-            kad_version <= 5,
-            "declared Kad version {kad_version} promises OP_FWCHECKUDPREQ (>= 6) \
-             or OP_KAD_FWTCPCHECK_ACK (>= 7), which padMule does not answer"
+        assert_eq!(
+            misc2, 0x4B8,
+            "the whole tag, not just the nibble: 0x4B5 was the honest value \
+             while 0xA7 went unanswered, and 0x4B8 is what aMule 3.0.1 sends \
+             with the crypt layer supported"
         );
+        assert_eq!(misc2 & 0xF, 8, "and the Kad nibble specifically is 8");
+
+        // THE OTHER HALF OF THE PROMISE, checked through the PRODUCTION
+        // classifier: a real OP_FWCHECKUDPREQ on a real stream must reach the
+        // answerer arm. Delete the arm and this goes red alongside the
+        // declaration, which is the coupling the test exists for.
+        use tokio::io::duplex;
+        let (client, server) = duplex(8192);
+        let mut server_fs = FramedStream::plaintext_with_prefix(server, &[]);
+        let mut client_fs = FramedStream::plaintext_with_prefix(client, &[]);
+        client_fs
+            .write_packet(&Packet::new(0xC5, 0xA7, vec![0x40, 0x12, 0, 0, 0, 0, 0, 0]))
+            .await
+            .unwrap();
         assert!(
-            kad_version > 1,
+            matches!(
+                classify_inbound(&mut server_fs, None, Duration::from_millis(200)).await,
+                InboundKind::KadFwCheck { .. }
+            ),
+            "declaring Kad version 8 obliges us to ANSWER OP_FWCHECKUDPREQ; the \
+             classifier must not drop it"
+        );
+
+        assert!(
+            misc2 & 0xF > 1,
             "still > 1, or a peer will not even bootstrap Kad from us \
              (eMule ListenSocket.cpp:353, aMule BaseClient.cpp:713)"
         );
+    }
+
+    /// A HELD INBOUND CONNECTION MUST NOT PIN THE KAD UDP PORT.
+    ///
+    /// This is the test that matters about the firewall-check answerer, and it is
+    /// about lifetimes, not bytes. The Kad socket binds a FIXED port
+    /// (`self.kad_port`) and `resume()` rebinds it; per-connection tasks are
+    /// DETACHED (`tokio::spawn` in `start_listener`) and `pause()` aborts only
+    /// the accept loop, so nothing else bounds their lifetime. If the answerer
+    /// held a STRONG `Arc<UdpSocket>` past `pause()`, that rebind would fail into
+    /// "Kad UDP port unavailable" and Kad would be silently dead for the rest of
+    /// the session - the worst shape of bug this feature can produce, because
+    /// everything else keeps working.
+    ///
+    /// Two things keep it from happening and BOTH are exercised here: `set_kad`
+    /// clears the shared slot (so the handle does not outlive the node), and the
+    /// handle inside it is a `Weak` upgraded only for one synchronous send (so a
+    /// strong reference can never straddle an await). The connection is
+    /// deliberately still OPEN and lingering across the whole pause/resume.
+    ///
+    /// **HOW A LEAK IS DETECTED, and it is not by watching the rebind fail.**
+    /// MEASURED 2026-08-12, refuting the obvious assumption: `bind_kad_socket`
+    /// sets `SO_REUSEADDR` (kad_live.rs:147), and on Linux two `SO_REUSEADDR` UDP
+    /// sockets bind the same port QUITE HAPPILY - so `resume()` would rebind
+    /// successfully OVER a leaked socket and emit nothing. The damage would be
+    /// silent instead of loud: two sockets on one port, inbound Kad datagrams
+    /// delivered to whichever the kernel picks, and half of them landing on the
+    /// aborted read loop. The probe that does work is a PLAIN bind (no
+    /// `SO_REUSEADDR`), which fails with `AddrInUse` while any socket holds the
+    /// port and succeeds the moment the last one is closed. That is what this
+    /// test asserts between the pause and the resume.
+    ///
+    /// UPnP is turned off because a unit test has no gateway; it is not part of
+    /// the path under test.
+    #[tokio::test]
+    async fn a_held_firewall_check_connection_does_not_pin_the_kad_port_across_resume() {
+        let dir = tmp("fwcheck-lifetime");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut engine, mut rx) = Engine::new(&dir).unwrap();
+        engine.set_upnp_enabled(false);
+        let tcp = free_local_port();
+        let kad_port = free_local_port();
+        engine.set_ports(tcp, tcp, kad_port, kad_port);
+        // One routable Kad2 contact, so `start_kad` has a dial list and reaches
+        // its `set_kad(Some(node))`. It never answers; that is fine - the bind is
+        // what this test is about.
+        engine.routing.load_nodes(&[KadContact {
+            id: Kad128::from_hash(&[0x5A; 16]),
+            ip: 0x0808_0404, // 8.8.4.4 - routable and acceptable
+            udp_port: 4672,
+            tcp_port: 4662,
+            version: 8,
+            udp_key: 0,
+            udp_key_ip: 0,
+            verified: false,
+        }]);
+        // What `start()` would have done, without its server search.
+        engine.set_state(EngineState::Running);
+        engine.start_listener().await;
+        engine.start_kad().await;
+        assert!(
+            engine.kad.is_some(),
+            "Kad must be UP before the pause, or the rebind below proves nothing"
+        );
+
+        // A real peer dials us, hellos, asks for a UDP firewall check, and then
+        // does NOT close - exactly the state the linger holds it in.
+        let stream = tokio::net::TcpStream::connect(("127.0.0.1", tcp))
+            .await
+            .expect("the listener must be up");
+        let mut fs = crate::framed::FramedStream::new(stream);
+        let me = HelloInfo::baseline([0x77; 16], 0, 4662, 4672, "fwprobe");
+        timeout(
+            Duration::from_secs(5),
+            crate::peer_conn::peer_handshake_outbound(&mut fs, &me),
+        )
+        .await
+        .expect("the listener must answer within the budget")
+        .expect("a HELLOANSWER, not an error");
+        fs.write_packet(&Packet::new(
+            0xC5,
+            0xA7,
+            vec![0x40, 0x12, 0x39, 0x30, 0xEF, 0xBE, 0xAD, 0xDE],
+        ))
+        .await
+        .unwrap();
+        // Let the connection task answer and settle into the linger.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let _ = drain(&mut rx).await; // clear the start-up chatter
+        engine.pause().await;
+
+        // THE PORT MUST BE GENUINELY FREE NOW, with the firewall-check
+        // connection still open and lingering. Bounded, because `KadNode::drop`
+        // ABORTS the read loop and abort is asynchronous - the task holds the
+        // last legitimate strong reference until the runtime reaps it.
+        let mut released = false;
+        for _ in 0..200 {
+            if let Ok(probe) = std::net::UdpSocket::bind(("0.0.0.0", kad_port)) {
+                drop(probe); // free it again before resume() wants it
+                released = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            released,
+            "the Kad UDP port was still held 2s after pause(), with only a \
+             lingering inbound firewall-check connection alive - that connection \
+             is pinning the socket, and SO_REUSEADDR means resume() would rebind \
+             over it and say nothing"
+        );
+
+        engine.resume().await;
+
+        // STILL OPEN across the whole boundary - dropped only now, after the
+        // assertions have been made against a live connection.
+        let evs = drain(&mut rx).await;
+        assert!(
+            engine.kad.is_some(),
+            "Kad did not come back after the resume; events {evs:?}"
+        );
+        assert!(
+            !evs.iter()
+                .any(|e| matches!(e, EngineEvent::Server(s) if s == "Kad UDP port unavailable")),
+            "the rebind reported the port still in use; events {evs:?}"
+        );
+        drop(fs);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// THE ACCEPT LOOP HANDS THE SESSION THE KEY WE HAVE ON FILE - the CALLER,

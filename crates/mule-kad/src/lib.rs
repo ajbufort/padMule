@@ -17,7 +17,7 @@ pub use hardening::{
 };
 pub use lookup::{CSearch, ALPHA_QUERY};
 pub use message::{
-    build_bootstrap_req, build_bootstrap_res, build_hello_req, build_hello_res,
+    build_bootstrap_req, build_bootstrap_res, build_firewall_udp, build_hello_req, build_hello_res,
     build_hello_res_ack, build_kad2_req, build_kad2_res, build_ping, build_pong,
     build_publish_key_req, build_publish_source_req, build_search_expression_and,
     build_search_key_req, build_search_key_req_restrictive, build_search_res,
@@ -25,13 +25,15 @@ pub use message::{
     kad_primary_keyword, parse_bootstrap_res, parse_hello, parse_hello_res_ack, parse_kad2_req,
     parse_kad2_res, parse_publish_res, parse_search_res, BootstrapRes, FileResult, Hello, Kad2Req,
     Kad2Res, KadTag, KadTagValue, KeywordEntry, PublishRes, SearchRes, SearchResult, Source,
-    SourceEntry, WireContact, EXPR_MAX_DEPTH, KADEMLIA_VERSION, KADEMLIA_VERSION_AMULE,
-    KADEMLIA_VERSION_EMULE, KAD_FIND_NODE, KAD_FIND_VALUE, KAD_FIND_VALUE_MORE, KAD_STORE,
-    OP_BOOTSTRAP_REQ, OP_BOOTSTRAP_RES, OP_HELLO_REQ, OP_HELLO_RES, OP_HELLO_RES_ACK, OP_KAD2_REQ,
-    OP_KAD2_RES, OP_PING, OP_PONG, OP_PUBLISH_KEY_REQ, OP_PUBLISH_RES, OP_PUBLISH_RES_ACK,
+    SourceEntry, WireContact, AICH_HASH_SIZE, EXPR_MAX_DEPTH, KADEMLIA_VERSION,
+    KADEMLIA_VERSION9_50A, KADEMLIA_VERSION_AMULE, KADEMLIA_VERSION_EMULE, KAD_FIND_NODE,
+    KAD_FIND_VALUE, KAD_FIND_VALUE_MORE, KAD_STORE, OP_BOOTSTRAP_REQ, OP_BOOTSTRAP_RES,
+    OP_FIREWALL_UDP, OP_HELLO_REQ, OP_HELLO_RES, OP_HELLO_RES_ACK, OP_KAD2_REQ, OP_KAD2_RES,
+    OP_PING, OP_PONG, OP_PUBLISH_KEY_REQ, OP_PUBLISH_RES, OP_PUBLISH_RES_ACK,
     OP_PUBLISH_SOURCE_REQ, OP_SEARCH_KEY_REQ, OP_SEARCH_RES, OP_SEARCH_SOURCE_REQ,
     PUBLISH_KEY_FILES_PER_PACKET, SEARCH_KEY_RESTRICTIVE, TAG_FILENAME, TAG_FILESIZE, TAG_FILETYPE,
-    TAG_KADMISCOPTIONS, TAG_SOURCEIP, TAG_SOURCEPORT, TAG_SOURCES, TAG_SOURCETYPE, TAG_SOURCEUPORT,
+    TAG_KADAICHHASHPUB, TAG_KADMISCOPTIONS, TAG_SOURCEIP, TAG_SOURCEPORT, TAG_SOURCES,
+    TAG_SOURCETYPE, TAG_SOURCEUPORT,
 };
 pub use routing::{
     Contact, RoutingTable, SweepOutcome, ALIVE_LEASE_SECS, DIVERSITY_STARVED_BELOW, K,

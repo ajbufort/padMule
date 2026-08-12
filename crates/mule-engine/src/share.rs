@@ -604,9 +604,22 @@ pub enum InboundKind {
     /// Silent (after any secure-ident): a called-back LowID source. Drive the
     /// download of one of OUR files from it.
     Source,
+    /// A peer is running its Kad UDP firewall check against us and sent
+    /// OP_FWCHECKUDPREQ (0xA7). `payload` is the raw
+    /// `<internKadPort u16><externKadPort u16><kadUDPKey u32>`; the answer goes
+    /// out of the KAD UDP SOCKET, not this connection, so it is the caller's job
+    /// (the engine's connection task, which holds that handle) - this module
+    /// stays socket-free.
+    KadFwCheck { payload: Vec<u8> },
     /// Spoke something that is neither secure-ident nor a file request; drop it.
     Other,
 }
+
+/// eMule OP_FWCHECKUDPREQ (opcodes.h:283), protocol 0xC5:
+/// `<Intern_Port 2><Extern_Port 2><KadUDPKey 4>`. Support is what Kad version 6
+/// promises (opcodes.h:27), which is why declaring 6 or above without answering
+/// it is not merely impolite - see `peer::HELLO_KAD_VERSION`.
+pub const OP_FWCHECKUDPREQ: u8 = 0xA7;
 
 /// Classify an inbound peer as a leecher vs a called-back source, running OUR side
 /// of secure identification along the way when `sec` is `Some`.
@@ -650,6 +663,22 @@ where
         match timeout(peek, fs.read_packet_unpacked()).await {
             Ok(Ok(pkt)) if is_upload_request(pkt.opcode) => {
                 return InboundKind::Leecher { first: pkt, sec };
+            }
+            // THE PROTOCOL BYTE IS PART OF THE MATCH. 0xA7 is only
+            // OP_FWCHECKUDPREQ under PROT_EMULE (0xC5); under PROT_EDONKEY it is
+            // somebody else's opcode entirely, and a classifier that ignored the
+            // header would answer a stranger's packet with a Kad datagram.
+            //
+            // Like the browse and AICH openers above, this arrives as the FIRST
+            // packet on a brand-new connection: `SendFirewallCheckUDPRequest`
+            // hands it to `SafeConnectAndSendPacket` (BaseClient.cpp:3141), so
+            // there is no session to open and nothing follows it.
+            Ok(Ok(pkt))
+                if pkt.protocol == mule_proto::PROT_EMULE && pkt.opcode == OP_FWCHECKUDPREQ =>
+            {
+                return InboundKind::KadFwCheck {
+                    payload: pkt.payload,
+                };
             }
             Ok(Ok(pkt)) if is_secident(pkt.opcode) => {
                 if pkt.payload.len() > MAX_SECIDENT_PAYLOAD {
@@ -2284,6 +2313,56 @@ mod tests {
                 _ => panic!("opcode 0x{want:02x} must open a serve session, not be dropped"),
             }
         }
+    }
+
+    /// 0xA7 OPENS ITS OWN ARM, AND ONLY UNDER 0xC5.
+    ///
+    /// A Kad UDP firewall check arrives as the first packet after the hello on a
+    /// fresh connection (`SafeConnectAndSendPacket`, BaseClient.cpp:3141), so
+    /// the classifier is the only thing standing between it and a dropped
+    /// connection - and a dropped one is a COUNTED failure for the requester
+    /// (BaseClient.cpp:1206-1207), not a silent no-op. The payload must arrive
+    /// intact, because the answer is built from it.
+    ///
+    /// The PROT_EDONKEY case is half the point: 0xA7 is only OP_FWCHECKUDPREQ
+    /// under the eMule extended protocol byte, and a classifier that matched on
+    /// the opcode alone would fire a Kad datagram at a stranger's packet.
+    #[tokio::test]
+    async fn a_kad_firewall_check_opens_its_own_arm_and_only_under_prot_emule() {
+        use tokio::io::duplex;
+
+        let payload = vec![0x40, 0x12, 0x39, 0x30, 0xDE, 0xAD, 0xBE, 0xEF];
+
+        let (client, server) = duplex(8192);
+        let mut server_fs = FramedStream::plaintext_with_prefix(server, &[]);
+        let mut client_fs = FramedStream::plaintext_with_prefix(client, &[]);
+        client_fs
+            .write_packet(&Packet::new(mule_proto::PROT_EMULE, 0xA7, payload.clone()))
+            .await
+            .unwrap();
+        match classify_inbound(&mut server_fs, None, Duration::from_millis(200)).await {
+            InboundKind::KadFwCheck { payload: got } => assert_eq!(
+                got, payload,
+                "the 8-byte request body must reach the answerer unchanged"
+            ),
+            _ => panic!("OP_FWCHECKUDPREQ must not be dropped as Other"),
+        }
+
+        // Same opcode, base protocol byte: NOT a firewall check.
+        let (client, server) = duplex(8192);
+        let mut server_fs = FramedStream::plaintext_with_prefix(server, &[]);
+        let mut client_fs = FramedStream::plaintext_with_prefix(client, &[]);
+        client_fs
+            .write_packet(&Packet::new(mule_proto::PROT_EDONKEY, 0xA7, payload))
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                classify_inbound(&mut server_fs, None, Duration::from_millis(200)).await,
+                InboundKind::Other
+            ),
+            "0xA7 under PROT_EDONKEY is somebody else's opcode"
+        );
     }
 
     #[tokio::test]

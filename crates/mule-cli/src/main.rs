@@ -1165,6 +1165,13 @@ async fn cmd_serve_file(port: u16, path: &str, eserver: Option<(String, u16)>) {
                     eprintln!("  peer {peer} stayed silent (a source, not a leecher); closing");
                     return;
                 }
+                InboundKind::KadFwCheck { .. } => {
+                    // The engine answers this out of its live Kad socket; this
+                    // serve harness runs no Kad node, so there is nothing to
+                    // answer WITH. Say so rather than pretend.
+                    eprintln!("  peer {peer} asked for a Kad UDP firewall check; no Kad node here");
+                    return;
+                }
             };
             let shared = vec![SharedFile {
                 hash,
@@ -2362,6 +2369,9 @@ async fn cmd_kad_publish(
         size,
         complete_sources: 1,
         file_type: String::new(),
+        // The oracle publishes no AICH root: this harness has no hashset for a
+        // synthetic file, and `None` is what omits the tag.
+        aich_root: None,
     };
     match node
         .publish_keyword(&target, &[entry], Duration::from_millis(1400))
