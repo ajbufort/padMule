@@ -2410,11 +2410,24 @@ final class EngineModel: ObservableObject {
         }
     }
 
-    /// The canonical public server-list URL. Plain http, because that is what the
-    /// endpoint publishes; an https:// source is equally usable since 2026-08-10
-    /// (the engine fetches it with rustls). Either way the fetch is a raw socket
-    /// inside the Rust engine, never URLSession, so no ATS exemption is involved.
-    nonisolated static let defaultServerListUrl = "http://upd.emule-security.org/server.met"
+    /// The canonical public server-list URL, over TLS - the same scheme as the
+    /// engine's built-in bootstrap constants (`mule_engine::bootstrap`), which the
+    /// host answers on 443 with the same file. The fetch is a raw socket inside
+    /// the Rust engine, never URLSession, so no ATS exemption is involved.
+    ///
+    /// NOT DOWNGRADED, and that differs from the built-in bootstrap on purpose. A
+    /// URL that reaches the engine from this screen is a USER url, so
+    /// `Engine::update_server_list` fetches it exactly as written; only the
+    /// built-in bootstrap retries in the clear, and only when the TLS attempt
+    /// never landed. So if this host's TLS ever breaks, a cold start still gets a
+    /// list while "Update all lists" reports unreachable - an explicit https
+    /// request is not silently weakened, and a user who wants plaintext can add
+    /// the `http://` URL by hand.
+    ///
+    /// FRESH INSTALLS ONLY: `SettingsDefaults.register(defaults:)` supplies a
+    /// value for an ABSENT key, so a device that already wrote
+    /// `padMule.serverListUrls` keeps the URL it stored.
+    nonisolated static let defaultServerListUrl = "https://upd.emule-security.org/server.met"
 
     /// The name padMule announces when the user has not chosen one. Must equal
     /// `mule_engine::DEFAULT_NICK`, which is the value the engine falls back to;
