@@ -2383,9 +2383,27 @@ impl Engine {
     /// Allow or refuse library browsing (eMule `CanSeeShares`). Takes effect on
     /// the next request; a browse already answered cannot be recalled.
     ///
-    /// A refusal answers with an EMPTY LIST, never silence and never a distinct
-    /// opcode - what eMule does, and the better privacy shape besides, since
-    /// "I refuse" and "I have nothing" then look identical on the wire.
+    /// A refusal is never SILENCE - silence is what hangs the asking client - but
+    /// its shape DEPENDS ON THE OPCODE, and only one of the three is
+    /// indistinguishable from "I have nothing". Both are eMule's, read from
+    /// `refs/emule-0.50a/eMule0.50a-Sources/srchybrid/ListenSocket.cpp`:
+    ///
+    /// - **`0x4A` OP_ASKSHAREDFILES -> empty `OP_ASKSHAREDFILESANSWER`.** The
+    ///   refusal branch (`:816-819`) only LOGS; the list stays empty and control
+    ///   falls into the same packet-building code the accept path uses
+    ///   (`:821-838`), which writes a count of 0. So refusing and having nothing
+    ///   emit the same bytes - the indistinguishability argument holds HERE, and
+    ///   only here.
+    /// - **`0x5D` OP_ASKSHAREDDIRS and `0x5E` OP_ASKSHAREDFILESDIR ->
+    ///   `OP_ASKSHAREDDENIEDANS` (`0x61`), null body**, a DISTINCT opcode
+    ///   (`:859-864` and `:941-948`; the opcode is `opcodes.h:236`). The
+    ///   directory flavours have a dedicated refusal upstream and padMule sends
+    ///   it, so on these two a refusal IS distinguishable from an empty share.
+    ///
+    /// That is a deliberate divergence from the privacy shape, not an oversight:
+    /// interop wins, because a real eMule drives `0x5D`/`0x5E` and expects
+    /// `0x61`. [`crate::share::browse_refusal`] is the one place all three are
+    /// built, so the split cannot drift.
     pub fn set_allow_browse(&mut self, on: bool) {
         self.allow_browse.store(on, Ordering::Relaxed);
     }
