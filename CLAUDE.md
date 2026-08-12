@@ -251,6 +251,17 @@ cross-session MEMORY file (the memory index lists them) - that is intentional,
 not an orphan. When a milestone supersedes older text in a dated section,
 annotate the old text in place rather than rewriting history.
 
+**A superseded block gets its annotation AT THE MOMENT it is superseded, or it
+gets moved out - "later" is not an option.** Annotating later is what left two
+disagreeing STATE OF THE TREE blocks in `handoff-for-fable.md` for two days, in
+the one document every session reads in full; an un-annotated stale block is
+indistinguishable from current text, and only an audit caught it. Closed work
+moves VERBATIM into a `*-history` archive - never trimmed, never deleted.
+`.claude/hooks/kb-drift-check.sh` ENFORCES this on Stop, not as advice: it
+BLOCKS on two un-annotated distinct answers in the handoff (gate figures, device
+build shas), and warns on closed work piling up and on oversized entries. It
+takes an optional path argument, so it can be run against a copy by hand.
+
 ---
 
 ## Coding rules (Karpathy guidelines)
