@@ -124,18 +124,28 @@ final class SettingsTests: XCTestCase {
             "an address-change pause must not read as sharing")
         // BOTH at once: the address change wins, because it is the one that
         // does NOT end by itself. Naming the metered pause here would promise a
-        // resumption on Wi-Fi that sharingDecision refuses to perform - it
-        // returns nil for exactly these inputs.
+        // resumption on Wi-Fi that nothing performs, since leaving the metered
+        // link clears only half of what is holding sharing down.
         XCTAssertEqual(
             SharingStatus.of(
                 wanted: true, pauseOnMetered: true, metered: true, pausedForIpChange: true),
             .pausedForIpChange,
             "the pause that needs the user must outrank the one that clears itself")
-        XCTAssertNil(
+        // [CORRECTED 2026-08-12 - this asserted Nil and went RED in CI, the
+        // first run that ever executed it. The PRODUCTION RULE IS RIGHT and the
+        // expectation was wrong: `sharingDecision` computes
+        // `effective = wanted && !(pauseOnMetered && metered)` and returns nil
+        // only when `effective` is TRUE and the address pause is latched. Here
+        // the metered pause already makes effective FALSE, so it returns
+        // `false` - push sharing OFF - which is the correct and safe answer.
+        // The caption precedence above is unaffected; only the reason given for
+        // it was wrong. Do not "fix" this back toward nil.]
+        XCTAssertEqual(
             EngineModel.sharingDecision(
                 wanted: true, pauseOnMetered: true, metered: true,
                 pausedForIpChange: true, userInitiated: false),
-            "the Wi-Fi promise would be false here - which is why the caption must not make it")
+            false,
+            "both pauses in force must push sharing OFF, not decline to push")
         // Neither pause applies to a user who is not trying to share. The
         // engine really can latch the address-change flag with sharing already
         // off: `note_public_id` does not consult it, and `set_sharing(false)`

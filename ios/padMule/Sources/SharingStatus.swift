@@ -9,9 +9,9 @@
 /// - Settings knew only the metered pause. While the public-address pause was
 ///   in force it showed "Share uploads" ON and stated padMule was serving
 ///   files, which was false; and on cellular it promised "It resumes
-///   automatically on Wi-Fi", which is also false in that state because
-///   `EngineModel.sharingDecision` returns nil while the address pause is
-///   latched and the call is not user-initiated.
+///   automatically on Wi-Fi", which is also false while the address pause is
+///   latched, because leaving the metered link clears only ONE of the two
+///   things holding sharing down.
 /// - The Shared screen knew only the address-change pause. A metered pause read
 ///   there as "Leech Mode: downloading only" - crediting the USER with a pause
 ///   padMule imposed - and tapping the switch bounced it back with nothing on
@@ -52,8 +52,14 @@ enum SharingStatus: Equatable {
     ///   `on` direction (both in mule-engine/src/engine.rs).
     /// - The address-change pause OUTRANKS the metered one, because it is the
     ///   one that does not end by itself. Naming the metered pause while both
-    ///   are in force would promise a resumption on Wi-Fi that
-    ///   `EngineModel.sharingDecision` refuses to perform.
+    ///   are in force would promise a resumption on Wi-Fi that will not happen:
+    ///   coming off the metered link clears only one of the two holds, and the
+    ///   address pause needs the user. [An earlier draft justified this by
+    ///   saying `sharingDecision` "returns nil for exactly these inputs". IT
+    ///   DOES NOT - it returns `false` here, because the metered pause already
+    ///   makes `effective` false and the nil branch requires `effective`. The
+    ///   PRECEDENCE above is right; only that reason was wrong, and the test
+    ///   built on it went red in CI.]
     static func of(
         wanted: Bool,
         pauseOnMetered: Bool,
