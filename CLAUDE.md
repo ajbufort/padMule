@@ -311,3 +311,28 @@ Bias toward caution over speed; use judgment on trivial tasks.
    not" is INCOMPLETE - the dispatcher is frequently wrong. The day that
    earned this rule (three refuted premises, one of which would have shipped
    silent data corruption): `docs/wiki/decisions-and-lessons.md`, 2026-08-09.
+6. **A REPORT is a hypothesis too** (BINDING since 2026-08-12). Rule 5 governs
+   what you are HANDED; this is its symmetric half and governs what comes BACK.
+   A subagent's conclusion is a CLAIM, not a fact, until it is verified or
+   labeled unverified. **Every claim relayed to Anthony is marked VERIFIED (I
+   ran it and read the output) or REPORTED (an agent said so and I have not
+   checked); unmarked reads as unverified.** Verify by preference what is
+   load-bearing, cheap to check, or about to be repeated to him. Demanding
+   verification from an agent and then relaying its answer untested only moves
+   the unverified claim one level up. The night that earned this rule
+   (2026-08-11) sent five false statements up that path: "both network lists
+   bootstrapped over HTTPS" (the URLs are plaintext `http://`), "the container
+   is empty" (its contents survived), and "the WDA runner embeds the 08-16
+   profile" (it embeds 08-19 - 08-16 was the local kit's ipa, not the installed
+   bundle).
+7. **No intention without a task.** State no future action in prose. If it is
+   real it goes in the session task list; if it is not in the list it does not
+   exist. A turn that ends with outstanding work ends by naming it as tracked
+   items, not as narrative. Twice on 2026-08-11 an "I'll do X next" died when
+   the next message redirected, and Anthony had to ask for work already
+   promised. `.claude/hooks/commitment-check.sh` ENFORCES this on Stop, not as
+   advice: it blocks when the closing message schedules a future action and the
+   session task list was not written in that turn. A promise is not a fix - the
+   KB already said an agent may renew a signing profile and permission was
+   asked for anyway, because the text read as a capability rather than an
+   instruction.
