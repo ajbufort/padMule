@@ -81,6 +81,24 @@ Authority rule, by domain:
 | wire-neutral policy | **aMule** (`refs/amule-master`, `amule-3.0.1/`) - and it is the runnable oracle |
 | **GUI, Settings, per-file behaviour** | **eMule 0.70b** (`refs/emule-0.70b`) - DECIDED 2026-08-06 by Anthony |
 
+**GREP THE `refs/` TREES WITH `/usr/bin/grep`, NEVER THE BARE `grep`.** On this
+box `grep` is a shell function wrapping `ugrep`, and on a file that is not valid
+UTF-8 it prints NOTHING to stdout, NOTHING to stderr, and EXITS 1 - there is no
+`Binary file matches` warning, so the result is indistinguishable from a genuine
+absence. eMule ships Windows-1252, so **25 of 714 source files in
+`refs/emule-0.50a` and 20 of 556 in `refs/emule-0.70b` are invisible to it**
+(`refs/amule-master`: none). The blind set is the core, not the fringe:
+`ListenSocket.cpp` - the ENTIRE eD2k TCP packet dispatch, every `case OP_...` -
+plus `PartFile.cpp`, `KnownFile.cpp` and `Preferences.h`. Measured:
+`grep -c 'case OP_ASKSHAREDFILES' ListenSocket.cpp` -> empty, exit 1;
+`/usr/bin/grep -c` -> 4. `LC_ALL=C` does NOT help; `-a` does.
+A POSITIVE finding survives this, a NEGATIVE one does not - "the authority does
+not do X" is exactly what a silent grep manufactures, and that class of claim is
+this project's strongest evidence. The 2026-08-12 audit found the KB CLEAN
+(no absence-claim is scoped to a blind file, and 59 of 85 citations carry a
+line number, which can only come from reading) - the citation-fidelity habit is
+what saved it. Keep citing lines.
+
 The 0.70b row is a STANDING directive, not a one-off: from 2026-08-06 on, when
 designing a screen, a setting, or how a download should behave (states, queueing,
 pause/resume, what the row says), go look at what eMule 0.70b does FIRST and
