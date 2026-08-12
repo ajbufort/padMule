@@ -2459,33 +2459,35 @@ impl Engine {
         // must not stop the engine; we simply come up offline and can retry).
         if !self.offline {
             self.emit(EngineEvent::Status("Fetching network lists...".into()));
-            // SAY what happened to the server list. `ensure` now re-fetches a
-            // file that is present but unusable (see its docs - that is what
-            // left the Servers tab empty), and the user has no other way to
-            // tell an auto-load from a list that was simply already there.
-            match bootstrap::ensure(
-                &self.config_dir,
-                "server.met",
-                bootstrap::SERVER_MET_URL,
-                bootstrap::looks_like_server_met,
-            )
-            .await
-            {
-                bootstrap::Fetched::Downloaded => {
-                    self.emit(EngineEvent::Server("Server list downloaded".into()))
-                }
+            // SAY what happened to the server list. The fetch re-runs for a file
+            // that is present but unusable (see `bootstrap::is_usable` - that is
+            // what left the Servers tab empty), and the user has no other way to
+            // tell an auto-load from a list that was simply already there. The
+            // transport is named because it is no longer decidable from the URL:
+            // the built-in default is https with a plaintext fallback.
+            match self.ensure_server_list(bootstrap::SERVER_MET_URL).await {
+                bootstrap::Fetched::Downloaded(via) => self.emit(EngineEvent::Server(format!(
+                    "Server list downloaded over {via}"
+                ))),
                 bootstrap::Fetched::Failed => self.emit(EngineEvent::Server(
                     "Server list unavailable - use Refresh on the Servers screen".into(),
                 )),
                 bootstrap::Fetched::AlreadyPresent => {}
             }
-            bootstrap::ensure(
+            // nodes.dat can still take the verbatim path: every contact in it is
+            // gated at LOAD by `gate_loaded_nodes` below.
+            if let bootstrap::Fetched::Downloaded(via) = bootstrap::ensure(
                 &self.config_dir,
                 "nodes.dat",
                 bootstrap::NODES_DAT_URL,
                 bootstrap::looks_like_nodes_dat,
             )
-            .await;
+            .await
+            {
+                self.emit(EngineEvent::Server(format!(
+                    "Kad node list downloaded over {via}"
+                )));
+            }
         }
 
         // Persisted Kad contacts, gated like aMule's loader (the file may have
@@ -3464,16 +3466,14 @@ impl Engine {
     }
 
     /// Fetch a server.met from `url` (`http://` or `https://`, unwrapped bytes)
-    /// and MERGE its entries into `config_dir/server.met` - every existing entry
-    /// (and its tags) is kept and only new `(ip, port)`s are appended. The fetched
-    /// bytes are validated as a real server.met BEFORE writing, so a bad URL /
-    /// HTML error page never corrupts the list.
+    /// and MERGE its entries into `config_dir/server.met` via
+    /// [`Engine::ingest_server_met`].
     ///
-    /// TLS IS TRANSPORT, NOT TRUST. An `https://` fetch proves only that the bytes
-    /// came unmodified from the host the certificate names; it says nothing about
-    /// what that host chose to put in the file. So `vet_downloaded_servers` below
-    /// runs on the result exactly as it does for plaintext - same gate, same
-    /// rules, no TLS shortcut.
+    /// NO DOWNGRADE HERE. This URL is the USER's - Settings keeps a list of them -
+    /// so an `https://` one they chose is fetched over TLS or not at all. Only the
+    /// built-in bootstrap defaults fall back to plaintext, and only because a
+    /// fresh install that cannot fetch a list has no way to start
+    /// (`bootstrap::fetch_bootstrap_list`).
     pub async fn update_server_list(&self, url: &str) -> ServerListUpdate {
         // Scheme gate. https was rejected here until 2026-08-10, so a user could
         // not use an https server list even deliberately - not eMule's design:
@@ -3488,10 +3488,37 @@ impl Engine {
         let Ok(body) = bootstrap::http_get_bytes(url).await else {
             return ServerListUpdate::Unreachable;
         };
-        if !bootstrap::looks_like_server_met(&body) {
+        self.ingest_server_met(&body)
+    }
+
+    /// Validate, VET and merge a FETCHED server.met into `config_dir/server.met` -
+    /// every existing entry (and its tags) is kept and only new `(ip, port)`s are
+    /// appended. The bytes are validated as a real server.met BEFORE writing, so a
+    /// bad URL / HTML error page never corrupts the list.
+    ///
+    /// THE ONE INGESTION GATE, shared by both paths that write a DOWNLOADED list:
+    /// the user's Refresh ([`Engine::update_server_list`]) and the first-run
+    /// bootstrap ([`Engine::ensure_server_list`]). The first run used to write the
+    /// fetched body straight to disk through `bootstrap::ensure`, so the launch
+    /// with nothing on disk - the one an injected list has the most to gain from -
+    /// was the single ingestion that skipped the gate the gate exists for.
+    ///
+    /// TLS IS TRANSPORT, NOT TRUST. An `https://` fetch proves only that the bytes
+    /// came unmodified from the host the certificate names; it says nothing about
+    /// what that host chose to put in the file. So `vet_downloaded_servers` below
+    /// runs on the result exactly as it does for plaintext - same gate, same
+    /// rules, no TLS shortcut.
+    ///
+    /// The BASE read off disk is deliberately NOT vetted: it is the user's own
+    /// file, and a loopback or LAN server they put there is legitimate (padMule's
+    /// own eserver oracle runs on 127.0.0.1). Vetting it would delete that entry
+    /// on the next refresh - see `vet_downloaded_servers` for why the gate sits at
+    /// ingestion rather than anywhere a user-chosen entry can reach it.
+    fn ingest_server_met(&self, body: &[u8]) -> ServerListUpdate {
+        if !bootstrap::looks_like_server_met(body) {
             return ServerListUpdate::NotServerMet;
         }
-        let Ok(incoming) = read_server_met(&body) else {
+        let Ok(incoming) = read_server_met(body) else {
             return ServerListUpdate::NotServerMet;
         };
         let path = self.config_dir.join("server.met");
@@ -3512,6 +3539,44 @@ impl Engine {
         ServerListUpdate::Updated {
             added: total - before,
             total,
+        }
+    }
+
+    /// FIRST RUN: make sure a usable server.met exists, fetching one if it does
+    /// not, and say which transport served it.
+    ///
+    /// NOT `bootstrap::ensure` (which nodes.dat still uses), because that writes
+    /// the fetched body VERBATIM. A server list has to be vetted on the way in:
+    /// every entry in it becomes a UDP target of the status probe and the global
+    /// search, so a hostile or MITM'd first-run list could seed loopback / LAN /
+    /// CGNAT addresses and aim padMule at the user's own network.
+    ///
+    /// WHY THIS IS NOT SYMMETRIC WITH KAD, which gates the same downloaded file at
+    /// LOAD (`gate_loaded_nodes`): a routing table can afford a load gate because
+    /// nothing else reads nodes.dat, while server.met is read directly by the
+    /// Servers screen (`probe_server_list`), the name lookup, the prune and the
+    /// crawl. Gating THOSE would hide - and eventually prune - a loopback or LAN
+    /// server the user added, which is a supported setup. So the server half gates
+    /// at ingestion and the Kad half at load, and each is at the only place its
+    /// own file can afford.
+    async fn ensure_server_list(&self, url: &str) -> bootstrap::Fetched {
+        if bootstrap::is_usable(
+            &self.config_dir,
+            "server.met",
+            bootstrap::looks_like_server_met,
+        ) {
+            return bootstrap::Fetched::AlreadyPresent;
+        }
+        let Ok((body, via)) = bootstrap::fetch_bootstrap_list(url).await else {
+            return bootstrap::Fetched::Failed;
+        };
+        // A list that parsed but had nothing survive vetting leaves exactly the
+        // empty Servers tab that a failed fetch does, so report it as one.
+        match self.ingest_server_met(&body) {
+            ServerListUpdate::Updated { total, .. } if total > 0 => {
+                bootstrap::Fetched::Downloaded(via)
+            }
+            _ => bootstrap::Fetched::Failed,
         }
     }
 
@@ -6268,6 +6333,164 @@ mod tests {
         );
         assert_eq!(vetted.servers.len(), 1, "a blocklisted server is dropped");
         assert_eq!(vetted.servers[0].port, 5000);
+    }
+
+    fn met_ip(a: u8, b: u8, c: u8, d: u8) -> u32 {
+        u32::from_le_bytes([a, b, c, d])
+    }
+
+    fn srv(ip: u32, port: u16) -> Server {
+        Server {
+            ip,
+            port,
+            tags: Vec::new(),
+        }
+    }
+
+    /// The set of `ip:port` strings a server.met on disk actually holds.
+    fn met_on_disk(dir: &Path) -> std::collections::BTreeSet<String> {
+        let bytes = std::fs::read(dir.join("server.met")).expect("server.met must exist");
+        read_server_met(&bytes)
+            .expect("server.met must parse")
+            .servers
+            .iter()
+            .map(|s| format!("{}:{}", ip_from_met_u32(s.ip), s.port))
+            .collect()
+    }
+
+    /// Serve `body` as an HTTP 200 to one connection on loopback; returns the port.
+    async fn serve_one_http_body(body: Vec<u8>) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = vec![0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(&body).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        port
+    }
+
+    /// THE FIRST RUN IS AN INGESTION TOO, and it was the one that skipped the gate.
+    ///
+    /// `update_server_list` has vetted a downloaded list since B8, but the FIRST
+    /// launch never went through it: `bootstrap::ensure` writes the fetched body
+    /// to disk having checked only that it PARSES. So the one launch with nothing
+    /// on disk to compare against - exactly the moment an injected list has the
+    /// most to gain - was the single path that could seed loopback / LAN / CGNAT
+    /// entries, each of which then becomes a UDP target of the status probe and
+    /// the global search.
+    #[tokio::test]
+    async fn a_first_run_server_list_is_vetted_before_it_lands_on_disk() {
+        let dir = tmp("first-run-vetting");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let hostile = write_server_met(&ServerMet {
+            header: 0xE0,
+            servers: vec![
+                srv(met_ip(127, 0, 0, 1), 4661),     // our own machine
+                srv(met_ip(192, 168, 0, 5), 4661),   // the user's LAN
+                srv(met_ip(100, 64, 0, 1), 4661),    // CGNAT
+                srv(met_ip(85, 17, 116, 222), 4242), // the only real server here
+            ],
+        });
+        let port = serve_one_http_body(hostile).await;
+
+        let (engine, _rx) = Engine::new(&dir).unwrap();
+        assert!(
+            !dir.join("server.met").exists(),
+            "the fixture must BE a first run"
+        );
+        let got = engine
+            .ensure_server_list(&format!("http://127.0.0.1:{port}/server.met"))
+            .await;
+        assert!(
+            matches!(got, bootstrap::Fetched::Downloaded(_)),
+            "the first run must still fetch a list, got {got:?}"
+        );
+        assert_eq!(
+            met_on_disk(&dir),
+            ["85.17.116.222:4242".to_string()].into_iter().collect(),
+            "only the routable entry may reach disk"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The gate must not eat the USER's own entries - the case that could break a
+    /// supported setup silently. padMule's eserver oracle runs on 127.0.0.1
+    /// (scripts/eserver-oracle.sh), and a LAN server is a legitimate thing to have
+    /// in server.met, so the rule is: vet what was DOWNLOADED, leave alone what is
+    /// already there.
+    ///
+    /// Both halves are asserted together, because either alone would pass a broken
+    /// implementation: the user's loopback survives the merge, AND the downloaded
+    /// loopback does not sneak in beside it.
+    #[tokio::test]
+    async fn a_user_added_loopback_server_survives_a_vetted_update() {
+        let dir = tmp("loopback-survives");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // What the user has: the local eserver oracle, and nothing else.
+        std::fs::write(
+            dir.join("server.met"),
+            write_server_met(&ServerMet {
+                header: 0xE0,
+                servers: vec![srv(met_ip(127, 0, 0, 1), 4661)],
+            }),
+        )
+        .unwrap();
+
+        let (engine, _rx) = Engine::new(&dir).unwrap();
+
+        // Phase 1: startup must not touch it. A dead port proves no fetch was even
+        // attempted - a loopback-only list is USABLE, so there is nothing to fix.
+        assert_eq!(
+            engine
+                .ensure_server_list("http://127.0.0.1:1/server.met")
+                .await,
+            bootstrap::Fetched::AlreadyPresent,
+            "a loopback-only server.met is a usable list, not a broken one"
+        );
+        assert_eq!(
+            met_on_disk(&dir),
+            ["127.0.0.1:4661".to_string()].into_iter().collect(),
+            "startup must leave the user's own list untouched"
+        );
+
+        // Phase 2: a Refresh that pulls a list carrying its OWN loopback entry.
+        let incoming = write_server_met(&ServerMet {
+            header: 0xE0,
+            servers: vec![
+                srv(met_ip(127, 0, 0, 1), 4242),     // downloaded - must be dropped
+                srv(met_ip(85, 17, 116, 222), 4242), // downloaded - must be kept
+            ],
+        });
+        let port = serve_one_http_body(incoming).await;
+        let r = engine
+            .update_server_list(&format!("http://127.0.0.1:{port}/server.met"))
+            .await;
+        assert_eq!(r, ServerListUpdate::Updated { added: 1, total: 2 }, "{r:?}");
+        assert_eq!(
+            met_on_disk(&dir),
+            [
+                "127.0.0.1:4661".to_string(),     // the USER's, still there
+                "85.17.116.222:4242".to_string(), // downloaded and routable
+            ]
+            .into_iter()
+            .collect(),
+            "the user's loopback stays; the downloaded one never arrives"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The scheme gate must ADMIT https and reject everything else.

@@ -14,8 +14,8 @@
 //!
 //! BOTH schemes are supported. `https://` is fetched over rustls with
 //! certificate verification ON (see [`tls_config`]); `http://` is unchanged, byte
-//! for byte, because the eserver/amuled oracles and the published bootstrap
-//! endpoints are plaintext and breaking them would be worse than the gap.
+//! for byte, because the eserver/amuled oracles are plaintext and breaking them
+//! would be worse than the gap.
 //! Supporting https is what eMule already does - it hands WinInet
 //! `INTERNET_FLAG_SECURE` for `AFX_INET_SERVICE_HTTPS`
 //! (refs/emule-0.70b/eMule0.70b-Sources/srchybrid/HttpDownloadDlg.cpp:461-463) -
@@ -34,8 +34,23 @@ use tokio_rustls::TlsConnector;
 
 /// Current, trusted sources (see docs/wiki/build-progress.md - the working
 /// source proven live on 2026-07-13).
-pub const SERVER_MET_URL: &str = "http://upd.emule-security.org/server.met";
-pub const NODES_DAT_URL: &str = "http://upd.emule-security.org/nodes.dat";
+///
+/// TLS BY DEFAULT, WITH A PLAINTEXT FALLBACK ([`fetch_bootstrap_list`]). A fresh
+/// install that cannot fetch a server list has no way to start, and the bootstrap
+/// is the one thing a new user cannot work around - so an https-ONLY default
+/// would trade a real availability risk for a guarantee that a downgrade attack
+/// defeats anyway. What the default does buy, and it is worth having, is that a
+/// PASSIVE observer past the VPN exit no longer learns from a cleartext request
+/// that this device runs an eD2k client.
+///
+/// STATE THE LIMIT: this is NOT MITM protection. An ACTIVE attacker blocks 443
+/// and the fetch downgrades itself, by design. The only thing that bounds the
+/// damage of an injected list is the INGESTION VETTING on the way in
+/// (`Engine::vet_downloaded_servers` for server.met, `gate_loaded_nodes` for
+/// nodes.dat) - never the transport. Do not let this comment, or a release note,
+/// grow into a claim that it is.
+pub const SERVER_MET_URL: &str = "https://upd.emule-security.org/server.met";
+pub const NODES_DAT_URL: &str = "https://upd.emule-security.org/nodes.dat";
 
 #[derive(Debug)]
 pub enum BootstrapError {
@@ -61,14 +76,25 @@ impl std::error::Error for BootstrapError {}
 /// Which transport a URL asks for. Nothing else is accepted - an unknown scheme
 /// (or none at all) is a `BadUrl`, never a silent downgrade to plaintext.
 ///
-/// Private: `bootstrap` is a public module, and nothing outside it needs to name
-/// a transport - callers pass a URL string and get bytes.
+/// PUBLIC since the built-in bootstrap URLs became `https://` with a plaintext
+/// fallback: a caller can no longer tell from the URL which transport actually
+/// served the bytes, and that is exactly what a session needs to be told. It was
+/// private before, when a URL string in was the whole story.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Scheme {
+pub enum Scheme {
     /// Plaintext over a bare TCP socket.
     Http,
     /// TLS with certificate verification.
     Https,
+}
+
+impl std::fmt::Display for Scheme {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Scheme::Http => write!(f, "http"),
+            Scheme::Https => write!(f, "https"),
+        }
+    }
 }
 
 /// Split `http://host[:port]/path` or `https://host[:port]/path`.
@@ -177,6 +203,40 @@ pub async fn http_get_bytes(url: &str) -> Result<Vec<u8>, BootstrapError> {
             .map_err(|e| BootstrapError::Io(format!("TLS: {e}")))?;
             request_and_read(tls, &host, &path).await
         }
+    }
+}
+
+/// Whether a failed `https://` attempt may be retried in the clear.
+///
+/// ONLY a transport failure, which is what `Io` is here: the connect, the TLS
+/// handshake, or the read never landed, so nothing about the file itself is
+/// known. Every other variant means the exchange DID happen - `Http` carries a
+/// status the host chose (a 404 over TLS means the file is gone, and fetching the
+/// same nothing in the clear gains exactly nothing), `Empty` means it answered
+/// with no body, and `BadUrl` never reached a socket at all.
+fn tls_attempt_never_landed(err: &BootstrapError) -> bool {
+    matches!(err, BootstrapError::Io(_))
+}
+
+/// GET a BUILT-IN bootstrap list, preferring TLS and falling back to plaintext
+/// when the TLS attempt never landed. Returns the body and the transport that
+/// actually served it.
+///
+/// Scoped to the built-in URLs on purpose. A user-configured server-list URL goes
+/// through [`http_get_bytes`] instead, so an `https://` one THEY chose is fetched
+/// over TLS or not at all - the availability argument that justifies a downgrade
+/// (see [`SERVER_MET_URL`]) applies to the cold-start path and to nothing else.
+pub async fn fetch_bootstrap_list(url: &str) -> Result<(Vec<u8>, Scheme), BootstrapError> {
+    let Some(rest) = url.strip_prefix("https://") else {
+        // Nothing to downgrade FROM: fetch it as written.
+        return http_get_bytes(url).await.map(|b| (b, Scheme::Http));
+    };
+    match http_get_bytes(url).await {
+        Ok(body) => Ok((body, Scheme::Https)),
+        Err(e) if tls_attempt_never_landed(&e) => http_get_bytes(&format!("http://{rest}"))
+            .await
+            .map(|b| (b, Scheme::Http)),
+        Err(e) => Err(e),
     }
 }
 
@@ -327,10 +387,27 @@ fn unzip_first(body: &[u8]) -> Option<Vec<u8>> {
 pub enum Fetched {
     /// Already on disk; nothing fetched.
     AlreadyPresent,
-    /// Downloaded and written.
-    Downloaded,
+    /// Downloaded and written, over the transport named - which is NOT decidable
+    /// from the URL any more, since the built-in ones are https with a plaintext
+    /// fallback.
+    Downloaded(Scheme),
     /// Not present and the download failed (caller carries on with what it has).
     Failed,
+}
+
+/// Whether `dir/name` is already a USABLE list - the exact question `ensure` asks
+/// before it decides to fetch, exposed so a caller doing its own fetching (the
+/// VETTED server.met path, `Engine::ensure_server_list`) asks the same one and
+/// the two cannot drift apart.
+///
+/// `validate` is deliberately the raw parse test, NOT an ingestion gate: a file
+/// holding only the loopback eserver oracle, or only a LAN server the user added,
+/// is usable, and answering "no" here would make the next launch fetch over the
+/// top of it.
+pub fn is_usable(dir: &Path, name: &str, validate: impl Fn(&[u8]) -> bool) -> bool {
+    std::fs::read(dir.join(name))
+        .map(|b| !b.is_empty() && validate(&b))
+        .unwrap_or(false)
 }
 
 /// Ensure a USABLE `name` exists in `dir`, downloading from `url` if it is
@@ -349,23 +426,24 @@ pub enum Fetched {
 /// happened to find the Refresh button. Seen on the device 2026-08-04. A
 /// prune that removes the last server produces exactly that file, so this is
 /// reachable in normal use, not just from a corrupt write.
+///
+/// WRITES THE FETCHED BODY VERBATIM, so this is only correct for a file whose
+/// contents are gated somewhere ELSE. nodes.dat is: `gate_loaded_nodes` filters
+/// every contact at LOAD. server.met is NOT, and no longer comes through here -
+/// see `Engine::ensure_server_list`.
 pub async fn ensure(
     dir: &Path,
     name: &str,
     url: &str,
     validate: impl Fn(&[u8]) -> bool,
 ) -> Fetched {
-    let path = dir.join(name);
-    if std::fs::read(&path)
-        .map(|b| !b.is_empty() && validate(&b))
-        .unwrap_or(false)
-    {
+    if is_usable(dir, name, &validate) {
         return Fetched::AlreadyPresent;
     }
-    match http_get_bytes(url).await {
-        Ok(body) if validate(&body) => {
-            if std::fs::write(&path, &body).is_ok() {
-                Fetched::Downloaded
+    match fetch_bootstrap_list(url).await {
+        Ok((body, via)) if validate(&body) => {
+            if std::fs::write(dir.join(name), &body).is_ok() {
+                Fetched::Downloaded(via)
             } else {
                 Fetched::Failed
             }
@@ -522,6 +600,107 @@ mod tests {
         );
         assert!(text.contains("Host: 127.0.0.1\r\n"), "got {text:?}");
         assert!(text.contains("Connection: close\r\n"), "got {text:?}");
+    }
+
+    /// The DECISION Anthony made, guarded against a silent revert: the built-in
+    /// bootstrap URLs default to TLS. A passive observer past the VPN exit
+    /// otherwise learns from the cleartext request that this device runs an eD2k
+    /// client, and these two fetches are the first thing a fresh install does.
+    #[test]
+    fn the_builtin_bootstrap_urls_default_to_tls() {
+        assert!(
+            SERVER_MET_URL.starts_with("https://"),
+            "got {SERVER_MET_URL}"
+        );
+        assert!(NODES_DAT_URL.starts_with("https://"), "got {NODES_DAT_URL}");
+    }
+
+    /// Which failures may downgrade, stated as the pure decision so it can be
+    /// enumerated offline - a real 404-over-TLS test would need a local CA.
+    ///
+    /// The 404 case is the one that matters: the host ANSWERED, so the file is
+    /// gone, and a plaintext retry fetches the same nothing while giving up the
+    /// only thing the https default buys.
+    #[test]
+    fn only_a_transport_failure_may_downgrade() {
+        assert!(tls_attempt_never_landed(&BootstrapError::Io(
+            "connect timeout".into()
+        )));
+        assert!(tls_attempt_never_landed(&BootstrapError::Io(
+            "TLS: invalid peer certificate".into()
+        )));
+        assert!(!tls_attempt_never_landed(&BootstrapError::Http(404)));
+        assert!(!tls_attempt_never_landed(&BootstrapError::Http(500)));
+        assert!(!tls_attempt_never_landed(&BootstrapError::Empty));
+        assert!(!tls_attempt_never_landed(&BootstrapError::BadUrl));
+    }
+
+    /// Serve `body` as an HTTP 200 to every connection, forever, counting them.
+    /// The COUNT is the evidence: it is what distinguishes "TLS was tried and
+    /// then downgraded" (2) from "plaintext was sent straight away" (1).
+    async fn counting_http_server(body: Vec<u8>) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(&body).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        (port, seen)
+    }
+
+    /// THE LOAD-BEARING TEST for the https default: when the TLS attempt cannot
+    /// land, the fetch falls back to plaintext and STILL RETURNS THE BYTES. A
+    /// fresh install that cannot fetch a server list has no way to start, which
+    /// is the whole reason the fallback exists.
+    ///
+    /// The listener speaks plaintext HTTP only, so the ClientHello is answered
+    /// with an HTTP response and rustls rejects it - a real TLS-unavailable host,
+    /// offline. Two connections is the proof the TLS attempt was actually MADE:
+    /// with one, the code would simply have ignored the https scheme.
+    #[tokio::test]
+    async fn https_falls_back_to_plaintext_when_the_tls_attempt_never_lands() {
+        let payload = sample_server_met();
+        let (port, seen) = counting_http_server(payload.clone()).await;
+
+        let (body, via) = fetch_bootstrap_list(&format!("https://127.0.0.1:{port}/server.met"))
+            .await
+            .expect("the fallback must still deliver a list");
+        assert_eq!(body, payload, "the fallback must return the real bytes");
+        assert_eq!(via, Scheme::Http, "the fallback must SAY it went plaintext");
+        assert_eq!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "TLS must be tried FIRST and plaintext only as the retry"
+        );
+
+        // And a plaintext URL must not grow a speculative TLS probe: one
+        // connection, one scheme, unchanged from before this feature existed.
+        let (port, seen) = counting_http_server(payload.clone()).await;
+        let (body, via) = fetch_bootstrap_list(&format!("http://127.0.0.1:{port}/server.met"))
+            .await
+            .expect("plaintext is unchanged");
+        assert_eq!(body, payload);
+        assert_eq!(via, Scheme::Http);
+        assert_eq!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "an http:// URL must be fetched once, with no TLS attempt"
+        );
     }
 
     #[test]
@@ -691,6 +870,26 @@ mod live {
         let n = http_get_bytes(NODES_DAT_URL).await.expect("nodes.dat");
         assert!(looks_like_nodes_dat(&n), "got {} bytes", n.len());
         println!("server.met {} bytes, nodes.dat {} bytes", b.len(), n.len());
+    }
+
+    /// THE DEFAULT MUST ACTUALLY HOLD against the real host, which no offline
+    /// test can show: `fetch_bootstrap_list` falls back to plaintext on its own,
+    /// so a `Scheme::Http` here means padMule is quietly bootstrapping in the
+    /// clear every time and nothing else would say so. Run this after any change
+    /// to the URLs or the TLS config.
+    ///
+    /// Run: cargo test -p mule-engine --lib -- --ignored --exact \
+    ///      bootstrap::live::the_builtin_urls_really_are_served_over_tls
+    #[tokio::test]
+    #[ignore]
+    async fn the_builtin_urls_really_are_served_over_tls() {
+        for url in [SERVER_MET_URL, NODES_DAT_URL] {
+            let (body, via) = fetch_bootstrap_list(url)
+                .await
+                .unwrap_or_else(|e| panic!("{url}: {e}"));
+            assert_eq!(via, Scheme::Https, "{url} fell back to plaintext");
+            println!("{url}: {} bytes over {via}", body.len());
+        }
     }
 
     /// The end-to-end proof the offline tests CANNOT give: a full TLS handshake
