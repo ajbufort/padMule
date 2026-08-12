@@ -31,8 +31,10 @@ enum SettingsKey {
     /// INCOGNITO (handoff 32): stop declaring padMule on the wire - drop the
     /// enhancement-channel marker, write the 7-tag hello stock aMule writes,
     /// and replace an UNCHANGED default nickname with aMule's own default.
-    /// OFF by default: it disables padMule-to-padMule enhancements, so turning
-    /// it on silently would remove a capability nobody asked to lose.
+    /// ON by default (Anthony, 2026-08-11): the padMule-to-padMule enhancement
+    /// channel it disables is DEFERRED and unbuilt, so the capability it costs
+    /// is theoretical today while the exposure it removes is real on every
+    /// connection. The registered default below says the same thing.
     static let incognito = "padMule.incognito"
     /// Who may BROWSE our shared files (eMule `CanSeeShares`). false = Nobody,
     /// true = Everybody. eMule's own default is Nobody, so refusing is upstream

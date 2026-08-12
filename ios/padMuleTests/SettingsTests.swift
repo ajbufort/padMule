@@ -252,10 +252,7 @@ final class SettingsTests: XCTestCase {
     /// no such type; it is `SettingsDefaults` - so the whole padMuleTests bundle
     /// failed to COMPILE from e3ed990 onward, and three device builds shipped
     /// with the Swift suite red because ship.sh did not check it.
-    /// Incognito must default OFF, and for a reason worth stating: turning it
-    /// on DISABLES padMule-to-padMule features, because other padMules find
-    /// each other by exactly the marker it suppresses. A privacy switch that
-    /// defaulted on would silently remove a capability nobody asked to lose.
+    ///
     /// Incognito defaults ON (Anthony, 2026-08-11). It costs the
     /// padMule-to-padMule enhancement channel - but that channel is DEFERRED
     /// and unbuilt, so the capability it disables is theoretical today while

@@ -529,13 +529,12 @@ struct SettingsView: View {
         } header: {
             Text("This device")
         } footer: {
-            // Blunt about WHEN it applies. The server login and any download
-            // padMule starts pick the name up on their next connection, but the
-            // inbound listener builds its greeting once when it binds - so a
-            // peer that dials US sees the old name until the engine is
-            // restarted. Saying "changes apply immediately" would be the kind of
-            // small lie that reads as a broken setting.
-            Text("Your nickname is the name other peers and servers see - up to 50 characters, the same limit eMule uses. Leave it empty to go back to \"padMule\". Servers and your own downloads pick up a new nickname the next time they connect; peers connecting TO you see it after you Stop and Start padMule.\n\nYour identity is generated on first launch and kept on device. It is never shown to peers as-is and never leaves the iPad.")
+            // Blunt about WHEN it applies. A new name reaches every connection
+            // made after it is set, in both directions - but a connection
+            // already open keeps the name it introduced itself with, so
+            // "changes apply immediately" would still be the kind of small lie
+            // that reads as a broken setting.
+            Text("Your nickname is the name other peers and servers see - up to 50 characters, the same limit eMule uses. Leave it empty to go back to \"padMule\". A new nickname is used by every connection made from then on, whether padMule connects out or a peer connects in; anything connected right now keeps the old name until it reconnects.\n\nYour identity is generated on first launch and kept on device. It is never shown to peers as-is and never leaves the iPad.")
         }
     }
 

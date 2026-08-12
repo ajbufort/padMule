@@ -722,13 +722,25 @@ final class EngineModel: ObservableObject {
                 e.setUpnpEnabled(on: d.bool(forKey: SettingsKey.upnpEnabled))
                 e.setMaxActiveDownloads(
                     n: UInt32(clamping: d.integer(forKey: SettingsKey.maxActiveDownloads)))
-                // BEFORE start(), for the same reason the ports are: the
-                // inbound listener builds its HELLO once, when it binds, so a
-                // nickname pushed afterwards would not reach a peer that dials
-                // us until the next Stop -> Start.
+                // BEFORE start(), but NOT for the ports' reason: the engine
+                // reads the nickname per connection, so pushing it late is not
+                // permanent - it is a WINDOW. applyLaunchSettings() runs after
+                // start(), and for the moments in between the engine still
+                // holds its own default while the UI already shows the user's
+                // saved name. Pushing here closes that window.
                 e.setNickname(
                     nick: EngineModel.nicknameToPush(
                         stored: d.string(forKey: SettingsKey.nickname)))
+                // INCOGNITO closes the same startup window, and matters more
+                // because it is a privacy choice the user has already made:
+                // applyLaunchSettings() pushes it AFTER start(), so a peer that
+                // dialed us in those first moments was answered without the
+                // stored preference having arrived. `SettingsDefaults.register()`
+                // has already run (PadMuleApp.init, before any view appears and
+                // so before boot()), which is what makes this read the
+                // registered default on a first launch rather than the false
+                // UserDefaults returns for an absent key.
+                e.setIncognito(on: d.bool(forKey: SettingsKey.incognito))
                 e.start()
                 engineLog.notice("boot OK; engine started")
                 DispatchQueue.main.async {
@@ -2065,11 +2077,6 @@ final class EngineModel: ObservableObject {
         }
     }
 
-    /// The finish sound. `AudioServicesPlaySystemSound` needs no session setup
-    /// and no audio permission, and it follows the silent switch - which is the
-    /// right behaviour for an alert the user did not ask to hear right now.
-    /// 1057 is the short "Tink": audible without being an alarm, since a busy
-    /// queue can finish several files in a row.
     /// The player must be held: an `AVAudioPlayer` in a local goes out of scope
     /// and is deallocated before a note ever sounds, which is silence that
     /// looks like a working call site.
@@ -2243,11 +2250,15 @@ final class EngineModel: ObservableObject {
         work.async { e.setAddServersFromServer(on: on) }
     }
 
-    /// Push INCOGNITO into the engine at boot. The engine defaults it OFF, so
-    /// this only matters when the user turned it on - but re-applying
+    /// Push INCOGNITO into the engine. BOTH defaults are ON - the engine's own
+    /// (`Engine::new`, mule-engine/src/engine.rs) and the registered iOS one
+    /// (`SettingsDefaults.register`) - so this only matters when the user
+    /// turned it OFF. boot() pushes the same preference BEFORE start(), to
+    /// close the startup window; this call re-applies it and refreshes the
+    /// published `wireNickname` for the Settings screen. Re-applying
     /// unconditionally is what keeps the engine and the pref in step, and a
-    /// PRIVACY setting that silently reverts to off on relaunch is the worst
-    /// kind of drift: the user believes they are covered and are not.
+    /// PRIVACY setting that silently reverts on relaunch is the worst kind of
+    /// drift: the user believes they are covered and are not.
     func applyIncognito() {
         guard let e = engine else { return }
         let on = UserDefaults.standard.bool(forKey: SettingsKey.incognito)
@@ -2428,10 +2439,12 @@ final class EngineModel: ObservableObject {
     /// Push the stored nickname into the engine. Called at boot (before
     /// `start()`, alongside the ports) and whenever the Settings field commits.
     ///
-    /// It takes effect on the next server login and the next outbound fetch;
-    /// peers that dial US keep seeing the previous name until the listener is
-    /// rebuilt by Stop then Start. The Settings footer says exactly that rather
-    /// than implying the change is instant everywhere.
+    /// It takes effect on the next connection in EITHER direction - the next
+    /// server login, the next outbound fetch, AND the next peer that dials us,
+    /// because the engine's accept loop reads the nickname per accepted
+    /// connection rather than snapshotting it. A connection already open keeps
+    /// the name it declared. The Settings footer says exactly that rather than
+    /// implying the change is instant everywhere.
     func pushNickname() {
         guard let e = engine else { return }
         let nick = EngineModel.nicknameToPush(
