@@ -111,6 +111,17 @@ Details: `docs/wiki/decisions-and-lessons.md`, `docs/wiki/ref-source-trees.md`,
   UNSIGNED `.ipa`; **Sideloadly** on the Windows host installs it with a free
   Apple ID (7-day re-sign). AltStore/AltServer failed here (-22411); do not
   retry it without new evidence.
+- **SIGNING-PROFILE RENEWAL IS AGENT WORK - do it, do not ask.** Sideload
+  profiles live 7 days, so signing and the WebDriverAgent runner lapse
+  constantly; renewing one is ordinary maintenance, not a decision to escalate.
+  The agent lists and dumps the profiles on the device, verifies one against a
+  signing kit, swaps it in, re-signs, installs and verifies the result. **Only
+  MINTING a new profile needs Anthony**, because that means authenticating to
+  Apple. So the first question on any expiry is never "may I mint one" - it is
+  whether the device already holds a newer profile, which it usually does, and
+  then nothing is needed from him at all. The kit's profile is the one that
+  binds, because that is what gets embedded at signing time. Procedure, the
+  pre-checks and the backup discipline: `docs/wiki/ipad-usb-tooling.md`.
 - iPadOS suspends backgrounded apps and reclaims sockets, so clean, honest
   pause/resume is a HARD requirement (see `docs/wiki/lifecycle-and-reactivation.md`).
   SUPERSEDED IN PART 2026-08-07 (build-progress 8cj): background SEEDING ships -
