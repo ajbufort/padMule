@@ -1211,37 +1211,74 @@ final class EngineModel: ObservableObject {
         }
     }
 
+    /// Start a download from a PASTED `ed2k://` or `magnet:` link.
+    ///
+    /// **This is the only route to a file whose hash is already known.** Until
+    /// 2026-08-13 the app had none: no paste field, no URL handler, and the
+    /// parser unexported - so a search hit was the sole way to begin a download,
+    /// and a link naming the exact file still had to be hunted for by keyword
+    /// through result sets that legitimately differ run to run.
+    ///
+    /// Reuses `download(_:)` by building a `SearchHit`, so the outcome handling,
+    /// the default-priority application and the banner behaviour cannot drift
+    /// from the search path - one of them changing silently while the other did
+    /// not is the shape this codebase keeps finding.
+    func addFromLink(_ raw: String) {
+        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        guard let f = parseEd2kLink(link: text) else {
+            // Say WHICH way it failed. `ed2k://|server|` and `ed2k://|search|`
+            // are legal links that name no file, so "not a link" would be wrong
+            // and "nothing happened" would be worse.
+            notice =
+                "That is not an ed2k file link. A downloadable one starts ed2k://|file| and carries a name, a size and a hash."
+            return
+        }
+        startDownload(hash: f.hash, size: f.size, name: f.name)
+    }
+
     /// Start downloading a hit. Blocks briefly (asking the server for sources),
     /// so it too goes through the work queue.
     func download(_ hit: SearchHit) {
+        startDownload(hash: hit.hash, size: hit.size, name: hit.name)
+    }
+
+    /// The ONE body behind both a tapped search hit and a pasted link.
+    ///
+    /// Kept single deliberately: two copies of this switch would drift, and the
+    /// half that drifts is always the one nobody is looking at. A `SearchHit` is
+    /// NOT constructed for the link path - it carries seventeen fields, sixteen
+    /// of which a link cannot know, and inventing zeros for them would put
+    /// fabricated metadata on screen.
+    private func startDownload(hash: String, size: UInt64, name: String) {
         guard let e = engine else { return }
-        adding.insert(hit.hash)
+        adding.insert(hash)
         work.async { [weak self] in
-            let outcome = e.addDownload(hash: hit.hash, size: hit.size, name: hit.name)
+            let outcome = e.addDownload(hash: hash, size: size, name: name)
             DispatchQueue.main.async {
                 guard let self else { return }
-                self.adding.remove(hit.hash)
+                self.adding.remove(hash)
                 switch outcome {
                 case .started:
                     // Apply the user's default priority. add_download registers at
                     // Normal; set it right after, so a non-Normal default is
                     // honored without a new engine argument.
                     let pri = UserDefaults.standard.integer(forKey: SettingsKey.defaultPriority)
-                    if pri != 1 { self.setPriority(hit.hash, priority: UInt8(pri)) }
+                    if pri != 1 { self.setPriority(hash, priority: UInt8(pri)) }
                     // POINT the banner at the row; the text is derived live
                     // (`downloadBannerText`), never captured as a string here.
-                    self.downloadNoticeHash = hit.hash
+                    self.downloadNoticeHash = hash
                 case .alreadyAdded:
                     // A positional fact, not an activity claim: the old "is
                     // already downloading" was false at birth for a row sitting
                     // paused or queued, and stayed on screen either way.
-                    self.notice = "\"\(hit.name)\" is already in your downloads."
+                    self.notice = "\"\(name)\" is already in your downloads."
                 case .noSources:
                     // Not an error: nobody who is online right now has it. Only
                     // reachable when we HAD a way to ask - the engine returns
                     // .notConnected otherwise, so this no longer blames the file
                     // for the user's connection.
-                    self.notice = "No one online has \"\(hit.name)\" right now."
+                    self.notice = "No one online has \"\(name)\" right now."
                 case .notConnected:
                     self.notice = "Not connected yet - pick a server on the Servers tab, or wait for Kad to find contacts. padMule cannot look for this file until then."
                 case .rejected(let reason):

@@ -133,6 +133,10 @@ struct ContentView: View {
     // nothing to reopen, and one more UserDefaults key earns nothing.
     @State private var showSearchOptions = false
     @State private var showRefine = false
+    @State private var showPasteLink = false
+    /// Local buffer for the pasted link - deliberately NOT persisted and NOT
+    /// pushed through on each keystroke; it is read once when Add is tapped.
+    @State private var linkText = ""
     @State private var query = ""
     @State private var serverListUrl = EngineModel.defaultServerListUrl
     @State private var detail: SearchHit?
@@ -577,6 +581,7 @@ struct ContentView: View {
                             .foregroundStyle(.secondary)
                     }
                     searchOptionsGroup
+                    pasteLinkGroup
                     if model.searched && !model.results.isEmpty {
                         HStack {
                             Menu {
@@ -1841,6 +1846,36 @@ struct ContentView: View {
     /// Collapsed by default, and its own `@ViewBuilder` for the reason row 8bw
     /// paid for: a handful of conditional controls inline in an already-long
     /// VStack is what pushed Swift's type-checker over its limit last time.
+    /// PASTE AN ed2k LINK. The only route to a file whose hash is already known.
+    ///
+    /// Sits here rather than on Downloads because this is the screen you are on
+    /// when you are trying to FIND something, and a link is simply the case
+    /// where you already have. Collapsed by default so it costs the ordinary
+    /// keyword user nothing.
+    ///
+    /// `.never` autocapitalization and autocorrection off are not cosmetic: a
+    /// link is a hash and iOS will happily capitalize or "correct" one into
+    /// something that no longer parses.
+    @ViewBuilder private var pasteLinkGroup: some View {
+        DisclosureGroup(isExpanded: $showPasteLink) {
+            HStack {
+                TextField("ed2k://|file|... or magnet:", text: $linkText)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled(true)
+                    .font(.caption)
+                Button("Add") {
+                    model.addFromLink(linkText)
+                    linkText = ""
+                }
+                .disabled(linkText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .font(.caption)
+            }
+        } label: {
+            Label("Paste a link", systemImage: "link")
+                .font(.caption)
+        }
+    }
+
     @ViewBuilder private var searchOptionsGroup: some View {
         DisclosureGroup(isExpanded: $showSearchOptions) {
             // The server applies these to what it RETURNS, so the capped result

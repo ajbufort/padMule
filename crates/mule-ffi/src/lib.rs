@@ -118,6 +118,49 @@ pub struct IdentityInfo {
     pub kad_id: String,
 }
 
+/// A file parsed out of an `ed2k://` link or a `magnet:` URI, in the shape
+/// `add_download` wants.
+///
+/// **WHY THIS EXISTS.** Until 2026-08-13 the iOS app had NO way to accept a
+/// link: no paste field, no `ed2k://` URL handler, and `mule_proto::parse_link`
+/// was not exported here - so the ONLY route to a download on device was tapping
+/// a search hit. That made a file whose exact hash was already in hand
+/// unreachable, and forced keyword search as the sole discovery path even when
+/// the target was known exactly. The capability was already present -
+/// `add_download` takes hash, size and name, which is precisely what a link
+/// carries - so this closes a UI/FFI gap rather than adding an engine feature.
+///
+/// `hash` is lowercase hex, matching what `add_download` expects.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct Ed2kFileLink {
+    pub name: String,
+    pub size: u64,
+    pub hash: String,
+    /// The AICH root from `h=` / `urn:aich:`, lowercase hex, empty when absent.
+    /// Carried so the caller can SEE the link had one; `add_download` does not
+    /// take it, and the engine learns the AICH root from the peer instead.
+    pub aich: String,
+}
+
+/// Parse an `ed2k://|file|...` link or a `magnet:` URI into its file fields.
+///
+/// Returns `None` for anything that is not a recognizable FILE link - including
+/// the `ed2k://|server|` and `ed2k://|search|` forms, which are legal links that
+/// name no file and so cannot be downloaded. The caller should report that
+/// rather than silently doing nothing.
+#[uniffi::export]
+pub fn parse_ed2k_link(link: String) -> Option<Ed2kFileLink> {
+    match mule_proto::parse_link(&link) {
+        Some(mule_proto::Ed2kLink::File(f)) => Some(Ed2kFileLink {
+            name: f.name,
+            size: f.size,
+            hash: hex::encode(f.hash),
+            aich: f.aich.map(hex::encode).unwrap_or_default(),
+        }),
+        _ => None,
+    }
+}
+
 /// The live server login, once one has accepted us. `None` when offline.
 ///
 /// Carries no client id by design - a HighID id encodes our public IP and this
@@ -1358,6 +1401,43 @@ pub fn fetch_report() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A LINK IS THE ONLY WAY TO REACH A FILE WHOSE HASH IS ALREADY KNOWN.
+    ///
+    /// Byte-checked against a real link rather than a hand-built one: the name
+    /// is percent-encoded, the size is exact, and the `h=` AICH root is present.
+    /// The expected hash is a LITERAL - re-deriving it from the parser under
+    /// test would assert nothing.
+    #[test]
+    fn an_ed2k_file_link_parses_into_what_add_download_wants() {
+        let link = "ed2k://|file|01%20Introduction%20To%20The%20Spanish%20Language.m4v\
+|180781023|7425B9FAF17C6AC720E800D6095A7E3B|h=5YXZ4OA3OY7SHQ6EV6ANLWGMIZGAWMUO|/";
+        let f = parse_ed2k_link(link.to_string()).expect("a well-formed file link must parse");
+        assert_eq!(
+            f.name, "01 Introduction To The Spanish Language.m4v",
+            "percent-decoded"
+        );
+        assert_eq!(f.size, 180_781_023);
+        assert_eq!(
+            f.hash, "7425b9faf17c6ac720e800d6095a7e3b",
+            "lowercase hex for add_download"
+        );
+        assert!(
+            !f.aich.is_empty(),
+            "this link carries an AICH root and it must survive"
+        );
+    }
+
+    /// LINKS THAT NAME NO FILE MUST NOT LOOK LIKE A DOWNLOAD. `|server|` and
+    /// `|search|` are legal ed2k links; neither can be fetched, and returning
+    /// `None` is what lets the UI say so instead of doing nothing.
+    #[test]
+    fn a_server_or_search_link_is_not_a_download() {
+        assert!(parse_ed2k_link("ed2k://|server|176.123.5.89|4725|/".to_string()).is_none());
+        assert!(parse_ed2k_link("ed2k://|search|stooges|/".to_string()).is_none());
+        assert!(parse_ed2k_link("not a link at all".to_string()).is_none());
+        assert!(parse_ed2k_link(String::new()).is_none());
+    }
 
     fn tmp(tag: &str) -> String {
         std::env::temp_dir()
