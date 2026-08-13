@@ -451,7 +451,7 @@ fn read_one_result_file(r: &mut Reader) -> Result<SearchResultFile, IoError> {
 
 /// One page of an OP_SEARCHRESULT: the result files plus the optional trailing
 /// "more results available" flag. `more` drives the "Load more results" button.
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct SearchResultPage {
     pub files: Vec<SearchResultFile>,
     pub more: bool,

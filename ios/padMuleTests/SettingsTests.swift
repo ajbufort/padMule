@@ -258,6 +258,26 @@ final class SettingsTests: XCTestCase {
     /// mapping is a no-op the tunnel bypasses, so leaving UPnP on could only
     /// produce a misleading Port-mapping row. If someone flips this back, the
     /// two must move together.
+    /// KAD DEFAULTS ON, AND THE SWITCH MUST AGREE WITH THE REGISTERED DEFAULT.
+    ///
+    /// ON is eMule 0.70b's own default (`NetworkKademlia`,
+    /// `Preferences.cpp:2202` reads `ini.GetBool(_T("NetworkKademlia"), true)`),
+    /// so this is replication rather than a padMule posture, and both networks
+    /// being on is what makes the origin badge on a search result meaningful.
+    ///
+    /// The literal `true` is deliberate - written against `SettingsKey` alone
+    /// this assertion would move with whatever was registered and could never
+    /// catch the default flipping. The SettingsView `@AppStorage` initializer
+    /// must match it or the switch renders in one state while the engine is in
+    /// the other, which on a network control is the confusing direction: the
+    /// user sees Kad on while padMule is querying the server only.
+    func testKadDefaultsOnMatchingEmule070b() {
+        SettingsDefaults.register()
+        XCTAssertTrue(
+            UserDefaults.standard.bool(forKey: SettingsKey.kadEnabled),
+            "Kad must default ON - eMule 0.70b registers NetworkKademlia true")
+    }
+
     func testUpnpDefaultsOffToMatchTheVpnPortDefaults() {
         SettingsDefaults.register()
         let d = UserDefaults.standard

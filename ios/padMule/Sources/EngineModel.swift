@@ -745,6 +745,12 @@ final class EngineModel: ObservableObject {
                 // registered default on a first launch rather than the false
                 // UserDefaults returns for an absent key.
                 e.setIncognito(on: d.bool(forKey: SettingsKey.incognito))
+                // KAD joins the network inside `Engine::start`, so this must be
+                // pushed BEFORE it for the same reason incognito is: a
+                // preference applied in the completion below would let a user
+                // who chose server-only announce themselves to Kad on every
+                // single launch. Same launch-window shape, one field over.
+                e.setKadEnabled(on: d.bool(forKey: SettingsKey.kadEnabled))
                 // SHARING closes the same startup window, and it is the one
                 // that serves BYTES. The engine defaults sharing ON
                 // (`Engine::new` builds it `AtomicBool::new(!ip_paused)`) and
@@ -2321,6 +2327,21 @@ final class EngineModel: ObservableObject {
         guard let e = engine else { return }
         let on = UserDefaults.standard.bool(forKey: SettingsKey.askServersForServers)
         work.async { e.setAddServersFromServer(on: on) }
+    }
+
+    /// Push the KAD switch into the engine. Default ON on both sides - the
+    /// engine's own (`Engine::new`) and the registered iOS one - so this only
+    /// matters once the user turns it off.
+    ///
+    /// Hops onto `work` FIRST and touches no `@Published` before doing so:
+    /// `setKadEnabled` can tear down or bootstrap a Kad node, which is the
+    /// slowest thing this screen can trigger, and blocking the main queue on it
+    /// would stutter the toggle it was drawn from. (`loadServers` gets this
+    /// wrong the other way and is filed as #69a.)
+    func applyKadEnabled() {
+        guard let e = engine else { return }
+        let on = UserDefaults.standard.bool(forKey: SettingsKey.kadEnabled)
+        work.async { e.setKadEnabled(on: on) }
     }
 
     /// Push INCOGNITO into the engine. BOTH defaults are ON - the engine's own

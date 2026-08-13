@@ -88,6 +88,9 @@ enum SettingsKey {
     /// the provider does the forwarding and a LAN-router mapping is a no-op the
     /// tunnel bypasses anyway.
     static let upnpEnabled = "padMule.upnpEnabled"
+    /// Join the Kad network, or query the server only. ON by default, which is
+    /// eMule's own default (0.70b `NetworkKademlia`, Preferences.cpp:2202).
+    static let kadEnabled = "padMule.kadEnabled"
     /// The name padMule announces to peers (the HELLO's CT_NAME) and to servers
     /// (the login's CT_NAME). eMule's Options -> General "Nick"
     /// (0.70b PPgGeneral.cpp:88/187), stored the same way: a plain string,
@@ -150,6 +153,12 @@ enum SettingsDefaults {
             // padMule" status line names the setting, so a user NOT behind a
             // VPN can find and enable it.
             SettingsKey.upnpEnabled: false,
+            // ON: eMule 0.70b registers NetworkKademlia true, and both networks
+            // on is what makes the origin badge on a result meaningful. The
+            // switch exists for isolation (Kad-on masked a dead server arm on
+            // 2026-08-13), battery, and the Kad-publishing exposure noted in the
+            // threat model - not because off is a sensible default.
+            SettingsKey.kadEnabled: true,
             // The nickname every padMule build announced before it became a
             // setting. Registering it (rather than leaning on nil for an absent
             // key) means the Settings field shows the name actually in force on

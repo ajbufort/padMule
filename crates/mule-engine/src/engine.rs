@@ -1881,6 +1881,26 @@ pub struct Engine {
     /// misleading - when a VPN tunnel is carrying the traffic, because the
     /// mapping would be made on the LAN router the tunnel bypasses.
     upnp_enabled: bool,
+    /// Whether to join the Kad network at all. **Default ON, which is eMule's
+    /// own default** (`networkkademlia = ini.GetBool(_T("NetworkKademlia"),
+    /// true)`, 0.70b `Preferences.cpp:2202`, surfaced as a checkbox on the
+    /// Connection page) - so this is replication, not a padMule posture.
+    ///
+    /// **WHY A SWITCH AT ALL, when both networks on is the right default.**
+    /// Three reasons, and the first is the one that earned it. (1) KAD-ON MASKS
+    /// A DEAD SERVER ARM: on 2026-08-13 a search returned 22 rows, every one of
+    /// them Kad-origin, while the server arm silently returned nothing - the
+    /// result LOOKED like a working search and the defect went a night
+    /// undiagnosed. Being able to ask one network at a time is how that gets
+    /// isolated. (2) Kad costs battery and uplink on a device with a ~100MB
+    /// jetsam budget. (3) Kad publishing announces "this address holds this
+    /// hash" to anyone crawling ([[threat-model]]), and a user who wants
+    /// server-only exposure had no way to get it.
+    ///
+    /// Enforced in ONE place - the top of `start_kad` - so every caller
+    /// (`start`, `resume`, `resume_from_seeding`) inherits it rather than each
+    /// remembering the check.
+    kad_enabled: bool,
     /// Our public IPv4, as UPnP/SSDP reported it (`theApp.GetPublicIP`). Learned
     /// in `map_port`, fed to the Kad node so it can echo a peer's UDP verify key
     /// (bound to THIS ip) and be verified faster. `None` until a mapping succeeds;
@@ -2051,6 +2071,8 @@ impl Engine {
             kad_port: KAD_UDP_PORT,
             kad_advertised_port: KAD_UDP_PORT,
             upnp_enabled: true,
+            // ON, matching eMule 0.70b's NetworkKademlia default (Preferences.cpp:2202).
+            kad_enabled: true,
             public_ip: Arc::new(std::sync::Mutex::new(None)),
             listener: None,
             server_tx: None,
@@ -2274,6 +2296,44 @@ impl Engine {
     /// the provider and a LAN-router mapping accomplishes nothing.
     pub fn set_upnp_enabled(&mut self, on: bool) {
         self.upnp_enabled = on;
+    }
+
+    /// Join the Kad network, or do not. See [`Engine::kad_enabled`] for why the
+    /// switch exists at all; the default is ON, which is eMule's.
+    ///
+    /// **TAKES EFFECT IMMEDIATELY, in both directions**, rather than at the next
+    /// start: turning it OFF on a running engine tears the node down through
+    /// `set_kad(None)` - which absorbs the live routing table into
+    /// `self.routing` first, so the contacts are kept and the UDP port is
+    /// genuinely released - and turning it ON while Running starts one. A
+    /// setting that only applied at the next launch would be the
+    /// launch-window shape `sharing_on.txt` exists to prevent, one field over.
+    ///
+    /// Idempotent by an early return, because `start_kad` is expensive (a
+    /// bootstrap round trip) and a UI that pushes every preference on every
+    /// change would otherwise re-bootstrap on unrelated edits.
+    pub async fn set_kad_enabled(&mut self, on: bool) {
+        if self.kad_enabled == on {
+            return;
+        }
+        self.kad_enabled = on;
+        if on {
+            // Only when the engine is actually up; `start()`/`resume()` will do
+            // it otherwise, and starting a node under a paused engine would
+            // bind a port nothing is draining.
+            if self.state == EngineState::Running && self.kad.is_none() {
+                self.start_kad().await;
+            }
+        } else {
+            self.set_kad(None);
+        }
+    }
+
+    /// Whether padMule joins Kad. Exported so the UI can render the ENGINE's
+    /// value rather than only its own stored preference - the two disagreeing is
+    /// the shape `ui-and-wire-must-be-compared` was written for.
+    pub fn is_kad_enabled(&self) -> bool {
+        self.kad_enabled
     }
 
     /// The name peers and servers are told. Always sanitized, never empty.
@@ -4264,6 +4324,14 @@ impl Engine {
 
     /// Bind the Kad UDP socket and bootstrap off the persisted contacts.
     async fn start_kad(&mut self) {
+        // THE ONE ENFORCEMENT POINT for the Kad switch. Every caller - `start`,
+        // `resume`, `resume_from_seeding` and `set_kad_enabled` itself - comes
+        // through here, so none of them has to remember the check. Returning
+        // before the seed/bootstrap means Kad-off costs nothing at all: no
+        // socket bound, no dial list built, no contacts aged.
+        if !self.kad_enabled {
+            return;
+        }
         // BOTH sources, unioned - and the in-memory one FIRST, because it is the
         // fresher of the two and the one this used to ignore.
         //
@@ -4453,12 +4521,23 @@ impl Engine {
         let kad = self.kad.as_mut();
         let (server_page, kad_files, global_files) = tokio::join!(
             async {
+                // REPORT, do not swallow. This used to be
+                // `.await.unwrap_or_default()`, which turned every FrameError
+                // into an empty page - so a search that FAILED and a server with
+                // NOTHING reached the user as the same bare "No results." The
+                // outcome (including a transport error) is carried out of this
+                // arm and named below.
                 match server {
-                    Some(link) => link
-                        .search_page(&params, SEARCH_WAIT)
-                        .await
-                        .unwrap_or_default(),
-                    None => SearchResultPage::default(),
+                    Some(link) => match link.search_page(&params, SEARCH_WAIT).await {
+                        Ok(outcome) => outcome,
+                        Err(e) => crate::link::ServerSearchOutcome::Malformed {
+                            bytes: 0,
+                            why: e.to_string(),
+                        },
+                    },
+                    // No server is not a failure - it is the serverless case, and
+                    // Kad may still answer. An EMPTY page, not a reason.
+                    None => crate::link::ServerSearchOutcome::Page(SearchResultPage::default()),
                 }
             },
             async {
@@ -4491,8 +4570,23 @@ impl Engine {
                 }
             },
         );
+        // NAME THE FAILURE BEFORE FLATTENING IT. `failure_reason()` is None when
+        // the server answered - including when it answered with an empty index,
+        // which is a legitimate result and not a fault. Emitted as a Server event
+        // so the UI can say "the server did not answer" instead of the bare
+        // "No results." that hid this for a night; Kad and global may still have
+        // contributed, so the search itself continues either way.
+        if let Some(why) = server_page.failure_reason() {
+            let _ = self.events.send(EngineEvent::Server(format!(
+                "Server search failed: {why}. Any results below came from Kad."
+            )));
+        }
         // Fold the Kad + global-UDP hits into the same shape the server hits
         // arrive in, so a single catalog pass dedupes across all three by hash.
+        let server_page = match server_page {
+            crate::link::ServerSearchOutcome::Page(p) => p,
+            _ => SearchResultPage::default(),
+        };
         let server_more = server_page.more;
         let mut combined = server_page.files;
         // Track WHERE each row came from, in step with `combined`. The origin is
@@ -4622,15 +4716,49 @@ impl Engine {
             };
         }
         // Continue the query on the SAME link; the server holds it in session state.
-        let page = match self.server.as_mut() {
-            Some(link) => link.search_more(SEARCH_WAIT).await.unwrap_or_default(),
-            None => SearchResultPage::default(),
+        let outcome = match self.server.as_mut() {
+            Some(link) => match link.search_more(SEARCH_WAIT).await {
+                Ok(o) => o,
+                Err(e) => crate::link::ServerSearchOutcome::Malformed {
+                    bytes: 0,
+                    why: e.to_string(),
+                },
+            },
+            None => crate::link::ServerSearchOutcome::Page(SearchResultPage::default()),
+        };
+        // Same rule as the first page: a failed "load more" must not read as a
+        // server that simply ran out of results.
+        if let Some(why) = outcome.failure_reason() {
+            let _ = self
+                .events
+                .send(EngineEvent::Server(format!("Load more failed: {why}")));
+        }
+        let page = match outcome {
+            crate::link::ServerSearchOutcome::Page(p) => p,
+            _ => SearchResultPage::default(),
         };
         let session = self
             .search_session
             .as_mut()
             .expect("can_page implies a session");
+        // ORIGINS MOVE WITH COMBINED, OR EVERY HIT FIRST SEEN ON A LATER PAGE
+        // RENDERS WITH A BLANK BADGE. `catalog_with_origins` reads
+        // `origins.get(i).unwrap_or(0)` and `origin_label(0)` is the EMPTY
+        // STRING, so a short `origins` does not error - it silently un-labels
+        // the tail. These two fields are one fact and must be extended together
+        // (the SNAPSHOT-sibling shape: fixing one field of a kind means checking
+        // its siblings). `search_more` continues the SERVER query, so every row
+        // it returns is server-origin.
+        let added = page.files.len();
         session.combined.extend(page.files);
+        session
+            .origins
+            .resize(session.combined.len(), crate::catalog::ORIGIN_SERVER);
+        debug_assert_eq!(
+            session.combined.len(),
+            session.origins.len(),
+            "combined and origins must stay in step ({added} added)"
+        );
         session.server_more = page.more;
         session.more_reqs += 1;
         let ranked = apply_search_filters(
@@ -6841,6 +6969,81 @@ mod tests {
     /// entries no matter how many `Engine::routing` held. That is the real
     /// content of the 2026-08-05 "138 -> 21" report: not a table being discarded,
     /// but a fresh one being built. The 8cd union fixed the bootstrap DIAL LIST
+    /// KAD OFF MEANS NO NODE, AND KAD ON AGAIN MEANS ONE - WITHOUT A RESTART.
+    ///
+    /// The switch exists because Kad-on MASKED a dead server arm on 2026-08-13:
+    /// a search returned 22 rows, all Kad-origin, while the server contributed
+    /// nothing, so the search LOOKED healthy. Being able to silence one network
+    /// is how that gets isolated. Default is ON, matching eMule 0.70b's
+    /// `NetworkKademlia` (`Preferences.cpp:2202`).
+    ///
+    /// The port probe is the load-bearing assertion: `set_kad(None)` must
+    /// genuinely RELEASE the UDP socket, not merely forget the node. A plain
+    /// bind is used deliberately - `bind_kad_socket` sets SO_REUSEADDR, and two
+    /// SO_REUSEADDR binds on one port BOTH succeed, so a reuse-flagged probe
+    /// would pass over a leaked socket and prove nothing (the refutation row
+    /// 8ev recorded for the firewall-check answerer).
+    #[tokio::test]
+    async fn the_kad_switch_tears_the_node_down_and_brings_it_back() {
+        let dir = tmp("kad-switch");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+        engine.set_upnp_enabled(false);
+        let tcp = free_local_port();
+        let kad_port = free_local_port();
+        engine.set_ports(tcp, tcp, kad_port, kad_port);
+        assert!(
+            engine.is_kad_enabled(),
+            "ON by default - eMule 0.70b's own default, not a padMule posture"
+        );
+        engine.routing.load_nodes(&[KadContact {
+            id: Kad128::from_hash(&[0x5A; 16]),
+            ip: 0x0808_0404,
+            udp_port: 4672,
+            tcp_port: 4662,
+            version: 8,
+            udp_key: 0,
+            udp_key_ip: 0,
+            verified: false,
+        }]);
+        engine.set_state(EngineState::Running);
+        engine.start_kad().await;
+        assert!(
+            engine.kad.is_some(),
+            "the control: Kad comes up when enabled"
+        );
+
+        engine.set_kad_enabled(false).await;
+        assert!(!engine.is_kad_enabled());
+        assert!(engine.kad.is_none(), "turning it off must drop the node");
+        // The port must be genuinely free - abort is asynchronous, so poll.
+        let mut released = false;
+        for _ in 0..200 {
+            if let Ok(p) = std::net::UdpSocket::bind(("0.0.0.0", kad_port)) {
+                drop(p);
+                released = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            released,
+            "Kad off must RELEASE the UDP port, not just forget it"
+        );
+
+        // And a start while disabled is a no-op, so nothing can sneak it back.
+        engine.start_kad().await;
+        assert!(
+            engine.kad.is_none(),
+            "start_kad must respect the switch - it is the ONE enforcement point"
+        );
+
+        engine.set_kad_enabled(true).await;
+        assert!(engine.kad.is_some(), "turning it back on must start a node");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// and did not touch this ([[kad-routing-lifecycle]], build-progress 8ce).
     ///
     /// Driven with NO nodes.dat and an unreachable seed set, so the bootstrap

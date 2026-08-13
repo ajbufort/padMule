@@ -29,6 +29,63 @@ fn not_connected() -> FrameError {
     ))
 }
 
+/// What a server search actually did - because "no results" has THREE causes
+/// and they used to be indistinguishable.
+///
+/// **WHY THIS TYPE EXISTS.** `read_search_page` returned an empty
+/// `SearchResultPage` for a genuinely empty index, for a server that never
+/// answered, AND for a payload that would not parse; the engine then
+/// `unwrap_or_default()`-ed the `Err` on top, making a fourth. Four distinct
+/// events, one indistinguishable output, reaching the user as a bare
+/// "No results." On 2026-08-13 that cost a night: the app reported zero results
+/// for a query the CLI answered with four hits against the same server, and
+/// nothing in the code, the UI or the logs could say which case it was.
+///
+/// **THE RULE THIS ENCODES:** an empty answer and a failed question are
+/// different facts. A caller that only wants files may still flatten them (see
+/// [`ServerLink::search`]), but it must do so DELIBERATELY rather than by
+/// default.
+#[derive(Debug)]
+pub enum ServerSearchOutcome {
+    /// The server answered and the payload parsed. **May legitimately contain
+    /// ZERO files** - that is an empty index, not a failure.
+    Page(SearchResultPage),
+    /// No OP_SEARCHRESULT arrived within the budget. On a long-lived shared link
+    /// this is either a real timeout or a demux miss, and the two are worth
+    /// telling apart later; today it is at least distinguishable from success.
+    NoAnswer { waited: Duration },
+    /// The server answered and the payload did NOT parse. Carries the size and
+    /// the parser's own complaint, because "malformed" without a length is not
+    /// actionable.
+    Malformed { bytes: usize, why: String },
+}
+
+impl ServerSearchOutcome {
+    /// The files, flattening both failures to empty. Named so a reader can see
+    /// the information being discarded at the call site.
+    pub fn files(self) -> Vec<SearchResultFile> {
+        match self {
+            ServerSearchOutcome::Page(p) => p.files,
+            _ => Vec::new(),
+        }
+    }
+
+    /// A short human-readable reason, or `None` when the server answered.
+    /// This is what the UI shows instead of an unqualified "No results."
+    pub fn failure_reason(&self) -> Option<String> {
+        match self {
+            ServerSearchOutcome::Page(_) => None,
+            ServerSearchOutcome::NoAnswer { waited } => Some(format!(
+                "the server did not answer the search within {}s",
+                waited.as_secs()
+            )),
+            ServerSearchOutcome::Malformed { bytes, why } => Some(format!(
+                "the server sent {bytes} bytes we could not read ({why})"
+            )),
+        }
+    }
+}
+
 /// Owns one server connection and its lifecycle.
 pub struct ServerLink {
     addr: SocketAddr,
@@ -205,46 +262,73 @@ impl ServerLink {
         }
     }
 
+    /// See [`ServerSearchOutcome`] for why this is an enum rather than a page.
+    ///
     /// Search the server's index. Empty when the server has nothing to say.
+    ///
+    /// **This flattens [`ServerSearchOutcome::NoAnswer`] and
+    /// [`ServerSearchOutcome::Malformed`] back into an empty vec**, which is correct
+    /// for the CLI and for `related_search` (both of which only want the files),
+    /// but is exactly the conflation that hid a live defect for a night on the
+    /// app path. Anything that RENDERS the result to a user should call
+    /// [`search_page`](Self::search_page) and report the outcome.
     pub async fn search(
         &mut self,
         params: &SearchParams,
         wait: Duration,
     ) -> Result<Vec<SearchResultFile>, FrameError> {
-        Ok(self.search_page(params, wait).await?.files)
+        Ok(self.search_page(params, wait).await?.files())
     }
 
-    /// Like [`search`](Self::search) but also reports the trailing "more results
-    /// available" flag, so a caller can offer "Load more results".
+    /// Like [`search`](Self::search) but reports WHICH of the three "no results"
+    /// outcomes happened, plus the trailing "more results available" flag.
     pub async fn search_page(
         &mut self,
         params: &SearchParams,
         wait: Duration,
-    ) -> Result<SearchResultPage, FrameError> {
+    ) -> Result<ServerSearchOutcome, FrameError> {
         let pkt = build_search_request(params);
         self.read_search_page(&pkt, wait).await
     }
 
     /// Ask for the NEXT page of the last search (bodiless OP_QUERY_MORE_RESULT;
     /// the query is held server-side, so this MUST run on the same connection).
-    pub async fn search_more(&mut self, wait: Duration) -> Result<SearchResultPage, FrameError> {
+    pub async fn search_more(&mut self, wait: Duration) -> Result<ServerSearchOutcome, FrameError> {
         let pkt = build_search_more_request();
         self.read_search_page(&pkt, wait).await
     }
 
-    /// Send `pkt`, read one OP_SEARCHRESULT, and parse it into a page (files +
-    /// the more-flag). Timeout / no answer -> an empty page (`more = false`).
+    /// Send `pkt`, read one OP_SEARCHRESULT, and say WHAT HAPPENED.
+    ///
+    /// **THIS FUNCTION USED TO RETURN AN EMPTY PAGE FOR THREE DIFFERENT EVENTS:**
+    /// a genuinely empty index, a server that never answered, and a payload
+    /// that would not parse. The call site then added a fourth by
+    /// `unwrap_or_default()`-ing the `Err`. So "the server has nothing" and
+    /// "the search failed" were byte-identical to every caller, to the UI and to
+    /// the logs. That is not hypothetical: on 2026-08-13 the app returned zero
+    /// results for a query a CLI control answered with four hits, on the same
+    /// server, and NOTHING anywhere could say which of the three had happened.
+    /// The variants exist so that question is answerable.
     async fn read_search_page(
         &mut self,
         pkt: &Packet,
         wait: Duration,
-    ) -> Result<SearchResultPage, FrameError> {
+    ) -> Result<ServerSearchOutcome, FrameError> {
         match self
             .request(pkt, crate::search::OP_SEARCHRESULT, wait)
             .await?
         {
-            Some(p) => Ok(parse_search_result_page(&p.payload).unwrap_or_default()),
-            None => Ok(SearchResultPage::default()),
+            // A page that parses is the answer, EVEN IF IT HAS ZERO FILES - an
+            // empty index is a legitimate reply and must stay distinct from the
+            // two failures below.
+            Some(p) => match parse_search_result_page(&p.payload) {
+                Ok(page) => Ok(ServerSearchOutcome::Page(page)),
+                Err(e) => Ok(ServerSearchOutcome::Malformed {
+                    bytes: p.payload.len(),
+                    why: e.to_string(),
+                }),
+            },
+            None => Ok(ServerSearchOutcome::NoAnswer { waited: wait }),
         }
     }
 
@@ -357,6 +441,106 @@ mod tests {
             }
         });
         addr
+    }
+
+    /// THE THREE "NO RESULTS" CAUSES MUST BE TELLABLE APART.
+    ///
+    /// This is the regression pin for the defect that cost a night on
+    /// 2026-08-13: the app reported zero results for a query a CLI control
+    /// answered with four hits, and nothing could say whether the server had
+    /// nothing, never answered, or sent something unreadable. All three used to
+    /// produce an identical empty `SearchResultPage`.
+    ///
+    /// The mock answers the SEARCH with whatever `reply` says, so each arm is
+    /// driven through the REAL `read_search_page`, not by constructing the enum.
+    async fn search_against(reply: Option<Vec<u8>>) -> ServerSearchOutcome {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((sock, _)) = listener.accept().await else {
+                return;
+            };
+            let mut sfs = FramedStream::new(sock);
+            if sfs.read_packet().await.is_err() {
+                return;
+            }
+            let _ = sfs
+                .write_packet(&Packet::new(
+                    PROT_EDONKEY,
+                    OP_IDCHANGE,
+                    0x0A00_0001u32.to_le_bytes().to_vec(),
+                ))
+                .await;
+            // The search request.
+            if sfs.read_packet().await.is_err() {
+                return;
+            }
+            match reply {
+                Some(payload) => {
+                    let _ = sfs
+                        .write_packet(&Packet::new(
+                            PROT_EDONKEY,
+                            crate::search::OP_SEARCHRESULT,
+                            payload,
+                        ))
+                        .await;
+                }
+                // Answer NOTHING, so the read hits its budget.
+                None => {
+                    let _ = sfs.read_packet().await;
+                }
+            }
+        });
+        let (tx, _rx) = mpsc::channel(64);
+        let mut link = ServerLink::new(addr, sample_login(), tx);
+        link.connect().await.unwrap();
+        let params = SearchParams {
+            keyword: "anything".to_string(),
+            ..Default::default()
+        };
+        link.search_page(&params, Duration::from_millis(400))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_empty_index_is_a_page_and_not_a_failure() {
+        // count = 0, no trailing byte: a well-formed, genuinely empty answer.
+        let out = search_against(Some(0u32.to_le_bytes().to_vec())).await;
+        match &out {
+            ServerSearchOutcome::Page(p) => assert!(p.files.is_empty()),
+            other => panic!("an empty index must be a Page, got {other:?}"),
+        }
+        assert!(
+            out.failure_reason().is_none(),
+            "a server that answered with nothing has NOT failed - conflating \
+             the two is the whole defect this type exists to prevent"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_that_never_answers_is_noanswer_not_an_empty_page() {
+        let out = search_against(None).await;
+        assert!(
+            matches!(out, ServerSearchOutcome::NoAnswer { .. }),
+            "a timeout must not masquerade as an empty index, got {out:?}"
+        );
+        let why = out.failure_reason().expect("a timeout is a failure");
+        assert!(
+            why.contains("did not answer"),
+            "the reason must name the timeout so a user can act on it: {why}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unparseable_payload_is_malformed_and_carries_its_size() {
+        // A count field claiming 9999 records with no records behind it.
+        let out = search_against(Some(9999u32.to_le_bytes().to_vec())).await;
+        match &out {
+            ServerSearchOutcome::Malformed { bytes, .. } => assert_eq!(*bytes, 4),
+            other => panic!("a truncated page must be Malformed, got {other:?}"),
+        }
+        assert!(out.failure_reason().is_some());
     }
 
     #[tokio::test]

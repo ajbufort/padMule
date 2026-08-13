@@ -1029,6 +1029,27 @@ impl MuleEngine {
             .block_on(async { self.inner.lock().await.is_incognito() })
     }
 
+    /// Join the Kad network, or do not. **Default ON, which is eMule's own
+    /// default** (0.70b `NetworkKademlia`, `Preferences.cpp:2202`), so both
+    /// networks are queried unless the user says otherwise.
+    ///
+    /// Takes effect IMMEDIATELY in both directions with no Stop/Start: off
+    /// tears the node down (keeping its contacts, releasing the UDP port), on
+    /// starts one when the engine is Running. Search degrades cleanly either
+    /// way - the Kad arm simply contributes nothing - and results carry an
+    /// origin badge, so a user can see which network answered.
+    pub fn set_kad_enabled(&self, on: bool) {
+        self.rt
+            .block_on(async { self.inner.lock().await.set_kad_enabled(on).await })
+    }
+
+    /// Whether padMule is joining Kad. Read from the ENGINE, not from the UI's
+    /// stored preference, so the screen can be checked against the truth.
+    pub fn is_kad_enabled(&self) -> bool {
+        self.rt
+            .block_on(async { self.inner.lock().await.is_kad_enabled() })
+    }
+
     /// Allow or refuse library BROWSING (eMule `CanSeeShares`, whose own default
     /// is `vsfaNobody`). A refusal answers an EMPTY list, never silence.
     ///

@@ -29,6 +29,9 @@ struct SettingsView: View {
     // Must agree with the registered default (false = Nobody), which is also
     // eMule's own default.
     @AppStorage(SettingsKey.allowBrowse) private var allowBrowse = false
+    // Must agree with the registered default (true), or the switch reads one
+    // state while the engine is in the other.
+    @AppStorage(SettingsKey.kadEnabled) private var kadEnabled = true
     @AppStorage(SettingsKey.beepOnDownloadComplete) private var beepOnComplete = true
     @AppStorage(SettingsKey.updateServerListAtLaunch) private var updateAtLaunch = false
     @AppStorage(SettingsKey.askServersForServers) private var askServers = true
@@ -317,6 +320,10 @@ struct SettingsView: View {
 
     private var networkSection: some View {
         Section {
+            Toggle("Use the Kad network", isOn: Binding(
+                get: { kadEnabled },
+                set: { kadEnabled = $0; model.applyKadEnabled() }
+            ))
             Toggle("Use UPnP port mapping", isOn: Binding(
                 get: { upnpEnabled },
                 set: { upnpEnabled = $0; model.applyPortSettings() }
@@ -334,7 +341,7 @@ struct SettingsView: View {
         } header: {
             Text("Network / VPN")
         } footer: {
-            Text("Most people should leave these alone. Behind a VPN, the provider forwards a port into the tunnel: turn UPnP off above, and set all four ports to the one the provider assigned you. The two \"advertised\" fields only differ from their listening counterparts when the provider forwards its port to a DIFFERENT local port - then padMule must listen locally but tell peers the provider's number. Tap Done, or tap outside a field, to apply. Changes take effect the next time padMule starts.")
+            Text("padMule searches two networks: the eD2k SERVER you are connected to, and KAD, which is serverless. Both are on by default and results are badged with where they came from. Turning Kad off makes padMule ask the server only - useful to see what one network is really returning, and it stops padMule announcing which files it holds to anyone crawling Kad. It takes effect immediately, with no restart. The rest of this section: most people should leave these alone. Behind a VPN, the provider forwards a port into the tunnel: turn UPnP off above, and set all four ports to the one the provider assigned you. The two \"advertised\" fields only differ from their listening counterparts when the provider forwards its port to a DIFFERENT local port - then padMule must listen locally but tell peers the provider's number. Tap Done, or tap outside a field, to apply. Changes take effect the next time padMule starts.")
         }
     }
 
