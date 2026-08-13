@@ -22,9 +22,14 @@ current build state is `docs/wiki/build-progress.md`.
 
 - The author is **Anthony Bufort** (`ajbufort@ajbconsulting.us`). Never "Alex".
 - **ASCII only in files.** No arrow glyphs and no em/en dashes. Use `->` and `-`.
-- The working tree is `crates/` + `ios/`. `amule-3.0.1/` is the vendored
-  upstream reference (pristine zip at `reference-archives/amule-3.0.1.zip`, gitignored);
-  treat it as read-only.
+- **What you EDIT is `crates/` + `ios/`** (plus `scripts/`, `fuzz/` and the docs
+  when the task is theirs). That is a narrower thing than what the tree CONTAINS,
+  and the Architecture table below - titled "the working tree" - lists the
+  containing set, `amule-3.0.1/` and `refs/` included. **The two are not in
+  conflict: this bullet is the WRITE list, the table is the INVENTORY.** Said
+  here because the phrase read two ways for weeks.
+  `amule-3.0.1/` is the vendored upstream reference (pristine zip at
+  `reference-archives/amule-3.0.1.zip`, gitignored); treat it as read-only.
 - aMule is GPL-2.0-or-later; padMule is too (root `LICENSE` + `NOTICE`).
   Anything borrowed from other forks (e.g. eMule AI) stays GPL-compatible.
   The compiled BINARY goes further: linking `ring` (Apache-2.0, via rustls, for
@@ -57,7 +62,11 @@ current build state is `docs/wiki/build-progress.md`.
   of handed to both. Working in place rather than in a worktree removes the
   safety net, so file ownership becomes the only guarantee.
 
-## Architecture (the working tree)
+## Architecture - EVERYTHING IN THE TREE, not just what you edit
+
+This is the INVENTORY. The house-rules bullet above names the narrower WRITE
+list; `amule-3.0.1/` and `refs/` appear here because they are present and you
+will read them, not because they may be modified - they may not.
 
 | Path | Responsibility |
 |------|----------------|
@@ -70,7 +79,7 @@ current build state is `docs/wiki/build-progress.md`.
 | `ios/` | SwiftUI app. XcodeGen `project.yml`; the pbxproj is generated in CI, never committed. |
 | `fuzz/` | 8 cargo-fuzz targets over the parse paths (packet, tag, link, kad_udp, met_files, ipfilter, ed2k_peer, ed2k_server). Its OWN workspace root, so `cargo test/clippy/fmt --workspace` never sees it; nightly-only and NOT wired into any CI workflow - run it by hand. |
 | `scripts/` | Oracles + the deploy loop: `build-amuled-oracle.sh`/`differential-test.sh`, `amuled-reverse-oracle.sh`, `kad-store-oracle.sh`/`kad-verify-oracle.sh`, `eserver-oracle.sh`, `emule-oracle.sh`, `aich-golden.sh`, `simulate.sh`, `device-timing.sh`, and `ship.sh`. |
-| `amule-3.0.1/` | Vendored upstream C++ - reference oracle only. `build-oracle/` holds a built amuled for differential tests. |
+| `amule-3.0.1/` | Vendored upstream C++ - reference oracle only. The amuled BUILT from it lands in `/build-oracle/` at the REPO ROOT (gitignored), NOT inside this directory - `build-amuled-oracle.sh:15` sets `BUILD="$REPO/build-oracle"` and `differential-test.sh:15` reads `$REPO/build-oracle/src/amuled`. |
 | `refs/` | Gitignored source oracles: eMule 0.50a (the WIRE authority), eMule 0.70b (community fork), aMule master. |
 
 Authority rule, by domain:

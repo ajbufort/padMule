@@ -74,12 +74,41 @@ pub const PADMULE_CHANNEL_VERSION: u8 = 1;
 /// push a healthy eMule into a false verdict. Never raise this without the
 /// answerer.
 ///
-/// Version 7's OP_KAD_FWTCPCHECK_ACK is still unimplemented, which is why this
-/// tracks `mule_kad::KADEMLIA_VERSION` (8, aMule's level) rather than eMule's 9:
-/// aMule 3.0.1 declares 8 and does not send 0xA8 either
-/// (`ClientList.cpp:593` picks it only for a peer at >= 7 that WE are testing -
-/// an outbound duty padMule has no equivalent of, since it never runs a TCP
-/// firewall check on anyone).
+/// WHY 8 AND NOT 9, stated separately from version 7 - THE TWO ARE DIFFERENT
+/// QUESTIONS and an earlier draft of this comment ran them together. Kad
+/// versions are CUMULATIVE, so declaring 8 asserts version 7's obligations
+/// exactly as 9 would; picking 8 over 9 does not dodge version 7. What it dodges
+/// is version 9's own obligation - "handling AICH hashes on keyword storage"
+/// (opcodes.h:30) - which is the INDEXING half. padMule PUBLISHES
+/// `TAG_KADAICHHASHPUB` to v9 targets (see `mule_kad::build_publish_key_req`)
+/// and does not index it for others, so 8 is the honest level.
+///
+/// WHY DECLARING 8 IS SAFE DESPITE VERSION 7's OP_KAD_FWTCPCHECK_ACK BEING
+/// UNIMPLEMENTED, and this was ENUMERATED rather than argued: `m_byKadVersion`
+/// has exactly ONE writer - this nibble (BaseClient.cpp:554) - and every reader
+/// in eMule 0.50a is a `> 1` / `>= 2` / `== 0` gate except two thresholds. One
+/// is the 0xA7 gate above, which we now answer. The other is
+/// `GetKadVersion() >= KADEMLIA_VERSION7_49a` (ClientList.cpp:551), reached ONLY
+/// in state `KS_CONNECTED_FWCHECK` - which a peer enters only after WE asked it
+/// to TCP-check us with KADEMLIA_FIREWALLED2_REQ (0x53). padMule has no 0x53
+/// SENDER, so it never puts a peer in that state and the branch never fires.
+/// Raising 5 -> 8 therefore has exactly ONE new consequence at a stock peer, and
+/// it is the one `7b85990` implements. aMule 3.0.1 declares 8 with no 0xA8
+/// sender either, for the same reason.
+///
+/// THE REMAINING GAP, named so it is not mistaken for two: 0x53 (Kad UDP) and
+/// 0xA8 (eD2k TCP) are the REQUEST and the ANSWER of one transaction - a peer
+/// asks us over Kad UDP to connect back to its TCP port, and 0xA8 is what we
+/// would send on that connection (ClientList.cpp:551-558, received at
+/// ListenSocket.cpp:2046-2057). padMule answers neither, and peers DO ask:
+/// `FirewalledCheck` gates on `byContactVersion > KADEMLIA_VERSION6_49aBETA`
+/// (KademliaUDPListener.cpp:170, called at :627/:707) against the version in our
+/// KAD-WIRE contact, which has been 8 all along. Unlike the 0xA7 case this is
+/// benign in POLARITY - `CPrefs::GetFirewalled` returns firewalled below TWO
+/// successes and 0xA8 only ever INCREMENTS that count (Prefs.cpp:187-199,
+/// ListenSocket.cpp:2051-2053) - so our silence withholds a confirmation and
+/// can never manufacture a false verdict, which is exactly what made 0xA7
+/// urgent and does not apply here.
 ///
 /// WHAT IT BUYS: `baseline_misc_options2` is once again byte-equal to stock
 /// aMule 3.0.1 (Constants.h:29 -> 0x438), so the 0x435 tell that Incognito could
