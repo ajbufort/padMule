@@ -6670,12 +6670,25 @@ impl Engine {
             version: 2,
             contacts,
         };
-        let _ = std::fs::write(self.config_dir.join("nodes.dat"), write_nodes_dat(&nd));
+        // ATOMIC, like every other durable write here. `write_bytes_atomic`'s own
+        // doc says why it exists: "a crash mid-write (routine on iOS, which
+        // suspends/terminates aggressively) never leaves a truncated file".
+        // These two were the last bare `std::fs::write`s on a durable path.
+        let _ = write_bytes_atomic(&self.config_dir.join("nodes.dat"), &write_nodes_dat(&nd));
         // Persist the credit history (clients.met). pause() is the only reliable
         // iPadOS checkpoint, so credit deltas since the last pause are lost on a
         // hard kill - acceptable for foreground-only v1, and eMule keeps its own
         // wait-clock in RAM too.
-        let _ = std::fs::write(self.config_dir.join(CLIENTS_MET), self.credit_store.save());
+        // clients.met is the ASYMMETRIC one and the reason pending #54 was filed:
+        // a torn file makes `read_clients_met` return Err, and `CreditStore::load`
+        // ends in `.unwrap_or_default()` (credit_store.rs:69) - so the ENTIRE
+        // credit ledger silently resets to empty, with no error anywhere. A
+        // truncated nodes.dat costs a re-bootstrap; a truncated clients.met costs
+        // every reputation this install ever earned, invisibly.
+        let _ = write_bytes_atomic(
+            &self.config_dir.join(CLIENTS_MET),
+            &self.credit_store.save(),
+        );
     }
 
     /// Seed the routing table with Kad contacts (e.g. from a fresh nodes.dat or a
@@ -9152,6 +9165,42 @@ mod tests {
             "the failure must be NAMED, not collapsed into one word; got {evs:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `checkpoint` must not write a durable file with bare `std::fs::write`.
+    ///
+    /// Atomicity cannot be observed from a unit test without fault injection, so
+    /// this pins the MECHANISM by scanning the function's own source - the same
+    /// `include_str!` idiom the heartbeat duty-roster pin uses, and for the same
+    /// reason: the property lives in which helper is called.
+    ///
+    /// Pending #54: both writes here were bare, while `write_bytes_atomic` sat in
+    /// this very file. The cost is asymmetric - a torn `clients.met` makes
+    /// `read_clients_met` return Err and `CreditStore::load` ends in
+    /// `.unwrap_or_default()`, so the whole credit ledger resets to empty with no
+    /// error. iOS terminates aggressively; this is a routine crash, not a rare one.
+    ///
+    /// MUTATION-CHECK: put either `std::fs::write` back -> red.
+    #[test]
+    fn checkpoint_writes_every_durable_file_atomically() {
+        let src = include_str!("engine.rs");
+        let start = src
+            .find("fn checkpoint(&self) {")
+            .expect("checkpoint must exist");
+        let body = &src[start..];
+        let end = body
+            .find("\n    /// Seed the routing table")
+            .expect("checkpoint's end marker must exist");
+        let body = &body[..end];
+        assert!(
+            !body.contains("std::fs::write("),
+            "checkpoint still writes a durable file non-atomically - pending #54"
+        );
+        assert_eq!(
+            body.matches("write_bytes_atomic(").count(),
+            2,
+            "both nodes.dat and clients.met must go through the atomic helper"
+        );
     }
 
     /// A HighID client id IS our public address, so a CHANGE in it between two
