@@ -3032,6 +3032,7 @@ impl Engine {
                         peer_ext_requests,
                         peer_software,
                         peer_is_low_id,
+                        peer_announced_port,
                     ) = match timeout(Duration::from_secs(8), peer_handshake_inbound(&mut fs, &me))
                         .await
                     {
@@ -3070,6 +3071,10 @@ impl Engine {
                                 extreq,
                                 h.client_software(),
                                 h.client_id < 0x0100_0000,
+                                // The port the peer says it LISTENS on. Not the
+                                // port it dialed us from - see `serve_peer`
+                                // below, which is the only consumer.
+                                h.tcp_port,
                             )
                         }
                         _ => return,
@@ -3117,6 +3122,28 @@ impl Engine {
                             Box::new(move |pubkey| cs.bind_verified(peer_hash, pubkey, now_secs())),
                         )
                     });
+                    // THE ADDRESS WE NAME THIS PEER BY TO OTHER PEERS - the IP we
+                    // OBSERVED paired with the port it ANNOUNCED, never the socket
+                    // it dialed us from. An inbound connection's source port is
+                    // ephemeral, so a source-exchange record built from it is
+                    // unconnectable by construction: the receiver dials a port
+                    // nothing listens on. eMule writes `cur_src->GetUserPort()`
+                    // (KnownFile.cpp:1311, in `CreateSrcInfoPacket`), which is the
+                    // hello body's port (`m_nUserPort = nUserPort`,
+                    // BaseClient.cpp:595) - not the accepted socket's.
+                    //
+                    // The IP stays the OBSERVED one deliberately: that is the
+                    // address that demonstrably reaches this peer, while a hello
+                    // can claim any IP it likes.
+                    //
+                    // ONE FIELD, BOTH USES, ON PURPOSE. `ServeSession.peer` is the
+                    // record address in `note_serving` AND the exclusion address in
+                    // `sources_for`. Moving only one would start telling a peer
+                    // about ITSELF, so they must move together - which is why this
+                    // is the right seam. It is never used for I/O; the called-back
+                    // SOURCE path below keeps the real socket `peer`, because that
+                    // one does dial.
+                    let serve_peer = SocketAddr::new(peer.ip(), peer_announced_port);
                     match classify_inbound(&mut fs, sec, SERVE_PEEK).await {
                         InboundKind::Leecher { first, sec } => {
                             serve_inbound(
@@ -3129,7 +3156,7 @@ impl Engine {
                                 crate::share::ServeSession {
                                     sec,
                                     credit: Some((Arc::clone(&credit_store), peer_hash)),
-                                    peer: Some(peer),
+                                    peer: Some(serve_peer),
                                     peer_crypt,
                                     peer_sx1,
                                     peer_aich,
@@ -12540,6 +12567,135 @@ mod tests {
     /// for any peer advertising CT_EMULE_VERSION, which padMule always does, so
     /// `:1749` picks OP_ASKSHAREDDIRS instead. The previous test spoke the
     /// opcode I had written rather than the one the client sends.
+    /// WE NAME A LEECHER TO OTHER PEERS BY THE PORT IT ANNOUNCED, NOT THE ONE IT
+    /// DIALED US FROM.
+    ///
+    /// An inbound connection's source port is EPHEMERAL - the OS picks it for the
+    /// duration of that socket and nothing listens there. A source-exchange record
+    /// built from it is therefore unconnectable by construction: the receiver dials
+    /// a port that is not open, which is worse than being told nothing at all.
+    /// eMule writes `cur_src->GetUserPort()` (KnownFile.cpp:1311, inside
+    /// `CreateSrcInfoPacket`), and that field is the hello BODY's port
+    /// (`m_nUserPort = nUserPort`, BaseClient.cpp:595).
+    ///
+    /// THIS TEST GOES THROUGH THE ACCEPT PATH ON PURPOSE, and that is the whole
+    /// point of it. Pending #71 records why the pre-existing coverage could not
+    /// catch this: `share.rs`'s source-exchange test bakes `4662` into a
+    /// hand-made `ServedPeer` and then asserts the answer carries `4662`, so the
+    /// accept path - the only place an ephemeral port is ever introduced - is
+    /// never involved. A test that constructs its input by hand tests the
+    /// FUNCTION, not the SYSTEM.
+    ///
+    /// It asserts on what the gate RECORDED rather than on an emitted SX packet
+    /// because `sources_for` filters through `is_routable_public_v4` (the
+    /// deliberate B8 SSRF gate), which 127.0.0.1 fails - so an end-to-end
+    /// loopback assertion would read an empty answer whether the port were right
+    /// or wrong, and prove nothing either way.
+    #[tokio::test]
+    async fn a_leecher_is_named_by_its_announced_port_not_its_ephemeral_one() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        /// The port the peer CLAIMS to listen on. Deliberately not 4662 and not
+        /// any default in this file, so no assertion below can pass by accident.
+        const ANNOUNCED: u16 = 4711;
+        const HASH: [u8; 16] = [0xD7; 16];
+
+        let dir = tmp("sx-announced-port");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut engine, _rx) = Engine::new(&dir).unwrap();
+        let port = free_local_port();
+        engine.set_ports(port, port, 0, 4672);
+        engine.set_sharing(true);
+        let path = dir.join("seed.bin");
+        std::fs::write(&path, vec![7u8; 24]).unwrap();
+        engine.shared.lock().await.push(SharedFile {
+            hash: HASH,
+            size: 24,
+            name: b"seed.bin".to_vec(),
+            part_hashes: vec![],
+            path,
+            rating: 0,
+            comment: String::new(),
+            aich_root: None,
+        });
+        let gate = Arc::clone(&engine.upload_gate);
+        engine.start_listener().await;
+
+        let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        // The port the OS gave THIS socket. This is what the record used to
+        // carry, and the assertion below is what separates the two.
+        let ephemeral = sock.local_addr().unwrap().port();
+        assert_ne!(
+            ephemeral, ANNOUNCED,
+            "the test is void if the OS happens to hand out the announced port"
+        );
+
+        let mut body = vec![16u8];
+        body.extend_from_slice(&[0x77u8; 16]);
+        body.extend_from_slice(&0x0A00_0001u32.to_le_bytes()); // HighID
+        body.extend_from_slice(&ANNOUNCED.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes()); // no tags
+        body.extend_from_slice(&0u32.to_le_bytes()); // server ip
+        body.extend_from_slice(&0u16.to_le_bytes()); // server port
+        let mut hello = vec![0xE3u8];
+        hello.extend_from_slice(&((body.len() + 1) as u32).to_le_bytes());
+        hello.push(0x01);
+        hello.extend_from_slice(&body);
+        sock.write_all(&hello).await.unwrap();
+
+        // The HELLOANSWER.
+        let mut hdr = [0u8; 6];
+        tokio::time::timeout(Duration::from_secs(5), sock.read_exact(&mut hdr))
+            .await
+            .expect("the listener must answer the hello")
+            .unwrap();
+        let len = u32::from_le_bytes(hdr[1..5].try_into().unwrap()) as usize;
+        let mut rest = vec![0u8; len - 1];
+        sock.read_exact(&mut rest).await.unwrap();
+
+        // Name the file we want, which is what registers us as a served peer.
+        let mut req = vec![0xE3u8];
+        req.extend_from_slice(&17u32.to_le_bytes());
+        req.push(crate::transfer::OP_SETREQFILEID);
+        req.extend_from_slice(&HASH);
+        sock.write_all(&req).await.unwrap();
+
+        // The registration happens on the serve task, so poll for it rather than
+        // racing it.
+        let mut recorded = Vec::new();
+        for _ in 0..100 {
+            recorded = gate.served_addrs(&HASH);
+            if !recorded.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            recorded.len(),
+            1,
+            "the leecher must be registered against the file it asked for"
+        );
+        assert_eq!(
+            recorded[0].port(),
+            ANNOUNCED,
+            "we must name the peer by the port it ANNOUNCED in its hello \
+             (eMule GetUserPort(), KnownFile.cpp:1311) - a source record is \
+             something another peer DIALS"
+        );
+        assert_ne!(
+            recorded[0].port(),
+            ephemeral,
+            "the accepted socket's source port is ephemeral; naming a peer by it \
+             hands out an address nothing listens on"
+        );
+
+        drop(sock);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn the_directory_browse_a_real_emule_sends_is_answered() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};

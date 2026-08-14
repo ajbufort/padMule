@@ -221,6 +221,24 @@ impl UploadGate {
         }
     }
 
+    /// The addresses recorded against `hash`, exactly as `note_serving` stored
+    /// them.
+    ///
+    /// TEST-ONLY, and it exists because `sources_for` cannot answer this
+    /// question from a loopback test: that method filters on
+    /// `is_routable_public_v4`, which 127.0.0.1 fails by design (the B8 SSRF
+    /// gate), so an end-to-end inbound test would always read an EMPTY answer
+    /// and could not tell a correct record from a broken one. This reads the
+    /// stored address itself, which is where the announced-vs-ephemeral port
+    /// distinction actually lives.
+    #[cfg(test)]
+    pub fn served_addrs(&self, hash: &[u8; 16]) -> Vec<SocketAddr> {
+        let g = self.served.lock_recover();
+        g.get(hash)
+            .map(|v| v.iter().map(|p| p.addr).collect())
+            .unwrap_or_default()
+    }
+
     /// The source records to answer a source-exchange request for `hash` with.
     /// Skips the asker itself and any peer we cannot name usefully (no port),
     /// matching aMule's own skips (`cur_src == forClient`, LowID).
@@ -238,6 +256,14 @@ impl UploadGate {
                     return None;
                 };
                 if !crate::fetch::is_routable_public_v4(*v4.ip()) {
+                    return None;
+                }
+                // A peer that announced no listening port cannot be dialed, so
+                // naming it is worse than saying nothing. This became reachable
+                // only when the record started carrying the ANNOUNCED port: the
+                // accepted socket's port is never 0, so nothing could hit it
+                // before, and the doc above has promised this skip all along.
+                if v4.port() == 0 {
                     return None;
                 }
                 let o = v4.ip().octets();
@@ -1489,6 +1515,51 @@ mod tests {
     use crate::transfer_session::{download_file, TransferError};
     use mule_proto::{ed2k_hash, md4, PARTSIZE};
     use tokio::net::TcpListener;
+
+    /// A PEER THAT ANNOUNCED NO PORT IS NOT A SOURCE.
+    ///
+    /// `sources_for`'s doc has always promised to skip "any peer we cannot name
+    /// usefully (no port)", but nothing could reach that case while the record
+    /// carried the ACCEPTED SOCKET's address - an accepted socket's port is
+    /// never 0. Now that the record carries the port the peer ANNOUNCED, a peer
+    /// that announced 0 reaches it, and naming such a peer would hand out an
+    /// address that cannot be dialled, which is the exact defect the announced
+    /// port was adopted to fix. eMule skips a source it cannot name the same
+    /// way (`cur_src->HasLowID()`, KnownFile.cpp:1234).
+    #[test]
+    fn a_peer_that_announced_no_port_is_never_handed_out_as_a_source() {
+        let gate = Arc::new(UploadGate::new(2, 4));
+        gate.note_serving(
+            [9u8; 16],
+            ServedPeer {
+                addr: "1.2.3.4:0".parse().unwrap(),
+                user_hash: None,
+                crypt: None,
+            },
+        );
+        // It IS recorded - the serve session is real and holds a slot.
+        assert_eq!(gate.served_addrs(&[9u8; 16]).len(), 1);
+        // ...but it is never named to anyone else.
+        assert!(
+            gate.sources_for(&[9u8; 16], None).is_empty(),
+            "a peer announcing port 0 cannot be dialled, so naming it is worse \
+             than saying nothing"
+        );
+
+        // The control: the SAME address with a real announced port IS handed
+        // out, so the assertion above is about the port and not about the setup.
+        gate.note_serving(
+            [9u8; 16],
+            ServedPeer {
+                addr: "1.2.3.4:4662".parse().unwrap(),
+                user_hash: None,
+                crypt: None,
+            },
+        );
+        let srcs = gate.sources_for(&[9u8; 16], None);
+        assert_eq!(srcs.len(), 1, "the dialable peer is still named");
+        assert_eq!(srcs[0].port, 4662);
+    }
 
     /// MUTEX POISONING (handoff #35a). A panic under an `UploadGate` lock must
     /// not kill the upload gate for the app's life. This gate is on the SERVE
