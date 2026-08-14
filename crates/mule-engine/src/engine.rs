@@ -3820,8 +3820,29 @@ impl Engine {
         if !url.starts_with("http://") && !url.starts_with("https://") {
             return ServerListUpdate::BadUrl;
         }
-        let Ok(body) = bootstrap::http_get_bytes(url).await else {
-            return ServerListUpdate::Unreachable;
+        let body = match bootstrap::http_get_bytes(url).await {
+            Ok(b) => b,
+            Err(e) => {
+                // SAY WHICH FAILURE HAPPENED - the same defect row 8ex fixed for
+                // SEARCH (`ServerSearchOutcome`), still live on this path until
+                // 2026-08-14. `Unreachable` collapses a bad URL, a DNS failure, a
+                // refused connect, a TLS handshake failure, an HTTP status and the
+                // body cap into ONE word, and the reason was DISCARDED right here.
+                //
+                // That is not hypothetical: on 2026-08-14 an https fetch failed
+                // repeatedly on the device and reached the screen as "Could not
+                // reach the server-list URL" with nothing to say why - TCP to 443
+                // was observed CONNECTING in the device syslog, so the failure was
+                // inside TLS, and padMule could not report which. Two hypotheses
+                // were investigated and refuted without ever seeing the error.
+                //
+                // `BootstrapError` already carries it: `Io` holds the underlying
+                // message, which for a handshake failure is the rustls reason.
+                self.emit(EngineEvent::Server(format!(
+                    "Server list fetch failed: {e}"
+                )));
+                return ServerListUpdate::Unreachable;
+            }
         };
         self.ingest_server_met(&body)
     }
@@ -9090,6 +9111,45 @@ mod tests {
         assert!(
             d1.last_retry_at() > 0,
             "a stale row releases its slot - the waiting row is admitted"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A failing server-list fetch must SAY WHICH failure it was.
+    ///
+    /// `ServerListUpdate::Unreachable` collapses a bad URL, DNS, a refused
+    /// connect, a TLS handshake failure, an HTTP status and the body cap into one
+    /// word. On 2026-08-14 a real TLS failure on the device reached the screen as
+    /// "Could not reach the server-list URL" with the reason discarded, and two
+    /// hypotheses were chased and refuted without ever seeing the actual error.
+    ///
+    /// Uses a REFUSED loopback port, so the failure is real rather than mocked -
+    /// the error text comes from the network stack, not from the test.
+    ///
+    /// MUTATION-CHECK: delete the `self.emit(...)` in the `Err` arm -> red.
+    #[tokio::test]
+    async fn a_failed_server_list_fetch_names_the_reason() {
+        let dir = tmp("srvlist-reason");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (engine, mut rx) = Engine::new(&dir).unwrap();
+
+        // Port 1 on loopback: nothing listens, so the connect is refused.
+        let out = engine
+            .update_server_list("http://127.0.0.1:1/server.met")
+            .await;
+        assert!(
+            matches!(out, ServerListUpdate::Unreachable),
+            "CONTROL: a refused connect is still Unreachable"
+        );
+        let evs = drain(&mut rx).await;
+        let named = evs.iter().any(|e| {
+            matches!(e, EngineEvent::Server(s)
+                if s.starts_with("Server list fetch failed:") && s.len() > 26)
+        });
+        assert!(
+            named,
+            "the failure must be NAMED, not collapsed into one word; got {evs:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
