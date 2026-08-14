@@ -563,4 +563,27 @@ final class SettingsTests: XCTestCase {
             EngineModel.serverRowConnected(
                 rowAddr: "198.51.100.7:4661", state: .running, liveServerAddr: "192.0.2.1:4661"))
     }
+    /// The Kad bootstrap warning is DERIVED, and the three ways it must stay
+    /// quiet are the point - a banner that cries wolf gets dismissed, and this
+    /// one cannot be dismissed.
+    ///
+    /// It replaced a one-shot engine string that landed in `serverNotice`, a
+    /// durable dismissible field: the claim outlived its own truth the moment
+    /// Kad picked up a contact. Same shape as the captured "Downloading X"
+    /// banner fixed in row 8dn.
+    func testTheKadWarningAppearsOnlyWhileKadIsActuallyStranded() {
+        XCTAssertNotNil(
+            EngineModel.kadBootstrapNotice(kadEnabled: true, ready: true, contacts: 0),
+            "Kad on, engine up, zero contacts: that is the fault this warns about")
+        XCTAssertNil(
+            EngineModel.kadBootstrapNotice(kadEnabled: true, ready: true, contacts: 1),
+            "one contact means it bootstrapped - the warning must go by itself")
+        XCTAssertNil(
+            EngineModel.kadBootstrapNotice(kadEnabled: false, ready: true, contacts: 0),
+            "Kad switched off: zero contacts is the user's choice, not a fault")
+        XCTAssertNil(
+            EngineModel.kadBootstrapNotice(kadEnabled: true, ready: false, contacts: 0),
+            "still starting: the startup banner owns that window")
+    }
+
 }

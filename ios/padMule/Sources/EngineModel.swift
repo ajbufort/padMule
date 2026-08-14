@@ -1190,6 +1190,31 @@ final class EngineModel: ObservableObject {
     /// nothing. A queued row gets its own honest line rather than silence,
     /// because with the max-active cap full a fresh Get lands queued AT BIRTH
     /// and the user still deserves feedback for the tap.
+    /// The Kad bootstrap warning, DERIVED from live state instead of captured
+    /// from an event.
+    ///
+    /// The engine emits `EngineEvent::Server("no Kad contacts to bootstrap")`
+    /// once, when `start_kad` finds an empty routing table
+    /// (`engine.rs`, in `start_kad`). That string was landing in `serverNotice`,
+    /// which is for server NEWS - a MOTD, "Discovered N servers" - and is a
+    /// durable dismissible string. But this is not news, it is a CLAIM ABOUT
+    /// CURRENT STATE, and it stopped being true the moment Kad picked up a
+    /// contact, with nothing to revise it. Same shape as the captured
+    /// "Downloading X" banner directly below, and the same cure: store no
+    /// string, ask the live state.
+    ///
+    /// `nil` while the engine is still starting - the startup banner already
+    /// owns that window, and a cold start legitimately has zero contacts for a
+    /// moment. Also `nil` when Kad is switched off, where zero contacts is the
+    /// user's own choice rather than a fault.
+    /// The exact engine string filtered above - see `engine.rs`, `start_kad`.
+    static let kadEmptyTableEvent = "no Kad contacts to bootstrap"
+
+    static func kadBootstrapNotice(kadEnabled: Bool, ready: Bool, contacts: UInt32) -> String? {
+        guard kadEnabled, ready, contacts == 0 else { return nil }
+        return "Kad has no contacts yet - it cannot find sources until it bootstraps."
+    }
+
     static func downloadBannerText(
         hash: String?, downloads: [DownloadInfo], engineStopped: Bool
     ) -> String? {
@@ -2141,7 +2166,18 @@ final class EngineModel: ObservableObject {
                 // NOT `status`: that would clobber the "Connected to <server>"
                 // line, which arrives as its own `.status` event (event-fed, not
                 // polled - see engine.rs connect_to_server).
-                serverNotice = text
+                // EXCEPT the Kad bootstrap line. It is a claim about CURRENT
+                // STATE, not news, and `serverNotice` is a durable dismissible
+                // string - so it outlived its own truth. Rendered instead from
+                // live state by `kadBootstrapNotice`. Still LOGGED above, and
+                // the engine still emits it (four engine tests use it as the
+                // seam that says `start_kad` took the empty-table path), so
+                // this filter is the only thing coupling the two: if that
+                // wording ever changes engine-side, this stops matching and the
+                // string returns as a sticky banner.
+                if text != Self.kadEmptyTableEvent {
+                    serverNotice = text
+                }
             }
         case .serverDropped(let addr):
             // The server kicked/dropped us: raise a prominent dialog and refresh

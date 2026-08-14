@@ -115,6 +115,10 @@ struct ContentView: View {
     /// 1), and this text asserted the pre-seeding rule unconditionally until
     /// 2026-08-09.
     @AppStorage(SettingsKey.backgroundSeeding) private var backgroundSeedingOn = false
+    /// Read here so the Kad bootstrap banner can tell zero-contacts-because-off
+    /// apart from zero-contacts-because-broken. Same key and same default as
+    /// the Settings toggle (`SettingsView`), which is the only writer.
+    @AppStorage(SettingsKey.kadEnabled) private var kadEnabled = true
     // Servers, not Search: padMule deliberately does not auto-connect, so
     // picking a server IS the first thing to do - landing on Search offered a
     // box that could not answer yet.
@@ -125,9 +129,6 @@ struct ContentView: View {
     // clearing a value the way `notice` and `bootError` can, so each hides until
     // its condition next changes (see the .onChange resets below) - "I have read
     // this", not "never show it again".
-    @State private var hidReconnecting = false
-    @State private var hidSharingPaused = false
-    @State private var hidStarting = false
     // Both search option groups start COLLAPSED - the point of the roll-up. Not
     // persisted: a collapsed group whose label names its active options costs
     // nothing to reopen, and one more UserDefaults key earns nothing.
@@ -249,15 +250,6 @@ struct ContentView: View {
             // dismissing means "I have read this" rather than silencing the
             // warning permanently. A second reconnect, or sharing pausing again
             // later, must be able to speak.
-            .onChange(of: model.reconnecting) { on in
-                if !on { hidReconnecting = false }
-            }
-            .onChange(of: model.sharingPausedForIpChange) { paused in
-                if !paused { hidSharingPaused = false }
-            }
-            .onChange(of: model.ready) { ready in
-                if !ready { hidStarting = false }
-            }
             .sheet(isPresented: $showSettings) {
                 SettingsView().environmentObject(model)
             }
@@ -1959,12 +1951,21 @@ struct ContentView: View {
         mb >= 1024 ? "\(mb / 1024) GB" : "\(mb) MB"
     }
 
-    /// Global status banners - visible on every screen, and ALL of them
-    /// closeable. The three driven by engine STATE (reconnect, sharing-paused,
-    /// starting) cannot be cleared by clearing a value, so each carries its own
-    /// "hidden" flag that RE-ARMS when its condition next changes (see the
-    /// .onChange resets) - dismissing means "I have read this", not "pretend it
-    /// never happened".
+    /// Global status banners, visible on every screen, in TWO kinds.
+    ///
+    /// The ones driven by LIVE ENGINE STATE - reconnecting, sharing-paused,
+    /// starting, and the Kad bootstrap warning - are drawn with [`liveBanner`]
+    /// and CANNOT be closed. Their visibility IS the condition. They used to be
+    /// closeable, each latched behind a "hidden" flag that re-armed on the next
+    /// change, on the reading that dismissing means "I have read this" - but
+    /// that leaves the screen denying a condition still in force, and for the
+    /// starting banner it left a UI whose every control silently no-ops. Anthony
+    /// settled it on 2026-08-14: only show it while it is actually true, and do
+    /// not let it be closed.
+    ///
+    /// The ones reporting an EVENT or the outcome of an action - boot error,
+    /// action notice, started-download - stay closeable via [`banner`], because
+    /// acknowledging those is meaningful.
     ///
     /// Its own @ViewBuilder rather than inline in the body: the conditional
     /// banners (five when this split was made; six now), each with a trailing
@@ -1973,19 +1974,25 @@ struct ContentView: View {
     /// in reasonable time". Splitting a view is the standard cure, and it
     /// costs nothing at runtime.
     @ViewBuilder private var statusBanners: some View {
-        if model.reconnecting && !hidReconnecting {
-            banner("Reconnecting...", systemImage: "arrow.clockwise", tint: .orange) {
-                hidReconnecting = true
-            }
+        if model.reconnecting {
+            liveBanner("Reconnecting...", systemImage: "arrow.clockwise", tint: .orange)
         }
         // Persistent (not just the one-shot alert): the user may dismiss the
         // alert and move to another screen, and sharing stays paused until they
         // turn it back on - this keeps that state visible the whole time.
-        if model.sharingPausedForIpChange && !hidSharingPaused {
-            banner(
+        if model.sharingPausedForIpChange {
+            liveBanner(
                 "Sharing paused: your public address changed. Turn sharing back on to clear this.",
                 systemImage: "wifi.exclamationmark", tint: .orange
-            ) { hidSharingPaused = true }
+            )
+        }
+        // Derived, never captured: see `EngineModel.kadBootstrapNotice`. Kad
+        // holding zero contacts is a live fault, so it appears exactly while it
+        // is one and needs nobody to tidy it away.
+        if let kadWarning = EngineModel.kadBootstrapNotice(
+            kadEnabled: kadEnabled, ready: model.ready, contacts: model.kadContacts)
+        {
+            liveBanner(kadWarning, systemImage: "antenna.radiowaves.left.and.right.slash", tint: .orange)
         }
         if let err = model.bootError {
             banner("Engine failed: " + err, systemImage: "exclamationmark.triangle", tint: .red) {
@@ -1998,11 +2005,11 @@ struct ContentView: View {
         // the timeouts, not a measurement. A warm boot with lists already on disk
         // is ~1s. The banner still earns its place on a cold, slow or blocked
         // network, where those timeouts really do elapse.)
-        if !model.ready && model.bootError == nil && !hidStarting {
-            banner(
+        if !model.ready && model.bootError == nil {
+            liveBanner(
                 "Starting padMule... searching and downloading will work in a moment.",
                 systemImage: "hourglass", tint: .orange
-            ) { hidStarting = true }
+            )
         }
         // Action feedback stays global - it must appear where the user is.
         // Server NEWS (MOTD, discovery) is Servers-only; see serverNotice.
@@ -2050,6 +2057,31 @@ struct ContentView: View {
     /// EVERY banner takes a dismiss action (Anthony, 2026-08-04): a banner the
     /// user cannot close is a permanent strip of lost screen, and on the Status
     /// and Transfers screens these sit directly over the content being read.
+    /// A banner that reports a LIVE CONDITION, and therefore cannot be closed.
+    ///
+    /// Anthony, 2026-08-14, watching a launch: "get rid of the user's ability to
+    /// close it, and only show it while it's actually true." A dismissible
+    /// state banner is a UI that lies on demand - the condition is still in
+    /// force, and the only thing the X changed is whether the screen admits it.
+    /// The starting banner was the worst case, because its own comment says
+    /// EVERY control silently no-ops until boot finishes: dismissing it left a
+    /// screen that looks live and does nothing, which is the handoff's
+    /// startup-window item.
+    ///
+    /// These take no dismiss closure at all, so there is nothing to latch and
+    /// nothing to re-arm. Visibility is the condition, and only the condition.
+    private func liveBanner(_ text: String, systemImage: String, tint: Color) -> some View {
+        Label(text, systemImage: systemImage)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .font(.footnote)
+            .foregroundStyle(.white)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .background(tint)
+    }
+
+    /// A banner reporting an EVENT or an action's outcome, which the user may
+    /// legitimately acknowledge and clear. Contrast [`liveBanner`].
     private func banner(
         _ text: String, systemImage: String, tint: Color, dismiss: @escaping () -> Void
     ) -> some View {
