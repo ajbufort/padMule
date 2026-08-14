@@ -570,6 +570,21 @@ pub async fn download_file(
                 pool.push(ps);
             }
         }
+        // Fold in sources the ENGINE discovered since the last round - its
+        // periodic server/Kad re-ask (eMule PartFile.cpp:2731,:2760). These are
+        // already `PeerSource`, so the routable-address gate has run; the
+        // BLOCKLIST is re-checked here for the same reason the SX drain above
+        // re-checks it - a mid-sweep source must not bypass a user's filter.
+        for ps in dl.take_discovered_sources() {
+            if let (Some(f), SocketAddr::V4(v4)) = (&ip_filter, ps.addr) {
+                if f.is_blocked(*v4.ip()) {
+                    continue;
+                }
+            }
+            if !pool.iter().any(|e| e.addr == ps.addr) {
+                pool.push(ps);
+            }
+        }
         if dl.is_complete().await || dl.is_cancelled() || dl.is_paused() || pool.is_empty() {
             break;
         }

@@ -330,6 +330,17 @@ pub struct Download {
     /// for the fetch manager to drain and dial them. Collected off the async
     /// transfer lock, like the two sets above.
     sx_sources: StdMutex<Vec<SxSource>>,
+    /// Sources the ENGINE discovered while this fetch was already running -
+    /// eMule's periodic server/Kad re-ask, waiting for the fetch manager to
+    /// drain and dial them exactly as it drains `sx_sources`.
+    ///
+    /// **WHY A SECOND INBOX RATHER THAN REUSING `sx_sources`.** These arrive
+    /// already validated as `PeerSource` (the three `PeerSource` constructors
+    /// apply `is_routable_public_v4`), whereas an SX entry is raw and is
+    /// re-validated through `from_sx` on the way in. Keeping them apart means
+    /// neither path has to pretend to be the other, and the blocklist re-check
+    /// still runs on both at fold-in time.
+    discovered_sources: StdMutex<Vec<crate::fetch::PeerSource>>,
     /// Peer IPs we have already asked for sources on this download. eMule
     /// rate-limits the same exchange per client (SOURCECLIENTREASKS = 40 min,
     /// x MINCOMMONPENALTY=4 for a non-rare file); a padMule download is a
@@ -557,6 +568,7 @@ impl Download {
             reserved: StdMutex::new(Vec::new()),
             banned: StdMutex::new(HashSet::new()),
             sx_sources: StdMutex::new(Vec::new()),
+            discovered_sources: StdMutex::new(Vec::new()),
             asked_sources: StdMutex::new(HashSet::new()),
         })
     }
@@ -574,6 +586,29 @@ impl Download {
     /// the fetch manager folds each into its dial queue exactly once.
     pub fn take_sx_sources(&self) -> Vec<SxSource> {
         std::mem::take(&mut *self.sx_sources.lock_recover())
+    }
+
+    /// Hand a running fetch sources the engine just discovered. Additive and
+    /// cheap; the fetch drains them at the top of its next round.
+    ///
+    /// **THIS IS WHAT MAKES A LIVE DOWNLOAD ABLE TO GROW ITS SOURCE SET.**
+    /// Before it existed, `spawn_fetch` took its sources BY VALUE and the only
+    /// mid-flight growth came from source exchange - so a download that started
+    /// with what one channel happened to know kept exactly that set until the
+    /// fetch gave up entirely. Connecting a server afterwards did nothing for
+    /// it, which is not what eMule does: it re-asks on a timer while
+    /// downloading (`PartFile.cpp:2731`, `:2760`).
+    pub fn note_discovered_sources(&self, sources: Vec<crate::fetch::PeerSource>) {
+        if sources.is_empty() {
+            return;
+        }
+        self.discovered_sources.lock_recover().extend(sources);
+    }
+
+    /// Take the engine-discovered sources learned since the last call.
+    /// Destructive, for the same reason `take_sx_sources` is.
+    pub fn take_discovered_sources(&self) -> Vec<crate::fetch::PeerSource> {
+        std::mem::take(&mut *self.discovered_sources.lock_recover())
     }
 
     /// Claim the right to ask `ip` for sources on this download. `true` only the
@@ -4171,6 +4206,49 @@ mod tests {
     /// sources of ten minutes ago would be actively misleading about a file that
     /// now has none - which is the failure mode this whole pair was added to
     /// end, not a new instance of it.
+    /// A RUNNING FETCH MUST BE ABLE TO GROW ITS SOURCE SET.
+    ///
+    /// The inbox is what closes eMule's periodic-re-ask gap: before it, sources
+    /// reached a fetch only at spawn time (by value) or via source exchange, so
+    /// a download that started thin stayed thin until its fetch gave up
+    /// entirely. Drain semantics are asserted because the fetch folds each
+    /// entry in EXACTLY ONCE - a non-destructive read would re-add every source
+    /// on every round.
+    #[tokio::test]
+    async fn discovered_sources_are_handed_over_exactly_once() {
+        let dir = tmpdir("discovered-inbox");
+        let store = PartStore::create(&dir, 1, [0x91; 16], 500, b"d.bin").unwrap();
+        let dl = Download::new(store);
+        assert!(
+            dl.take_discovered_sources().is_empty(),
+            "a fresh download has nothing waiting"
+        );
+        let a = crate::fetch::PeerSource::from_found(&crate::sources::FoundSource {
+            // ed2k LOW-BYTE order (first octet in the low byte), matching the
+            // fixtures in fetch.rs. NOT a 203.0.113.x doc address: that range is
+            // TEST-NET-3 and `is_routable_public_v4` rejects it via
+            // `is_documentation()`, so the source would be dropped and this test
+            // would pass for the wrong reason.
+            ip: u32::from_le_bytes([81, 2, 69, 142]),
+            port: 4662,
+            crypt: None,
+            user_hash: None,
+        })
+        .expect("a routable public source");
+        dl.note_discovered_sources(vec![a.clone()]);
+        let got = dl.take_discovered_sources();
+        assert_eq!(got.len(), 1, "the engine's find must reach the fetch");
+        assert_eq!(got[0].addr, a.addr);
+        assert!(
+            dl.take_discovered_sources().is_empty(),
+            "DESTRUCTIVE: a second drain must be empty, or the fetch re-adds \
+             the same source every round"
+        );
+        // Empty pushes are a no-op rather than a wake-up.
+        dl.note_discovered_sources(Vec::new());
+        assert!(dl.take_discovered_sources().is_empty());
+    }
+
     #[tokio::test]
     async fn the_source_pool_counts_describe_the_latest_lookup_only() {
         let dir = tmpdir("pool");

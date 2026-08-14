@@ -569,6 +569,45 @@ const RESUME_RETRY_BUDGET: Duration = Duration::from_secs(6);
 /// period roughly constant as the queue grows, with a floor so a huge queue
 /// cannot turn the heartbeat into a source-discovery treadmill.
 const RESUME_RETRY_EVERY: Duration = Duration::from_secs(45);
+
+/// eMule's per-file source re-ask bookkeeping, reproduced.
+///
+/// `kad_due` is an ABSOLUTE due time rather than a "last asked" stamp, because
+/// that is how eMule stores it - `m_LastSearchTimeKad = dwCurTick +
+/// (KADEMLIAREASKTIME * m_TotalSearchesKad)` (`PartFile.cpp:2742`) - and
+/// keeping the same shape means the escalating backoff falls out instead of
+/// having to be re-derived.
+#[derive(Debug)]
+struct SourceReask {
+    last_server: Option<Instant>,
+    kad_due: Option<Instant>,
+    /// eMule's `m_TotalSearchesKad`, capped at [`KAD_REASK_MAX_MULTIPLIER`].
+    kad_searches: u32,
+}
+
+/// Re-ask the SERVER for more sources on a download that is ALREADY FETCHING,
+/// per download. eMule: `SERVERREASKTIME` = 15 min (`opcodes.h:64`), applied at
+/// `PartFile.cpp:2760`.
+const SERVER_REASK_EVERY: Duration = Duration::from_secs(15 * 60);
+
+/// Base interval for re-asking KAD on an already-fetching download. eMule:
+/// `KADEMLIAREASKTIME` = 1 hour (`opcodes.h:71`), and the next due time is
+/// `now + KADEMLIAREASKTIME * m_TotalSearchesKad` with the multiplier capped at
+/// 7 (`PartFile.cpp:2740-2742`) - an ESCALATING backoff, so a file nobody has
+/// stops costing lookups. Both halves are reproduced.
+const KAD_REASK_EVERY: Duration = Duration::from_secs(60 * 60);
+/// The cap eMule puts on that multiplier (`if (m_TotalSearchesKad < 7)`).
+const KAD_REASK_MAX_MULTIPLIER: u32 = 7;
+
+/// Stop asking for more once a download holds this many sources. **eMule's
+/// number, kept deliberately** (`MaxSourcesPerFile` defaults to 400,
+/// `Preferences.cpp:2051`; the re-asks are gated on `GetSourceCount()` being
+/// under a cap derived from it at `PartFile.cpp:2731` and `:2761`).
+///
+/// It is a CEILING on asking, not on connecting: `MAX_INBOUND_CONNS` (200) and
+/// the per-download parallelism still bound how many are dialled at once, so a
+/// large pool costs a Vec entry each and buys resilience when peers churn.
+const SOURCE_REASK_TARGET: usize = 400;
 /// The gap is floored at this MULTIPLE of the budget, which bounds how much of
 /// the time the retry holds the engine lock.
 ///
@@ -1755,6 +1794,12 @@ pub struct Engine {
     last_checkpoint: Instant,
     last_share_verify: Instant,
     last_resume_retry: Instant,
+    /// Per-download re-ask bookkeeping for downloads that are ALREADY FETCHING
+    /// (eMule's `m_LastSearchTime` / `m_LastSearchTimeKad` / `m_TotalSearchesKad`,
+    /// `PartFile.cpp`). Keyed by hash and pruned when a download leaves the
+    /// registry, so a long session cannot accumulate entries for files that are
+    /// finished or removed.
+    source_reask: std::collections::HashMap<[u8; 16], SourceReask>,
     /// Max simultaneously-DRIVEN downloads (0 = unlimited); the rest report
     /// QUEUED and are admitted in add order as slots free, except that a row
     /// ACTIVELY RECEIVING keeps its slot first. Shared with
@@ -2032,6 +2077,7 @@ impl Engine {
             last_checkpoint: Instant::now(),
             last_share_verify: Instant::now(),
             last_resume_retry: Instant::now(),
+            source_reask: std::collections::HashMap::new(),
             max_active: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             last_kad_refresh: Instant::now(),
             last_kad_sweep: Instant::now(),
@@ -5026,6 +5072,64 @@ impl Engine {
     /// path and pointed the other way - 195ms instead of 6.001s, 16 of 16
     /// retries sub-second. The widest net is worth little if it is cast 15
     /// seconds late, under the engine lock, once per queued file.
+    /// Ask ONLY the channels whose clock is due, and return dialable sources.
+    ///
+    /// Deliberately NOT `find_sources`: that one is add/resume-time discovery
+    /// and always asks both, with a server-answers-first fast path. The re-ask
+    /// clocks are independent by design (eMule asks the server four times as
+    /// often as Kad and then backs Kad off further), so a shared entry point
+    /// would have to ignore one of them.
+    async fn reask_sources(
+        &mut self,
+        hash: [u8; 16],
+        size: u64,
+        ask_server: bool,
+        ask_kad: bool,
+    ) -> Vec<crate::fetch::PeerSource> {
+        let server = self.server.as_mut();
+        let kad = self.kad.as_mut();
+        let (found, kad_sources) = tokio::join!(
+            async {
+                match (ask_server, server) {
+                    (true, Some(link)) => link
+                        .get_sources(&hash, size, SOURCES_WAIT)
+                        .await
+                        .unwrap_or_default(),
+                    _ => Vec::new(),
+                }
+            },
+            async {
+                match (ask_kad, kad) {
+                    (true, Some(node)) => timeout(
+                        KAD_SEARCH_WAIT,
+                        node.resolve_sources(&Kad128::from_hash(&hash), size, 20, KAD_PER_QUERY),
+                    )
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .map(|o| o.sources)
+                    .unwrap_or_default(),
+                    _ => Vec::new(),
+                }
+            },
+        );
+        // Only DIALABLE sources: the constructors apply the routable-address
+        // gate, and a LowID/unroutable entry would just be dropped again at
+        // fold-in. The blocklist is re-checked there, on the fetch side.
+        let mut out: Vec<crate::fetch::PeerSource> = Vec::new();
+        for f in &found {
+            if let Some(ps) = crate::fetch::PeerSource::from_found(f) {
+                out.push(ps);
+            }
+        }
+        for k in &kad_sources {
+            if let Some(ps) = crate::fetch::PeerSource::from_kad(k) {
+                out.push(ps);
+            }
+        }
+        out
+    }
+
     async fn find_sources(
         &mut self,
         hash: [u8; 16],
@@ -5864,6 +5968,105 @@ impl Engine {
     /// One per tick keeps the cost bounded; the oldest-idle-first ordering means
     /// a set of stalled downloads is worked through round-robin rather than the
     /// first one hogging every retry.
+    /// TOP UP THE SOURCES OF A DOWNLOAD THAT IS ALREADY RUNNING - eMule's
+    /// periodic re-ask, which padMule did not have.
+    ///
+    /// **THE GAP THIS CLOSES.** `maintain_resume_fetches` excludes
+    /// `dl.is_fetching()`, so the only re-discovery padMule performed was for a
+    /// download whose fetch had given up ENTIRELY. A download that started with
+    /// whatever one channel happened to know kept exactly that set for its whole
+    /// life: connecting a server afterwards never helped it, and a source that
+    /// dropped was never replaced. Observed on glass 2026-08-13 - a download sat
+    /// at "3 kad" through a HighID server login while a real eMule watching the
+    /// same file showed 9(12).
+    ///
+    /// **eMULE'S RULE, AND IT IS NOT THE ONE PADMULE HAD.** The gate is the
+    /// SOURCE COUNT against a cap, never idle-vs-active: server every
+    /// [`SERVER_REASK_EVERY`] while `GetSourceCount()` is under the soft cap
+    /// (`PartFile.cpp:2760-2766`), Kad on an ESCALATING backoff of
+    /// [`KAD_REASK_EVERY`] x searches, capped at
+    /// [`KAD_REASK_MAX_MULTIPLIER`] (`PartFile.cpp:2731-2750`). Both cadences
+    /// and the 400-source ceiling are eMule's own numbers.
+    ///
+    /// ONE download per beat, and the two channels are asked on their OWN
+    /// clocks - a Kad lookup costs far more than a server question, which is
+    /// exactly why upstream asks it a quarter as often and then backs off.
+    /// Results go into the running fetch's inbox
+    /// ([`Download::note_discovered_sources`]); this never spawns a fetch,
+    /// because a fetch is by definition already running.
+    pub async fn maintain_source_reask(&mut self) -> bool {
+        if self.state != EngineState::Running || self.offline {
+            return false;
+        }
+        let now = Instant::now();
+        // Candidates: FETCHING (the case the resume sweep cannot reach), not
+        // paused/cancelled/complete, and under the source ceiling.
+        let candidate = {
+            let guard = self.downloads.lock().await;
+            let mut best: Option<(Arc<Download>, [u8; 16])> = None;
+            for dl in guard.iter() {
+                if !dl.is_fetching() || dl.is_cancelled() || dl.is_paused() {
+                    continue;
+                }
+                if dl.source_pool().0 as usize >= SOURCE_REASK_TARGET {
+                    continue;
+                }
+                let h = dl.hash().await;
+                let st = self.source_reask.get(&h);
+                let server_due = st
+                    .and_then(|s| s.last_server)
+                    .is_none_or(|t| now.saturating_duration_since(t) >= SERVER_REASK_EVERY);
+                let kad_due = st.and_then(|s| s.kad_due).is_none_or(|t| now >= t);
+                if server_due || kad_due {
+                    best = Some((Arc::clone(dl), h));
+                    break;
+                }
+            }
+            best
+        };
+        let Some((dl, hash)) = candidate else {
+            return false;
+        };
+        // PRUNE while we hold no lock: entries for downloads that have left the
+        // registry would otherwise accumulate for the life of the process.
+        {
+            let live: std::collections::HashSet<[u8; 16]> = {
+                let guard = self.downloads.lock().await;
+                let mut v = std::collections::HashSet::new();
+                for dl in guard.iter() {
+                    v.insert(dl.hash().await);
+                }
+                v
+            };
+            self.source_reask.retain(|h, _| live.contains(h));
+        }
+        let size = dl.size().await;
+        let st = self.source_reask.entry(hash).or_insert(SourceReask {
+            last_server: None,
+            kad_due: None,
+            kad_searches: 0,
+        });
+        let ask_server = st
+            .last_server
+            .is_none_or(|t| now.saturating_duration_since(t) >= SERVER_REASK_EVERY);
+        let ask_kad = st.kad_due.is_none_or(|t| now >= t);
+        if ask_server {
+            st.last_server = Some(now);
+        }
+        if ask_kad {
+            // eMule increments FIRST and then multiplies, so the very first
+            // re-ask is already one full interval out rather than immediate.
+            st.kad_searches = (st.kad_searches + 1).min(KAD_REASK_MAX_MULTIPLIER);
+            st.kad_due = Some(now + KAD_REASK_EVERY * st.kad_searches);
+        }
+        let found = self.reask_sources(hash, size, ask_server, ask_kad).await;
+        if found.is_empty() {
+            return false;
+        }
+        dl.note_discovered_sources(found);
+        true
+    }
+
     pub async fn maintain_resume_fetches(&mut self) -> bool {
         if self.state != EngineState::Running || self.offline {
             return false;

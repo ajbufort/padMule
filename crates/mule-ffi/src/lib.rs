@@ -931,10 +931,12 @@ impl MuleEngine {
     /// It drains pending share re-announces, finalizes downloads that completed
     /// outside a fetch task, detects a server drop/kick, runs the periodic
     /// checkpoint, unshares files deleted in the Files app, re-drives idle
-    /// downloads, merges gossip-harvested servers into server.met, refreshes the
+    /// downloads, TOPS UP the sources of a download that is already fetching
+    /// (eMule's periodic re-ask, which the idle sweep before it cannot reach),
+    /// merges gossip-harvested servers into server.met, refreshes the
     /// Kad routing table, runs the Kad LIVENESS SWEEP (eMule's `OnSmallTimer`:
     /// probe the oldest due contact per bin, remove whoever failed to answer),
-    /// and PUBLISHES one due shared file/keyword to the Kad DHT. That is TEN:
+    /// and PUBLISHES one due shared file/keyword to the Kad DHT. That is ELEVEN:
     /// the sentence said seven for as long as `maintain_kad` had existed,
     /// because it was added to the BODY without being added to the list that
     /// enumerates it - the same shape as a test that pins "these callers" and
@@ -946,7 +948,7 @@ impl MuleEngine {
     /// derives the real count from the body and goes RED when this sentence,
     /// or the wiring comment below, disagrees.
     ///
-    /// IF THIS STOPS BEING CALLED, all TEN stop SILENTLY - nothing errors and
+    /// IF THIS STOPS BEING CALLED, all ELEVEN stop SILENTLY - nothing errors and
     /// nothing on screen changes; downloads simply stall, finished files are
     /// never shared, and a kick goes unnoticed. It used to be a side effect of
     /// `downloads()`, which made it impossible to forget but also forced every
@@ -972,6 +974,13 @@ impl MuleEngine {
             self.inner.lock().await.maintain_checkpoint().await;
             self.inner.lock().await.maintain_share_verify().await;
             self.inner.lock().await.maintain_resume_fetches().await;
+            // TOP UP an already-fetching download's sources on eMule's own
+            // clocks (server 15 min, Kad 1 hour x searches, both gated on the
+            // 400-source ceiling). Distinct from the duty above, which only
+            // reaches downloads whose fetch has given up ENTIRELY - so before
+            // this existed a live download could never grow its source set.
+            // Rate-limited per download inside.
+            self.inner.lock().await.maintain_source_reask().await;
             self.inner.lock().await.maintain_server_harvest().await;
             // Kad routing-table maintenance. Rate-limited to KAD_REFRESH_EVERY
             // inside, so calling it every heartbeat costs a comparison.
@@ -982,7 +991,7 @@ impl MuleEngine {
             self.inner.lock().await.maintain_kad_liveness().await;
             // PUBLISH one due shared file/keyword to the Kad DHT (eMule's STORE
             // half). Rate-limited to KAD_PUBLISH_EVERY inside, one job per
-            // pass, bounded at KAD_PUBLISH_BUDGET. DUTY TEN - if you add
+            // pass, bounded at KAD_PUBLISH_BUDGET. DUTY ELEVEN - if you add
             // another, update the count HERE and in the doc above; the
             // source-scan test named there stays RED until both agree with
             // the body. Swift states no number any more (its refresh() points
