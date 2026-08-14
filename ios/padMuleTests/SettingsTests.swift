@@ -586,4 +586,23 @@ final class SettingsTests: XCTestCase {
             "still starting: the startup banner owns that window")
     }
 
+    /// The Kad start-up diagnostics are a FAMILY, and the first version of this
+    /// filter handled one of them - the other two appeared on glass within the
+    /// hour, still sticky. This pins all three by name.
+    ///
+    /// It cannot see `engine.rs`, so it does NOT prove the set matches what the
+    /// engine emits; that coupling is by string equality and is called out at
+    /// both ends. What it does catch is the cheap regression: someone trimming
+    /// the set back to one entry.
+    func testEveryKadStartupDiagnosticIsKeptOutOfTheDurableServerNotice() {
+        let d = EngineModel.kadStartupDiagnostics
+        XCTAssertEqual(d.count, 3, "three start_kad outcomes report through this channel")
+        for s in ["no Kad contacts to bootstrap", "Kad UDP port unavailable", "Kad bootstrap incomplete"] {
+            XCTAssertTrue(d.contains(s), "\(s) must not reach serverNotice as durable news")
+        }
+        XCTAssertFalse(
+            d.contains("Discovered 12 servers"),
+            "CONTROL: genuine server NEWS still goes to serverNotice")
+    }
+
 }

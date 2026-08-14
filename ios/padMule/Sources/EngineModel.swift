@@ -1207,8 +1207,28 @@ final class EngineModel: ObservableObject {
     /// owns that window, and a cold start legitimately has zero contacts for a
     /// moment. Also `nil` when Kad is switched off, where zero contacts is the
     /// user's own choice rather than a fault.
-    /// The exact engine string filtered above - see `engine.rs`, `start_kad`.
-    static let kadEmptyTableEvent = "no Kad contacts to bootstrap"
+    /// The engine's Kad START-UP DIAGNOSTICS, which are not server news.
+    ///
+    /// `start_kad` reports its outcome through `EngineEvent::Server`, the same
+    /// channel a server MOTD and "Discovered N servers" arrive on - so all three
+    /// landed in `serverNotice`, a DURABLE, dismissible string. They are not
+    /// news; each is a moment-in-time claim about whether Kad came up, and each
+    /// outlived its own truth with nothing to revise it.
+    ///
+    /// They stay in the LOG, where a diagnostic belongs. What the user sees
+    /// comes from `kadBootstrapNotice`, derived from the live contact count, so
+    /// it speaks exactly while Kad is actually stranded and goes quiet by itself
+    /// the moment a contact arrives. All three collapse to that one question:
+    /// a failed port bind and a failed bootstrap both leave zero contacts, and
+    /// "incomplete" with contacts in hand is not a fault worth a banner.
+    ///
+    /// THE FIRST VERSION OF THIS FILTERED ONE STRING and missed the other two,
+    /// which showed up on glass within the hour. A family needs a set.
+    static let kadStartupDiagnostics: Set<String> = [
+        "no Kad contacts to bootstrap",  // engine.rs, start_kad: empty table
+        "Kad UDP port unavailable",      // engine.rs, start_kad: bind failed
+        "Kad bootstrap incomplete",      // engine.rs, start_kad: partial fill
+    ]
 
     static func kadBootstrapNotice(kadEnabled: Bool, ready: Bool, contacts: UInt32) -> String? {
         guard kadEnabled, ready, contacts == 0 else { return nil }
@@ -2166,16 +2186,16 @@ final class EngineModel: ObservableObject {
                 // NOT `status`: that would clobber the "Connected to <server>"
                 // line, which arrives as its own `.status` event (event-fed, not
                 // polled - see engine.rs connect_to_server).
-                // EXCEPT the Kad bootstrap line. It is a claim about CURRENT
-                // STATE, not news, and `serverNotice` is a durable dismissible
-                // string - so it outlived its own truth. Rendered instead from
-                // live state by `kadBootstrapNotice`. Still LOGGED above, and
-                // the engine still emits it (four engine tests use it as the
-                // seam that says `start_kad` took the empty-table path), so
-                // this filter is the only thing coupling the two: if that
-                // wording ever changes engine-side, this stops matching and the
-                // string returns as a sticky banner.
-                if text != Self.kadEmptyTableEvent {
+                // EXCEPT Kad's start-up diagnostics - see
+                // `kadStartupDiagnostics`. Those are claims about CURRENT STATE,
+                // not news, and `serverNotice` is a durable dismissible string,
+                // so each outlived its own truth. The user-facing answer is
+                // derived by `kadBootstrapNotice` instead; these stay in the log
+                // above. The engine still emits them (engine tests use the
+                // empty-table one as a seam), so this set is the only thing
+                // coupling the two: a wording change engine-side stops matching
+                // here and the string returns as a sticky banner.
+                if !Self.kadStartupDiagnostics.contains(text) {
                     serverNotice = text
                 }
             }
