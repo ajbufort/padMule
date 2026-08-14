@@ -194,12 +194,32 @@ pub async fn http_get_bytes(url: &str) -> Result<Vec<u8>, BootstrapError> {
             // The handshake gets its own bound, matching the connect timeout: a
             // peer that completes the TCP connect and then stalls mid-handshake
             // must not hold the fetch open indefinitely.
+            // TIMED, and the timing is reported in the error rather than
+            // discarded. On 2026-08-14 the device fell back to plaintext for
+            // server.met and then completed the handshake over TLS for nodes.dat
+            // SECONDS LATER, to the SAME HOST, in the SAME launch - which rules
+            // out the network and points at the FIRST handshake in a process
+            // being slower than the ones after it (provider setup and decoding
+            // the root list are one-time costs charged entirely to it, and they
+            // are counted inside this budget). "TLS handshake timeout" alone
+            // could not distinguish that from a stalled peer; the elapsed time
+            // and the config-build time can.
+            let cfg_started = std::time::Instant::now();
+            let cfg = tls_config();
+            let cfg_ms = cfg_started.elapsed().as_millis();
+            let hs_started = std::time::Instant::now();
             let tls = timeout(
                 Duration::from_secs(10),
-                TlsConnector::from(tls_config()).connect(name, tcp),
+                TlsConnector::from(cfg).connect(name, tcp),
             )
             .await
-            .map_err(|_| BootstrapError::Io("TLS handshake timeout".into()))?
+            .map_err(|_| {
+                BootstrapError::Io(format!(
+                    "TLS handshake timeout after {}ms (tls config build {}ms)",
+                    hs_started.elapsed().as_millis(),
+                    cfg_ms
+                ))
+            })?
             .map_err(|e| BootstrapError::Io(format!("TLS: {e}")))?;
             request_and_read(tls, &host, &path).await
         }
