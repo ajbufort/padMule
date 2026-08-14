@@ -233,16 +233,18 @@ impl Zone {
 
     /// `starved`: the whole table holds fewer than [`DIVERSITY_STARVED_BELOW`]
     /// contacts, so the per-bin subnet cap is off (see that constant).
-    fn add(&mut self, contact: Contact, starved: bool) {
+    ///
+    /// Returns whether the contact was ACCEPTED (inserted or updated in place).
+    /// `false` is one of the silent refusals below - eMule's `bUpdate = false`.
+    fn add(&mut self, contact: Contact, starved: bool) -> bool {
         // Descend toward the child matching this contact's distance bit at our
         // level (bit 0 = the half closer to our own ID).
         if let Node::Internal(zero, one) = &mut self.node {
-            if contact.distance.bit(self.level as u32) == 0 {
-                zero.add(contact, starved);
+            return if contact.distance.bit(self.level as u32) == 0 {
+                zero.add(contact, starved)
             } else {
-                one.add(contact, starved);
-            }
-            return;
+                one.add(contact, starved)
+            };
         }
 
         // Leaf. Copy the split-decision inputs first to avoid borrowing all of
@@ -274,7 +276,7 @@ impl Zone {
                     && contact.udp_key == 0
                     && (bin[pos].ip != contact.ip || bin[pos].udp_port != contact.udp_port)
                 {
-                    return;
+                    return false;
                 }
                 // IN PLACE, and the POSITION is the load-bearing half. eMule's
                 // found-contact branch returns without `PushToBottom`, which
@@ -311,7 +313,7 @@ impl Zone {
                     contact.last_type_set = old.last_type_set;
                 }
                 bin[pos] = contact;
-                return;
+                return true;
             }
             if bin.len() < K {
                 // ECLIPSE RESISTANCE, and eMule checks its per-bin caps in
@@ -323,22 +325,22 @@ impl Zone {
                 // evicts anyone to make room (RoutingBin.cpp:102-106), so this
                 // is an ADMISSION rule and not a replacement policy.
                 if !starved && subnet_capped(bin, contact.ip) {
-                    return;
+                    return false;
                 }
                 bin.push(contact);
-                return;
+                return true;
             }
             // Full bin. It may split only if shallow (level < KBASE) or close to
             // us (index < KK), and not at the depth limit - eMule CanSplit. If it
             // cannot split, the new contact is dropped.
             let can_split = level < MAXLEVELS && (index < KK || level < KBASE);
             if !can_split {
-                return;
+                return false;
             }
         }
         // Full, splittable leaf: split, then re-descend into the new subtree.
         self.split();
-        self.add(contact, starved);
+        self.add(contact, starved)
     }
 
     /// eMule `CRoutingBin::SetAlive` (RoutingBin.cpp:125-138): `UpdateType`
@@ -538,14 +540,23 @@ impl RoutingTable {
         tcp_port: u16,
         version: u8,
         verified: bool,
-    ) {
+    ) -> bool {
+        // RETURNS WHETHER THE CONTACT WAS ACCEPTED - eMule's `bUpdate`. Every
+        // refusal below is SILENT, and a caller that assumes success will act on
+        // a contact this table rejected. That is not hypothetical: pending #56
+        // was exactly it - `kad_live` renewed a contact's liveness lease after a
+        // refused add, including past the anti-hijack address freeze, whose own
+        // comment promises "an attacker must not be able to forge a liveness
+        // signal either". eMule reaches `SetAlive` only inside the accepted
+        // branch (RoutingZone.cpp:548/:588, both under `if(bUpdate)`).
+
         // eMule runs its entire insert inside `if (uID != uMe && uVersion > 1)`
         // (RoutingZone.cpp:494), so BOTH conditions belong at this one gate
         // rather than at each caller. Kad1 contacts cannot speak the Kad2 wire
         // padMule sends, so every request to one is a wasted datagram - and
         // `closest_to` would pass it on to other nodes as a lead.
         if id == self.self_id || version <= 1 {
-            return;
+            return false;
         }
         // ONE walk of the table answers both whole-table diversity questions.
         //
@@ -571,7 +582,7 @@ impl RoutingTable {
             (starved, full)
         };
         if slash16_full {
-            return;
+            return false;
         }
         let c = Contact::new(
             &self.self_id,
@@ -584,13 +595,9 @@ impl RoutingTable {
             0,
             0,
         );
-        self.root.add(c, starved);
+        self.root.add(c, starved)
     }
 
-    /// Record the verify key `key` (minted against OUR IP `key_ip`) that the peer
-    /// `id` at `ip` handed us, so we can echo it back and be verified. A no-op if
-    /// the contact is absent or at a different IP (a key is IP-bound). Kept a
-    /// separate call so `add`'s many callers stay untouched.
     /// A contact has PROVEN itself alive - it answered something we sent, or
     /// sent us a HELLO_REQ whose sender key matches the one we hold for it.
     /// eMule `SetAlive` (RoutingBin.cpp:125-138), reached from the `bUpdate =
@@ -640,6 +647,10 @@ impl RoutingTable {
         out
     }
 
+    /// Record the verify key `key` (minted against OUR IP `key_ip`) that the peer
+    /// `id` at `ip` handed us, so we can echo it back and be verified. A no-op if
+    /// the contact is absent or at a different IP (a key is IP-bound). Kept a
+    /// separate call so `add`'s many callers stay untouched.
     pub fn note_verify_key(&mut self, id: &Kad128, ip: u32, key: u32, key_ip: u32) {
         if let Some(c) = self.root.find_mut(id) {
             if c.ip == ip {

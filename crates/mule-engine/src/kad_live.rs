@@ -520,11 +520,22 @@ fn gated_add_contact(
         }
     }
     let known = t.contains(&c.id);
-    t.add(c.id, c.ip, c.udp_port, c.tcp_port, c.version, verified);
+    let accepted = t.add(c.id, c.ip, c.udp_port, c.tcp_port, c.version, verified);
     // Only an EXISTING contact is promoted, matching eMule: its new-contact
     // branch inserts at type 3 (`InitContact`) with no `SetAlive`, even from a
     // HELLO. A first sighting is not yet a proof of liveness we can pass on.
-    if proven_alive && known {
+    //
+    // AND ONLY IF THE ADD WAS ACCEPTED (pending #56). `known` is computed BEFORE
+    // the add, so on its own it says the contact existed - not that this update
+    // was allowed. `add` refuses silently in four places, and the sharp one is
+    // the ANTI-HIJACK ADDRESS FREEZE: a KadID is semi-public, so a third party
+    // can name a contact we have corresponded with at an address of their
+    // choosing. The freeze refuses to MOVE it, and its comment already promised
+    // the rest - "an attacker must not be able to forge a liveness signal
+    // either" - which was untrue precisely here, because the lease was renewed
+    // anyway. eMule reaches `SetAlive` only under `if(bUpdate)`
+    // (RoutingZone.cpp:548, :588); every refusal sets `bUpdate = false`.
+    if proven_alive && known && accepted {
         t.set_alive(&c.id, now);
     }
 }
@@ -2357,6 +2368,78 @@ pub struct ResolveOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PENDING #56: a REFUSED add still renewed the contact's liveness lease -
+    /// remote, unauthenticated lease renewal.
+    ///
+    /// `gated_add_contact` computed `known` BEFORE calling `add`, and `add`
+    /// returned nothing, so its four silent refusals were invisible. The sharp
+    /// one is the ANTI-HIJACK ADDRESS FREEZE: a KadID is semi-public, so a third
+    /// party can name a contact we have corresponded with at an address of their
+    /// choosing. The freeze correctly refuses to MOVE it - and its own comment
+    /// already promised the rest, "an attacker must not be able to forge a
+    /// liveness signal either", which was untrue at exactly this call site.
+    /// eMule reaches `SetAlive` only under `if(bUpdate)` (RoutingZone.cpp:548,
+    /// :588); every refusal sets `bUpdate = false`.
+    ///
+    /// Driven through `gated_add_contact`, the production entry point, rather
+    /// than by hand-calling `add` + `set_alive` - a test that re-implements the
+    /// rule cannot catch the caller, which is the whole shape of pending #71.
+    /// The lease is observed through `sweep`, because a renewed lease drops the
+    /// contact out of the probe-due set.
+    ///
+    /// MUTATION-CHECK: drop `&& accepted` from the `set_alive` guard -> red.
+    #[test]
+    fn a_refused_hijack_update_must_not_renew_the_liveness_lease() {
+        use mule_kad::{RoutingTable, ALIVE_LEASE_SECS};
+        use mule_proto::Kad128;
+
+        let me = Kad128::from_hash(&[0xAA; 16]);
+        let victim = Kad128::from_hash(&[0xBB; 16]);
+        let routing = Mutex::new(RoutingTable::new(me));
+        let filter: Mutex<Option<Arc<IpFilter>>> = Mutex::new(None);
+        let ip_a = 0x0102_0304u32; // 1.2.3.4, public
+        let ip_b = 0x0506_0708u32; // 5.6.7.8, the attacker
+        let t0 = 1_000_000u64;
+
+        let wire = |ip| WireContact {
+            id: victim,
+            ip,
+            udp_port: 4672,
+            tcp_port: 4662,
+            version: 8,
+        };
+
+        // A contact we have actually corresponded with: it holds a verify key,
+        // which is what arms the freeze, and it holds a fresh lease.
+        gated_add_contact(&routing, &filter, &wire(ip_a), true, true, t0);
+        {
+            let mut t = routing.lock_recover();
+            t.note_verify_key(&victim, ip_a, 0xDEAD_BEEF, ip_a);
+            assert!(t.set_alive(&victim, t0), "CONTROL: the contact is present");
+        }
+
+        // A THIRD PARTY names that same semi-public KadID at ITS address, half a
+        // lease later, claiming the contact just proved itself alive.
+        let t1 = t0 + ALIVE_LEASE_SECS / 2;
+        gated_add_contact(&routing, &filter, &wire(ip_b), true, true, t1);
+
+        assert_eq!(
+            routing.lock_recover().ip_of(&victim),
+            Some(ip_a),
+            "CONTROL: the address freeze itself still holds"
+        );
+
+        // The lease must still expire on the ORIGINAL clock. Had the refused
+        // update renewed it, it would run to t1 + ALIVE_LEASE_SECS and the
+        // contact would not be due here.
+        let out = routing.lock_recover().sweep(t0 + ALIVE_LEASE_SECS + 1, 8);
+        let touched = out.probes.iter().any(|p| p.id == victim) || out.removed.contains(&victim);
+        assert!(
+            touched,
+            "a REFUSED hijack update renewed the liveness lease - pending #56"
+        );
+    }
 
     /// The exact 8 bytes eMule's `SendFirewallCheckUDPRequest` builds
     /// (BaseClient.cpp:3136-3140): intern port, extern port, our verify key for
