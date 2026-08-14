@@ -58,8 +58,9 @@ pub struct SecIdentCtx {
 
 /// The optional extras one download connection can carry, bundled so the
 /// transfer functions keep a readable arity: the secure-ident context, the
-/// credit sink for bytes this source gives us, and whether to ask this peer for
-/// more sources (source exchange).
+/// credit sink for bytes this source gives us, whether to ask this peer for
+/// more sources (source exchange), and where the session goes if the peer
+/// queues us instead of granting a slot.
 #[derive(Default)]
 pub struct PeerSession {
     pub sec: Option<SecIdentCtx>,
@@ -72,6 +73,113 @@ pub struct PeerSession {
     /// Gates the root ask and recovery requests on eMule's own
     /// IsSupportingAICH bit-0 test.
     pub peer_aich: u8,
+    /// Where this session goes when the peer QUEUES it instead of granting a
+    /// slot. `None` (the default) keeps the historical behavior: `bail_on_queue`
+    /// decides, and a queued session is abandoned. See [`ParkHandle`].
+    pub park: Option<ParkHandle>,
+}
+
+/// A queued session's route OUT of the sweep, without giving up its place.
+///
+/// **The authority does the opposite of what padMule used to do.**
+/// `ProcessEmuleQueueRank` reads the rank, calls `SetRemoteQueueRank`, puts the
+/// client in `DS_ONQUEUE` and **stays connected**
+/// (`DownloadClient.cpp:2210-2219`). eD2k's whole economy is queue-based -
+/// credits buy queue POSITION - so a client that never waits never converts
+/// credit into throughput. padMule bailed the instant it was queued, and the
+/// on-device funnel measured the cost on 2026-08-14: of 61 sessions that asked
+/// for a slot, 30 were accepted and **29 were queued and abandoned**.
+///
+/// **Why the socket is HELD rather than redialed later.** A reconnecting client
+/// keeps its place only because eMule re-attaches it to the existing waiting
+/// entry - `if (cur_client == client)` then `SendRankingInfo()` and return
+/// (`UploadQueue.cpp:559-577`) - and re-asking inside `MIN_REQUESTTIME` (10 min,
+/// `opcodes.h:116`) is scored against us as an abusive re-ask
+/// (`UploadClient.cpp:900`). Holding the connection sidesteps both questions:
+/// the place is never at risk and no re-ask is sent.
+///
+/// **A flag flip would not have worked**, which is why this type exists at all:
+/// simply passing `bail_on_queue = false` converts an instant bail into a
+/// `per_peer` (45s) stall that still loses the peer, while holding one of only
+/// `parallel` worker slots. A parked session must LEAVE the sweep.
+#[derive(Clone)]
+pub struct ParkHandle {
+    /// Fires once, when this session decides to wait its turn. The fetch worker
+    /// watches it so it can move to the next source immediately, and the session
+    /// wrapper watches it so the 45s per-peer deadline stops applying.
+    signal: tokio::sync::watch::Sender<bool>,
+    /// Concurrent parks are capped. Each parked session holds a real file
+    /// descriptor, and unlike bandwidth that IS a genuine limit on the device -
+    /// so this cap is padMule's own, not a mobile-sized version of upstream's.
+    permits: Arc<tokio::sync::Semaphore>,
+}
+
+impl ParkHandle {
+    pub fn new(
+        signal: tokio::sync::watch::Sender<bool>,
+        permits: Arc<tokio::sync::Semaphore>,
+    ) -> Self {
+        ParkHandle { signal, permits }
+    }
+
+    /// Claim one of the park slots. `None` means the cap is full, and the caller
+    /// must fall back to the historical bail - an honest refusal rather than an
+    /// unbounded socket count.
+    fn claim(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        Arc::clone(&self.permits).try_acquire_owned().ok()
+    }
+
+    /// Tell the sweep this session is staying. Idempotent.
+    fn announce(&self) {
+        let _ = self.signal.send(true);
+    }
+}
+
+/// One session's park state, owned by [`run_peer`].
+///
+/// The permit lives HERE, in the session's own frame, for the same reason
+/// [`HeldBlocks`] does: a session most often ends by having its future DROPPED
+/// (the caller's deadline, a pause, a cancel), where trailing code never runs
+/// but a destructor always does. Holding the permit in a local means a park slot
+/// is returned on every one of those paths without a single explicit release.
+struct ParkState<'a> {
+    handle: Option<&'a ParkHandle>,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl<'a> ParkState<'a> {
+    fn new(handle: Option<&'a ParkHandle>) -> Self {
+        ParkState {
+            handle,
+            permit: None,
+        }
+    }
+
+    /// True once this session has left the sweep and is waiting its turn.
+    fn parked(&self) -> bool {
+        self.permit.is_some()
+    }
+
+    /// Try to leave the sweep while keeping our place in the peer's queue.
+    ///
+    /// False when there is no park handle at all (the CLI and test paths, which
+    /// keep the historical bail) or when the cap is full. Idempotent: a session
+    /// that parks, is granted a slot, and is later revoked back onto the queue
+    /// keeps the permit it already holds rather than claiming a second one.
+    fn park(&mut self) -> bool {
+        if self.parked() {
+            return true;
+        }
+        let Some(h) = self.handle else {
+            return false;
+        };
+        let Some(p) = h.claim() else {
+            return false;
+        };
+        self.permit = Some(p);
+        h.announce();
+        true
+    }
 }
 
 /// The AICH trust states padMule holds in memory (eMule EAICHStatus,
@@ -2062,6 +2170,7 @@ async fn await_slot<S>(
     peer: Option<SocketAddr>,
     aich: &mut AichAsk,
     bail_on_queue: bool,
+    park: &mut ParkState<'_>,
 ) -> Result<(), TransferError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -2076,6 +2185,12 @@ where
                     dl.note_source_slot_granted(addr).await;
                 }
                 crate::stats::note_accepted();
+                // A slot won by a session that had been QUEUED and chose to wait
+                // is the whole return on parking. Counted separately because
+                // `note_accepted` cannot distinguish it from an immediate grant.
+                if park.parked() {
+                    crate::stats::note_park_won();
+                }
                 return Ok(());
             }
             OP_QUEUERANKING if bail_on_queue => {
@@ -2085,6 +2200,19 @@ where
                 // #26 - a real eMule was seen ranking us #8 -> #11 -> #9 over
                 // the hour before it granted).
                 note_rank_if_ranking(&pkt, dl, peer).await;
+                // Try to keep our place instead of abandoning it. On success the
+                // session LEAVES the sweep (the worker is told, and takes the
+                // next source) and carries on here exactly like the wait-in-queue
+                // path: later rankings land in the aux handler below, each
+                // overwriting the last, so the per-source record tracks the queue
+                // as it moves. This is what makes pending #26's label witnessable
+                // at all - padMule never used to stay long enough to see it move.
+                if park.park() {
+                    crate::stats::note_parked();
+                    continue;
+                }
+                // Cap full: do what padMule always did. An honest refusal beats
+                // an unbounded socket count.
                 crate::stats::note_queued();
                 return Err(TransferError::Queued);
             }
@@ -2116,7 +2244,11 @@ where
         credit,
         ask_sources,
         peer_aich,
+        park,
     } = session;
+    // Owned here so the park permit is released however this session ends -
+    // including the dropped-future path, which is the common one.
+    let mut park = ParkState::new(park.as_ref());
     // The AICH part (if any) we asked THIS source recovery data for; the
     // answer handler matches against it like eMule matches its recorded
     // per-client request.
@@ -2234,7 +2366,7 @@ where
     // background client would instead keep the slot and wait its turn.
     crate::stats::note_slot_ask();
     fs.write_packet(&build_start_upload_req(&hash)).await?;
-    await_slot(fs, dl, &mut sec, peer, &mut aich, bail_on_queue).await?;
+    await_slot(fs, dl, &mut sec, peer, &mut aich, bail_on_queue, &mut park).await?;
 
     // Fetch blocks until this peer has nothing we still need.
     let size = dl.size().await;
@@ -2350,7 +2482,13 @@ where
             // answers, so it is deferred to the same flag.
             if pkt.opcode == OP_OUTOFPARTREQS {
                 crate::stats::note_revoked();
-                if bail_on_queue {
+                // A PARKED session does not bail here even though it is on the
+                // bail_on_queue path: it already holds a park slot and its place
+                // in this peer's queue, and upstream re-queues us itself as part
+                // of revoking (`AddClientToQueue(this, true)`,
+                // UploadClient.cpp:781). Walking away would throw away exactly
+                // what the park was claimed to keep.
+                if bail_on_queue && !park.parked() {
                     // Report the bytes rather than an error: this source DID
                     // deliver and behaved correctly, so the manager must score
                     // it as a proven deliverer and come back to it.
@@ -2359,7 +2497,7 @@ where
                 // Waiting our turn: give the in-flight blocks back first, so
                 // they are not stranded behind our place in the queue.
                 held.release_all();
-                await_slot(fs, dl, &mut sec, peer, &mut aich, bail_on_queue).await?;
+                await_slot(fs, dl, &mut sec, peer, &mut aich, bail_on_queue, &mut park).await?;
                 break;
             }
             let writes = rx.accept(pkt.opcode, &pkt.payload)?;
@@ -4763,6 +4901,209 @@ mod tests {
             Some(8),
             "the rank the peer sent must survive the bail - this is the defect"
         );
+        drop(fs);
+        up.abort();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// THE DEFECT (handoff pending #74): on the app's fetch path
+    /// (bail_on_queue = true) a peer that QUEUED us was abandoned on the spot,
+    /// so padMule never climbed anybody's queue. Measured on glass 2026-08-14:
+    /// of 61 sessions that asked for a slot, 30 were accepted and 29 were queued
+    /// and thrown away. The authority stays connected instead
+    /// (`ProcessEmuleQueueRank` -> `SetRemoteQueueRank` + DS_ONQUEUE,
+    /// DownloadClient.cpp:2210-2219).
+    ///
+    /// Same path and same flag as `queue_rank_recorded_when_bailing_on_queue`
+    /// above - the ONLY difference is that a park handle is supplied - so the
+    /// pair brackets the behavior exactly: without a park the session bails,
+    /// with one it waits and is served.
+    ///
+    /// MUTATION-CHECK: make `ParkState::park` return `false` unconditionally
+    /// (the old behavior) and this goes red with `Err(Queued)`.
+    #[tokio::test]
+    async fn a_queued_session_parks_and_is_served_when_the_slot_is_granted() {
+        use crate::transfer::{
+            build_queue_ranking, build_sending_part, parse_request_parts, OP_REQUESTPARTS,
+            OP_REQUESTPARTS_I64,
+        };
+
+        let size = (2 * mule_proto::EMBLOCKSIZE) as usize;
+        let data: Vec<u8> = (0..size as u32)
+            .map(|i| (i.wrapping_mul(11)) as u8)
+            .collect();
+        let hash = ed2k_hash(&data);
+        let name = b"parked.bin";
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let served = data.clone();
+        let up = tokio::spawn(async move {
+            let me = HelloInfo::baseline([0xE1; 16], 0, 4662, 4672, "up");
+            let (_p, mut fs) = accept_peer(&listener, &me).await.unwrap();
+            while let Ok(pkt) = fs.read_packet_unpacked().await {
+                match pkt.opcode {
+                    crate::transfer::OP_REQUESTFILENAME => {
+                        let _ = fs
+                            .write_packet(&crate::transfer::build_req_filename_answer(&hash, name))
+                            .await;
+                    }
+                    crate::transfer::OP_SETREQFILEID => {
+                        let _ = fs
+                            .write_packet(&crate::transfer::build_file_status_complete(&hash))
+                            .await;
+                    }
+                    // Busy: queue the asker. The grant comes only after a real
+                    // pause, so a session that bails on the ranking cannot
+                    // accidentally still be here to receive it.
+                    crate::transfer::OP_STARTUPLOADREQ => {
+                        let _ = fs.write_packet(&build_queue_ranking(8)).await;
+                        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                        let _ = fs
+                            .write_packet(&crate::transfer::build_accept_upload())
+                            .await;
+                    }
+                    OP_REQUESTPARTS | OP_REQUESTPARTS_I64 => {
+                        let (_h, blocks) =
+                            parse_request_parts(&pkt.payload, pkt.opcode == OP_REQUESTPARTS_I64)
+                                .unwrap();
+                        for (s, e) in blocks {
+                            let _ = fs
+                                .write_packet(&build_sending_part(
+                                    &hash,
+                                    s,
+                                    e,
+                                    &served[s as usize..e as usize],
+                                ))
+                                .await;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let dir = tmpdir("park-granted");
+        let store = PartStore::create(&dir, 1, hash, size as u64, name).unwrap();
+        let dl = Download::new(store);
+        let me = HelloInfo::baseline([0xE2; 16], 0x0A00_0001, 4663, 4673, "dl");
+        let (_p, mut fs) = connect_peer(addr, &me).await.unwrap();
+        dl.note_source(
+            "up".into(),
+            addr,
+            false,
+            false,
+            crate::fetch::SourceOrigin::Server,
+        )
+        .await;
+
+        // The one difference from the bail test: a park slot is available.
+        let (ptx, _prx) = tokio::sync::watch::channel(false);
+        let session = PeerSession {
+            park: Some(ParkHandle::new(
+                ptx,
+                Arc::new(tokio::sync::Semaphore::new(1)),
+            )),
+            ..PeerSession::default()
+        };
+
+        let got = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            download_from_peer_at(&mut fs, &dl, true, Some(addr), session),
+        )
+        .await
+        .expect("a parked session must still finish");
+        assert_eq!(
+            got.expect("the parked session was served"),
+            size as u64,
+            "a queued peer that later grants must deliver the whole file"
+        );
+        drop(fs);
+        up.abort();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The cap is what DECIDES, not the presence of a handle: a park lot with no
+    /// free slot must fall back to the historical bail rather than opening an
+    /// unbounded number of held sockets.
+    ///
+    /// Deliberately NOT tautological - the lot is built with zero permits, a
+    /// value the assertion never mentions, and the peer here NEVER grants, so
+    /// the only way to return is the bail arm.
+    ///
+    /// MUTATION-CHECK: give the semaphore 1 permit and this goes red (the
+    /// session parks and the 5s timeout expires instead of returning Queued).
+    #[tokio::test]
+    async fn a_full_park_lot_still_bails_on_a_queue_ranking() {
+        use crate::transfer::build_queue_ranking;
+
+        let size = 400_000u64;
+        let name = b"nopark.bin";
+        let hash = [0x78; 16];
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let up = tokio::spawn(async move {
+            let me = HelloInfo::baseline([0xE3; 16], 0, 4662, 4672, "up");
+            let (_p, mut fs) = accept_peer(&listener, &me).await.unwrap();
+            while let Ok(pkt) = fs.read_packet_unpacked().await {
+                match pkt.opcode {
+                    crate::transfer::OP_REQUESTFILENAME => {
+                        let _ = fs
+                            .write_packet(&crate::transfer::build_req_filename_answer(&hash, name))
+                            .await;
+                    }
+                    crate::transfer::OP_SETREQFILEID => {
+                        let _ = fs
+                            .write_packet(&crate::transfer::build_file_status_complete(&hash))
+                            .await;
+                    }
+                    // Queues, and never grants.
+                    crate::transfer::OP_STARTUPLOADREQ => {
+                        let _ = fs.write_packet(&build_queue_ranking(4)).await;
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let dir = tmpdir("park-full");
+        let store = PartStore::create(&dir, 1, hash, size, name).unwrap();
+        let dl = Download::new(store);
+        let me = HelloInfo::baseline([0xE4; 16], 0x0A00_0001, 4663, 4673, "dl");
+        let (_p, mut fs) = connect_peer(addr, &me).await.unwrap();
+        dl.note_source(
+            "up".into(),
+            addr,
+            false,
+            false,
+            crate::fetch::SourceOrigin::Server,
+        )
+        .await;
+
+        let (ptx, _prx) = tokio::sync::watch::channel(false);
+        let session = PeerSession {
+            park: Some(ParkHandle::new(
+                ptx,
+                Arc::new(tokio::sync::Semaphore::new(0)),
+            )),
+            ..PeerSession::default()
+        };
+
+        let got = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            download_from_peer_at(&mut fs, &dl, true, Some(addr), session),
+        )
+        .await
+        .expect("a session that cannot park must bail promptly, not hang");
+        assert!(
+            matches!(got, Err(TransferError::Queued)),
+            "with the park cap full the session must abandon the peer as before"
+        );
+        // The rank still lands - the park attempt must not cost the record.
+        let srcs = dl.sources().await;
+        let s = srcs.iter().find(|s| s.addr == addr).expect("record exists");
+        assert_eq!(s.queue_rank, Some(4));
         drop(fs);
         up.abort();
         std::fs::remove_dir_all(&dir).ok();

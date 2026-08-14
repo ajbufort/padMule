@@ -2092,7 +2092,17 @@ async fn cmd_search_download(met_path: &str, keyword: &str, out: &str) {
             per_peer: Duration::from_secs(45),
             rounds: 3,
         };
-        let out = download_file(&dl, reg.sources(), &me, cfg, None, None, None).await;
+        let out = download_file(
+            &dl,
+            reg.sources(),
+            &me,
+            cfg,
+            None,
+            None,
+            None,
+            mule_engine::fetch::ParkLot::new(mule_engine::fetch::MAX_PARKED_SESSIONS),
+        )
+        .await;
         println!(
             "  {} / {size} bytes; complete={}",
             out.bytes_present, out.completed
@@ -2648,7 +2658,17 @@ async fn cmd_link(link: &str, out: Option<&str>) {
                 per_peer: Duration::from_secs(60),
                 rounds: 6,
             };
-            let o = download_file(&dl, &sources, &me, cfg, None, None, None).await;
+            let o = download_file(
+                &dl,
+                &sources,
+                &me,
+                cfg,
+                None,
+                None,
+                None,
+                mule_engine::fetch::ParkLot::new(mule_engine::fetch::MAX_PARKED_SESSIONS),
+            )
+            .await;
             println!(
                 "{} / {} bytes; complete={}",
                 o.bytes_present, f.size, o.completed
@@ -2933,7 +2953,17 @@ async fn cmd_fetch_complete(
         };
         // Direct HighID sources (each bails in ~2s if it queues us rather than
         // granting a slot, so this whole call is fast when nobody is free)...
-        download_file(&dl, reg.sources(), &me, cfg, None, None, None).await;
+        download_file(
+            &dl,
+            reg.sources(),
+            &me,
+            cfg,
+            None,
+            None,
+            None,
+            mule_engine::fetch::ParkLot::new(mule_engine::fetch::MAX_PARKED_SESSIONS),
+        )
+        .await;
         // ...then, if we asked LowID sources to call back, wait WHILE they keep
         // delivering. A callback can take many seconds to connect and then streams
         // the whole file, so a fixed short wait would abandon an in-flight

@@ -476,18 +476,58 @@ const FWCHECK_LINGER_PKTS: usize = 8;
 /// never holds it, which is why it is a tuple rather than a borrow.
 type PublishableFile = ([u8; 16], u64, String, Vec<String>, Option<[u8; 20]>);
 
-/// The most simultaneous uploads we grant. Modest by desktop standards (aMule
-/// floors at 20) because an iPad on a phone uplink is not a seedbox. A peer
-/// that finds every slot taken is not refused: the `UploadGate` queues it by
-/// credit score and answers OP_QUEUERANKING, exactly the standard wait-line
-/// behaviour. The only true refusal is a FULL QUEUE (`UPLOAD_QUEUE_CAP`),
-/// which is dropped silently - no packet - matching upstream.
-const MAX_UPLOAD_SLOTS: usize = 8;
-/// How many peers may wait for a slot before we decline further requests. A
-/// small cap is honest for a foreground-only client (eMule's desktop default is
-/// thousands, which assumes an always-on seedbox); a queued peer holds an open
-/// connection here, so this also bounds fd/memory use.
-const UPLOAD_QUEUE_CAP: usize = 32;
+/// The most simultaneous uploads we grant.
+///
+/// **NEITHER AUTHORITY USES A FIXED NUMBER HERE** - both derive the slot count
+/// from upload bandwidth, and padMule's situation is their UNLIMITED branch
+/// because padMule has no upload throttle at all.
+/// - aMule `CUploadQueue::GetMaxSlots` (`src/UploadQueue.cpp:303-331`):
+///   `max(N_FLOOR, uploadRate/slotRate + 2)`, ceiling `MAX_UP_CLIENTS_ALLOWED`
+///   250. **`N_FLOOR` is 20** (`:313`), and its comment gives a FUNCTIONAL
+///   reason rather than a generous one: a rate-derived cap starves itself,
+///   because too few parallel TCP flows cannot break cold start and let the
+///   uplink ramp up in the first place.
+/// - eMule 0.50a (`UploadQueue.cpp:440-472`) grants another slot while
+///   `curUploadSlots < datarate/upPerClient`, `upPerClient` 3072-7680 B/s
+///   (`opcodes.h:109`), ceiling `MAX_UP_CLIENTS_ALLOWED` 100.
+///
+/// **20 IS aMule'S FLOOR FOR EXACTLY THIS CONFIGURATION**, and it is what
+/// padMule takes. This was 8, whose comment read "an iPad on a phone uplink is
+/// not a seedbox" - the premise Anthony retired on 2026-08-14 (the standing
+/// modern-wifi directive), and 8 was below even the floor whose whole purpose is
+/// to stop a client throttling its own uplink. 20 stays far under
+/// `MAX_INBOUND_CONNS` (200), so it cannot starve the accept path.
+///
+/// **WHAT IS DELIBERATELY NOT IMPLEMENTED, so the gap is recorded rather than
+/// implied:** the SCALING half. Both authorities raise the count as the measured
+/// upload rate rises; padMule pins it at the floor. That is a real divergence,
+/// and the honest one to close next - it needs an upload-rate measurement the
+/// engine does not currently keep.
+///
+/// A peer that finds every slot taken is not refused: the `UploadGate` queues it
+/// by credit score and answers OP_QUEUERANKING, exactly the standard wait-line
+/// behaviour. The only true refusal is a FULL QUEUE (`UPLOAD_QUEUE_CAP`), which
+/// is dropped silently - no packet - matching upstream.
+const MAX_UPLOAD_SLOTS: usize = 20;
+/// How many peers may wait for a slot before we decline further requests.
+///
+/// **THE AUTHORITIES CONFLICT HERE and the comparison is not like-for-like**, so
+/// both are cited. eMule 0.50a defaults to **5000** (`50*100`,
+/// `Preferences.cpp:2261-2263`); aMule defaults to **50**
+/// (`Preferences.cpp:1302`). CLAUDE.md says follow eMule where they conflict -
+/// but eMule's 5000 counts queue ENTRIES it can re-contact later, via the
+/// slot-grant dial-out and UDP `OP_REASKFILEPING` that padMule explicitly does
+/// not implement (see [`UploadGate`]'s own doc). **In padMule every waiter is a
+/// LIVE CONNECTION**, held by a `QueueWaiter` task, so this number bounds open
+/// sockets and is structurally bounded by `MAX_INBOUND_CONNS` (200) - not by any
+/// judgement about how much this device ought to serve.
+///
+/// So padMule takes **aMule's 50**, the authority whose queue is the same KIND
+/// of thing, and says why. This was 32, justified as "honest for a
+/// foreground-only client" - a restatement of the retired phone-link premise,
+/// and it left the queue only 1.6x the slot count where aMule pairs its floor of
+/// 20 slots with 50.
+const UPLOAD_QUEUE_CAP: usize = 50;
 /// Cap on CONCURRENT inbound peer-connection tasks the listener will spawn. A
 /// hostile peer opening thousands would otherwise exhaust file descriptors + task
 /// memory; excess connections are dropped (the peer can retry).
@@ -1902,6 +1942,16 @@ pub struct Engine {
     /// The last HighID client id we were assigned, which IS our public address.
     /// Kept ONLY to notice a change; never emitted, never rendered.
     last_public_id: Option<u32>,
+    /// Whether we hold an eD2K HighID RIGHT NOW - the first clause of eMule's
+    /// `CemuleApp::IsFirewalled` (`emule.cpp:1344-1353`), which is recomputed on
+    /// every `Publish()` rather than latched.
+    ///
+    /// SEPARATE from `last_public_id` on purpose, because the two are different
+    /// kinds of fact and conflating them was pending #52: `last_public_id` is a
+    /// MEMORY of the last public address (correctly sticky - it is the VPN
+    /// address-change guard), while this is a LIVE reachability answer that must
+    /// go false the moment the server connection ends or downgrades to LowID.
+    server_high_id: bool,
     /// True while sharing is off BECAUSE the address changed, so the UI can keep
     /// saying why and `set_sharing(true)` can clear it. DURABLE: mirrored by a
     /// marker file (see `ip_pause_path`) that `new()` restores, so a relaunch
@@ -1963,6 +2013,10 @@ pub struct Engine {
     /// The IP blocklist (ipfilter.dat / .p2p), if the user placed one. Shared with
     /// the listener task so inbound peers are gated too. `None` = no filtering.
     ip_filter: Option<Arc<IpFilter>>,
+    /// ONE park lot for the whole engine, cloned into every sweep.
+    /// Shared rather than per-download because it caps HELD SOCKETS and
+    /// `maxActiveDownloads` ships unlimited - see [`fetch::download_file`].
+    park: crate::fetch::ParkLot,
     /// The eD2k SERVER we are currently using, as an IPv4 in HOST order
     /// (`u32::from(Ipv4Addr)`, the convention `IpFilter::is_blocked_u32` holds -
     /// NOT the byte-reversed met u32 that server.met stores). `0` = none.
@@ -2105,12 +2159,14 @@ impl Engine {
             known2,
             credit_store,
             ip_filter: None,
+            park: crate::fetch::ParkLot::new(crate::fetch::MAX_PARKED_SESSIONS),
             server_probe_ip: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             server: None,
             connection: None,
             kad: None,
             kad_fw: Arc::new(std::sync::Mutex::new(None)),
             last_public_id: None,
+            server_high_id: false,
             sharing_paused_for_ip_change: ip_paused,
             listen_port: TCP_PORT,
             advertised_port: TCP_PORT,
@@ -2529,8 +2585,16 @@ impl Engine {
     /// never leaves this function.
     pub fn note_public_id(&mut self, id: u32, low_id: bool) {
         if low_id {
+            // We are NOT a reachable source any more. `last_public_id` is
+            // deliberately left alone - it is the address-change guard's memory,
+            // and a LowID login carries no address to compare - but the live
+            // reachability answer must move, which is pending #52: it used to be
+            // read off `last_public_id.is_some()`, so one HighID login unlocked
+            // source publishing permanently, LowID or not.
+            self.server_high_id = false;
             return;
         }
+        self.server_high_id = true;
         match self.last_public_id {
             Some(prev) if prev != id => {
                 self.sharing.store(false, Ordering::Relaxed);
@@ -4212,6 +4276,21 @@ impl Engine {
             l.disconnect().await;
         }
         self.connection = None;
+        // Everything the connection justified dies WITH it (pending #52 + #53).
+        // `disconnect_server` already cleared all three; this path - the server
+        // dropping US - did not, so a kick left them standing for the rest of
+        // the session.
+        //
+        // `server_probe_ip` is the sharpest of the three: it exempts that
+        // address from the user's blocklist on the ACCEPT path, and an exempted
+        // inbound connection runs `peer_handshake_inbound` FIRST - so it has
+        // already been told our userhash, nickname, ports and capabilities
+        // before the post-handshake blocklist check can refuse it. The exemption
+        // is deliberately narrow and its comment says so; the defect was that it
+        // OUTLIVED the relationship that justified it.
+        self.server_high_id = false;
+        self.set_server_probe_ip(None);
+        self.search_session = None;
         self.emit(EngineEvent::ServerDropped { addr: addr.clone() });
         // The DURABLE status line too. The app feeds its status row from
         // `Status` events ALONE and routes `Server` text to a transient banner,
@@ -5317,6 +5396,8 @@ impl Engine {
         let credit_store = Arc::clone(&self.credit_store);
         // Sources learned mid-sweep via source exchange are filtered too.
         let ip_filter = self.ip_filter.clone();
+        // ONE lot for the whole engine - the cap is a global fd budget.
+        let park = self.park.clone();
         let dest = self.downloads_dir.join(safe_filename(name));
         let events = self.events.clone();
         let ctx = FinishCtx {
@@ -5345,6 +5426,7 @@ impl Engine {
                 Some(identity),
                 Some(credit_store),
                 ip_filter,
+                park,
             )
             .await;
             // Cancelled while in flight: the engine already removed it and deleted
@@ -6257,8 +6339,27 @@ impl Engine {
         self.last_kad_publish = Instant::now();
 
         // Refill the schedule from the current library when it is idle. A
-        // firewalled node (no public id) publishes keywords but not sources.
-        let can_publish_source = self.last_public_id.is_some();
+        // firewalled node publishes keywords but not sources.
+        //
+        // READ LIVE, never latched (pending #52). eMule recomputes
+        // `theApp.IsFirewalled()` inside every `CSharedFileList::Publish`
+        // (`SharedFileList.cpp:1327`), and `IsFirewalled` is itself a fresh
+        // two-clause test (`emule.cpp:1344-1353`). This used to read
+        // `last_public_id.is_some()`, which is set once and never cleared - so a
+        // single HighID login permanently unlocked source publishing, and we
+        // kept announcing "this address holds this hash" to the whole DHT long
+        // after dropping to LowID, where nobody can dial us. That is the same
+        // unconnectable-record harm as pending #60, aimed at Kad instead of SX.
+        //
+        // NARROWER THAN eMULE, AND DELIBERATELY SO: only the SERVER clause is
+        // implemented. eMule also publishes when Kad itself reports a HighID
+        // (`CKademlia::IsConnected() && !CKademlia::IsFirewalled()`), which needs
+        // a UDP firewall-tester padMule does not have (see pending #72, where
+        // building the connect-back half was declined). So a serverless but
+        // Kad-reachable padMule still publishes keywords and not sources - the
+        // remaining half of #52, and the safe direction: we under-claim
+        // reachability rather than over-claim it.
+        let can_publish_source = self.server_high_id;
         let now = u64::from(now_secs());
         // (hash, size, name, keywords, aich_root) for each shared file. The AICH
         // root rides along because a v9 target gets it published as
@@ -9671,6 +9772,112 @@ mod tests {
             }
         });
         addr
+    }
+
+    /// PENDING #52: source publishing was gated on `last_public_id.is_some()`,
+    /// a latch written only ever as `Some` - so ONE HighID login unlocked it for
+    /// the life of the process. After dropping to LowID nobody can dial us, yet
+    /// we would keep announcing "this address holds this hash" to the whole DHT.
+    /// That is the same unconnectable-record harm as pending #60, aimed at Kad.
+    /// eMule recomputes `theApp.IsFirewalled()` inside every `Publish()`
+    /// (`SharedFileList.cpp:1327`, `emule.cpp:1344-1353`).
+    ///
+    /// BOTH halves are asserted, because the obvious wrong fix - relocking by
+    /// clearing `last_public_id` - would silently DISARM the VPN address-change
+    /// guard, which is a privacy control. One field was carrying a live
+    /// reachability answer and a sticky address memory; they are now separate.
+    ///
+    /// MUTATION-CHECK, either direction: restore
+    /// `let can_publish_source = self.last_public_id.is_some();`, or delete the
+    /// `server_high_id = false` from the LowID arm -> the relock assert reds.
+    #[tokio::test]
+    async fn a_lowid_login_relocks_source_publishing_without_disarming_the_address_guard() {
+        let dir = tmp("publish-latch-52");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut engine, mut rx) = Engine::new(&dir).unwrap();
+
+        engine.note_public_id(0x0102_0304, false);
+        assert!(
+            engine.server_high_id,
+            "CONTROL: a HighID login makes us a publishable source"
+        );
+
+        engine.note_public_id(7, true);
+        assert!(
+            !engine.server_high_id,
+            "a LowID login must RELOCK source publishing - pending #52"
+        );
+        assert_eq!(
+            engine.last_public_id,
+            Some(0x0102_0304),
+            "the address MEMORY must survive a LowID episode - it is the VPN \
+             guard, not the reachability flag"
+        );
+
+        // ...and the guard is still armed: a HighID at a DIFFERENT address pauses.
+        let _ = drain(&mut rx).await;
+        engine.note_public_id(0x0506_0708, false);
+        let evs = drain(&mut rx).await;
+        assert!(
+            evs.iter()
+                .any(|e| matches!(e, EngineEvent::PublicAddressChanged)),
+            "the address-change guard must still fire after a LowID episode; got {evs:?}"
+        );
+        assert!(
+            engine.server_high_id,
+            "and a fresh HighID re-unlocks source publishing"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PENDING #53: the accept-path blocklist EXEMPTION for our own server
+    /// outlived the connection that justified it. `disconnect_server` cleared
+    /// it; the path where the server drops US did not - so after a kick that
+    /// address kept a standing exemption for the rest of the session.
+    ///
+    /// Not cosmetic. An exempted inbound connection runs
+    /// `peer_handshake_inbound` FIRST and only then meets the post-handshake
+    /// blocklist check, so by the time it is refused it has already been told
+    /// our userhash, nickname, ports and capabilities. The exemption is
+    /// deliberately narrow; the defect was that it outlived its justification.
+    ///
+    /// MUTATION-CHECK: delete the `set_server_probe_ip(None)` from
+    /// `poll_server_drop` -> red.
+    #[tokio::test]
+    async fn a_server_that_kicks_us_loses_its_blocklist_exemption() {
+        let dir = tmp("kick-exemption-53");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut engine, mut rx) = Engine::new(&dir).unwrap();
+
+        let addr = spawn_kicking_login_server().await;
+        assert!(
+            engine.connect_to_server(addr).await,
+            "mock login should win"
+        );
+        assert_ne!(
+            engine.server_probe_ip.load(Ordering::Relaxed),
+            0,
+            "CONTROL: connecting exempts the server address from the blocklist"
+        );
+        let _ = drain(&mut rx).await;
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            engine.poll_server_drop().await.is_some(),
+            "the closed connection must be detected as a drop"
+        );
+        assert_eq!(
+            engine.server_probe_ip.load(Ordering::Relaxed),
+            0,
+            "a server that KICKS us must lose its accept-path exemption - #53"
+        );
+        assert!(
+            engine.search_session.is_none(),
+            "and its search session goes with it, as on the disconnect path"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A server DROP must refresh the durable Status line, not only raise the

@@ -106,7 +106,19 @@ funnel! {
     F_HS_GOT    => note_hashset_got / hashset_got,   "  got hashset";
     F_SLOT_ASK  => note_slot_ask / slot_asked,    "asked for a slot";
     F_ACCEPT    => note_accepted / accepted,      "  slot ACCEPTED";
-    F_QUEUED    => note_queued / queued,          "  queued (bailed)";
+    // The queue answer splits in two, and the split is the whole point of the
+    // 2026-08-14 park work: a queued session either KEEPS its place (parked, and
+    // still able to become a transfer) or is abandoned because the park cap is
+    // full. Before parking existed every queue answer was the second kind - 29
+    // of 61 slot asks on the measured glass run.
+    F_PARKED    => note_parked / parked,          "  queued: PARKED, waiting our turn";
+    // THE CONVERSION, and the only line that answers whether parking was worth
+    // building: a session that was QUEUED and later won its slot on the SAME
+    // held connection. `slot ACCEPTED` above counts these too, so this is a
+    // subset of it, not another column to add in. Without this line the funnel
+    // can say sessions parked but not that parking ever paid.
+    F_PARKWON   => note_park_won / park_won,      "    ...of those, GRANTED after waiting";
+    F_QUEUED    => note_queued / queued,          "  queued: abandoned (park full)";
     F_NOBLOCK   => note_no_blocks / no_blocks,    "accepted, no block to take";
     F_REQ       => note_requested / requested,    "requested blocks";
     F_DELIVERED => note_delivered / delivered,    "DELIVERED bytes";
