@@ -22,6 +22,16 @@ current build state is `docs/wiki/build-progress.md`.
 
 - The author is **Anthony Bufort** (`ajbufort@ajbconsulting.us`). Never "Alex".
 - **ASCII only in files.** No arrow glyphs and no em/en dashes. Use `->` and `-`.
+- **ASSUME A MODERN WIFI CONNECTION, NEVER A PHONE LINK** (Anthony, STANDING,
+  2026-08-14). padMule's users are on real broadband over wifi. Do NOT reason
+  from "an iPad is a phone", do NOT tune constants down for a mobile uplink, and
+  do NOT offer "it costs bandwidth on a mobile device" as an argument against
+  doing what the authority does. **This is the same stale-calibration trap the
+  Platform-facts section already names for the A12Z:** the original target was a
+  2020 iPad and the constraints derived from it are calibrated to the wrong
+  machine. The device is an M4 on wifi. Where upstream's number and a
+  mobile-sized number disagree, **take upstream's** unless there is a MEASURED
+  reason on THIS hardware not to.
 - **What you EDIT is `crates/` + `ios/`** (plus `scripts/`, `fuzz/` and the docs
   when the task is theirs). That is a narrower thing than what the tree CONTAINS,
   and the Architecture table below - titled "the working tree" - lists the
